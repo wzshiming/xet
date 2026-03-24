@@ -41,6 +41,8 @@ func mergedHashOfSequence(hashes []HashWithSize) HashWithSize {
 }
 
 // aggregatedNodeHash iteratively collapses a slice of HashWithSize down to a single hash.
+// Each outer iteration processes the entire array left-to-right, finding all merge cuts
+// and producing a shorter array. This repeats until only one element remains.
 func aggregatedNodeHash(chunks []HashWithSize) DataHash {
 	if len(chunks) == 0 {
 		return DataHash{}
@@ -51,14 +53,20 @@ func aggregatedNodeHash(chunks []HashWithSize) DataHash {
 	copy(work, chunks)
 
 	for len(work) > 1 {
-		cut := nextMergeCut(work)
-		merged := mergedHashOfSequence(work[:cut])
-		// Replace the first cut elements with the merged result.
-		newWork := make([]HashWithSize, 0, 1+len(work)-cut)
-		newWork = append(newWork, merged)
-		newWork = append(newWork, work[cut:]...)
-		work = newWork
+		writeIdx := 0
+		readIdx := 0
+
+		for readIdx < len(work) {
+			cut := nextMergeCut(work[readIdx:])
+			nextCut := readIdx + cut
+			work[writeIdx] = mergedHashOfSequence(work[readIdx:nextCut])
+			writeIdx++
+			readIdx = nextCut
+		}
+
+		work = work[:writeIdx]
 	}
+
 	return work[0].Hash
 }
 
