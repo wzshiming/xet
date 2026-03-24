@@ -1,6 +1,7 @@
 package merkle
 
 import (
+	"encoding/hex"
 	"testing"
 
 	"github.com/wzshiming/xet/pkg/xet"
@@ -74,8 +75,8 @@ Input: Two chunk hashes from the Internal Node Hash Test Vector
 	  eb06a8ad81d588ac05d1d9a079232d9c1e7d0b07232fa58091caa7bf333a2768
 */
 func TestVerificationHash(t *testing.T) {
-	chunk1, _ := xet.StringToHash("aad4607a38588fc2777f7cda1c310c209e86f564486186f6694aa1d065f7ebad")
-	chunk2, _ := xet.StringToHash("2cce73e063324e6e271e360c77cc780e65ab984b053bdb78220fa74f08fc77e2")
+	chunk1, _ := decodeRawHash("aad4607a38588fc2777f7cda1c310c209e86f564486186f6694aa1d065f7ebad")
+	chunk2, _ := decodeRawHash("2cce73e063324e6e271e360c77cc780e65ab984b053bdb78220fa74f08fc77e2")
 
 	// Compute verification hash
 
@@ -86,4 +87,14 @@ func TestVerificationHash(t *testing.T) {
 	if verificationHash != expectedHash {
 		t.Errorf("Verification hash does not match expected value. Got %s, want %s", verificationHash.String(), expectedHash.String())
 	}
+}
+
+func decodeRawHash(hexStr string) (xet.Hash, error) {
+	bytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return xet.Hash{}, err
+	}
+	var hash xet.Hash
+	copy(hash[:], bytes)
+	return hash, nil
 }
