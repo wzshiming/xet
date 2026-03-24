@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -74,13 +73,12 @@ func TestQwen25_05B_ModelSafetensors(t *testing.T) {
 
 	// Compute file hash (Merkle root + final keyed hash)
 	fileHash := merkle.ComputeFileHash(chunkHashes, chunkSizes)
-	fileHashHex := hex.EncodeToString(fileHash[:])
+	fileHashXET := xet.HashToString(fileHash)
 
-	t.Logf("Computed file hash (raw hex): %s", fileHashHex)
-	t.Logf("Computed file hash (XET str): %s", xet.HashToString(fileHash))
+	t.Logf("Computed file hash (XET str): %s", fileHashXET)
 
-	if fileHashHex != expectedHash {
-		t.Errorf("file hash mismatch:\n  got:  %s\n  want: %s", fileHashHex, expectedHash)
+	if fileHashXET != expectedHash {
+		t.Errorf("file hash mismatch:\n  got:  %s\n  want: %s", fileHashXET, expectedHash)
 	}
 }
 
