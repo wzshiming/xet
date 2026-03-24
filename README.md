@@ -26,9 +26,10 @@ This implementation follows the [XET Protocol Specification](https://datatracker
 - [x] **Xorb Format** - Binary serialization and deserialization
 - [x] **Shard Format** - Binary metadata structure for file reconstructions
 - [x] **HTTP API Client** - Complete client for XET CAS server
+- [x] **HTTP API Server** - Full server implementation supporting all XET endpoints
 - [x] **Upload Flow** - Full upload orchestration with deduplication
 - [x] **Download Flow** - File reconstruction and download
-- [x] **CLI Tool** - Command-line tool with upload/download commands
+- [x] **CLI Tools** - Command-line tools for client and server operations
 
 ## Installation
 
@@ -37,6 +38,53 @@ go get github.com/wzshiming/xet
 ```
 
 ## Usage
+
+### Running the XET Server
+
+The XET server provides a complete implementation of the CAS (Content-Addressable Storage) server API:
+
+```bash
+# Build the server
+go build -o xet-server ./cmd/xet-server
+
+# Run the server (default port :8080)
+./xet-server
+
+# Run with custom options
+./xet-server \
+  --addr :9000 \
+  --storage ./my-xet-data \
+  --token my-secret-token \
+  --base-url http://localhost:9000
+```
+
+Server options:
+- `--addr` - Server address (default: `:8080`)
+- `--storage` - Storage directory for xorbs and shards (default: `./xet-data`)
+- `--token` - Authentication token (optional, enables authentication)
+- `--base-url` - Base URL for serving xorb data (optional)
+- `--tls-cert` - TLS certificate file for HTTPS (optional)
+- `--tls-key` - TLS key file for HTTPS (optional)
+
+The server implements all XET protocol endpoints:
+- `GET /api/v1/reconstructions/{file_hash}` - File reconstruction queries
+- `POST /api/v1/xorbs/{namespace}/{xorb_hash}` - Upload xorbs
+- `POST /api/v1/shards` - Upload shards (register files)
+- `GET /api/v1/chunks/{namespace}/{chunk_hash}` - Chunk deduplication queries
+- `GET /api/v1/xorbs/{namespace}/{xorb_hash}/data` - Download xorb data
+
+Example server workflow:
+```bash
+# Terminal 1: Start the server
+./xet-server --token abc123
+
+# Terminal 2: Upload a file
+echo "Hello, XET Server!" > test.txt
+./xet upload test.txt --url http://localhost:8080 --token abc123
+
+# Terminal 3: Download the file
+./xet download <file-hash> output.txt --url http://localhost:8080
+```
 
 ### Command-Line Tool
 
@@ -247,12 +295,18 @@ xet/
 │   ├── api/          # HTTP API client
 │   │   ├── client.go         # API client implementation
 │   │   └── types.go          # API types
+│   ├── server/       # HTTP API server
+│   │   ├── server.go         # Server implementation
+│   │   ├── storage.go        # Storage interface
+│   │   └── server_test.go    # Server tests
 │   ├── upload/       # Upload orchestration
 │   │   └── session.go        # Upload session logic
 │   └── download/     # Download orchestration
 │       └── session.go        # Download session logic
 ├── cmd/
-│   └── xet/          # CLI tool
+│   ├── xet/          # CLI client tool
+│   │   └── main.go
+│   └── xet-server/   # CAS server
 │       └── main.go
 ├── draft-denis-xet-03.txt  # Protocol specification
 └── README.md
@@ -305,6 +359,14 @@ The test suite includes:
   - Chunk deduplication queries
   - Byte range downloads
   - Error handling
+
+- **Server Tests** (`pkg/server/server_test.go`)
+  - Xorb upload and storage
+  - Shard upload and registration
+  - File reconstruction queries
+  - Xorb data downloads
+  - Authentication and authorization
+  - Chunk deduplication endpoint
 
 - **Upload Session Tests** (`pkg/upload/session_test.go`)
   - Session initialization with various options
@@ -390,7 +452,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## Status
 
-This is a complete implementation of the XET protocol upload and download flows. All core protocol components are fully functional:
+This is a complete implementation of the XET protocol with both client and server components. All core protocol components are fully functional:
 
 - ✅ Content-defined chunking (Gearhash)
 - ✅ Cryptographic hashing (BLAKE3)
@@ -399,9 +461,10 @@ This is a complete implementation of the XET protocol upload and download flows.
 - ✅ Xorb serialization/deserialization
 - ✅ Shard format implementation
 - ✅ HTTP API client
+- ✅ HTTP API server
 - ✅ Upload flow with deduplication
 - ✅ Download flow with reconstruction
-- ✅ CLI tool with upload/download commands
+- ✅ CLI tools for client and server
 
 ### Protocol Compliance
 
@@ -424,7 +487,15 @@ This implementation follows the XET Protocol Specification (draft-denis-xet-03) 
 
 ### API Endpoints Supported
 
+**Client API:**
 - `GET /api/v1/reconstructions/{file_hash}` - File reconstruction queries
 - `POST /api/v1/xorbs/{namespace}/{xorb_hash}` - Upload xorbs
 - `POST /api/v1/shards` - Upload shards
 - `GET /api/v1/chunks/{namespace}/{chunk_hash}` - Chunk deduplication queries
+
+**Server Implementation:**
+- `GET /api/v1/reconstructions/{file_hash}` - File reconstruction queries
+- `POST /api/v1/xorbs/{namespace}/{xorb_hash}` - Upload xorbs
+- `POST /api/v1/shards` - Register file shards
+- `GET /api/v1/chunks/{namespace}/{chunk_hash}` - Chunk deduplication queries
+- `GET /api/v1/xorbs/{namespace}/{xorb_hash}/data` - Download xorb data with range support
