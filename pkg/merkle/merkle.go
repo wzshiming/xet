@@ -30,27 +30,40 @@ func (t *Tree) AddLeaf(hash xet.Hash, size uint64) {
 // ComputeRoot computes the Merkle tree root hash
 func (t *Tree) ComputeRoot() xet.Hash {
 	if len(t.leaves) == 0 {
+		// Return ZERO_HASH (32 zero bytes)
 		return xet.Hash{}
 	}
 
-	if len(t.leaves) == 1 {
-		return t.leaves[0]
-	}
-
-	// Build the tree level by level
-	currentLevel := make([]node, len(t.leaves))
+	// Build initial list of entries
+	entries := make([]node, len(t.leaves))
 	for i := range t.leaves {
-		currentLevel[i] = node{
+		entries[i] = node{
 			hash: t.leaves[i],
 			size: t.sizes[i],
 		}
 	}
 
-	for len(currentLevel) > 1 {
-		currentLevel = t.buildNextLevel(currentLevel)
+	// Iteratively collapse until single root remains
+	for len(entries) > 1 {
+		nextLevel := make([]node, 0)
+		readIdx := 0
+
+		for readIdx < len(entries) {
+			// Determine how many entries to merge
+			cutSize := nextMergeCut(entries[readIdx:])
+			cutEnd := readIdx + cutSize
+
+			// Merge this group
+			merged := t.mergeNodes(entries[readIdx:cutEnd])
+			nextLevel = append(nextLevel, merged)
+
+			readIdx = cutEnd
+		}
+
+		entries = nextLevel
 	}
 
-	return currentLevel[0].hash
+	return entries[0].hash
 }
 
 // node represents a node in the Merkle tree
@@ -59,64 +72,35 @@ type node struct {
 	size uint64
 }
 
-// buildNextLevel builds the next level of the tree from the current level
-func (t *Tree) buildNextLevel(currentLevel []node) []node {
-	cutPoints := findCutPoints(currentLevel)
+// nextMergeCut determines how many entries to merge based on the XET specification
+// Returns the number of entries to merge (cut point)
+func nextMergeCut(nodes []node) int {
+	n := len(nodes)
 
-	nextLevel := make([]node, 0, len(cutPoints))
-	start := 0
-
-	for _, cutPoint := range cutPoints {
-		// Merge nodes from start to cutPoint (exclusive)
-		mergedNode := t.mergeNodes(currentLevel[start:cutPoint])
-		nextLevel = append(nextLevel, mergedNode)
-		start = cutPoint
+	// If 2 or fewer, merge all
+	if n <= 2 {
+		return n
 	}
 
-	// Handle remaining nodes
-	if start < len(currentLevel) {
-		mergedNode := t.mergeNodes(currentLevel[start:])
-		nextLevel = append(nextLevel, mergedNode)
+	// Maximum we can merge is MAX_CHILDREN or all remaining
+	end := xet.MaxChildren
+	if end > n {
+		end = n
 	}
 
-	return nextLevel
-}
-
-// findCutPoints determines where to split the sequence based on hash values
-func findCutPoints(nodes []node) []int {
-	if len(nodes) <= xet.MinChildren {
-		return nil
-	}
-
-	cutPoints := make([]int, 0)
-
-	for i := xet.MinChildren; i < len(nodes); i++ {
-		if i >= len(nodes)-xet.MinChildren && len(nodes)-i < xet.MinChildren {
-			// Don't create a cut point that would leave too few children at the end
-			break
-		}
-
-		// Use the hash value to determine if this is a cut point
-		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[:8])
+	// Check indices 2 through end-1 (0-based indexing)
+	// Minimum merge is 3 children when input has more than 2 hashes
+	for i := 2; i < end; i++ {
+		// Use last 8 bytes of hash as little-endian 64-bit unsigned int
+		// Per spec: hash[24:32] are the last 8 bytes
+		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[24:32])
 		if hashValue%xet.MeanBranchingFactor == 0 {
-			cutPoints = append(cutPoints, i)
-
-			// Check if we've reached MaxChildren
-			if i-getLastCutPoint(cutPoints, 0) >= xet.MaxChildren {
-				break
-			}
+			return i + 1 // Cut after element i (include i+1 elements)
 		}
 	}
 
-	return cutPoints
-}
-
-// getLastCutPoint returns the last cut point or the default value
-func getLastCutPoint(cutPoints []int, defaultVal int) int {
-	if len(cutPoints) == 0 {
-		return defaultVal
-	}
-	return cutPoints[len(cutPoints)-1]
+	// No cut point found, merge up to MAX_CHILDREN or all remaining
+	return end
 }
 
 // mergeNodes merges a sequence of nodes into a single parent node

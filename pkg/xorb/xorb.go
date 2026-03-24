@@ -330,41 +330,37 @@ func computeXorbHashFromChunks(hashes []xet.Hash, sizes []uint64) xet.Hash {
 	}
 
 	if len(hashes) == 0 {
+		// Return ZERO_HASH (32 zero bytes)
 		return xet.Hash{}
 	}
 
-	if len(hashes) == 1 {
-		return hashes[0]
-	}
-
-	// Build Merkle tree with variable fan-out
-	currentLevel := make([]merkleNode, len(hashes))
+	// Build initial list of entries
+	entries := make([]merkleNode, len(hashes))
 	for i := range hashes {
-		currentLevel[i] = merkleNode{hash: hashes[i], size: sizes[i]}
+		entries[i] = merkleNode{hash: hashes[i], size: sizes[i]}
 	}
 
-	// Iteratively build parent levels until we have a single root
-	for len(currentLevel) > 1 {
-		cutPoints := findCutPoints(currentLevel)
+	// Iteratively collapse until single root remains
+	for len(entries) > 1 {
 		nextLevel := make([]merkleNode, 0)
-		start := 0
+		readIdx := 0
 
-		for _, cutPoint := range cutPoints {
-			merged := mergeNodes(currentLevel[start:cutPoint])
+		for readIdx < len(entries) {
+			// Determine how many entries to merge
+			cutSize := nextMergeCut(entries[readIdx:])
+			cutEnd := readIdx + cutSize
+
+			// Merge this group
+			merged := mergeNodes(entries[readIdx:cutEnd])
 			nextLevel = append(nextLevel, merged)
-			start = cutPoint
+
+			readIdx = cutEnd
 		}
 
-		// Handle remaining nodes
-		if start < len(currentLevel) {
-			merged := mergeNodes(currentLevel[start:])
-			nextLevel = append(nextLevel, merged)
-		}
-
-		currentLevel = nextLevel
+		entries = nextLevel
 	}
 
-	return currentLevel[0].hash
+	return entries[0].hash
 }
 
 // merkleNode represents a node in the Merkle tree
@@ -373,33 +369,35 @@ type merkleNode struct {
 	size uint64
 }
 
-// findCutPoints determines where to split the sequence based on hash values
-func findCutPoints(nodes []merkleNode) []int {
-	if len(nodes) <= xet.MinChildren {
-		return nil
+// nextMergeCut determines how many entries to merge based on the XET specification
+// Returns the number of entries to merge (cut point)
+func nextMergeCut(nodes []merkleNode) int {
+	n := len(nodes)
+
+	// If 2 or fewer, merge all
+	if n <= 2 {
+		return n
 	}
 
-	cutPoints := make([]int, 0)
-	lastCut := 0
+	// Maximum we can merge is MAX_CHILDREN or all remaining
+	end := xet.MaxChildren
+	if end > n {
+		end = n
+	}
 
-	for i := xet.MinChildren; i < len(nodes); i++ {
-		remaining := len(nodes) - i
-		if remaining < xet.MinChildren {
-			break
-		}
-
-		// Use hash value to determine if this is a cut point
-		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[:8])
+	// Check indices 2 through end-1 (0-based indexing)
+	// Minimum merge is 3 children when input has more than 2 hashes
+	for i := 2; i < end; i++ {
+		// Use last 8 bytes of hash as little-endian 64-bit unsigned int
+		// Per spec: hash[24:32] are the last 8 bytes
+		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[24:32])
 		if hashValue%xet.MeanBranchingFactor == 0 {
-			groupSize := i - lastCut
-			if groupSize >= xet.MinChildren && groupSize <= xet.MaxChildren {
-				cutPoints = append(cutPoints, i)
-				lastCut = i
-			}
+			return i + 1 // Cut after element i (include i+1 elements)
 		}
 	}
 
-	return cutPoints
+	// No cut point found, merge up to MAX_CHILDREN or all remaining
+	return end
 }
 
 // mergeNodes merges a sequence of nodes into a single parent node
