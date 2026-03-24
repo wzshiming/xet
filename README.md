@@ -268,24 +268,84 @@ xet/
 
 ## Testing
 
+This project has comprehensive test coverage across all major components.
+
+### Running Tests
+
 Run all tests:
 
 ```bash
-go test ./pkg/...
+go test ./...
 ```
 
 Run tests with verbose output:
 
 ```bash
-go test -v ./pkg/...
+go test -v ./...
 ```
 
-Test with a specific file:
+Run tests for a specific package:
 
 ```bash
-go build -o xet ./cmd/xet
-./xet path/to/your/file
+go test ./pkg/api/...      # API client tests
+go test ./pkg/upload/...   # Upload session tests
+go test ./pkg/download/... # Download session tests
+go test ./pkg/xorb/...     # Xorb format tests
+go test ./pkg/shard/...    # Shard format tests
 ```
+
+### Test Coverage
+
+The test suite includes:
+
+- **API Client Tests** (`pkg/api/client_test.go`)
+  - HTTP client initialization and configuration
+  - File reconstruction queries
+  - Xorb and shard uploads
+  - Chunk deduplication queries
+  - Byte range downloads
+  - Error handling
+
+- **Upload Session Tests** (`pkg/upload/session_test.go`)
+  - Session initialization with various options
+  - Local chunk deduplication
+  - File upload orchestration
+  - Multi-file uploads
+  - Empty file handling
+
+- **Download Session Tests** (`pkg/download/session_test.go`)
+  - Session initialization with caching options
+  - File download and reconstruction
+  - Byte range downloads
+  - Chunk caching
+  - Multi-chunk file handling
+
+- **Core Protocol Tests**
+  - Gearhash chunking algorithm (`pkg/gearhash/gearhash_test.go`)
+  - BLAKE3 hashing with domain separation (`pkg/xet/hash_test.go`)
+  - Merkle tree construction (`pkg/merkle/merkle_test.go`)
+  - Compression (LZ4, ByteGrouping4) (`pkg/xorb/compression_test.go`)
+  - Xorb serialization/deserialization (`pkg/xorb/xorb_test.go`)
+  - Shard serialization/deserialization (`pkg/shard/shard_test.go`)
+
+### Example: Testing File Upload and Download
+
+Test the CLI tool with a sample file:
+
+```bash
+# Build the tool
+go build -o xet ./cmd/xet
+
+# Test file information display
+echo "Hello, XET Protocol!" > test.txt
+./xet info test.txt
+```
+
+This will display:
+- Chunking information (number of chunks, sizes, hashes)
+- Xorb creation details
+- File hash computation
+- Data integrity verification
 
 ## Protocol Specification
 
