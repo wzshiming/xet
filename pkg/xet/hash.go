@@ -99,3 +99,8 @@ func StringToHash(hexStr string) (Hash, error) {
 	}
 	return hash, nil
 }
+
+// ParseHash is an alias for StringToHash
+func ParseHash(hexStr string) (Hash, error) {
+	return StringToHash(hexStr)
+}
