@@ -22,30 +22,25 @@ func TestChunkHash(t *testing.T) {
 	}
 }
 
-func TestHashToString(t *testing.T) {
-	// Test the hash string conversion
-	// Create a known hash value
-	testHash := Hash{}
-	for i := range 32 {
-		testHash[i] = byte(i)
+func TestHashToStringAndBack(t *testing.T) {
+	originalHash := [32]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
+
+	wantHex := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
+
+	got := HashToString(originalHash)
+	if got != wantHex {
+		t.Errorf("Expected hash string %s, got %s", wantHex, got)
 	}
 
-	str := testHash.String()
-	t.Logf("Hash string: %s", str)
-
-	// Should be 64 hex characters
-	if len(str) != 64 {
-		t.Errorf("Hash string length should be 64, got %d", len(str))
-	}
-
-	// Test round-trip conversion
-	hash2, err := StringToHash(str)
+	// Now convert back to hash
+	parsedHash, err := StringToHash(got)
 	if err != nil {
-		t.Errorf("Failed to parse hash string: %v", err)
+		t.Fatalf("Failed to parse hash string: %v", err)
 	}
 
-	if hash2 != testHash {
-		t.Errorf("Round-trip conversion failed")
+	if parsedHash != originalHash {
+		t.Errorf("Parsed hash does not match original. Got %v, want %v", parsedHash, originalHash)
 	}
 }
 
