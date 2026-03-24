@@ -1,0 +1,256 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/pkg/xet"
+)
+
+// Client represents an HTTP client for the XET protocol
+type Client struct {
+	baseURL    string
+	httpClient *http.Client
+	token      string
+	namespace  string
+}
+
+// ClientOptions configures the API client
+type ClientOptions struct {
+	BaseURL   string
+	Token     string
+	Namespace string
+	Timeout   time.Duration
+}
+
+// NewClient creates a new API client
+func NewClient(opts ClientOptions) *Client {
+	if opts.Timeout == 0 {
+		opts.Timeout = 30 * time.Second
+	}
+	if opts.Namespace == "" {
+		opts.Namespace = "default"
+	}
+
+	return &Client{
+		baseURL: strings.TrimSuffix(opts.BaseURL, "/"),
+		httpClient: &http.Client{
+			Timeout: opts.Timeout,
+		},
+		token:     opts.Token,
+		namespace: opts.Namespace,
+	}
+}
+
+// GetReconstruction retrieves reconstruction information for a file
+func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*ReconstructionResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/reconstructions/%s", c.baseURL, fileHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var reconstruction ReconstructionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &reconstruction, nil
+}
+
+// GetReconstructionRange retrieves reconstruction information for a byte range
+func (c *Client) GetReconstructionRange(ctx context.Context, fileHash xet.Hash, start, end int64) (*ReconstructionResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/reconstructions/%s", c.baseURL, fileHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var reconstruction ReconstructionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &reconstruction, nil
+}
+
+// UploadXorb uploads a serialized xorb to the server
+func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []byte) (*XorbUploadResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(xorbData))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var uploadResp XorbUploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &uploadResp, nil
+}
+
+// UploadShard uploads a serialized shard to the server
+func (c *Client) UploadShard(ctx context.Context, shardData []byte) (*ShardUploadResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/shards", c.baseURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(shardData))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var uploadResp ShardUploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &uploadResp, nil
+}
+
+// QueryChunkDeduplication checks if a chunk exists in the global deduplication index
+func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*shard.Shard, error) {
+	url := fmt.Sprintf("%s/api/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Chunk not found - this is expected for new chunks
+		return nil, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Read shard data
+	shardData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	// Deserialize shard
+	shard, err := shard.Deserialize(shardData)
+	if err != nil {
+		return nil, fmt.Errorf("deserialize shard: %w", err)
+	}
+
+	return shard, nil
+}
+
+// DownloadXorbData downloads xorb data from a URL with optional byte range
+func (c *Client) DownloadXorbData(ctx context.Context, url string, byteRange *ByteRange) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if byteRange != nil {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("download error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	return data, nil
+}
