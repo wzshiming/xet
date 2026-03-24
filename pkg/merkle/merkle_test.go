@@ -9,9 +9,9 @@ import (
 func TestMerkleTreeConstruction(t *testing.T) {
 	// Test with various numbers of chunks to ensure the algorithm works correctly
 	testCases := []struct {
-		name       string
-		numChunks  int
-		chunkSize  uint64
+		name      string
+		numChunks int
+		chunkSize uint64
 	}{
 		{"Single chunk", 1, 100},
 		{"Two chunks", 2, 100},
