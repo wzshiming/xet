@@ -76,7 +76,11 @@ func XorbHash(chunks []HashWithSize) DataHash {
 }
 
 // FileHashWithSalt computes the aggregated file hash with an HMAC salt.
+// Returns zero hash for empty input, matching the Rust implementation.
 func FileHashWithSalt(chunks []HashWithSize, salt [32]byte) DataHash {
+	if len(chunks) == 0 {
+		return DataHash{}
+	}
 	h := aggregatedNodeHash(chunks)
 	key, _ := FromSlice(salt[:])
 	return h.HMAC(key)
