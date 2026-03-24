@@ -10,7 +10,7 @@ XET is a content-addressable storage protocol that uses:
 - **Xorbs** (XET Orbs) as containers that aggregate multiple compressed chunks
 - **Merkle trees** with variable fan-out for efficient verification
 
-This implementation follows the [XET Protocol Specification](draft-denis-xet-03.txt) (draft-denis-xet-03).
+This implementation follows the [XET Protocol Specification](https://datatracker.ietf.org/doc/draft-denis-xet/03/) ([draft-denis-xet-03.txt](draft-denis-xet-03.txt)).
 
 ## Features
 
