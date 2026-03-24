@@ -3,6 +3,7 @@ package xorb
 import (
 	"bytes"
 	"fmt"
+	"io"
 
 	"github.com/pierrec/lz4/v4"
 )
@@ -67,8 +68,10 @@ func decompressLZ4(data []byte, uncompressedSize int) ([]byte, error) {
 	r := lz4.NewReader(bytes.NewReader(data))
 	result := make([]byte, uncompressedSize)
 
-	n, err := r.Read(result)
-	if err != nil && err.Error() != "EOF" {
+	// Use io.ReadFull to ensure we read all expected bytes
+	// A single Read() call may return fewer bytes without error
+	n, err := io.ReadFull(r, result)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return nil, fmt.Errorf("failed to decompress LZ4: %w", err)
 	}
 
@@ -103,14 +106,17 @@ func applyByteGrouping4(data []byte) []byte {
 	}
 
 	result := make([]byte, len(data))
-	numGroups := (len(data) + 3) / 4
+	writePos := 0
 
-	for i := range data {
-		groupIdx := i / 4
-		byteIdx := i % 4
-		newPos := byteIdx*numGroups + groupIdx
-		if newPos < len(result) {
-			result[newPos] = data[i]
+	// Process each byte position within groups (0-3)
+	for bytePos := 0; bytePos < 4; bytePos++ {
+		// Collect bytes at this position from all groups
+		for groupStart := 0; groupStart < len(data); groupStart += 4 {
+			idx := groupStart + bytePos
+			if idx < len(data) {
+				result[writePos] = data[idx]
+				writePos++
+			}
 		}
 	}
 
@@ -124,14 +130,25 @@ func reverseByteGrouping4(data []byte) []byte {
 	}
 
 	result := make([]byte, len(data))
-	numGroups := (len(data) + 3) / 4
+	numFullGroups := len(data) / 4
+	remainder := len(data) % 4
 
-	for i := range data {
-		byteIdx := i / numGroups
-		groupIdx := i % numGroups
-		origPos := groupIdx*4 + byteIdx
-		if origPos < len(result) {
-			result[origPos] = data[i]
+	readPos := 0
+
+	// Process each byte position within groups (0-3)
+	for bytePos := 0; bytePos < 4; bytePos++ {
+		// Calculate how many groups have this byte position
+		numGroups := numFullGroups
+		if bytePos < remainder {
+			numGroups++
+		}
+
+		// Scatter bytes at this position to all groups
+		for g := 0; g < numGroups; g++ {
+			if readPos < len(data) {
+				result[g*4+bytePos] = data[readPos]
+				readPos++
+			}
 		}
 	}
 
