@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet/pkg/api"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xet"
@@ -19,7 +20,7 @@ import (
 // Server represents an XET CAS server
 type Server struct {
 	storage Storage
-	mux     *http.ServeMux
+	router  *mux.Router
 	authFn  AuthFunc
 }
 
@@ -37,7 +38,7 @@ type ServerOptions struct {
 func NewServer(opts ServerOptions) *Server {
 	s := &Server{
 		storage: opts.Storage,
-		mux:     http.NewServeMux(),
+		router:  mux.NewRouter(),
 		authFn:  opts.AuthFn,
 	}
 
@@ -47,10 +48,11 @@ func NewServer(opts ServerOptions) *Server {
 
 // registerRoutes sets up all HTTP routes
 func (s *Server) registerRoutes() {
-	s.mux.HandleFunc("/api/v1/reconstructions/", s.handleGetReconstruction)
-	s.mux.HandleFunc("/api/v1/xorbs/", s.handleXorb)
-	s.mux.HandleFunc("/api/v1/shards", s.handleUploadShard)
-	s.mux.HandleFunc("/api/v1/chunks/", s.handleQueryChunk)
+	s.router.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
+	s.router.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
+	s.router.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 }
 
 // ServeHTTP implements http.Handler
@@ -62,7 +64,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[%s] %s %s - %v\n", r.Method, r.URL.Path, r.RemoteAddr, duration)
 	}()
 
-	s.mux.ServeHTTP(w, r)
+	s.router.ServeHTTP(w, r)
 }
 
 // authenticate checks if a request is authenticated
@@ -87,14 +89,9 @@ func (s *Server) authenticate(r *http.Request) bool {
 
 // handleGetReconstruction handles GET /api/v1/reconstructions/{file_hash}
 func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract file hash from path
-	path := strings.TrimPrefix(r.URL.Path, "/api/v1/reconstructions/")
-	fileHashStr := strings.TrimSuffix(path, "/")
+	// Extract file hash from path using mux
+	vars := mux.Vars(r)
+	fileHashStr := vars["file_hash"]
 
 	fileHash, err := xet.ParseHash(fileHashStr)
 	if err != nil {
@@ -201,42 +198,18 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 	return response, nil
 }
 
-// handleXorb handles xorb-related operations
-func (s *Server) handleXorb(w http.ResponseWriter, r *http.Request) {
-	// Parse path: /api/v1/xorbs/{namespace}/{xorb_hash}[/data]
-	path := strings.TrimPrefix(r.URL.Path, "/api/v1/xorbs/")
-	parts := strings.Split(path, "/")
-
-	if len(parts) < 2 {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
-	}
-
-	namespace := parts[0]
-	xorbHashStr := parts[1]
-
-	// Check if this is a data download request
-	if len(parts) >= 3 && parts[2] == "data" {
-		s.handleDownloadXorb(w, r, namespace, xorbHashStr)
-		return
-	}
-
-	// Otherwise, it's an upload
-	if r.Method == http.MethodPost {
-		s.handleUploadXorb(w, r, namespace, xorbHashStr)
-		return
-	}
-
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-}
-
 // handleUploadXorb handles POST /api/v1/xorbs/{namespace}/{xorb_hash}
-func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request, namespace, xorbHashStr string) {
+func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+
+	// Extract parameters from path using mux
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	xorbHashStr := vars["xorb_hash"]
 
 	// Parse xorb hash
 	xorbHash, err := xet.ParseHash(xorbHashStr)
@@ -281,7 +254,12 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request, namesp
 }
 
 // handleDownloadXorb handles GET /api/v1/xorbs/{namespace}/{xorb_hash}/data
-func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request, namespace, xorbHashStr string) {
+func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
+	// Extract parameters from path using mux
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	xorbHashStr := vars["xorb_hash"]
+
 	// Parse xorb hash
 	xorbHash, err := xet.ParseHash(xorbHashStr)
 	if err != nil {
@@ -348,11 +326,6 @@ func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, data
 
 // handleUploadShard handles POST /api/v1/shards
 func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	// Authenticate
 	if !s.authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -396,22 +369,10 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 
 // handleQueryChunk handles GET /api/v1/chunks/{namespace}/{chunk_hash}
 func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse path: /api/v1/chunks/{namespace}/{chunk_hash}
-	path := strings.TrimPrefix(r.URL.Path, "/api/v1/chunks/")
-	parts := strings.Split(path, "/")
-
-	if len(parts) != 2 {
-		http.Error(w, "Invalid path", http.StatusBadRequest)
-		return
-	}
-
-	namespace := parts[0]
-	chunkHashStr := parts[1]
+	// Extract parameters from path using mux
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	chunkHashStr := vars["chunk_hash"]
 
 	// Parse chunk hash
 	chunkHash, err := xet.ParseHash(chunkHashStr)
