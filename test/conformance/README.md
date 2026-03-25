@@ -61,7 +61,7 @@ The conformance tests work by:
 - **Xorb Hash** (TestHashConformance/xorb): Validates Merkle tree construction and xorb hash computation match between implementations
 - **File Hash** (TestHashConformance/file): Validates ZERO_KEY application to xorb hash produces identical results
 - **Range Hash** (TestHashConformance/range): Validates VERIFICATION_KEY hash computation matches
-- **Xorb Deserialization** (TestXorbCheckConformance): Validates that Go xorb-check tool can correctly deserialize Go-created xorbs and extract chunk information
+- **Xorb Deserialization** (TestXorbCheckConformance): Validates cross-implementation xorb format compatibility by testing both Go and Rust xorb-check tools reading Go-created xorbs
 
 ## Tools
 

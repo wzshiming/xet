@@ -187,8 +187,8 @@ func TestChunkHashConformance(t *testing.T) {
 
 func TestXorbCheckConformance(t *testing.T) {
 	// This test validates that both Go and Rust xorb-check tools can correctly
-	// extract chunk information from their respective xorb formats and that the
-	// extracted chunks match the original chunking results
+	// extract chunk information from xorbs created by either implementation,
+	// ensuring full cross-implementation serialization compatibility
 
 	tests := []struct {
 		name string
@@ -222,19 +222,35 @@ func TestXorbCheckConformance(t *testing.T) {
 				t.Fatalf("Failed to create xorb: %v", err)
 			}
 
-			// Run Go xorb-check on Go-created xorb
-			goChunks, err := runGoXorbCheck(goXorbBytes)
-			if err != nil {
-				t.Fatalf("Go xorb-check failed: %v", err)
-			}
+			// Test 1: Go xorb-check reading Go-created xorb
+			t.Run("Go xorb-check reads Go xorb", func(t *testing.T) {
+				goChunks, err := runGoXorbCheck(goXorbBytes)
+				if err != nil {
+					t.Fatalf("Go xorb-check failed on Go xorb: %v", err)
+				}
 
-			// Verify Go xorb-check output matches expected chunks
-			if goChunks != expectedChunks {
-				t.Errorf("Go xorb-check output doesn't match original chunks:\nExpected:\n%s\n\nGot:\n%s", expectedChunks, goChunks)
-			}
+				if goChunks != expectedChunks {
+					t.Errorf("Go xorb-check output doesn't match original chunks:\nExpected:\n%s\n\nGot:\n%s", expectedChunks, goChunks)
+				}
 
-			t.Logf("Go xorb-check successfully extracted %d chunks from %d byte xorb (original data: %d bytes)",
-				strings.Count(goChunks, "\n"), len(goXorbBytes), len(tt.data))
+				t.Logf("Go xorb-check successfully extracted %d chunks from %d byte Go xorb (original data: %d bytes)",
+					strings.Count(goChunks, "\n"), len(goXorbBytes), len(tt.data))
+			})
+
+			// Test 2: Rust xorb-check reading Go-created xorb (cross-implementation)
+			t.Run("Rust xorb-check reads Go xorb", func(t *testing.T) {
+				rustChunks, err := runRustXorbCheck(goXorbBytes)
+				if err != nil {
+					t.Fatalf("Rust xorb-check failed on Go xorb: %v", err)
+				}
+
+				if rustChunks != expectedChunks {
+					t.Errorf("Rust xorb-check output doesn't match original chunks:\nExpected:\n%s\n\nGot:\n%s", expectedChunks, rustChunks)
+				}
+
+				t.Logf("Rust xorb-check successfully extracted %d chunks from %d byte Go xorb (original data: %d bytes)",
+					strings.Count(rustChunks, "\n"), len(goXorbBytes), len(tt.data))
+			})
 		})
 	}
 }
