@@ -1,7 +1,6 @@
 package gearhash
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 )
@@ -79,73 +78,201 @@ const (
 	Mask            = 0xFFFF000000000000
 )
 
-// ChunkData reads data from the provided reader and invokes fn for each chunk.
-func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
-	reader := bufio.NewReader(r)
+// hashWindowSize is the effective window size of the gearhash rolling hash.
+// Bytes more than this many positions ago have no effect on the current hash value.
+const hashWindowSize = 64
 
-	var offset int64
-	var buf [MaxChunkSize]byte
+// Chunker performs content-defined chunking using the Gearhash algorithm.
+// It mirrors the structure of the xet-core Rust reference implementation:
+// https://github.com/huggingface/xet-core/blob/main/xet_data/src/deduplication/chunking.rs
+type Chunker struct {
+	hash         uint64
+	minimumChunk int
+	maximumChunk int
+	mask         uint64
+	chunkBuf     []byte
+}
 
-	for {
-		chunkSize, err := findChunkBoundary(reader, buf[:])
-		if err != nil && err != io.EOF {
-			return err
-		}
-
-		if chunkSize == 0 {
-			return nil
-		}
-
-		if err := fn(offset, buf[:chunkSize]); err != nil {
-			return fmt.Errorf("error processing chunk: %w", err)
-		}
-
-		offset += int64(chunkSize)
-
-		if err == io.EOF {
-			return nil
-		}
+// NewChunker creates a new Chunker with default XET chunking parameters.
+func NewChunker() *Chunker {
+	return &Chunker{
+		minimumChunk: MinChunkSize,
+		maximumChunk: MaxChunkSize,
+		mask:         Mask,
 	}
 }
 
-// findChunkBoundary fills buf with the next chunk and returns its size.
-func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
-	var (
-		hash uint64
-		size int
-	)
-
-	for size < MinChunkSize {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				return size, io.EOF
-			}
-			return 0, fmt.Errorf("read chunk prefix: %w", err)
-		}
-
-		buf[size] = b
-		size++
-		hash = (hash << 1) + lookupTable[b]
+// NextBoundary finds the next chunk boundary within data, taking into account any
+// previously buffered bytes. Returns (n, true) where n is the number of bytes
+// consumed from data to reach the boundary, or (n, false) if no boundary was found.
+// When a boundary is found the complete chunk is chunkBuf + data[:n].
+func (c *Chunker) NextBoundary(data []byte) (int, bool) {
+	nBytes := len(data)
+	if nBytes == 0 {
+		return 0, false
 	}
 
-	for size < MaxChunkSize {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				return size, io.EOF
-			}
-			return 0, fmt.Errorf("read chunk data: %w", err)
-		}
+	previousLen := len(c.chunkBuf)
+	curIndex := 0
+	createChunk := false
 
-		buf[size] = b
-		size++
-		hash = (hash << 1) + lookupTable[b]
-
-		if (hash & Mask) == 0 {
-			return size, nil
+	// Skip bytes before the hash window to avoid unnecessary hash computation.
+	// The rolling hash only reflects the last hashWindowSize bytes, so we only
+	// need to start hashing hashWindowSize bytes before the minimum chunk point.
+	// The guard `previousLen+hashWindowSize < minimumChunk` guarantees
+	// `skip >= 0` before the `-1`, but we clamp explicitly for clarity.
+	if previousLen+hashWindowSize < c.minimumChunk {
+		skip := c.minimumChunk - previousLen - hashWindowSize - 1
+		if skip < 0 {
+			skip = 0
 		}
+		if skip > nBytes {
+			skip = nBytes
+		}
+		curIndex += skip
 	}
 
-	return size, nil
+	// Limit the search to avoid exceeding the maximum chunk size.
+	// Guard against previousLen already at or beyond maximumChunk (invariant
+	// violation that should not occur in practice, but handled defensively).
+	readEnd := nBytes
+	if maxRead := curIndex + c.maximumChunk - previousLen; maxRead > 0 && maxRead < readEnd {
+		readEnd = maxRead
+	}
+
+	// Search for a hash boundary, skipping any that fall before the minimum chunk size.
+	// The outer loop restarts the inner scan whenever a boundary is found too early
+	// (rare edge case when the hash window spans a previous chunk boundary).
+	for {
+		found := false
+		for ; curIndex < readEnd; curIndex++ {
+			c.hash = (c.hash << 1) + lookupTable[data[curIndex]]
+			if c.hash&c.mask == 0 {
+				curIndex++
+				found = true
+				break
+			}
+		}
+
+		if found {
+			// Ensure the boundary is at or past the minimum chunk size.
+			if curIndex+previousLen < c.minimumChunk {
+				continue
+			}
+			createChunk = true
+		} else {
+			curIndex = readEnd
+		}
+		break
+	}
+
+	// Force a boundary at the maximum chunk size if none was found earlier.
+	if !createChunk && curIndex+previousLen >= c.maximumChunk {
+		curIndex = c.maximumChunk - previousLen
+		createChunk = true
+	}
+
+	if createChunk {
+		c.hash = 0 // reset hash for the next chunk
+		return curIndex, true
+	}
+	return curIndex, false
+}
+
+// Next processes data and returns the next complete chunk together with the number
+// of bytes consumed from data. If isFinal is true and no boundary exists, all
+// remaining buffered data is returned as the last chunk. Returns (nil, n) when no
+// chunk is ready yet.
+func (c *Chunker) Next(data []byte, isFinal bool) ([]byte, int) {
+	if idx, found := c.NextBoundary(data); found {
+		var chunkData []byte
+		if len(c.chunkBuf) == 0 {
+			// Chunk lies entirely within data; return a slice without copying.
+			// Callers must copy the slice if they need to retain it beyond the
+			// next call to Next or NextBlock.
+			chunkData = data[:idx]
+		} else {
+			c.chunkBuf = append(c.chunkBuf, data[:idx]...)
+			chunkData = c.chunkBuf
+			c.chunkBuf = nil
+		}
+		return chunkData, idx
+	}
+
+	// No boundary found; buffer all of data for the next call.
+	c.chunkBuf = append(c.chunkBuf, data...)
+	if isFinal {
+		chunkData := c.chunkBuf
+		c.chunkBuf = nil
+		c.hash = 0
+		if len(chunkData) == 0 {
+			return nil, len(data)
+		}
+		return chunkData, len(data)
+	}
+	return nil, len(data)
+}
+
+// NextBlock processes data and returns all complete chunks. If isFinal is true,
+// any remaining buffered data is returned as a final chunk.
+func (c *Chunker) NextBlock(data []byte, isFinal bool) [][]byte {
+	var result [][]byte
+	pos := 0
+	for {
+		if pos >= len(data) {
+			if isFinal {
+				c.hash = 0
+			}
+			return result
+		}
+		chunk, consumed := c.Next(data[pos:], isFinal)
+		if chunk != nil {
+			result = append(result, chunk)
+		}
+		pos += consumed
+	}
+}
+
+// Finish returns the final chunk from any remaining buffered data and resets the
+// chunker to its initial state.
+func (c *Chunker) Finish() []byte {
+	chunk, _ := c.Next(nil, true)
+	return chunk
+}
+
+// ChunkData reads from r and calls fn for each chunk. fn receives a slice that is
+// only valid for the duration of the callback; callers must copy the slice if they
+// need to retain the data beyond the callback.
+func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
+	chunker := NewChunker()
+	var offset int64
+	buf := make([]byte, MaxChunkSize)
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			isFinal := err == io.EOF
+			for _, chunk := range chunker.NextBlock(buf[:n], isFinal) {
+				if fnErr := fn(offset, chunk); fnErr != nil {
+					return fmt.Errorf("error processing chunk: %w", fnErr)
+				}
+				offset += int64(len(chunk))
+			}
+		}
+		if err == io.EOF {
+			// Some io.Reader implementations return (0, io.EOF) on a separate call
+			// after the last data read. Flush any remaining buffered data.
+			if n == 0 {
+				if last := chunker.Finish(); last != nil {
+					if fnErr := fn(offset, last); fnErr != nil {
+						return fmt.Errorf("error processing chunk: %w", fnErr)
+					}
+				}
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+	}
 }
