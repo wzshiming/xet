@@ -7,10 +7,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/wzshiming/xet/pkg/api"
-	"github.com/wzshiming/xet/pkg/download"
+	"github.com/wzshiming/xet/pkg/client"
+	"github.com/wzshiming/xet/pkg/client/download"
+	"github.com/wzshiming/xet/pkg/client/upload"
 	"github.com/wzshiming/xet/pkg/gearhash"
-	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
@@ -217,7 +217,7 @@ func uploadCommand() {
 	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())
 
 	// Create API client
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL:   *url,
 		Token:     *token,
 		Namespace: *namespace,
@@ -274,7 +274,7 @@ func downloadCommand() {
 	fmt.Printf("Downloading file: %s\n", hashStr)
 
 	// Create API client
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: *url,
 		Token:   *token,
 		Timeout: 5 * time.Minute,

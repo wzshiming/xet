@@ -4,20 +4,20 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 // Session represents a download session
 type Session struct {
-	client     *api.Client
+	client     *client.Client
 	chunkCache map[xet.Hash][]byte
 }
 
 // SessionOptions configures a download session
 type SessionOptions struct {
-	Client         *api.Client
+	Client         *client.Client
 	EnableCaching  bool
 }
 
@@ -42,7 +42,7 @@ func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) ([]byte, 
 // DownloadFileRange downloads a byte range from a file
 func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, start, length int64) ([]byte, error) {
 	// Step 1: Query reconstruction
-	var reconstruction *api.ReconstructionResponse
+	var reconstruction *client.ReconstructionResponse
 	var err error
 
 	if length > 0 {
