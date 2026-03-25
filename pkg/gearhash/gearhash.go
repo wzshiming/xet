@@ -2,7 +2,6 @@ package gearhash
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 )
@@ -113,29 +112,6 @@ func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 			return nil
 		}
 	}
-}
-
-// ChunkBytes chunks the provided byte slice using the streaming ChunkData API.
-func ChunkBytes(data []byte) ([]Chunk, error) {
-	if len(data) == 0 {
-		return nil, nil
-	}
-
-	var chunks []Chunk
-	err := ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		chunks = append(chunks, Chunk{
-			Data:   buf,
-			Offset: offset,
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return chunks, nil
 }
 
 // findChunkBoundary fills buf with the next chunk and returns its size.

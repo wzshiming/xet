@@ -114,9 +114,15 @@ func TestDeterminism(t *testing.T) {
 func collectChunks(t *testing.T, data []byte) []Chunk {
 	t.Helper()
 
-	chunks, err := ChunkBytes(data)
+	var chunks []Chunk
+	err := ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, Chunk{Data: buf, Offset: offset})
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("ChunkBytes failed: %v", err)
+		t.Fatalf("ChunkData failed: %v", err)
 	}
 
 	return chunks

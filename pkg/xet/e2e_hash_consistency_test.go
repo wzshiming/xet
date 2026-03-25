@@ -1,6 +1,7 @@
 package xet_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/wzshiming/xet/pkg/gearhash"
@@ -234,7 +235,13 @@ func TestCompleteUploadDownloadCycle(t *testing.T) {
 func chunkData(t *testing.T, data []byte) []gearhash.Chunk {
 	t.Helper()
 
-	chunks, err := gearhash.ChunkBytes(data)
+	var chunks []gearhash.Chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, gearhash.Chunk{Data: buf, Offset: offset})
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("ChunkData failed: %v", err)
 	}

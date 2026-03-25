@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -86,7 +87,7 @@ func infoCommand() {
 
 	// Chunk the data
 	fmt.Println("=== Chunking ===")
-	chunks, err := gearhash.ChunkBytes(data)
+	chunks, err := collectChunks(data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error chunking data: %v\n", err)
 		os.Exit(1)
@@ -250,6 +251,17 @@ func uploadCommand() {
 
 	fmt.Println("✓ Upload complete!")
 	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())
+}
+
+func collectChunks(data []byte) ([]gearhash.Chunk, error) {
+	var chunks []gearhash.Chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, gearhash.Chunk{Data: buf, Offset: offset})
+		return nil
+	})
+	return chunks, err
 }
 
 func downloadCommand() {

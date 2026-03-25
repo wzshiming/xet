@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -75,7 +76,7 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 
 	for fileIdx, file := range files {
 		// Chunk the file
-		chunks, err := gearhash.ChunkBytes(file.Data)
+		chunks, err := chunkAll(file.Data)
 		if err != nil {
 			return fmt.Errorf("chunk file %s: %w", file.Path, err)
 		}
@@ -376,7 +377,7 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 // ComputeFileInfo computes hash information for a file
 func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	// Chunk the file
-	chunks, err := gearhash.ChunkBytes(data)
+	chunks, err := chunkAll(data)
 	if err != nil {
 		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
 	}
@@ -407,4 +408,18 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 		FileHash: fileHash,
 		SHA256:   sha256Hash,
 	}, nil
+}
+
+func chunkAll(data []byte) ([]gearhash.Chunk, error) {
+	var chunks []gearhash.Chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, gearhash.Chunk{
+			Data:   buf,
+			Offset: offset,
+		})
+		return nil
+	})
+	return chunks, err
 }
