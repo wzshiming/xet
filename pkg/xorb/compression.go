@@ -109,7 +109,7 @@ func applyByteGrouping4(data []byte) []byte {
 	writePos := 0
 
 	// Process each byte position within groups (0-3)
-	for bytePos := 0; bytePos < 4; bytePos++ {
+	for bytePos := range 4 {
 		// Collect bytes at this position from all groups
 		for groupStart := 0; groupStart < len(data); groupStart += 4 {
 			idx := groupStart + bytePos
@@ -136,7 +136,7 @@ func reverseByteGrouping4(data []byte) []byte {
 	readPos := 0
 
 	// Process each byte position within groups (0-3)
-	for bytePos := 0; bytePos < 4; bytePos++ {
+	for bytePos := range 4 {
 		// Calculate how many groups have this byte position
 		numGroups := numFullGroups
 		if bytePos < remainder {

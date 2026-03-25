@@ -42,11 +42,11 @@ type FileBlock struct {
 
 // FileDataSequenceEntry describes a term in the file reconstruction
 type FileDataSequenceEntry struct {
-	CASHash            xet.Hash // xorb hash
-	CASFlags           uint32   // Reserved, must be 0
-	UnpackedSegBytes   uint32
-	ChunkIndexStart    uint32
-	ChunkIndexEnd      uint32 // Exclusive
+	CASHash          xet.Hash // xorb hash
+	CASFlags         uint32   // Reserved, must be 0
+	UnpackedSegBytes uint32
+	ChunkIndexStart  uint32
+	ChunkIndexEnd    uint32 // Exclusive
 }
 
 // FileMetadataExt contains optional metadata (SHA-256 hash)
@@ -56,10 +56,10 @@ type FileMetadataExt struct {
 
 // CASBlock represents a xorb and its chunks
 type CASBlock struct {
-	CASHash       xet.Hash
-	CASFlags      uint32 // Reserved, must be 0
-	Chunks        []CASChunkSequenceEntry
-	NumBytesInCAS uint32 // Total uncompressed bytes
+	CASHash        xet.Hash
+	CASFlags       uint32 // Reserved, must be 0
+	Chunks         []CASChunkSequenceEntry
+	NumBytesInCAS  uint32 // Total uncompressed bytes
 	NumBytesOnDisk uint32 // Serialized xorb size
 }
 
@@ -241,14 +241,14 @@ func (s *Shard) writeFileInfoSection(buf *bytes.Buffer) error {
 func (s *Shard) writeFileBlock(buf *bytes.Buffer, fb FileBlock) error {
 	// FileDataSequenceHeader (48 bytes)
 	buf.Write(fb.FileHash[:])                                       // 32 bytes
-	binary.Write(buf, binary.LittleEndian, uint32(fb.Flags))       // 4 bytes
+	binary.Write(buf, binary.LittleEndian, uint32(fb.Flags))        // 4 bytes
 	binary.Write(buf, binary.LittleEndian, uint32(len(fb.Entries))) // 4 bytes
 	buf.Write(make([]byte, 8))                                      // 8 bytes reserved
 
 	// FileDataSequenceEntry entries (48 bytes each)
 	for _, entry := range fb.Entries {
-		buf.Write(entry.CASHash[:])                                   // 32 bytes
-		binary.Write(buf, binary.LittleEndian, entry.CASFlags)        // 4 bytes
+		buf.Write(entry.CASHash[:])                                    // 32 bytes
+		binary.Write(buf, binary.LittleEndian, entry.CASFlags)         // 4 bytes
 		binary.Write(buf, binary.LittleEndian, entry.UnpackedSegBytes) // 4 bytes
 		binary.Write(buf, binary.LittleEndian, entry.ChunkIndexStart)  // 4 bytes
 		binary.Write(buf, binary.LittleEndian, entry.ChunkIndexEnd)    // 4 bytes
@@ -290,19 +290,19 @@ func (s *Shard) writeCASInfoSection(buf *bytes.Buffer) error {
 // writeCASBlock writes a single CAS block
 func (s *Shard) writeCASBlock(buf *bytes.Buffer, cb CASBlock) error {
 	// CASChunkSequenceHeader (48 bytes)
-	buf.Write(cb.CASHash[:])                                    // 32 bytes
-	binary.Write(buf, binary.LittleEndian, cb.CASFlags)         // 4 bytes
+	buf.Write(cb.CASHash[:])                                       // 32 bytes
+	binary.Write(buf, binary.LittleEndian, cb.CASFlags)            // 4 bytes
 	binary.Write(buf, binary.LittleEndian, uint32(len(cb.Chunks))) // 4 bytes
-	binary.Write(buf, binary.LittleEndian, cb.NumBytesInCAS)   // 4 bytes
-	binary.Write(buf, binary.LittleEndian, cb.NumBytesOnDisk)  // 4 bytes
+	binary.Write(buf, binary.LittleEndian, cb.NumBytesInCAS)       // 4 bytes
+	binary.Write(buf, binary.LittleEndian, cb.NumBytesOnDisk)      // 4 bytes
 
 	// CASChunkSequenceEntry entries (48 bytes each)
 	for _, chunk := range cb.Chunks {
-		buf.Write(chunk.ChunkHash[:])                                 // 32 bytes
-		binary.Write(buf, binary.LittleEndian, chunk.ByteRangeStart)  // 4 bytes
+		buf.Write(chunk.ChunkHash[:])                                  // 32 bytes
+		binary.Write(buf, binary.LittleEndian, chunk.ByteRangeStart)   // 4 bytes
 		binary.Write(buf, binary.LittleEndian, chunk.UnpackedSegBytes) // 4 bytes
 		binary.Write(buf, binary.LittleEndian, uint32(chunk.Flags))    // 4 bytes
-		binary.Write(buf, binary.LittleEndian, uint32(0))             // 4 bytes reserved
+		binary.Write(buf, binary.LittleEndian, uint32(0))              // 4 bytes reserved
 	}
 
 	return nil
@@ -325,23 +325,23 @@ func (s *Shard) writeFooter(buf *bytes.Buffer) error {
 	f := s.Footer
 
 	// Write all footer fields in order (200 bytes total)
-	binary.Write(buf, binary.LittleEndian, f.Version)               // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.FileInfoOffset)        // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.CASInfoOffset)         // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.FileLookupOffset)      // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.FileLookupNumEntries)  // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.CASLookupOffset)       // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.CASLookupNumEntries)   // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.ChunkLookupOffset)     // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.ChunkLookupNumEntries) // 8 bytes
-	buf.Write(f.ChunkHashKey[:])                                    // 32 bytes
+	binary.Write(buf, binary.LittleEndian, f.Version)                // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.FileInfoOffset)         // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.CASInfoOffset)          // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.FileLookupOffset)       // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.FileLookupNumEntries)   // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.CASLookupOffset)        // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.CASLookupNumEntries)    // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.ChunkLookupOffset)      // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.ChunkLookupNumEntries)  // 8 bytes
+	buf.Write(f.ChunkHashKey[:])                                     // 32 bytes
 	binary.Write(buf, binary.LittleEndian, f.ShardCreationTimestamp) // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.ShardKeyExpiry)        // 8 bytes
-	buf.Write(f.Reserved[:])                                        // 48 bytes
-	binary.Write(buf, binary.LittleEndian, f.StoredBytesOnDisk)    // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.MaterializedBytes)    // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.StoredBytes)          // 8 bytes
-	binary.Write(buf, binary.LittleEndian, f.FooterOffset)         // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.ShardKeyExpiry)         // 8 bytes
+	buf.Write(f.Reserved[:])                                         // 48 bytes
+	binary.Write(buf, binary.LittleEndian, f.StoredBytesOnDisk)      // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.MaterializedBytes)      // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.StoredBytes)            // 8 bytes
+	binary.Write(buf, binary.LittleEndian, f.FooterOffset)           // 8 bytes
 
 	return nil
 }
@@ -471,7 +471,7 @@ func (s *Shard) readFileBlock(data []byte, offset *int) (FileBlock, error) {
 
 	// Read FileDataSequenceEntry entries
 	fb.Entries = make([]FileDataSequenceEntry, numEntries)
-	for i := uint32(0); i < numEntries; i++ {
+	for i := range numEntries {
 		if *offset+48 > len(data) {
 			return fb, fmt.Errorf("data too short for file data sequence entry %d", i)
 		}
@@ -498,7 +498,7 @@ func (s *Shard) readFileBlock(data []byte, offset *int) (FileBlock, error) {
 	// Read FileVerificationEntry entries if flag set
 	if fb.Flags&FileWithVerification != 0 {
 		fb.Verification = make([]xet.Hash, numEntries)
-		for i := uint32(0); i < numEntries; i++ {
+		for i := range numEntries {
 			if *offset+48 > len(data) {
 				return fb, fmt.Errorf("data too short for file verification entry %d", i)
 			}
@@ -575,7 +575,7 @@ func (s *Shard) readCASBlock(data []byte, offset *int) (CASBlock, error) {
 
 	// Read CASChunkSequenceEntry entries
 	cb.Chunks = make([]CASChunkSequenceEntry, numEntries)
-	for i := uint32(0); i < numEntries; i++ {
+	for i := range numEntries {
 		if *offset+48 > len(data) {
 			return cb, fmt.Errorf("data too short for CAS chunk sequence entry %d", i)
 		}
@@ -676,7 +676,7 @@ func isBookend(data []byte) bool {
 	}
 
 	// Check bytes 0-31 are all 0xFF
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		if data[i] != 0xFF {
 			return false
 		}

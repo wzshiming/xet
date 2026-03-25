@@ -8,10 +8,10 @@ import (
 func TestLZ4CompressionDecompression(t *testing.T) {
 	// Test with various sizes to ensure io.ReadFull works correctly
 	testSizes := []int{
-		100,      // Small
-		10000,    // Medium
-		100000,   // Large
-		1000000,  // Very large (1MB)
+		100,     // Small
+		10000,   // Medium
+		100000,  // Large
+		1000000, // Very large (1MB)
 	}
 
 	for _, size := range testSizes {
@@ -98,11 +98,11 @@ func TestByteGrouping4Compression(t *testing.T) {
 func TestByteGrouping4Transform(t *testing.T) {
 	// Test the transform and reverse with various sizes
 	testData := [][]byte{
-		[]byte("Hello"),                                    // Not multiple of 4
-		[]byte("Hello World!"),                             // Multiple of 4
-		[]byte("ABCDEFGHIJKLMNOP"),                         // 16 bytes
-		[]byte{0x01, 0x02, 0x03},                           // 3 bytes
-		[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},   // 7 bytes
+		[]byte("Hello"),                                  // Not multiple of 4
+		[]byte("Hello World!"),                           // Multiple of 4
+		[]byte("ABCDEFGHIJKLMNOP"),                       // 16 bytes
+		[]byte{0x01, 0x02, 0x03},                         // 3 bytes
+		[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}, // 7 bytes
 	}
 
 	for i, data := range testData {

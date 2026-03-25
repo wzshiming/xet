@@ -17,8 +17,8 @@ type Session struct {
 
 // SessionOptions configures a download session
 type SessionOptions struct {
-	Client         *client.Client
-	EnableCaching  bool
+	Client        *client.Client
+	EnableCaching bool
 }
 
 // NewSession creates a new download session

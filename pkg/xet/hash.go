@@ -73,7 +73,7 @@ func ComputeVerificationHash(chunkHashes []Hash) Hash {
 // each formatted as 16 lowercase hex digits
 func HashToString(hash Hash) string {
 	var out [64]byte
-	for seg := 0; seg < 4; seg++ {
+	for seg := range 4 {
 		offset := seg * 8
 		val := binary.LittleEndian.Uint64(hash[offset : offset+8])
 		s := fmt.Sprintf("%016x", val)
@@ -88,7 +88,7 @@ func StringToHash(hexStr string) (Hash, error) {
 	if len(hexStr) != 64 {
 		return hash, fmt.Errorf("invalid hash string length: %d", len(hexStr))
 	}
-	for seg := 0; seg < 4; seg++ {
+	for seg := range 4 {
 		start := seg * 16
 		var val uint64
 		_, err := fmt.Sscanf(hexStr[start:start+16], "%016x", &val)

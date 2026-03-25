@@ -4,8 +4,8 @@ import "github.com/wzshiming/xet/pkg/xet"
 
 // ReconstructionResponse represents the response from the file reconstruction API
 type ReconstructionResponse struct {
-	OffsetIntoFirstRange int64  `json:"offset_into_first_range"`
-	Terms                []Term `json:"terms"`
+	OffsetIntoFirstRange int64                       `json:"offset_into_first_range"`
+	Terms                []Term                      `json:"terms"`
 	FetchInfo            map[string][]FetchInfoEntry `json:"fetch_info"`
 }
 

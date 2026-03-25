@@ -460,7 +460,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	s := NewShard()
 
 	// Add multiple file blocks
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		fileHash := xet.Hash{}
 		for j := range fileHash {
 			fileHash[j] = byte(i*32 + j)
@@ -483,7 +483,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Add multiple CAS blocks
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		casHash := xet.Hash{}
 		for j := range casHash {
 			casHash[j] = byte(i*64 + j)
@@ -532,7 +532,7 @@ func TestSerializeComplexShard(t *testing.T) {
 func TestIsBookend(t *testing.T) {
 	// Create a valid bookend
 	bookend := make([]byte, 48)
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		bookend[i] = 0xFF
 	}
 	for i := 32; i < 48; i++ {

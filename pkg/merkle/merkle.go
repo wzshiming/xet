@@ -83,10 +83,7 @@ func nextMergeCut(nodes []node) int {
 	}
 
 	// Maximum we can merge is MAX_CHILDREN or all remaining
-	end := xet.MaxChildren
-	if end > n {
-		end = n
-	}
+	end := min(xet.MaxChildren, n)
 
 	// Check indices 2 through end-1 (0-based indexing)
 	// Minimum merge is 3 children when input has more than 2 hashes

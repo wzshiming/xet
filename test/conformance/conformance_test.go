@@ -347,7 +347,7 @@ func runGoHash(hashType string, input string) (string, error) {
 func makeRepeatedData(size int) []byte {
 	pattern := []byte("XET Protocol Test Pattern - Conformance Testing - ")
 	result := make([]byte, size)
-	for i := 0; i < size; i++ {
+	for i := range size {
 		result[i] = pattern[i%len(pattern)]
 	}
 	return result
