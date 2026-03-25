@@ -42,7 +42,7 @@ func main() {
 func printUsage() {
 	fmt.Println("XET - Content-Addressable Storage Tool")
 	fmt.Println()
-	fmt.Println("Usage: xet <command> [options]")
+	fmt.Println("Usage: xetc <command> [options]")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  info <file>              Display chunking and hashing information for a file")
@@ -62,14 +62,14 @@ func printUsage() {
 	fmt.Println("  --cache                  Enable chunk caching")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  xet info myfile.txt")
-	fmt.Println("  xet upload myfile.txt --url https://xet.example.com --token abc123")
-	fmt.Println("  xet download a1b2c3d4... output.txt --url https://xet.example.com")
+	fmt.Println("  xetc info myfile.txt")
+	fmt.Println("  xetc upload myfile.txt --url https://xet.example.com --token abc123")
+	fmt.Println("  xetc download a1b2c3d4... output.txt --url https://xet.example.com")
 }
 
 func infoCommand() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: xet info <file>")
+		fmt.Println("Usage: xetc info <file>")
 		os.Exit(1)
 	}
 
