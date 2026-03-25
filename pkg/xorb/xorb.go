@@ -74,9 +74,6 @@ func (x *Xorb) Serialize() ([]byte, error) {
 
 	// Write chunk data region
 	for i, chunk := range x.Chunks {
-		chunkOffsets[i] = currentOffset
-		unpackedOffsets[i] = currentUnpacked
-
 		// Write chunk header (8 bytes)
 		header := ChunkHeader{
 			Version:          0,
@@ -96,6 +93,10 @@ func (x *Xorb) Serialize() ([]byte, error) {
 
 		currentOffset += 8 + uint64(len(chunk.CompressedData))
 		currentUnpacked += uint64(len(chunk.UncompressedData))
+
+		// Store END offsets per spec section 7.5.3
+		chunkOffsets[i] = currentOffset
+		unpackedOffsets[i] = currentUnpacked
 	}
 
 	// Build CasObjectInfo footer
@@ -176,12 +177,12 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 
 	// Write boundary offsets (packed offsets in xorb)
 	for _, offset := range chunkOffsets {
-		binary.Write(&buf, binary.LittleEndian, offset)
+		binary.Write(&buf, binary.LittleEndian, uint32(offset))
 	}
 
 	// Write unpacked offsets (offsets in reconstructed file)
 	for _, offset := range unpackedOffsets {
-		binary.Write(&buf, binary.LittleEndian, offset)
+		binary.Write(&buf, binary.LittleEndian, uint32(offset))
 	}
 
 	// Trailer: num_chunks (4), hash_offset_from_end (4), boundary_offset_from_end (4), reserved (16)
