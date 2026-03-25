@@ -80,28 +80,26 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
 	for fileIdx, file := range files {
-		// Chunk the file
-		chunks, err := chunkAll(file.Data)
-		if err != nil {
-			return fmt.Errorf("chunk file %s: %w", file.Path, err)
-		}
-
-		for _, chunk := range chunks {
-			chunkHash := xet.ComputeChunkHash(chunk.data)
+		err := gearhash.ChunkData(bytes.NewReader(file.Data), func(offset int64, chunk []byte) error {
+			chunkHash := xet.ComputeChunkHash(chunk)
 
 			// Deduplicate
-			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk.data)
+			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
 				FileIndex: fileIdx,
-				Data:      chunk.data,
+				Data:      chunk,
 				Hash:      chunkHash,
-				Offset:    uint64(chunk.offset),
+				Offset:    uint64(offset),
 				Dedup:     dedupResult,
 			})
 
 			fileChunkRanges[fileIdx] = append(fileChunkRanges[fileIdx], chunkIdx)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("chunk file %s: %w", file.Path, err)
 		}
 	}
 
@@ -381,29 +379,22 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 
 // ComputeFileInfo computes hash information for a file
 func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
-	// Chunk the file
-	chunks, err := chunkAll(data)
+	// Compute chunk hashes
+	chunkHashes := []xet.Hash{}
+
+	// Compute chunk sizes
+	chunkSizes := []uint64{}
+
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		chunkHashes = append(chunkHashes, xet.ComputeChunkHash(chunk))
+		chunkSizes = append(chunkSizes, uint64(len(chunk)))
+		return nil
+	})
 	if err != nil {
 		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
 	}
 
-	// Compute chunk hashes
-	chunkHashes := make([]xet.Hash, len(chunks))
-	for i, chunk := range chunks {
-		chunkHashes[i] = xet.ComputeChunkHash(chunk.data)
-	}
-
-	// Compute chunk sizes
-	chunkSizes := make([]uint64, len(chunks))
-	for i, chunk := range chunks {
-		chunkSizes[i] = uint64(len(chunk.data))
-	}
-
-	// Compute xorb hash (merkle root)
-	xorbHash := merkle.ComputeXorbHash(chunkHashes, chunkSizes)
-
-	// Compute file hash
-	fileHash := xet.ComputeFileHash(xorbHash[:])
+	fileHash := merkle.ComputeFileHash(chunkHashes, chunkSizes)
 
 	// Compute SHA-256
 	sha256Hash := sha256.Sum256(data)
@@ -413,18 +404,4 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 		FileHash: fileHash,
 		SHA256:   sha256Hash,
 	}, nil
-}
-
-func chunkAll(data []byte) ([]chunkSegment, error) {
-	var chunks []chunkSegment
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		chunks = append(chunks, chunkSegment{
-			data:   buf,
-			offset: offset,
-		})
-		return nil
-	})
-	return chunks, err
 }
