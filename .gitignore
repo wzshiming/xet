@@ -33,3 +33,10 @@ go.work.sum
 
 /xetc
 /xetd
+
+# Conformance test artifacts
+/test/conformance/target/
+/test/conformance/Cargo.lock
+/test/conformance/go/chunk
+/test/conformance/go/hash
+/test/conformance/go/xorb-check

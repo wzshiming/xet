@@ -1,0 +1,14 @@
+[package]
+name = "chunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chunk"
+path = "src/main.rs"
+
+[dependencies]
+xet-data.workspace = true
+clap.workspace = true
+anyhow.workspace = true
