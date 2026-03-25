@@ -155,7 +155,7 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 
 	// Main Header: XETBLOB ident (7 bytes), version (1), xorb hash (32 bytes)
 	buf.Write([]byte("XETBLOB"))
-	buf.WriteByte(0) // version
+	buf.WriteByte(1) // version - MUST be 1 per spec
 	buf.Write(x.Hash[:])
 
 	// Hash Section: XBLBHSH ident (7 bytes), version (1), num_chunks (4 bytes), chunk hashes
@@ -169,9 +169,10 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 		buf.Write(hash[:])
 	}
 
-	// Boundary Section: XBLBBND ident (7 bytes), version (1), chunk offsets
+	// Boundary Section: XBLBBND ident (7 bytes), version (1), num_chunks (4 bytes), chunk offsets
 	buf.Write([]byte("XBLBBND"))
-	buf.WriteByte(0) // version
+	buf.WriteByte(1) // version - MUST be 1 per spec
+	binary.Write(&buf, binary.LittleEndian, numChunks)
 
 	// Write boundary offsets (packed offsets in xorb)
 	for _, offset := range chunkOffsets {
@@ -182,6 +183,26 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	for _, offset := range unpackedOffsets {
 		binary.Write(&buf, binary.LittleEndian, offset)
 	}
+
+	// Trailer: num_chunks (4), hash_offset_from_end (4), boundary_offset_from_end (4), reserved (16)
+	// Calculate offsets from the end of the footer (not including the 4-byte length trailer)
+	footerEndPos := buf.Len() + 4 + 4 + 4 + 16 // current pos + trailer fields
+
+	// Hash section starts at position 40 (after main header)
+	hashSectionStart := 40
+	hashOffsetFromEnd := uint32(footerEndPos - hashSectionStart)
+
+	// Boundary section starts after hash section
+	boundarySectionStart := 40 + 8 + 4 + int(numChunks)*32 // main header + hash header + num_chunks + hashes
+	boundaryOffsetFromEnd := uint32(footerEndPos - boundarySectionStart)
+
+	binary.Write(&buf, binary.LittleEndian, numChunks)
+	binary.Write(&buf, binary.LittleEndian, hashOffsetFromEnd)
+	binary.Write(&buf, binary.LittleEndian, boundaryOffsetFromEnd)
+
+	// Reserved: 16 bytes, zero
+	reserved := make([]byte, 16)
+	buf.Write(reserved)
 
 	return buf.Bytes(), nil
 }
@@ -232,8 +253,8 @@ func (x *Xorb) parseFooter(data []byte) error {
 	offset += 7
 
 	version := data[offset]
-	if version != 0 {
-		return fmt.Errorf("unsupported xorb version: %d", version)
+	if version != 1 {
+		return fmt.Errorf("unsupported xorb version: %d (expected 1)", version)
 	}
 	offset++
 
