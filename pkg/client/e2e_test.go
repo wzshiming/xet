@@ -1,4 +1,4 @@
-package conformance_test
+package client_test
 
 import (
 	"bytes"
@@ -32,9 +32,11 @@ func TestClientE2EWithServer(t *testing.T) {
 	defer cancel()
 
 	serverAddr := "localhost:18080"
+	baseURL := fmt.Sprintf("http://%s", serverAddr)
 	serverCmd := exec.CommandContext(ctx, xetdBinary,
 		"-addr", serverAddr,
 		"-storage", storageDir,
+		"-base-url", baseURL,
 	)
 	serverCmd.Stdout = os.Stdout
 	serverCmd.Stderr = os.Stderr
@@ -138,9 +140,11 @@ func TestClientE2ECacheConsistency(t *testing.T) {
 	defer cancel()
 
 	serverAddr := "localhost:18081"
+	baseURL := fmt.Sprintf("http://%s", serverAddr)
 	serverCmd := exec.CommandContext(ctx, xetdBinary,
 		"-addr", serverAddr,
 		"-storage", storageDir,
+		"-base-url", baseURL,
 	)
 	serverCmd.Stdout = os.Stdout
 	serverCmd.Stderr = os.Stderr
@@ -250,9 +254,11 @@ func TestClientE2ERangeRequest(t *testing.T) {
 	defer cancel()
 
 	serverAddr := "localhost:18082"
+	baseURL := fmt.Sprintf("http://%s", serverAddr)
 	serverCmd := exec.CommandContext(ctx, xetdBinary,
 		"-addr", serverAddr,
 		"-storage", storageDir,
+		"-base-url", baseURL,
 	)
 	serverCmd.Stdout = os.Stdout
 	serverCmd.Stderr = os.Stderr
@@ -317,8 +323,9 @@ func TestClientE2ERangeRequest(t *testing.T) {
 
 			expectedData := testData[tc.start : tc.start+tc.length]
 			if !bytes.Equal(rangeData, expectedData) {
-				t.Errorf("Range data mismatch:\nExpected length: %d\nGot length: %d",
-					len(expectedData), len(rangeData))
+				t.Errorf("Range data mismatch:\nExpected length: %d\nGot length: %d\nFirst 20 bytes of expected: %v\nFirst 20 bytes of got: %v",
+					len(expectedData), len(rangeData), expectedData[:min(20, len(expectedData))], rangeData[:min(20, len(rangeData))])
+				return
 			}
 
 			t.Logf("Range request successful: bytes %d-%d", tc.start, tc.start+tc.length)
@@ -343,9 +350,11 @@ func TestClientE2EGlobalDeduplication(t *testing.T) {
 	defer cancel()
 
 	serverAddr := "localhost:18083"
+	baseURL := fmt.Sprintf("http://%s", serverAddr)
 	serverCmd := exec.CommandContext(ctx, xetdBinary,
 		"-addr", serverAddr,
 		"-storage", storageDir,
+		"-base-url", baseURL,
 	)
 	serverCmd.Stdout = os.Stdout
 	serverCmd.Stderr = os.Stderr
@@ -422,4 +431,14 @@ func TestClientE2EGlobalDeduplication(t *testing.T) {
 	}
 
 	t.Logf("Global deduplication test passed: both files downloaded correctly")
+}
+
+// makeRepeatedData creates test data of the specified size
+func makeRepeatedData(size int) []byte {
+	pattern := []byte("XET Protocol Test Pattern - Conformance Testing - ")
+	result := make([]byte, size)
+	for i := 0; i < size; i++ {
+		result[i] = pattern[i%len(pattern)]
+	}
+	return result
 }
