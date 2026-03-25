@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "chunk",
+    "hash",
+    "xorb-check",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+xet-data = { git = "https://github.com/huggingface/xet-core", rev = "101837f69114499b2d48a01a7d5d422028c95f04" }
+xet-runtime = { git = "https://github.com/huggingface/xet-core", rev = "101837f69114499b2d48a01a7d5d422028c95f04" }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core", rev = "101837f69114499b2d48a01a7d5d422028c95f04" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"

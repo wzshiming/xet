@@ -1,0 +1,66 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  go-tests:
+    name: Go Tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Run Go tests
+      run: go test -v ./pkg/...
+
+    - name: Build xetc
+      run: go build -o xetc ./cmd/xetc
+
+    - name: Build xetd
+      run: go build -o xetd ./cmd/xetd
+
+  conformance:
+    name: Conformance Tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          test/conformance/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('test/conformance/**/Cargo.lock', 'test/conformance/**/Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Build Rust conformance tools
+      working-directory: test/conformance
+      run: cargo build --release
+
+    - name: Run conformance tests
+      working-directory: test/conformance
+      run: go test -v
