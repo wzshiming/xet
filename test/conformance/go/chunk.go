@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -49,9 +50,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	chunks := gearhash.ChunkData(data)
-	for _, chunk := range chunks {
-		hash := xet.ComputeChunkHash(chunk.Data)
-		fmt.Fprintf(output, "%s %d\n", hash.String(), len(chunk.Data))
+	err = gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		hash := xet.ComputeChunkHash(chunk)
+		fmt.Fprintf(output, "%s %d\n", hash.String(), len(chunk))
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error chunking data: %v\n", err)
+		os.Exit(1)
 	}
 }

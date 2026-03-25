@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -15,9 +16,9 @@ import (
 
 // Session represents an upload session
 type Session struct {
-	client           *client.Client
-	localChunkCache  map[xet.Hash]*DeduplicationResult
-	targetXorbSize   uint64
+	client            *client.Client
+	localChunkCache   map[xet.Hash]*DeduplicationResult
+	targetXorbSize    uint64
 	enableGlobalDedup bool
 }
 
@@ -43,9 +44,9 @@ func NewSession(opts SessionOptions) *Session {
 	}
 
 	return &Session{
-		client:           opts.Client,
-		localChunkCache:  make(map[xet.Hash]*DeduplicationResult),
-		targetXorbSize:   opts.TargetXorbSize,
+		client:            opts.Client,
+		localChunkCache:   make(map[xet.Hash]*DeduplicationResult),
+		targetXorbSize:    opts.TargetXorbSize,
 		enableGlobalDedup: opts.EnableGlobalDedup,
 	}
 }
@@ -67,6 +68,11 @@ type ChunkInfo struct {
 	Dedup     *DeduplicationResult
 }
 
+type chunkSegment struct {
+	data   []byte
+	offset int64
+}
+
 // UploadFiles uploads one or more files to the CAS server
 func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error {
 	// Step 1: Chunk all files and deduplicate
@@ -74,25 +80,26 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
 	for fileIdx, file := range files {
-		// Chunk the file
-		chunks := gearhash.ChunkData(file.Data)
-
-		for _, chunk := range chunks {
-			chunkHash := xet.ComputeChunkHash(chunk.Data)
+		err := gearhash.ChunkData(bytes.NewReader(file.Data), func(offset int64, chunk []byte) error {
+			chunkHash := xet.ComputeChunkHash(chunk)
 
 			// Deduplicate
-			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk.Data)
+			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
 				FileIndex: fileIdx,
-				Data:      chunk.Data,
+				Data:      chunk,
 				Hash:      chunkHash,
-				Offset:    uint64(chunk.Offset),
+				Offset:    uint64(offset),
 				Dedup:     dedupResult,
 			})
 
 			fileChunkRanges[fileIdx] = append(fileChunkRanges[fileIdx], chunkIdx)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("chunk file %s: %w", file.Path, err)
 		}
 	}
 
@@ -158,11 +165,11 @@ func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash, data
 
 // XorbGroup represents a group of chunks to be packed into a single xorb
 type XorbGroup struct {
-	Chunks       [][]byte
-	ChunkHashes  []xet.Hash
-	Xorb         *xorb.Xorb
-	Serialized   []byte
-	StartIndex   int
+	Chunks      [][]byte
+	ChunkHashes []xet.Hash
+	Xorb        *xorb.Xorb
+	Serialized  []byte
+	StartIndex  int
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size
@@ -371,27 +378,23 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 }
 
 // ComputeFileInfo computes hash information for a file
-func ComputeFileInfo(data []byte) FileUploadInfo {
-	// Chunk the file
-	chunks := gearhash.ChunkData(data)
-
+func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	// Compute chunk hashes
-	chunkHashes := make([]xet.Hash, len(chunks))
-	for i, chunk := range chunks {
-		chunkHashes[i] = xet.ComputeChunkHash(chunk.Data)
-	}
+	chunkHashes := []xet.Hash{}
 
 	// Compute chunk sizes
-	chunkSizes := make([]uint64, len(chunks))
-	for i, chunk := range chunks {
-		chunkSizes[i] = uint64(len(chunk.Data))
+	chunkSizes := []uint64{}
+
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		chunkHashes = append(chunkHashes, xet.ComputeChunkHash(chunk))
+		chunkSizes = append(chunkSizes, uint64(len(chunk)))
+		return nil
+	})
+	if err != nil {
+		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
 	}
 
-	// Compute xorb hash (merkle root)
-	xorbHash := merkle.ComputeXorbHash(chunkHashes, chunkSizes)
-
-	// Compute file hash
-	fileHash := xet.ComputeFileHash(xorbHash[:])
+	fileHash := merkle.ComputeFileHash(chunkHashes, chunkSizes)
 
 	// Compute SHA-256
 	sha256Hash := sha256.Sum256(data)
@@ -400,5 +403,5 @@ func ComputeFileInfo(data []byte) FileUploadInfo {
 		Data:     data,
 		FileHash: fileHash,
 		SHA256:   sha256Hash,
-	}
+	}, nil
 }

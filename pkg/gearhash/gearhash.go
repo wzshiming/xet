@@ -1,5 +1,11 @@
 package gearhash
 
+import (
+	"bufio"
+	"fmt"
+	"io"
+)
+
 // Gearhash lookup table (256 64-bit constants from XET specification)
 var lookupTable = [256]uint64{
 	0x9fe2c28f12b8e0c9, 0x3f847d5b4a7b3d3a, 0xd8e3f27a5c91b4e2, 0xb83e5d8f7c4b9e3a,
@@ -73,86 +79,73 @@ const (
 	Mask            = 0xFFFF000000000000
 )
 
-// Chunk represents a single chunk of data
-type Chunk struct {
-	Data   []byte
-	Offset int64 // Offset in the original file
-}
+// ChunkData reads data from the provided reader and invokes fn for each chunk.
+func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
+	reader := bufio.NewReader(r)
 
-// Chunker implements content-defined chunking using the Gearhash algorithm
-type Chunker struct {
-	hash uint64
-	size int
-}
+	var offset int64
+	var buf [MaxChunkSize]byte
 
-// NewChunker creates a new Chunker instance
-func NewChunker() *Chunker {
-	return &Chunker{
-		hash: 0,
-		size: 0,
+	for {
+		chunkSize, err := findChunkBoundary(reader, buf[:])
+		if err != nil && err != io.EOF {
+			return err
+		}
+
+		if chunkSize == 0 {
+			return nil
+		}
+
+		if err := fn(offset, buf[:chunkSize]); err != nil {
+			return fmt.Errorf("error processing chunk: %w", err)
+		}
+
+		offset += int64(chunkSize)
+
+		if err == io.EOF {
+			return nil
+		}
 	}
 }
 
-// ChunkData splits data into chunks using the Gearhash algorithm
-func ChunkData(data []byte) []Chunk {
-	if len(data) == 0 {
-		return nil
-	}
+// findChunkBoundary fills buf with the next chunk and returns its size.
+func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
+	var (
+		hash uint64
+		size int
+	)
 
-	// Special case: if file is smaller than MinChunkSize, return as single chunk
-	if len(data) < MinChunkSize {
-		return []Chunk{{Data: data, Offset: 0}}
-	}
-
-	var chunks []Chunk
-	start := 0
-
-	for start < len(data) {
-		chunkEnd := findChunkBoundary(data, start)
-		chunks = append(chunks, Chunk{
-			Data:   data[start:chunkEnd],
-			Offset: int64(start),
-		})
-		start = chunkEnd
-	}
-
-	return chunks
-}
-
-// findChunkBoundary finds the next chunk boundary starting from offset
-func findChunkBoundary(data []byte, start int) int {
-	remaining := len(data) - start
-
-	// If remaining data is less than or equal to MinChunkSize, return it all
-	if remaining <= MinChunkSize {
-		return len(data)
-	}
-
-	// Initialize rolling hash
-	hash := uint64(0)
-
-	// Process bytes up to MAX_CHUNK_SIZE
-	maxEnd := min(start+MaxChunkSize, len(data))
-
-	for i := start; i < maxEnd; i++ {
-		// Update rolling hash
-		hash = (hash << 1) + lookupTable[data[i]]
-
-		// Check if we've passed MIN_CHUNK_SIZE
-		if i-start >= MinChunkSize {
-			// Check for boundary condition
-			if (hash & Mask) == 0 {
-				return i + 1
+	for size < MinChunkSize {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				return size, io.EOF
 			}
+			return 0, fmt.Errorf("read chunk prefix: %w", err)
+		}
+
+		buf[size] = b
+		size++
+		hash = (hash << 1) + lookupTable[b]
+	}
+
+	for size < MaxChunkSize {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				return size, io.EOF
+			}
+			return 0, fmt.Errorf("read chunk data: %w", err)
+		}
+
+		buf[size] = b
+		size++
+		hash = (hash << 1) + lookupTable[b]
+
+		if (hash & Mask) == 0 {
+			return size, nil
 		}
 	}
 
-	// If we reached MAX_CHUNK_SIZE without finding a boundary, force one
-	return maxEnd
-}
-
-// Reset resets the chunker state
-func (c *Chunker) Reset() {
-	c.hash = 0
-	c.size = 0
+	return size, nil
 }

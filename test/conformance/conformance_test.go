@@ -257,10 +257,19 @@ func TestXorbCheckConformance(t *testing.T) {
 
 func createXorb(data []byte) ([]byte, error) {
 	// Use xetc info-style logic to create an xorb
-	chunks := gearhash.ChunkData(data)
+	var chunks [][]byte
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, buf)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
-		if err := xorbObj.AddChunk(chunk.Data); err != nil {
+		if err := xorbObj.AddChunk(chunk); err != nil {
 			return nil, err
 		}
 	}
