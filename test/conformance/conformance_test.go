@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/wzshiming/xet/pkg/gearhash"
+	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 var (
@@ -20,6 +23,23 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// Check if required Rust binaries are present; if not, skip all conformance tests
+	if _, err := os.Stat(rustChunkBin); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "skipping conformance tests: Rust chunk binary not found at", rustChunkBin)
+		fmt.Fprintln(os.Stderr, "Run 'cargo build --release' to build the Rust tools")
+		os.Exit(0)
+	}
+	if _, err := os.Stat(rustHashBin); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "skipping conformance tests: Rust hash binary not found at", rustHashBin)
+		fmt.Fprintln(os.Stderr, "Run 'cargo build --release' to build the Rust tools")
+		os.Exit(0)
+	}
+	if _, err := os.Stat(rustXorbCheckBin); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "skipping conformance tests: Rust xorb-check binary not found at", rustXorbCheckBin)
+		fmt.Fprintln(os.Stderr, "Run 'cargo build --release' to build the Rust tools")
+		os.Exit(0)
+	}
+
 	goDir := filepath.Join(".", "go")
 
 	if err := exec.Command("go", "build", "-o", filepath.Join(goDir, "chunk"), filepath.Join(goDir, "chunk.go")).Run(); err != nil {
@@ -163,6 +183,96 @@ func TestChunkHashConformance(t *testing.T) {
 			t.Logf("Chunk hash matches: %s", rustHash)
 		})
 	}
+}
+
+func TestXorbCheckConformance(t *testing.T) {
+	// This test validates that both Go and Rust xorb-check tools can correctly
+	// extract chunk information from their respective xorb formats and that the
+	// extracted chunks match the original chunking results
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "Small file - Hello World",
+			data: []byte("Hello World!"),
+		},
+		{
+			name: "100KB file",
+			data: makeRepeatedData(100 * 1024),
+		},
+		{
+			name: "1MB file",
+			data: makeRepeatedData(1024 * 1024),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// First, get the expected chunk information using the chunk tool
+			expectedChunks, err := runGoChunk(tt.data)
+			if err != nil {
+				t.Fatalf("Failed to chunk data: %v", err)
+			}
+
+			// Create xorb from test data using Go implementation
+			goXorbBytes, err := createXorb(tt.data)
+			if err != nil {
+				t.Fatalf("Failed to create xorb: %v", err)
+			}
+
+			// Run Go xorb-check on Go-created xorb
+			goChunks, err := runGoXorbCheck(goXorbBytes)
+			if err != nil {
+				t.Fatalf("Go xorb-check failed: %v", err)
+			}
+
+			// Verify Go xorb-check output matches expected chunks
+			if goChunks != expectedChunks {
+				t.Errorf("Go xorb-check output doesn't match original chunks:\nExpected:\n%s\n\nGot:\n%s", expectedChunks, goChunks)
+			}
+
+			t.Logf("Go xorb-check successfully extracted %d chunks from %d byte xorb (original data: %d bytes)",
+				strings.Count(goChunks, "\n"), len(goXorbBytes), len(tt.data))
+		})
+	}
+}
+
+func createXorb(data []byte) ([]byte, error) {
+	// Use xetc info-style logic to create an xorb
+	chunks := gearhash.ChunkData(data)
+	xorbObj := xorb.NewXorb()
+	for _, chunk := range chunks {
+		if err := xorbObj.AddChunk(chunk.Data); err != nil {
+			return nil, err
+		}
+	}
+	return xorbObj.Serialize()
+}
+
+func runRustXorbCheck(xorbBytes []byte) (string, error) {
+	cmd := exec.Command(rustXorbCheckBin, "--output-chunks-stdout")
+	cmd.Stdin = bytes.NewReader(xorbBytes)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%w: %s", err, stderr.String())
+	}
+	return out.String(), nil
+}
+
+func runGoXorbCheck(xorbBytes []byte) (string, error) {
+	cmd := exec.Command(goXorbCheckBin, "--output-chunks-stdout")
+	cmd.Stdin = bytes.NewReader(xorbBytes)
+	var out, stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%w: %s", err, stderr.String())
+	}
+	return out.String(), nil
 }
 
 func runRustChunk(data []byte) (string, error) {

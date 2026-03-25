@@ -56,12 +56,12 @@ The conformance tests work by:
 
 ## Test Coverage
 
-- **Chunking**: Validates that content-defined chunking produces identical chunk boundaries and hashes
-- **Chunk Hash**: Validates BLAKE3 DATA_KEY hash computation
-- **Xorb Hash**: Validates Merkle tree construction and xorb hash computation
-- **File Hash**: Validates ZERO_KEY application to xorb hash
-- **Range Hash**: Validates VERIFICATION_KEY hash computation
-- **Xorb Serialization**: Validates xorb format compatibility
+- **Chunking** (TestChunkConformance): Validates that content-defined chunking produces identical chunk boundaries and hashes between Go and Rust implementations
+- **Chunk Hash** (TestChunkHashConformance): Validates BLAKE3 DATA_KEY hash computation produces identical results
+- **Xorb Hash** (TestHashConformance/xorb): Validates Merkle tree construction and xorb hash computation match between implementations
+- **File Hash** (TestHashConformance/file): Validates ZERO_KEY application to xorb hash produces identical results
+- **Range Hash** (TestHashConformance/range): Validates VERIFICATION_KEY hash computation matches
+- **Xorb Deserialization** (TestXorbCheckConformance): Validates that Go xorb-check tool can correctly deserialize Go-created xorbs and extract chunk information
 
 ## Tools
 
