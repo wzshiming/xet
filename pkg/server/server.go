@@ -132,14 +132,44 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 		return nil, fmt.Errorf("file not found in shard")
 	}
 
+	// Parse range header if present
+	var requestedStart, requestedEnd int64
+	hasRange := false
+	if rangeHeader != "" {
+		hasRange = true
+		rangeHeader = strings.TrimPrefix(rangeHeader, "bytes=")
+		parts := strings.Split(rangeHeader, "-")
+		if len(parts) == 2 {
+			fmt.Sscanf(parts[0], "%d", &requestedStart)
+			fmt.Sscanf(parts[1], "%d", &requestedEnd)
+		}
+	}
+
 	response := &client.ReconstructionResponse{
 		OffsetIntoFirstRange: 0,
 		Terms:                []client.Term{},
 		FetchInfo:            make(map[string][]client.FetchInfoEntry),
 	}
 
+	// Calculate cumulative byte positions for each term
+	var currentByteOffset int64
+
 	// Build terms from file data sequence entries
 	for _, entry := range fileBlock.Entries {
+		termStart := currentByteOffset
+		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
+
+		// Skip terms that are completely outside the requested range
+		if hasRange {
+			if termEnd <= requestedStart {
+				currentByteOffset = termEnd
+				continue
+			}
+			if termStart > requestedEnd {
+				break
+			}
+		}
+
 		// Find the CAS block
 		var casBlock *shard.CASBlock
 		for i := range sh.CASInfos {
@@ -150,7 +180,13 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 		}
 
 		if casBlock == nil {
+			currentByteOffset = termEnd
 			continue
+		}
+
+		// Calculate offset into first term if this is the first included term
+		if len(response.Terms) == 0 && hasRange && termStart < requestedStart {
+			response.OffsetIntoFirstRange = requestedStart - termStart
 		}
 
 		term := client.Term{
@@ -193,6 +229,8 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 
 		xorbHashStr := entry.CASHash.String()
 		response.FetchInfo[xorbHashStr] = append(response.FetchInfo[xorbHashStr], fetchEntry)
+
+		currentByteOffset = termEnd
 	}
 
 	return response, nil

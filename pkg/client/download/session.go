@@ -76,7 +76,8 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 
 		// Download xorb data
 		fetchInfo := fetchInfoList[0] // Usually only one entry per xorb
-		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, &fetchInfo.URLRange)
+		// Note: We download the full xorb, not just the URLRange, because we need to deserialize it
+		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("download xorb data: %w", err)
 		}
