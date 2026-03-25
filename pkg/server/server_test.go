@@ -408,14 +408,19 @@ func TestServerAuthentication(t *testing.T) {
 	}
 }
 
-func chunkData(t *testing.T, data []byte) []gearhash.Chunk {
+type chunk struct {
+	Data   []byte
+	Offset int64
+}
+
+func chunkData(t *testing.T, data []byte) []chunk {
 	t.Helper()
 
-	var chunks []gearhash.Chunk
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		chunks = append(chunks, gearhash.Chunk{Data: buf, Offset: offset})
+	var chunks []chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
+		buf := make([]byte, len(dataChunk))
+		copy(buf, dataChunk)
+		chunks = append(chunks, chunk{Data: buf, Offset: offset})
 		return nil
 	})
 	if err != nil {

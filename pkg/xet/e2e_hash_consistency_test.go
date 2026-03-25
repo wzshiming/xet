@@ -10,6 +10,11 @@ import (
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
+type chunk struct {
+	Data   []byte
+	Offset int64
+}
+
 // TestFileHashConsistency validates that for the same file, the XET hash
 // computed by this implementation is deterministic and follows the specification.
 // This ensures consistency with HuggingFace's xet-core implementation.
@@ -232,14 +237,14 @@ func TestCompleteUploadDownloadCycle(t *testing.T) {
 	}
 }
 
-func chunkData(t *testing.T, data []byte) []gearhash.Chunk {
+func chunkData(t *testing.T, data []byte) []chunk {
 	t.Helper()
 
-	var chunks []gearhash.Chunk
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		chunks = append(chunks, gearhash.Chunk{Data: buf, Offset: offset})
+	var chunks []chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
+		buf := make([]byte, len(dataChunk))
+		copy(buf, dataChunk)
+		chunks = append(chunks, chunk{Data: buf, Offset: offset})
 		return nil
 	})
 	if err != nil {

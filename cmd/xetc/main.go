@@ -253,12 +253,17 @@ func uploadCommand() {
 	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())
 }
 
-func collectChunks(data []byte) ([]gearhash.Chunk, error) {
-	var chunks []gearhash.Chunk
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		buf := make([]byte, len(chunk))
-		copy(buf, chunk)
-		chunks = append(chunks, gearhash.Chunk{Data: buf, Offset: offset})
+type chunk struct {
+	Data   []byte
+	Offset int64
+}
+
+func collectChunks(data []byte) ([]chunk, error) {
+	var chunks []chunk
+	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
+		buf := make([]byte, len(dataChunk))
+		copy(buf, dataChunk)
+		chunks = append(chunks, chunk{Data: buf, Offset: offset})
 		return nil
 	})
 	return chunks, err

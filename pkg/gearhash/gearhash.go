@@ -79,12 +79,6 @@ const (
 	Mask            = 0xFFFF000000000000
 )
 
-// Chunk represents a single chunk of data
-type Chunk struct {
-	Data   []byte
-	Offset int64 // Offset in the original file
-}
-
 // ChunkData reads data from the provided reader and invokes fn for each chunk.
 func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 	reader := bufio.NewReader(r)

@@ -68,6 +68,11 @@ type ChunkInfo struct {
 	Dedup     *DeduplicationResult
 }
 
+type chunkSegment struct {
+	data   []byte
+	offset int64
+}
+
 // UploadFiles uploads one or more files to the CAS server
 func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error {
 	// Step 1: Chunk all files and deduplicate
@@ -82,17 +87,17 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 		}
 
 		for _, chunk := range chunks {
-			chunkHash := xet.ComputeChunkHash(chunk.Data)
+			chunkHash := xet.ComputeChunkHash(chunk.data)
 
 			// Deduplicate
-			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk.Data)
+			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk.data)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
 				FileIndex: fileIdx,
-				Data:      chunk.Data,
+				Data:      chunk.data,
 				Hash:      chunkHash,
-				Offset:    uint64(chunk.Offset),
+				Offset:    uint64(chunk.offset),
 				Dedup:     dedupResult,
 			})
 
@@ -385,13 +390,13 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	// Compute chunk hashes
 	chunkHashes := make([]xet.Hash, len(chunks))
 	for i, chunk := range chunks {
-		chunkHashes[i] = xet.ComputeChunkHash(chunk.Data)
+		chunkHashes[i] = xet.ComputeChunkHash(chunk.data)
 	}
 
 	// Compute chunk sizes
 	chunkSizes := make([]uint64, len(chunks))
 	for i, chunk := range chunks {
-		chunkSizes[i] = uint64(len(chunk.Data))
+		chunkSizes[i] = uint64(len(chunk.data))
 	}
 
 	// Compute xorb hash (merkle root)
@@ -410,14 +415,14 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	}, nil
 }
 
-func chunkAll(data []byte) ([]gearhash.Chunk, error) {
-	var chunks []gearhash.Chunk
+func chunkAll(data []byte) ([]chunkSegment, error) {
+	var chunks []chunkSegment
 	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
 		buf := make([]byte, len(chunk))
 		copy(buf, chunk)
-		chunks = append(chunks, gearhash.Chunk{
-			Data:   buf,
-			Offset: offset,
+		chunks = append(chunks, chunkSegment{
+			data:   buf,
+			offset: offset,
 		})
 		return nil
 	})

@@ -5,15 +5,20 @@ import (
 	"testing"
 )
 
+type testChunk struct {
+	Data   []byte
+	Offset int64
+}
+
 func TestChunkData(t *testing.T) {
 	// Test with a simple piece of data
 	data := []byte("Hello, World! This is a test of the Gearhash chunking algorithm.")
 
-	var chunks []Chunk
+	var chunks []testChunk
 	err := ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
 		buf := make([]byte, len(chunk))
 		copy(buf, chunk)
-		chunks = append(chunks, Chunk{Data: buf, Offset: offset})
+		chunks = append(chunks, testChunk{Data: buf, Offset: offset})
 		return nil
 	})
 	if err != nil {
@@ -111,14 +116,14 @@ func TestDeterminism(t *testing.T) {
 	}
 }
 
-func collectChunks(t *testing.T, data []byte) []Chunk {
+func collectChunks(t *testing.T, data []byte) []testChunk {
 	t.Helper()
 
-	var chunks []Chunk
+	var chunks []testChunk
 	err := ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
 		buf := make([]byte, len(chunk))
 		copy(buf, chunk)
-		chunks = append(chunks, Chunk{Data: buf, Offset: offset})
+		chunks = append(chunks, testChunk{Data: buf, Offset: offset})
 		return nil
 	})
 	if err != nil {
