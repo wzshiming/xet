@@ -77,7 +77,7 @@ func TestFileHashConsistency(t *testing.T) {
 // 4. Apply ZERO_KEY to merkle root to get file hash
 func computeFileHashE2E(t *testing.T, data []byte) xet.Hash {
 	// Step 1: Chunk the data
-	chunks := gearhash.ChunkData(data)
+	chunks := chunkData(t, data)
 
 	if len(data) > 0 && len(chunks) == 0 {
 		t.Fatal("ChunkData returned 0 chunks for non-empty data")
@@ -119,7 +119,7 @@ func TestXorbHashConsistency(t *testing.T) {
 	xorbObj := xorb.NewXorb()
 
 	// Chunk and add to xorb
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 	for _, chunk := range chunks {
 		err := xorbObj.AddChunk(chunk.Data)
 		if err != nil {
@@ -210,7 +210,7 @@ func TestCompleteUploadDownloadCycle(t *testing.T) {
 
 			// Create xorb and verify its hash is the merkle root
 			xorbObj := xorb.NewXorb()
-			chunks := gearhash.ChunkData(testData)
+			chunks := chunkData(t, testData)
 			for _, chunk := range chunks {
 				xorbObj.AddChunk(chunk.Data)
 			}
@@ -229,6 +229,17 @@ func TestCompleteUploadDownloadCycle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func chunkData(t *testing.T, data []byte) []gearhash.Chunk {
+	t.Helper()
+
+	chunks, err := gearhash.ChunkBytes(data)
+	if err != nil {
+		t.Fatalf("ChunkData failed: %v", err)
+	}
+
+	return chunks
 }
 
 // makeRepeatedData creates test data with a repeated pattern

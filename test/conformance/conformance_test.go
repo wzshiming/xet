@@ -257,7 +257,10 @@ func TestXorbCheckConformance(t *testing.T) {
 
 func createXorb(data []byte) ([]byte, error) {
 	// Use xetc info-style logic to create an xorb
-	chunks := gearhash.ChunkData(data)
+	chunks, err := gearhash.ChunkBytes(data)
+	if err != nil {
+		return nil, err
+	}
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
 		if err := xorbObj.AddChunk(chunk.Data); err != nil {

@@ -86,7 +86,11 @@ func infoCommand() {
 
 	// Chunk the data
 	fmt.Println("=== Chunking ===")
-	chunks := gearhash.ChunkData(data)
+	chunks, err := gearhash.ChunkBytes(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error chunking data: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("Number of chunks: %d\n", len(chunks))
 
 	// Compute chunk hashes
@@ -211,7 +215,11 @@ func uploadCommand() {
 	fmt.Printf("Uploading: %s (%d bytes)\n", filename, len(data))
 
 	// Compute file info
-	fileInfo := upload.ComputeFileInfo(data)
+	fileInfo, err := upload.ComputeFileInfo(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error computing file info: %v\n", err)
+		os.Exit(1)
+	}
 	fileInfo.Path = filename
 
 	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())

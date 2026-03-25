@@ -33,7 +33,7 @@ func TestServerXorbUpload(t *testing.T) {
 
 	// Create test data and xorb
 	testData := []byte("Hello, XET Protocol! This is a test file.")
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
@@ -104,10 +104,13 @@ func TestServerShardUpload(t *testing.T) {
 
 	// Create test data
 	testData := []byte("Hello, XET Protocol! This is a test file for shard upload.")
-	fileInfo := upload.ComputeFileInfo(testData)
+	fileInfo, err := upload.ComputeFileInfo(testData)
+	if err != nil {
+		t.Fatalf("Failed to compute file info: %v", err)
+	}
 
 	// Create chunks and xorb manually
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
 		if err := xorbObj.AddChunk(chunk.Data); err != nil {
@@ -195,10 +198,13 @@ func TestServerGetReconstruction(t *testing.T) {
 
 	// Create test data and upload xorb + shard
 	testData := []byte("Hello, XET Protocol! This is a test file for reconstruction.")
-	fileInfo := upload.ComputeFileInfo(testData)
+	fileInfo, err := upload.ComputeFileInfo(testData)
+	if err != nil {
+		t.Fatalf("Failed to compute file info: %v", err)
+	}
 
 	// Create chunks and xorb manually
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
 		if err := xorbObj.AddChunk(chunk.Data); err != nil {
@@ -298,7 +304,7 @@ func TestServerXorbDownload(t *testing.T) {
 
 	// Create test data and xorb
 	testData := []byte("Hello, XET Protocol! This is a test file for download.")
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
@@ -359,7 +365,7 @@ func TestServerAuthentication(t *testing.T) {
 
 	// Create test xorb
 	testData := []byte("Hello, XET!")
-	chunks := gearhash.ChunkData(testData)
+	chunks := chunkData(t, testData)
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
 		xorbObj.AddChunk(chunk.Data)
@@ -400,4 +406,15 @@ func TestServerAuthentication(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
+}
+
+func chunkData(t *testing.T, data []byte) []gearhash.Chunk {
+	t.Helper()
+
+	chunks, err := gearhash.ChunkBytes(data)
+	if err != nil {
+		t.Fatalf("ChunkData failed: %v", err)
+	}
+
+	return chunks
 }

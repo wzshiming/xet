@@ -1,6 +1,7 @@
 package gearhash
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -8,7 +9,16 @@ func TestChunkData(t *testing.T) {
 	// Test with a simple piece of data
 	data := []byte("Hello, World! This is a test of the Gearhash chunking algorithm.")
 
-	chunks := ChunkData(data)
+	var chunks []Chunk
+	err := ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+		buf := make([]byte, len(chunk))
+		copy(buf, chunk)
+		chunks = append(chunks, Chunk{Data: buf, Offset: offset})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ChunkData failed: %v", err)
+	}
 
 	if len(chunks) == 0 {
 		t.Fatal("Expected at least one chunk")
@@ -33,7 +43,7 @@ func TestChunkData(t *testing.T) {
 func TestSmallFile(t *testing.T) {
 	// Files smaller than MinChunkSize should produce a single chunk
 	data := make([]byte, MinChunkSize-1)
-	chunks := ChunkData(data)
+	chunks := collectChunks(t, data)
 
 	if len(chunks) != 1 {
 		t.Errorf("Small file should produce 1 chunk, got %d", len(chunks))
@@ -45,7 +55,7 @@ func TestSmallFile(t *testing.T) {
 }
 
 func TestEmptyData(t *testing.T) {
-	chunks := ChunkData([]byte{})
+	chunks := collectChunks(t, []byte{})
 	if len(chunks) != 0 {
 		t.Errorf("Empty data should produce 0 chunks, got %d", len(chunks))
 	}
@@ -58,7 +68,7 @@ func TestChunkSizeBounds(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	chunks := ChunkData(data)
+	chunks := collectChunks(t, data)
 
 	for i, chunk := range chunks {
 		size := len(chunk.Data)
@@ -84,8 +94,8 @@ func TestDeterminism(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	chunks1 := ChunkData(data)
-	chunks2 := ChunkData(data)
+	chunks1 := collectChunks(t, data)
+	chunks2 := collectChunks(t, data)
 
 	if len(chunks1) != len(chunks2) {
 		t.Errorf("Chunking is not deterministic: got %d and %d chunks", len(chunks1), len(chunks2))
@@ -99,4 +109,15 @@ func TestDeterminism(t *testing.T) {
 			t.Errorf("Chunk %d size mismatch: %d vs %d", i, len(chunks1[i].Data), len(chunks2[i].Data))
 		}
 	}
+}
+
+func collectChunks(t *testing.T, data []byte) []Chunk {
+	t.Helper()
+
+	chunks, err := ChunkBytes(data)
+	if err != nil {
+		t.Fatalf("ChunkBytes failed: %v", err)
+	}
+
+	return chunks
 }

@@ -15,9 +15,9 @@ import (
 
 // Session represents an upload session
 type Session struct {
-	client           *client.Client
-	localChunkCache  map[xet.Hash]*DeduplicationResult
-	targetXorbSize   uint64
+	client            *client.Client
+	localChunkCache   map[xet.Hash]*DeduplicationResult
+	targetXorbSize    uint64
 	enableGlobalDedup bool
 }
 
@@ -43,9 +43,9 @@ func NewSession(opts SessionOptions) *Session {
 	}
 
 	return &Session{
-		client:           opts.Client,
-		localChunkCache:  make(map[xet.Hash]*DeduplicationResult),
-		targetXorbSize:   opts.TargetXorbSize,
+		client:            opts.Client,
+		localChunkCache:   make(map[xet.Hash]*DeduplicationResult),
+		targetXorbSize:    opts.TargetXorbSize,
 		enableGlobalDedup: opts.EnableGlobalDedup,
 	}
 }
@@ -75,7 +75,10 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 
 	for fileIdx, file := range files {
 		// Chunk the file
-		chunks := gearhash.ChunkData(file.Data)
+		chunks, err := gearhash.ChunkBytes(file.Data)
+		if err != nil {
+			return fmt.Errorf("chunk file %s: %w", file.Path, err)
+		}
 
 		for _, chunk := range chunks {
 			chunkHash := xet.ComputeChunkHash(chunk.Data)
@@ -158,11 +161,11 @@ func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash, data
 
 // XorbGroup represents a group of chunks to be packed into a single xorb
 type XorbGroup struct {
-	Chunks       [][]byte
-	ChunkHashes  []xet.Hash
-	Xorb         *xorb.Xorb
-	Serialized   []byte
-	StartIndex   int
+	Chunks      [][]byte
+	ChunkHashes []xet.Hash
+	Xorb        *xorb.Xorb
+	Serialized  []byte
+	StartIndex  int
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size
@@ -371,9 +374,12 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 }
 
 // ComputeFileInfo computes hash information for a file
-func ComputeFileInfo(data []byte) FileUploadInfo {
+func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	// Chunk the file
-	chunks := gearhash.ChunkData(data)
+	chunks, err := gearhash.ChunkBytes(data)
+	if err != nil {
+		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
+	}
 
 	// Compute chunk hashes
 	chunkHashes := make([]xet.Hash, len(chunks))
@@ -400,5 +406,5 @@ func ComputeFileInfo(data []byte) FileUploadInfo {
 		Data:     data,
 		FileHash: fileHash,
 		SHA256:   sha256Hash,
-	}
+	}, nil
 }
