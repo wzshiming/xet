@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+
+	"github.com/wzshiming/xet/pkg/xet"
 )
 
 // Gearhash lookup table (256 64-bit constants from XET specification)
@@ -71,12 +73,13 @@ var lookupTable = [256]uint64{
 	0x7c9e3b4f5a2d8e7c, 0x3c9e7f4b5a2d8e7c, 0xc7e9f4b3a2d5e8c7, 0x9c7e4f3b2d5a8e7c,
 }
 
-// Parameters for content-defined chunking
+// Content-defined chunking parameters
+// These constants are imported from pkg/xet to maintain consistency with the reference implementation
 const (
-	TargetChunkSize = 65536  // 64 KiB
-	MinChunkSize    = 8192   // 8 KiB
-	MaxChunkSize    = 131072 // 128 KiB
-	Mask            = 0xFFFF000000000000
+	TargetChunkSize = xet.TargetChunkSize
+	MinChunkSize    = xet.MinChunkSize
+	MaxChunkSize    = xet.MaxChunkSize
+	Mask            = xet.GearhashMask
 )
 
 // ChunkData reads data from the provided reader and invokes fn for each chunk.
