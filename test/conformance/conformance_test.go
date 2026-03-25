@@ -264,7 +264,7 @@ func createXorb(data []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return xorbObj.Serialize()
+	return xorbObj.SerializeChunksOnly()
 }
 
 func runRustXorbCheck(xorbBytes []byte) (string, error) {

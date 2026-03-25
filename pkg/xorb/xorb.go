@@ -62,7 +62,35 @@ func (x *Xorb) AddChunk(data []byte) error {
 	return nil
 }
 
-// Serialize serializes the xorb to binary format
+// SerializeChunksOnly serializes only the chunk data region without footer
+// This is used for conformance testing with tools that expect raw chunk data
+func (x *Xorb) SerializeChunksOnly() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Write chunk data region
+	for _, chunk := range x.Chunks {
+		// Write chunk header (8 bytes)
+		header := ChunkHeader{
+			Version:          0,
+			CompressedSize:   uint32(len(chunk.CompressedData)),
+			CompressionType:  chunk.CompressionType,
+			UncompressedSize: uint32(len(chunk.UncompressedData)),
+		}
+
+		if err := writeChunkHeader(&buf, header); err != nil {
+			return nil, fmt.Errorf("failed to write chunk header: %w", err)
+		}
+
+		// Write compressed data
+		if _, err := buf.Write(chunk.CompressedData); err != nil {
+			return nil, fmt.Errorf("failed to write chunk data: %w", err)
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// Serialize serializes the xorb to binary format with CasObjectInfo footer
 func (x *Xorb) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -206,6 +234,75 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	buf.Write(reserved)
 
 	return buf.Bytes(), nil
+}
+
+// DeserializeChunksOnly deserializes only the chunk data region without expecting a footer
+// This matches the Rust deserialize_chunks() function behavior
+func DeserializeChunksOnly(data []byte) (*Xorb, error) {
+	xorb := NewXorb()
+	offset := 0
+
+	// Parse chunks until we run out of data or hit a footer marker
+	for offset < len(data) {
+		if offset+8 > len(data) {
+			// Not enough data for a chunk header
+			break
+		}
+
+		// Check if we've hit the start of a footer (XETBLOB identifier)
+		if offset+7 <= len(data) && string(data[offset:offset+7]) == "XETBLOB" {
+			// We've hit a footer, stop parsing chunks
+			break
+		}
+
+		// Parse chunk header
+		header := ChunkHeader{
+			Version:          data[offset],
+			CompressedSize:   uint32(data[offset+1]) | uint32(data[offset+2])<<8 | uint32(data[offset+3])<<16,
+			CompressionType:  CompressionType(data[offset+4]),
+			UncompressedSize: uint32(data[offset+5]) | uint32(data[offset+6])<<8 | uint32(data[offset+7])<<16,
+		}
+		offset += 8
+
+		if header.Version != 0 {
+			return nil, fmt.Errorf("unsupported chunk version: %d", header.Version)
+		}
+
+		if offset+int(header.CompressedSize) > len(data) {
+			return nil, fmt.Errorf("data too short for chunk data")
+		}
+
+		compressedData := data[offset : offset+int(header.CompressedSize)]
+		offset += int(header.CompressedSize)
+
+		// Decompress chunk
+		uncompressedData, err := DecompressChunk(compressedData, header.CompressionType, int(header.UncompressedSize))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress chunk: %w", err)
+		}
+
+		// Compute chunk hash
+		chunkHash := xet.ComputeChunkHash(uncompressedData)
+
+		xorb.Chunks = append(xorb.Chunks, ChunkData{
+			UncompressedData: uncompressedData,
+			CompressedData:   compressedData,
+			CompressionType:  header.CompressionType,
+			Hash:             chunkHash,
+		})
+		xorb.ChunkHashes = append(xorb.ChunkHashes, chunkHash)
+	}
+
+	// Compute xorb hash from chunks
+	if len(xorb.Chunks) > 0 {
+		chunkSizes := make([]uint64, len(xorb.Chunks))
+		for i, chunk := range xorb.Chunks {
+			chunkSizes[i] = uint64(len(chunk.UncompressedData))
+		}
+		xorb.Hash = computeXorbHashFromChunks(xorb.ChunkHashes, chunkSizes)
+	}
+
+	return xorb, nil
 }
 
 // Deserialize deserializes an xorb from binary format

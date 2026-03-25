@@ -69,7 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	xorbObj, err := xorb.Deserialize(data)
+	xorbObj, err := xorb.DeserializeChunksOnly(data)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to deserialize xorb: %v\n", err)
 		os.Exit(1)
