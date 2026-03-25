@@ -7,13 +7,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 func TestNewSession(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -31,7 +31,7 @@ func TestNewSession(t *testing.T) {
 }
 
 func TestNewSessionNoCaching(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -62,21 +62,21 @@ func TestDownloadFileSimple(t *testing.T) {
 			w.Write(xorbData)
 		} else {
 			// Serve reconstruction response
-			resp := api.ReconstructionResponse{
+			resp := client.ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []api.Term{
+				Terms: []client.Term{
 					{
 						Hash:           xorbObj.Hash.String(),
 						UnpackedLength: uint64(len(testData)),
-						Range:          api.ChunkRange{Start: 0, End: 1},
+						Range:          client.ChunkRange{Start: 0, End: 1},
 					},
 				},
-				FetchInfo: map[string][]api.FetchInfoEntry{
+				FetchInfo: map[string][]client.FetchInfoEntry{
 					xorbObj.Hash.String(): {
 						{
-							Range:    api.ChunkRange{Start: 0, End: 1},
+							Range:    client.ChunkRange{Start: 0, End: 1},
 							URL:      server.URL + "/xorb-data",
-							URLRange: api.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
+							URLRange: client.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
 						},
 					},
 				},
@@ -86,7 +86,7 @@ func TestDownloadFileSimple(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 
@@ -122,21 +122,21 @@ func TestDownloadFileWithCaching(t *testing.T) {
 		if r.URL.Path == "/xorb-data" {
 			w.Write(xorbData)
 		} else {
-			resp := api.ReconstructionResponse{
+			resp := client.ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []api.Term{
+				Terms: []client.Term{
 					{
 						Hash:           xorbObj.Hash.String(),
 						UnpackedLength: uint64(len(testData)),
-						Range:          api.ChunkRange{Start: 0, End: 1},
+						Range:          client.ChunkRange{Start: 0, End: 1},
 					},
 				},
-				FetchInfo: map[string][]api.FetchInfoEntry{
+				FetchInfo: map[string][]client.FetchInfoEntry{
 					xorbObj.Hash.String(): {
 						{
-							Range:    api.ChunkRange{Start: 0, End: 1},
+							Range:    client.ChunkRange{Start: 0, End: 1},
 							URL:      server.URL + "/xorb-data",
-							URLRange: api.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
+							URLRange: client.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
 						},
 					},
 				},
@@ -146,7 +146,7 @@ func TestDownloadFileWithCaching(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 
@@ -192,21 +192,21 @@ func TestDownloadFileRange(t *testing.T) {
 			w.Write(xorbData)
 		} else {
 			// For range request, return partial reconstruction
-			resp := api.ReconstructionResponse{
+			resp := client.ReconstructionResponse{
 				OffsetIntoFirstRange: 5, // Start at byte 5
-				Terms: []api.Term{
+				Terms: []client.Term{
 					{
 						Hash:           xorbObj.Hash.String(),
 						UnpackedLength: uint64(len(testData)),
-						Range:          api.ChunkRange{Start: 0, End: 1},
+						Range:          client.ChunkRange{Start: 0, End: 1},
 					},
 				},
-				FetchInfo: map[string][]api.FetchInfoEntry{
+				FetchInfo: map[string][]client.FetchInfoEntry{
 					xorbObj.Hash.String(): {
 						{
-							Range:    api.ChunkRange{Start: 0, End: 1},
+							Range:    client.ChunkRange{Start: 0, End: 1},
 							URL:      server.URL + "/xorb-data",
-							URLRange: api.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
+							URLRange: client.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
 						},
 					},
 				},
@@ -216,7 +216,7 @@ func TestDownloadFileRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 
@@ -238,7 +238,7 @@ func TestDownloadFileRange(t *testing.T) {
 }
 
 func TestClearCache(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -264,7 +264,7 @@ func TestClearCache(t *testing.T) {
 }
 
 func TestGetCachedChunkNotFound(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -299,21 +299,21 @@ func TestDownloadFileMultipleChunks(t *testing.T) {
 		if r.URL.Path == "/xorb-data" {
 			w.Write(xorbData)
 		} else {
-			resp := api.ReconstructionResponse{
+			resp := client.ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []api.Term{
+				Terms: []client.Term{
 					{
 						Hash:           xorbObj.Hash.String(),
 						UnpackedLength: uint64(len(chunk1Data) + len(chunk2Data)),
-						Range:          api.ChunkRange{Start: 0, End: 2}, // Both chunks
+						Range:          client.ChunkRange{Start: 0, End: 2}, // Both chunks
 					},
 				},
-				FetchInfo: map[string][]api.FetchInfoEntry{
+				FetchInfo: map[string][]client.FetchInfoEntry{
 					xorbObj.Hash.String(): {
 						{
-							Range:    api.ChunkRange{Start: 0, End: 2},
+							Range:    client.ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorb-data",
-							URLRange: api.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
+							URLRange: client.ByteRange{Start: 0, End: int64(len(xorbData) - 1)},
 						},
 					},
 				},
@@ -323,7 +323,7 @@ func TestDownloadFileMultipleChunks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 

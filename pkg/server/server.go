@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
@@ -118,7 +118,7 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 }
 
 // buildReconstructionResponse builds a reconstruction response from a shard
-func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*api.ReconstructionResponse, error) {
+func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponse, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -132,10 +132,10 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 		return nil, fmt.Errorf("file not found in shard")
 	}
 
-	response := &api.ReconstructionResponse{
+	response := &client.ReconstructionResponse{
 		OffsetIntoFirstRange: 0,
-		Terms:                []api.Term{},
-		FetchInfo:            make(map[string][]api.FetchInfoEntry),
+		Terms:                []client.Term{},
+		FetchInfo:            make(map[string][]client.FetchInfoEntry),
 	}
 
 	// Build terms from file data sequence entries
@@ -153,10 +153,10 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 			continue
 		}
 
-		term := api.Term{
+		term := client.Term{
 			Hash:           entry.CASHash.String(),
 			UnpackedLength: uint64(entry.UnpackedSegBytes),
-			Range: api.ChunkRange{
+			Range: client.ChunkRange{
 				Start: entry.ChunkIndexStart,
 				End:   entry.ChunkIndexEnd,
 			},
@@ -179,13 +179,13 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 
 		xorbURL := s.storage.GetXorbURL("default", entry.CASHash)
 
-		fetchEntry := api.FetchInfoEntry{
-			Range: api.ChunkRange{
+		fetchEntry := client.FetchInfoEntry{
+			Range: client.ChunkRange{
 				Start: entry.ChunkIndexStart,
 				End:   entry.ChunkIndexEnd,
 			},
 			URL: xorbURL,
-			URLRange: api.ByteRange{
+			URLRange: client.ByteRange{
 				Start: startByte,
 				End:   endByte,
 			},
@@ -245,7 +245,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return response
-	response := api.XorbUploadResponse{
+	response := client.XorbUploadResponse{
 		WasInserted: wasInserted,
 	}
 
@@ -359,7 +359,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		result = 1
 	}
 
-	response := api.ShardUploadResponse{
+	response := client.ShardUploadResponse{
 		Result: result,
 	}
 

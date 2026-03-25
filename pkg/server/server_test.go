@@ -9,10 +9,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
+	"github.com/wzshiming/xet/pkg/client/upload"
 	"github.com/wzshiming/xet/pkg/gearhash"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -58,7 +58,7 @@ func TestServerXorbUpload(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var response api.XorbUploadResponse
+	var response client.XorbUploadResponse
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestServerShardUpload(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var response api.ShardUploadResponse
+	var response client.ShardUploadResponse
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestServerGetReconstruction(t *testing.T) {
 		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var response api.ReconstructionResponse
+	var response client.ReconstructionResponse
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}

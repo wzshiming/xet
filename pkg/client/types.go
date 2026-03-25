@@ -1,4 +1,4 @@
-package api
+package client
 
 import "github.com/wzshiming/xet/pkg/xet"
 

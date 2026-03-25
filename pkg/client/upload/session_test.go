@@ -7,12 +7,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/xet"
 )
 
 func TestNewSession(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -37,7 +37,7 @@ func TestNewSession(t *testing.T) {
 }
 
 func TestNewSessionDefaults(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -51,7 +51,7 @@ func TestNewSessionDefaults(t *testing.T) {
 }
 
 func TestLocalDeduplication(t *testing.T) {
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: "https://example.com",
 	})
 
@@ -111,17 +111,17 @@ func TestUploadFilesSimple(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shards" {
 			uploadedShards++
-			resp := api.ShardUploadResponse{Result: 1}
+			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
 		} else if r.Method == http.MethodPost {
 			uploadedXorbs++
-			resp := api.XorbUploadResponse{WasInserted: true}
+			resp := client.XorbUploadResponse{WasInserted: true}
 			json.NewEncoder(w).Encode(resp)
 		}
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 
@@ -160,16 +160,16 @@ func TestUploadFilesSimple(t *testing.T) {
 func TestUploadFilesWithDeduplication(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shards" {
-			resp := api.ShardUploadResponse{Result: 1}
+			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
 		} else if r.Method == http.MethodPost {
-			resp := api.XorbUploadResponse{WasInserted: true}
+			resp := client.XorbUploadResponse{WasInserted: true}
 			json.NewEncoder(w).Encode(resp)
 		}
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 
@@ -210,13 +210,13 @@ func TestUploadFilesWithDeduplication(t *testing.T) {
 func TestUploadEmptyFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/shards" {
-			resp := api.ShardUploadResponse{Result: 1}
+			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
 		}
 	}))
 	defer server.Close()
 
-	client := api.NewClient(api.ClientOptions{
+	client := client.NewClient(client.ClientOptions{
 		BaseURL: server.URL,
 	})
 

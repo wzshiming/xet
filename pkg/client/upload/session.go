@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	"github.com/wzshiming/xet/pkg/api"
+	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/gearhash"
 	"github.com/wzshiming/xet/pkg/merkle"
 	"github.com/wzshiming/xet/pkg/shard"
@@ -15,7 +15,7 @@ import (
 
 // Session represents an upload session
 type Session struct {
-	client           *api.Client
+	client           *client.Client
 	localChunkCache  map[xet.Hash]*DeduplicationResult
 	targetXorbSize   uint64
 	enableGlobalDedup bool
@@ -31,7 +31,7 @@ type DeduplicationResult struct {
 
 // SessionOptions configures an upload session
 type SessionOptions struct {
-	Client            *api.Client
+	Client            *client.Client
 	TargetXorbSize    uint64
 	EnableGlobalDedup bool
 }
