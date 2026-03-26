@@ -35,8 +35,8 @@ go.work.sum
 /xetd
 
 # Conformance test artifacts
-/test/conformance/target/
-/test/conformance/Cargo.lock
-/test/conformance/go/chunk
-/test/conformance/go/hash
-/test/conformance/go/xorb-check
+/test/conformance/encoding/target/
+/test/conformance/encoding/Cargo.lock
+/test/conformance/encoding/go/chunk
+/test/conformance/encoding/go/hash
+/test/conformance/encoding/go/xorb-check
