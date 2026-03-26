@@ -8,4 +8,8 @@ require (
 	github.com/zeebo/blake3 v0.2.4
 )
 
-require github.com/klauspost/cpuid/v2 v2.0.12 // indirect
+require (
+	github.com/gorilla/mux v1.8.1 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
+	github.com/wzshiming/xet-go v0.0.0-20260326043632-bde0e0baa488 // indirect
+)
