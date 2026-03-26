@@ -147,6 +147,10 @@ func ComputeXorbHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
 func ComputeFileHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
 	// First compute the Merkle root (same as xorb hash)
 	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
+	if xorbHash == (xet.Hash{}) {
+		// If xorb hash is ZERO_HASH, return ZERO_HASH for file hash as well
+		return xet.Hash{}
+	}
 
 	// Then apply the final keyed hash with ZERO_KEY
 	return xet.ComputeFileHash(xorbHash[:])

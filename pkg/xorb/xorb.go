@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/wzshiming/xet/pkg/merkle"
 	"github.com/wzshiming/xet/pkg/xet"
 )
 
@@ -180,7 +181,7 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	}
 
 	// Compute xorb hash using inline Merkle tree implementation
-	x.Hash = computeXorbHashFromChunks(x.ChunkHashes, chunkSizes)
+	x.Hash = merkle.ComputeXorbHash(x.ChunkHashes, chunkSizes)
 
 	// Main Header: XETBLOB ident (7 bytes), version (1), xorb hash (32 bytes)
 	buf.Write([]byte("XETBLOB"))
@@ -299,7 +300,7 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 		for i, chunk := range xorb.Chunks {
 			chunkSizes[i] = uint64(len(chunk.UncompressedData))
 		}
-		xorb.Hash = computeXorbHashFromChunks(xorb.ChunkHashes, chunkSizes)
+		xorb.Hash = merkle.ComputeXorbHash(xorb.ChunkHashes, chunkSizes)
 	}
 
 	return xorb, nil
@@ -467,100 +468,4 @@ func CompressedDataStream(data []byte) (stream []byte, chunkOffsets []int, err e
 	}
 
 	return buf, chunkOffsets, nil
-}
-
-func computeXorbHashFromChunks(hashes []xet.Hash, sizes []uint64) xet.Hash {
-	if len(hashes) != len(sizes) {
-		panic("chunk hashes and sizes length mismatch")
-	}
-
-	if len(hashes) == 0 {
-		// Return ZERO_HASH (32 zero bytes)
-		return xet.Hash{}
-	}
-
-	// Build initial list of entries
-	entries := make([]merkleNode, len(hashes))
-	for i := range hashes {
-		entries[i] = merkleNode{hash: hashes[i], size: sizes[i]}
-	}
-
-	// Iteratively collapse until single root remains
-	for len(entries) > 1 {
-		nextLevel := make([]merkleNode, 0)
-		readIdx := 0
-
-		for readIdx < len(entries) {
-			// Determine how many entries to merge
-			cutSize := nextMergeCut(entries[readIdx:])
-			cutEnd := readIdx + cutSize
-
-			// Merge this group
-			merged := mergeNodes(entries[readIdx:cutEnd])
-			nextLevel = append(nextLevel, merged)
-
-			readIdx = cutEnd
-		}
-
-		entries = nextLevel
-	}
-
-	return entries[0].hash
-}
-
-// merkleNode represents a node in the Merkle tree
-type merkleNode struct {
-	hash xet.Hash
-	size uint64
-}
-
-// nextMergeCut determines how many entries to merge based on the XET specification
-// Returns the number of entries to merge (cut point)
-func nextMergeCut(nodes []merkleNode) int {
-	n := len(nodes)
-
-	// If 2 or fewer, merge all
-	if n <= 2 {
-		return n
-	}
-
-	// Maximum we can merge is MAX_CHILDREN or all remaining
-	end := min(xet.MaxChildren, n)
-
-	// Check indices 2 through end-1 (0-based indexing)
-	// Minimum merge is 3 children when input has more than 2 hashes
-	for i := 2; i < end; i++ {
-		// Use last 8 bytes of hash as little-endian 64-bit unsigned int
-		// Per spec: hash[24:32] are the last 8 bytes
-		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[24:32])
-		if hashValue%xet.MeanBranchingFactor == 0 {
-			return i + 1 // Cut after element i (include i+1 elements)
-		}
-	}
-
-	// No cut point found, merge up to MAX_CHILDREN or all remaining
-	return end
-}
-
-// mergeNodes merges a sequence of nodes into a single parent node
-func mergeNodes(nodes []merkleNode) merkleNode {
-	if len(nodes) == 1 {
-		return nodes[0]
-	}
-
-	// Build input for internal node hash: "{hash_hex} : {size}\n" per child
-	var input []byte
-	var totalSize uint64
-
-	for _, n := range nodes {
-		hashStr := n.hash.String()
-		sizeStr := fmt.Sprintf("%d", n.size)
-		line := hashStr + " : " + sizeStr + "\n"
-		input = append(input, []byte(line)...)
-		totalSize += n.size
-	}
-
-	parentHash := xet.ComputeInternalNodeHash(input)
-
-	return merkleNode{hash: parentHash, size: totalSize}
 }

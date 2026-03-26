@@ -79,7 +79,9 @@ func main() {
 			tree.AddLeaf(chunk.hash, chunk.size)
 		}
 		xorbHash := tree.ComputeRoot()
-		hash = xet.ComputeFileHash(xorbHash[:])
+		if xorbHash != (xet.Hash{}) {
+			hash = xet.ComputeFileHash(xorbHash[:])
+		}
 	case "range":
 		hashes := make([]xet.Hash, len(chunks))
 		for i, chunk := range chunks {

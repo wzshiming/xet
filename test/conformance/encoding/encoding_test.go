@@ -62,8 +62,6 @@ func TestConformance(t *testing.T) {
 				t.Errorf("Chunk output mismatch:\nRust:\n%s\n\nGo:\n%s", rustChunks, goChunks)
 			}
 
-			t.Logf("Chunks match! (%d bytes input, %d lines output)", len(tt.data), strings.Count(rustChunks, "\n"))
-
 			hashTypes := []string{"xorb", "file", "range", "chunk"}
 
 			for _, hashType := range hashTypes {
@@ -81,8 +79,6 @@ func TestConformance(t *testing.T) {
 					if rustHash != goHash {
 						t.Errorf("Hash mismatch for type %s:\nRust: %s\nGo:   %s", hashType, rustHash, goHash)
 					}
-
-					t.Logf("Hash type %s matches: %s", hashType, rustHash)
 				})
 			}
 		})
