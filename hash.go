@@ -12,7 +12,7 @@ type Hash [HashSize]byte
 
 // String returns the hash as a hex string (byte-swapped for XET format)
 func (h Hash) String() string {
-	return HashToString(h)
+	return hashToString(h)
 }
 
 // ComputeChunkHash computes the hash of a chunk using DATA_KEY
@@ -27,8 +27,8 @@ func ComputeChunkHash(data []byte) Hash {
 	return result
 }
 
-// ComputeInternalNodeHash computes the hash of an internal node using INTERNAL_NODE_KEY
-func ComputeInternalNodeHash(data []byte) Hash {
+// computeInternalNodeHash computes the hash of an internal node using INTERNAL_NODE_KEY
+func computeInternalNodeHash(data []byte) Hash {
 	hasher, err := blake3.NewKeyed(InternalNodeKey)
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
@@ -39,8 +39,8 @@ func ComputeInternalNodeHash(data []byte) Hash {
 	return result
 }
 
-// ComputeFileHash computes the final file hash using ZERO_KEY
-func ComputeFileHash(data []byte) Hash {
+// computeFileHash computes the final file hash using ZERO_KEY
+func computeFileHash(data []byte) Hash {
 	hasher, err := blake3.NewKeyed(ZeroKey)
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
@@ -68,10 +68,10 @@ func ComputeVerificationHash(chunkHashes []Hash) Hash {
 	return result
 }
 
-// HashToString converts a 32-byte hash to XET string format
+// hashToString converts a 32-byte hash to XET string format
 // The hash is interpreted as four little-endian 64-bit values,
 // each formatted as 16 lowercase hex digits
-func HashToString(hash Hash) string {
+func hashToString(hash Hash) string {
 	var out [64]byte
 	for seg := range 4 {
 		offset := seg * 8
@@ -82,8 +82,8 @@ func HashToString(hash Hash) string {
 	return string(out[:])
 }
 
-// StringToHash converts an XET hash string back to a 32-byte hash
-func StringToHash(hexStr string) (Hash, error) {
+// HashFrom converts an XET hash string back to a 32-byte hash
+func HashFrom(hexStr string) (Hash, error) {
 	var hash [32]byte
 	if len(hexStr) != 64 {
 		return hash, fmt.Errorf("invalid hash string length: %d", len(hexStr))
@@ -102,5 +102,5 @@ func StringToHash(hexStr string) (Hash, error) {
 
 // ParseHash is an alias for StringToHash
 func ParseHash(hexStr string) (Hash, error) {
-	return StringToHash(hexStr)
+	return HashFrom(hexStr)
 }

@@ -9,9 +9,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/client/upload"
-	"github.com/wzshiming/xet/pkg/gearhash"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
@@ -417,7 +417,7 @@ func chunkData(t *testing.T, data []byte) []chunk {
 	t.Helper()
 
 	var chunks []chunk
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
+	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
 		buf := make([]byte, len(dataChunk))
 		copy(buf, dataChunk)
 		chunks = append(chunks, chunk{Data: buf, Offset: offset})

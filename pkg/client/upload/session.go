@@ -6,11 +6,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/gearhash"
-	"github.com/wzshiming/xet/pkg/merkle"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -80,7 +78,7 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
 	for fileIdx, file := range files {
-		err := gearhash.ChunkData(bytes.NewReader(file.Data), func(offset int64, chunk []byte) error {
+		err := xet.ChunkData(bytes.NewReader(file.Data), func(offset int64, chunk []byte) error {
 			chunkHash := xet.ComputeChunkHash(chunk)
 
 			// Deduplicate
@@ -385,7 +383,7 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 	// Compute chunk sizes
 	chunkSizes := []uint64{}
 
-	err := gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
 		chunkHashes = append(chunkHashes, xet.ComputeChunkHash(chunk))
 		chunkSizes = append(chunkSizes, uint64(len(chunk)))
 		return nil
@@ -394,7 +392,7 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
 	}
 
-	fileHash := merkle.ComputeFileHash(chunkHashes, chunkSizes)
+	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 
 	// Compute SHA-256
 	sha256Hash := sha256.Sum256(data)

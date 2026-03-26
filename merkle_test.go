@@ -1,9 +1,7 @@
-package merkle
+package xet
 
 import (
 	"testing"
-
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 func TestMerkleTreeConstruction(t *testing.T) {
@@ -23,12 +21,12 @@ func TestMerkleTreeConstruction(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			tree := NewTree()
+			tree := newTree()
 
 			// Add dummy chunks
 			for i := 0; i < tc.numChunks; i++ {
 				// Create a dummy hash for each chunk
-				var hash xet.Hash
+				var hash Hash
 				hash[0] = byte(i)
 				hash[1] = byte(i >> 8)
 				tree.AddLeaf(hash, tc.chunkSize)
@@ -39,9 +37,9 @@ func TestMerkleTreeConstruction(t *testing.T) {
 			t.Logf("Root hash for %d chunks: %s", tc.numChunks, root.String())
 
 			// Verify it's deterministic
-			tree2 := NewTree()
+			tree2 := newTree()
 			for i := 0; i < tc.numChunks; i++ {
-				var hash xet.Hash
+				var hash Hash
 				hash[0] = byte(i)
 				hash[1] = byte(i >> 8)
 				tree2.AddLeaf(hash, tc.chunkSize)
@@ -75,7 +73,7 @@ func TestNextMergeCut(t *testing.T) {
 			for i := 0; i < tc.numNodes; i++ {
 				// Create dummy nodes
 				nodes[i] = node{
-					hash: xet.Hash{},
+					hash: Hash{},
 					size: 100,
 				}
 			}
@@ -92,8 +90,8 @@ func TestNextMergeCut(t *testing.T) {
 				t.Errorf("For <= 2 nodes, should return all nodes. Got %d, expected %d", cut, tc.numNodes)
 			}
 
-			if cut > xet.MaxChildren {
-				t.Errorf("Cut should not exceed MAX_CHILDREN (%d), got %d", xet.MaxChildren, cut)
+			if cut > MaxChildren {
+				t.Errorf("Cut should not exceed MAX_CHILDREN (%d), got %d", MaxChildren, cut)
 			}
 		})
 	}

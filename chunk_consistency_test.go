@@ -17,7 +17,7 @@ func TestChunkHashWithKnownInput(t *testing.T) {
 	data := []byte("Hello World!")
 	hash := ComputeChunkHash(data)
 
-	expectedHash, _ := StringToHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
+	expectedHash, _ := HashFrom("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
 
 	if hash != expectedHash {
 		t.Errorf("Chunk hash does not match expected value. Got %s, want %s", hash.String(), expectedHash.String())
@@ -44,7 +44,7 @@ func TestHashToStringFormat(t *testing.T) {
 
 	expected := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
 
-	got := HashToString(hash)
+	got := hashToString(hash)
 	if got != expected {
 		t.Errorf("HashToString output does not match expected format. Got %s, want %s", got, expected)
 	}

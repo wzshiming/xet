@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/client/download"
 	"github.com/wzshiming/xet/pkg/client/upload"
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 func main() {

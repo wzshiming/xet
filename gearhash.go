@@ -1,11 +1,9 @@
-package gearhash
+package xet
 
 import (
 	"bufio"
 	"fmt"
 	"io"
-
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 // Gearhash lookup table (256 64-bit constants from XET specification)
@@ -76,19 +74,12 @@ var lookupTable = [256]uint64{
 	0x18f346f7abc9d394, 0x636dc655d61ad33d, 0xcc8bab4939f7f3f6, 0x63c7a906c1dd187b,
 }
 
-// Parameters for content-defined chunking, imported from xet package for consistency.
-const (
-	minChunkSize = xet.MinChunkSize
-	maxChunkSize = xet.MaxChunkSize
-	mask         = xet.GearhashMask
-)
-
 // ChunkData reads data from the provided reader and invokes fn for each chunk.
 func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 	reader := bufio.NewReader(r)
 
 	var offset int64
-	var buf [maxChunkSize]byte
+	var buf [MaxChunkSize]byte
 
 	for {
 		chunkSize, err := findChunkBoundary(reader, buf[:])
@@ -119,7 +110,7 @@ func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
 		size int
 	)
 
-	for size < minChunkSize {
+	for size < MinChunkSize {
 		b, err := reader.ReadByte()
 		if err != nil {
 			if err == io.EOF {
@@ -133,7 +124,7 @@ func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
 		hash = (hash << 1) + lookupTable[b]
 	}
 
-	for size < maxChunkSize {
+	for size < MaxChunkSize {
 		b, err := reader.ReadByte()
 		if err != nil {
 			if err == io.EOF {
@@ -146,7 +137,7 @@ func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
 		size++
 		hash = (hash << 1) + lookupTable[b]
 
-		if (hash & mask) == 0 {
+		if (hash & GearhashMask) == 0 {
 			return size, nil
 		}
 	}

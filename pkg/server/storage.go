@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 // Storage defines the interface for storing and retrieving XET data

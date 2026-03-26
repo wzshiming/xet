@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 

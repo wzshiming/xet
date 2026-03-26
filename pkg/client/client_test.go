@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 func TestNewClient(t *testing.T) {

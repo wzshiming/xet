@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/wzshiming/xet/pkg/xet"
+	"github.com/wzshiming/xet"
 )
 
 // Shard represents a binary metadata structure that describes file reconstructions and xorb contents

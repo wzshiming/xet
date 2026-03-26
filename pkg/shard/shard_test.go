@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/wzshiming/xet/pkg/xet"
+	"github.com/wzshiming/xet"
 )
 
 // TestNewShard tests creating a new shard with default values

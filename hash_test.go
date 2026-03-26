@@ -28,13 +28,13 @@ func TestHashToStringAndBack(t *testing.T) {
 
 	wantHex := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
 
-	got := HashToString(originalHash)
+	got := hashToString(originalHash)
 	if got != wantHex {
 		t.Errorf("Expected hash string %s, got %s", wantHex, got)
 	}
 
 	// Now convert back to hash
-	parsedHash, err := StringToHash(got)
+	parsedHash, err := HashFrom(got)
 	if err != nil {
 		t.Fatalf("Failed to parse hash string: %v", err)
 	}
@@ -51,19 +51,4 @@ func TestDataKey(t *testing.T) {
 	}
 
 	t.Logf("DATA_KEY: %s", hex.EncodeToString(DataKey))
-}
-
-func TestVerificationHash(t *testing.T) {
-	// Test verification hash with some chunk hashes
-	chunk1 := ComputeChunkHash([]byte("chunk1"))
-	chunk2 := ComputeChunkHash([]byte("chunk2"))
-
-	verifyHash := ComputeVerificationHash([]Hash{chunk1, chunk2})
-	t.Logf("Verification hash: %s", verifyHash.String())
-
-	// Should be deterministic
-	verifyHash2 := ComputeVerificationHash([]Hash{chunk1, chunk2})
-	if verifyHash != verifyHash2 {
-		t.Errorf("Verification hash is not deterministic")
-	}
 }

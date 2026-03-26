@@ -11,8 +11,7 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/wzshiming/xet/pkg/merkle"
-	"github.com/wzshiming/xet/pkg/xet"
+	"github.com/wzshiming/xet"
 )
 
 func main() {
@@ -63,29 +62,17 @@ func main() {
 		return
 	}
 
-	chunks := readChunksList(input)
+	hashes, sizes := readChunksList(input)
 
 	var hash xet.Hash
 	switch *hashType {
 	case "xorb":
-		tree := merkle.NewTree()
-		for _, chunk := range chunks {
-			tree.AddLeaf(chunk.hash, chunk.size)
-		}
-		hash = tree.ComputeRoot()
+		hash = xet.ComputeXorbHash(hashes, sizes)
 	case "file":
-		tree := merkle.NewTree()
-		for _, chunk := range chunks {
-			tree.AddLeaf(chunk.hash, chunk.size)
-		}
-		xorbHash := tree.ComputeRoot()
-		if xorbHash != (xet.Hash{}) {
-			hash = xet.ComputeFileHash(xorbHash[:])
-		}
+		hash = xet.ComputeFileHash(hashes, sizes)
 	case "range":
-		hashes := make([]xet.Hash, len(chunks))
-		for i, chunk := range chunks {
-			hashes[i] = chunk.hash
+		for i, hash := range hashes {
+			hashes[i] = hash
 		}
 		hash = xet.ComputeVerificationHash(hashes)
 	default:
@@ -96,15 +83,11 @@ func main() {
 	fmt.Fprintf(output, "%s", hash.String())
 }
 
-type chunkInfo struct {
-	hash xet.Hash
-	size uint64
-}
-
-func readChunksList(input io.Reader) []chunkInfo {
+func readChunksList(input io.Reader) ([]xet.Hash, []uint64) {
 	lineRegex := regexp.MustCompile(`^([0-9a-fA-F]+)\s+(\d+)$`)
 
-	var result []chunkInfo
+	var hashes []xet.Hash
+	var sizes []uint64
 	scanner := bufio.NewScanner(input)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -116,7 +99,7 @@ func readChunksList(input io.Reader) []chunkInfo {
 			fmt.Fprintf(os.Stderr, "Failed to parse line: %s\n", line)
 			os.Exit(1)
 		}
-		hash, err := xet.StringToHash(matches[1])
+		hash, err := xet.HashFrom(matches[1])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to parse hash: %v\n", err)
 			os.Exit(1)
@@ -126,7 +109,9 @@ func readChunksList(input io.Reader) []chunkInfo {
 			fmt.Fprintf(os.Stderr, "Failed to parse size: %v\n", err)
 			os.Exit(1)
 		}
-		result = append(result, chunkInfo{hash: hash, size: size})
+
+		hashes = append(hashes, hash)
+		sizes = append(sizes, size)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -134,5 +119,5 @@ func readChunksList(input io.Reader) []chunkInfo {
 		os.Exit(1)
 	}
 
-	return result
+	return hashes, sizes
 }

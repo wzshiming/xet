@@ -1,6 +1,6 @@
 package client
 
-import "github.com/wzshiming/xet/pkg/xet"
+import "github.com/wzshiming/xet"
 
 // ReconstructionResponse represents the response from the file reconstruction API
 type ReconstructionResponse struct {

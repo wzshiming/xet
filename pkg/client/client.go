@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 // Client represents an HTTP client for the XET protocol

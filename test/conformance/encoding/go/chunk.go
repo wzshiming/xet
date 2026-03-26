@@ -9,8 +9,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/wzshiming/xet/pkg/gearhash"
-	"github.com/wzshiming/xet/pkg/xet"
+	"github.com/wzshiming/xet"
 )
 
 func main() {
@@ -50,7 +49,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = gearhash.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
+	err = xet.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
 		hash := xet.ComputeChunkHash(chunk)
 		fmt.Fprintf(output, "%s %d\n", hash.String(), len(chunk))
 		return nil

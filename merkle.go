@@ -1,37 +1,35 @@
-package merkle
+package xet
 
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 // Tree represents a Merkle tree with variable fan-out
 type Tree struct {
-	leaves []xet.Hash
+	leaves []Hash
 	sizes  []uint64 // Size in bytes of each leaf chunk
 }
 
-// NewTree creates a new Merkle tree
-func NewTree() *Tree {
+// newTree creates a new Merkle tree
+func newTree() *Tree {
 	return &Tree{
-		leaves: make([]xet.Hash, 0),
+		leaves: make([]Hash, 0),
 		sizes:  make([]uint64, 0),
 	}
 }
 
 // AddLeaf adds a leaf (chunk hash and size) to the tree
-func (t *Tree) AddLeaf(hash xet.Hash, size uint64) {
+func (t *Tree) AddLeaf(hash Hash, size uint64) {
 	t.leaves = append(t.leaves, hash)
 	t.sizes = append(t.sizes, size)
 }
 
 // ComputeRoot computes the Merkle tree root hash
-func (t *Tree) ComputeRoot() xet.Hash {
+func (t *Tree) ComputeRoot() Hash {
 	if len(t.leaves) == 0 {
 		// Return ZERO_HASH (32 zero bytes)
-		return xet.Hash{}
+		return Hash{}
 	}
 
 	// Build initial list of entries
@@ -68,7 +66,7 @@ func (t *Tree) ComputeRoot() xet.Hash {
 
 // node represents a node in the Merkle tree
 type node struct {
-	hash xet.Hash
+	hash Hash
 	size uint64
 }
 
@@ -83,7 +81,7 @@ func nextMergeCut(nodes []node) int {
 	}
 
 	// Maximum we can merge is MAX_CHILDREN or all remaining
-	end := min(xet.MaxChildren, n)
+	end := min(MaxChildren, n)
 
 	// Check indices 2 through end-1 (0-based indexing)
 	// Minimum merge is 3 children when input has more than 2 hashes
@@ -91,7 +89,7 @@ func nextMergeCut(nodes []node) int {
 		// Use last 8 bytes of hash as little-endian 64-bit unsigned int
 		// Per spec: hash[24:32] are the last 8 bytes
 		hashValue := binary.LittleEndian.Uint64(nodes[i].hash[24:32])
-		if hashValue%xet.MeanBranchingFactor == 0 {
+		if hashValue%MeanBranchingFactor == 0 {
 			return i + 1 // Cut after element i (include i+1 elements)
 		}
 	}
@@ -120,7 +118,7 @@ func (t *Tree) mergeNodes(nodes []node) node {
 	}
 
 	// Compute the parent hash
-	parentHash := xet.ComputeInternalNodeHash(input)
+	parentHash := computeInternalNodeHash(input)
 
 	return node{
 		hash: parentHash,
@@ -129,12 +127,12 @@ func (t *Tree) mergeNodes(nodes []node) node {
 }
 
 // ComputeXorbHash computes the xorb hash from chunk hashes and sizes
-func ComputeXorbHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
+func ComputeXorbHash(chunkHashes []Hash, chunkSizes []uint64) Hash {
 	if len(chunkHashes) != len(chunkSizes) {
 		panic("chunk hashes and sizes length mismatch")
 	}
 
-	tree := NewTree()
+	tree := newTree()
 	for i := range chunkHashes {
 		tree.AddLeaf(chunkHashes[i], chunkSizes[i])
 	}
@@ -144,14 +142,14 @@ func ComputeXorbHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
 
 // ComputeFileHash computes the file hash from chunk hashes and sizes
 // This is the same as xorb hash but with an additional keyed hash step
-func ComputeFileHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
+func ComputeFileHash(chunkHashes []Hash, chunkSizes []uint64) Hash {
 	// First compute the Merkle root (same as xorb hash)
 	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
-	if xorbHash == (xet.Hash{}) {
+	if xorbHash == (Hash{}) {
 		// If xorb hash is ZERO_HASH, return ZERO_HASH for file hash as well
-		return xet.Hash{}
+		return Hash{}
 	}
 
 	// Then apply the final keyed hash with ZERO_KEY
-	return xet.ComputeFileHash(xorbHash[:])
+	return computeFileHash(xorbHash[:])
 }

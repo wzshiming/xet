@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 

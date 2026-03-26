@@ -1,4 +1,4 @@
-package gearhash
+package xet
 
 import (
 	"crypto/sha256"

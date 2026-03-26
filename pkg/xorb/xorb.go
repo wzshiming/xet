@@ -6,8 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/wzshiming/xet/pkg/merkle"
-	"github.com/wzshiming/xet/pkg/xet"
+	"github.com/wzshiming/xet"
 )
 
 // Xorb represents a container of compressed chunks
@@ -181,7 +180,7 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	}
 
 	// Compute xorb hash using inline Merkle tree implementation
-	x.Hash = merkle.ComputeXorbHash(x.ChunkHashes, chunkSizes)
+	x.Hash = xet.ComputeXorbHash(x.ChunkHashes, chunkSizes)
 
 	// Main Header: XETBLOB ident (7 bytes), version (1), xorb hash (32 bytes)
 	buf.Write([]byte("XETBLOB"))
@@ -300,7 +299,7 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 		for i, chunk := range xorb.Chunks {
 			chunkSizes[i] = uint64(len(chunk.UncompressedData))
 		}
-		xorb.Hash = merkle.ComputeXorbHash(xorb.ChunkHashes, chunkSizes)
+		xorb.Hash = xet.ComputeXorbHash(xorb.ChunkHashes, chunkSizes)
 	}
 
 	return xorb, nil

@@ -1,10 +1,8 @@
-package merkle
+package xet
 
 import (
 	"encoding/hex"
 	"testing"
-
-	"github.com/wzshiming/xet/pkg/xet"
 )
 
 /*
@@ -29,8 +27,8 @@ Result (XET string):
 */
 func TestInternalNodeHash(t *testing.T) {
 	// Create two child nodes with specified hashes and sizes
-	child1Hash, _ := xet.StringToHash("c28f58387a60d4aa200c311cda7c7f77f686614864f5869eadebf765d0a14a69")
-	child2Hash, _ := xet.StringToHash("6e4e3263e073ce2c0e78cc770c361e2778db3b054b98ab65e277fc084fa70f22")
+	child1Hash, _ := HashFrom("c28f58387a60d4aa200c311cda7c7f77f686614864f5869eadebf765d0a14a69")
+	child2Hash, _ := HashFrom("6e4e3263e073ce2c0e78cc770c361e2778db3b054b98ab65e277fc084fa70f22")
 
 	child1 := node{
 		hash: child1Hash,
@@ -42,14 +40,14 @@ func TestInternalNodeHash(t *testing.T) {
 	}
 
 	// Create a tree and add these as leaves
-	tree := NewTree()
+	tree := newTree()
 	tree.AddLeaf(child1.hash, child1.size)
 	tree.AddLeaf(child2.hash, child2.size)
 
 	// Compute the root hash (which will merge these two nodes)
 	root := tree.ComputeRoot()
 
-	expectedRoot, _ := xet.StringToHash("be64c7003ccd3cf4357364750e04c9592b3c36705dee76a71590c011766b6c14")
+	expectedRoot, _ := HashFrom("be64c7003ccd3cf4357364750e04c9592b3c36705dee76a71590c011766b6c14")
 
 	if root != expectedRoot {
 		t.Errorf("Internal node hash does not match expected value. Got %s, want %s", root.String(), expectedRoot.String())
@@ -80,21 +78,21 @@ func TestVerificationHash(t *testing.T) {
 
 	// Compute verification hash
 
-	verificationHash := xet.ComputeVerificationHash([]xet.Hash{chunk1, chunk2})
+	verificationHash := ComputeVerificationHash([]Hash{chunk1, chunk2})
 
-	expectedHash, _ := xet.StringToHash("eb06a8ad81d588ac05d1d9a079232d9c1e7d0b07232fa58091caa7bf333a2768")
+	expectedHash, _ := HashFrom("eb06a8ad81d588ac05d1d9a079232d9c1e7d0b07232fa58091caa7bf333a2768")
 
 	if verificationHash != expectedHash {
 		t.Errorf("Verification hash does not match expected value. Got %s, want %s", verificationHash.String(), expectedHash.String())
 	}
 }
 
-func decodeRawHash(hexStr string) (xet.Hash, error) {
+func decodeRawHash(hexStr string) (Hash, error) {
 	bytes, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return xet.Hash{}, err
+		return Hash{}, err
 	}
-	var hash xet.Hash
+	var hash Hash
 	copy(hash[:], bytes)
 	return hash, nil
 }
