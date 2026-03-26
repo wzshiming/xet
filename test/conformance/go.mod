@@ -1,4 +1,4 @@
-module github.com/wzshiming/xet/test/conformance/encoding
+module github.com/wzshiming/xet/test/conformance
 
 go 1.24.13
 
@@ -12,4 +12,4 @@ require (
 	github.com/zeebo/blake3 v0.2.4 // indirect
 )
 
-replace github.com/wzshiming/xet => ../../..
+replace github.com/wzshiming/xet => ../..
