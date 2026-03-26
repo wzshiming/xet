@@ -102,10 +102,6 @@ func nextMergeCut(nodes []node) int {
 
 // mergeNodes merges a sequence of nodes into a single parent node
 func (t *Tree) mergeNodes(nodes []node) node {
-	if len(nodes) == 1 {
-		return nodes[0]
-	}
-
 	// Build the input for the internal node hash
 	// Format: "{hash_hex} : {size}\n" for each child
 	var input []byte
@@ -145,6 +141,11 @@ func ComputeXorbHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
 // ComputeFileHash computes the file hash from chunk hashes and sizes
 // This is the same as xorb hash but with an additional keyed hash step
 func ComputeFileHash(chunkHashes []xet.Hash, chunkSizes []uint64) xet.Hash {
+	if len(chunkHashes) == 0 {
+		// Return ZERO_HASH for empty files (matches Rust behavior)
+		return xet.Hash{}
+	}
+
 	// First compute the Merkle root (same as xorb hash)
 	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
 

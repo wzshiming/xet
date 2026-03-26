@@ -544,10 +544,6 @@ func nextMergeCut(nodes []merkleNode) int {
 
 // mergeNodes merges a sequence of nodes into a single parent node
 func mergeNodes(nodes []merkleNode) merkleNode {
-	if len(nodes) == 1 {
-		return nodes[0]
-	}
-
 	// Build input for internal node hash: "{hash_hex} : {size}\n" per child
 	var input []byte
 	var totalSize uint64
