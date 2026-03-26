@@ -418,9 +418,9 @@ func chunkData(t *testing.T, data []byte) []chunk {
 
 	var chunks []chunk
 	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
-		buf := make([]byte, len(dataChunk))
-		copy(buf, dataChunk)
-		chunks = append(chunks, chunk{Data: buf, Offset: offset})
+		newChunk := make([]byte, len(dataChunk))
+		copy(newChunk, dataChunk)
+		chunks = append(chunks, chunk{Data: newChunk, Offset: offset})
 		return nil
 	})
 	if err != nil {

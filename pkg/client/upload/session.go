@@ -79,10 +79,12 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 			// Deduplicate
 			dedupResult := s.deduplicateChunk(ctx, chunkHash)
 
+			newChunk := make([]byte, len(chunk))
+			copy(newChunk, chunk)
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
 				FileIndex: fileIdx,
-				Data:      chunk,
+				Data:      newChunk,
 				Hash:      chunkHash,
 				Offset:    uint64(offset),
 				Dedup:     dedupResult,
