@@ -71,9 +71,6 @@ func main() {
 	case "file":
 		hash = xet.ComputeFileHash(hashes, sizes)
 	case "range":
-		for i, hash := range hashes {
-			hashes[i] = hash
-		}
 		hash = xet.ComputeVerificationHash(hashes)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown hash type: %s\n", *hashType)

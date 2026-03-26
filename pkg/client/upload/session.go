@@ -38,7 +38,7 @@ type SessionOptions struct {
 // NewSession creates a new upload session
 func NewSession(opts SessionOptions) *Session {
 	if opts.TargetXorbSize == 0 {
-		opts.TargetXorbSize = 64 * 1024 * 1024 // 64 MiB default
+		opts.TargetXorbSize = xet.TargetChunkSize
 	}
 
 	return &Session{
@@ -66,11 +66,6 @@ type ChunkInfo struct {
 	Dedup     *DeduplicationResult
 }
 
-type chunkSegment struct {
-	data   []byte
-	offset int64
-}
-
 // UploadFiles uploads one or more files to the CAS server
 func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error {
 	// Step 1: Chunk all files and deduplicate
@@ -82,7 +77,7 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 			chunkHash := xet.ComputeChunkHash(chunk)
 
 			// Deduplicate
-			dedupResult := s.deduplicateChunk(ctx, chunkHash, chunk)
+			dedupResult := s.deduplicateChunk(ctx, chunkHash)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
@@ -125,7 +120,7 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 }
 
 // deduplicateChunk checks if a chunk already exists
-func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash, data []byte) *DeduplicationResult {
+func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *DeduplicationResult {
 	// Check local session cache first
 	if result, ok := s.localChunkCache[chunkHash]; ok {
 		return result

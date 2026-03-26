@@ -131,19 +131,3 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 
 	return result, nil
 }
-
-// GetCachedChunk retrieves a cached chunk if available
-func (s *Session) GetCachedChunk(chunkHash xet.Hash) ([]byte, bool) {
-	if s.chunkCache == nil {
-		return nil, false
-	}
-	data, ok := s.chunkCache[chunkHash]
-	return data, ok
-}
-
-// ClearCache clears the chunk cache
-func (s *Session) ClearCache() {
-	if s.chunkCache != nil {
-		s.chunkCache = make(map[xet.Hash][]byte)
-	}
-}
