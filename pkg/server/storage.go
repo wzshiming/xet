@@ -267,6 +267,15 @@ func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string
 	return nil, fmt.Errorf("shard not found")
 }
 
+// SetBaseURL updates the base URL used for generating xorb download URLs.
+// This is useful in tests where the server address is only known after
+// the listener has started (e.g. httptest.NewServer).
+func (fs *FileStorage) SetBaseURL(baseURL string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.baseURL = baseURL
+}
+
 // GetXorbURL generates a URL for accessing xorb data
 func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.Hash) string {
 	if fs.baseURL == "" {

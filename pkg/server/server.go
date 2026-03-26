@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
@@ -72,14 +73,7 @@ func (s *Server) registerRoutes() {
 
 // ServeHTTP implements http.Handler
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Log request
-	start := time.Now()
-	defer func() {
-		duration := time.Since(start)
-		fmt.Printf("[%s] %s %s - %v\n", r.Method, r.URL.Path, r.RemoteAddr, duration)
-	}()
-
-	s.router.ServeHTTP(w, r)
+	handlers.CombinedLoggingHandler(os.Stderr, s.router).ServeHTTP(w, r)
 }
 
 // authenticate checks if a request is authenticated
@@ -253,9 +247,13 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 
 // compressedDataRange returns the [start, end] byte range (inclusive) within
 // the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
-// The returned range includes the 8-byte chunk header for each chunk, so that
-// xet-core can parse the header (version, compressed/uncompressed size,
-// compression type) when it downloads that byte range.
+//
+// URL ranges within the fetch_info entries point into the compressed-data
+// stream of the stored xorb (i.e. the raw compressed bytes for each chunk,
+// concatenated without the 8-byte per-chunk headers).  This matches the
+// convention used by xet-core: ByteRangeStart is an offset into the
+// header-stripped stream, and range requests to the xorb download endpoint
+// are served from the same stripped stream (see handleDownloadXorb).
 func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
 	xorbData, err := s.storage.GetXorb(context.Background(), "default", xorbHash)
 	if err != nil {
@@ -265,34 +263,38 @@ func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uin
 	// Parse chunks to find byte offsets in the stored xorb.
 	// The stored format for xet-core uploads is [header0(8)][data0][header1(8)][data1]...
 	// where header = version(1) + compressedSize(3 LE) + comprType(1) + uncompressedSize(3 LE).
+	//
+	// The returned ranges are offsets into the header-stripped compressed-data
+	// stream (each chunk's payload bytes only, with the 8-byte header omitted).
+	// This is what xet-core expects when it makes byte-range requests.
 	type chunkSpan struct{ start, end int64 }
 	var spans []chunkSpan
-	offset := int64(0)
+	rawOffset := int64(0)   // offset in the raw stored xorb (includes headers)
+	stripOffset := int64(0) // offset in the header-stripped stream
 	data := xorbData
 
-	for int(offset) < len(data) {
-		if int(offset)+8 > len(data) {
+	for int(rawOffset) < len(data) {
+		if int(rawOffset)+8 > len(data) {
 			break
 		}
 		// Stop at XETBLOB footer (Go-client full format)
-		if int(offset)+7 <= len(data) && string(data[offset:offset+7]) == xorb.XorbIdentifier {
+		if int(rawOffset)+7 <= len(data) && string(data[rawOffset:rawOffset+7]) == xorb.XorbIdentifier {
 			break
 		}
-
-		headerStart := offset
 
 		// Read compressed size (3-byte LE, bytes 1-3 of the 8-byte header)
-		compressedSize := int64(data[offset+1]) | int64(data[offset+2])<<8 | int64(data[offset+3])<<16
-		offset += 8 // skip header
+		compressedSize := int64(data[rawOffset+1]) | int64(data[rawOffset+2])<<8 | int64(data[rawOffset+3])<<16
+		rawOffset += 8 // skip header
 
-		if int(offset)+int(compressedSize) > len(data) {
+		if int(rawOffset)+int(compressedSize) > len(data) {
 			break
 		}
 
-		offset += compressedSize
+		rawOffset += compressedSize
 
-		// The chunk span includes the header and the compressed payload.
-		spans = append(spans, chunkSpan{start: headerStart, end: offset - 1})
+		// Span covers only the compressed payload (header excluded).
+		spans = append(spans, chunkSpan{start: stripOffset, end: stripOffset + compressedSize - 1})
+		stripOffset += compressedSize
 	}
 
 	if int(chunkStart) >= len(spans) || int(chunkEnd) > len(spans) || chunkStart >= chunkEnd {
@@ -555,17 +557,24 @@ func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 
 	// Handle range requests.
 	//
-	// Serve the raw stored xorb bytes.  The URL ranges produced by
-	// buildReconstructionResponse / compressedDataRange account for the 8-byte
-	// per-chunk headers, so xet-core receives [header|compressed-data] pairs
-	// that it can parse and decompress independently.
+	// URL ranges in fetch_info (produced by compressedDataRange) are offsets
+	// into the header-stripped compressed-data stream (payloads only, no 8-byte
+	// per-chunk headers).  Build that stream and serve the requested byte range
+	// from it so that xet-core receives exactly the compressed payload bytes it
+	// expects.
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader != "" {
-		s.handleRangeRequest(w, r, xorbData, rangeHeader)
+		stream, _, err := xorb.CompressedDataStream(xorbData)
+		if err != nil {
+			http.Error(w, "Failed to build compressed data stream", http.StatusInternalServerError)
+			return
+		}
+		s.handleRangeRequest(w, r, stream, rangeHeader)
 		return
 	}
 
-	// Return full xorb
+	// Return full xorb for clients that download the whole object (e.g. the
+	// Go native download session which calls xorb.Deserialize on the result).
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(xorbData)))
 	w.Write(xorbData)

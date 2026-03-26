@@ -4,11 +4,15 @@ go 1.24.13
 
 require (
 	github.com/wzshiming/xet v0.0.0
-	github.com/wzshiming/xet-go v0.0.0-20260326084846-e1dc29026759
+	github.com/wzshiming/xet-go v0.0.0-20260327045759-3147b59f65e2
 )
 
 require (
+	github.com/felixge/httpsnoop v1.0.3 // indirect
+	github.com/gorilla/handlers v1.5.2 // indirect
+	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
+	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 )
 
