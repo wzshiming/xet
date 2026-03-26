@@ -1,0 +1,15 @@
+module github.com/wzshiming/xet/test/conformance
+
+go 1.24.13
+
+require (
+	github.com/wzshiming/xet v0.0.0
+	github.com/wzshiming/xet-go v0.0.0-20260326084846-e1dc29026759
+)
+
+require (
+	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
+	github.com/zeebo/blake3 v0.2.4 // indirect
+)
+
+replace github.com/wzshiming/xet => ../..

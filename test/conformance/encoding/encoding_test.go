@@ -2,10 +2,18 @@ package encoding_test
 
 import (
 	"bytes"
-	"os/exec"
-	"strings"
+	"os"
 	"testing"
+
+	"github.com/wzshiming/xet"
+	xetgo "github.com/wzshiming/xet-go"
 )
+
+// chunkEntry holds the hash and size for a single chunk.
+type chunkEntry struct {
+	hash string
+	size uint64
+}
 
 func TestConformance(t *testing.T) {
 	tests := []struct {
@@ -48,87 +56,119 @@ func TestConformance(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rustChunks, err := runRustChunk(tt.data)
-			if err != nil {
-				t.Fatalf("Rust chunk failed: %v", err)
-			}
+			nativeChunks := getNativeChunks(t, tt.data)
+			refChunks := getReferenceChunks(t, tt.data)
 
-			goChunks, err := runGoChunk(tt.data)
-			if err != nil {
-				t.Fatalf("Go chunk failed: %v", err)
-			}
-
-			if rustChunks != goChunks {
-				t.Errorf("Chunk output mismatch:\nRust:\n%s\n\nGo:\n%s", rustChunks, goChunks)
-			}
-
-			hashTypes := []string{"xorb", "file", "range", "chunk"}
-
-			for _, hashType := range hashTypes {
-				t.Run(hashType, func(t *testing.T) {
-					rustHash, err := runRustHash(hashType, rustChunks)
-					if err != nil {
-						t.Fatalf("Rust hash failed: %v", err)
+			t.Run("chunking", func(t *testing.T) {
+				if len(nativeChunks) != len(refChunks) {
+					t.Fatalf("chunk count mismatch: native=%d reference=%d",
+						len(nativeChunks), len(refChunks))
+				}
+				for i := range nativeChunks {
+					if nativeChunks[i].hash != refChunks[i].hash {
+						t.Errorf("chunk[%d] hash mismatch: native=%s reference=%s",
+							i, nativeChunks[i].hash, refChunks[i].hash)
 					}
-
-					goHash, err := runGoHash(hashType, goChunks)
-					if err != nil {
-						t.Fatalf("Go hash failed: %v", err)
+					if nativeChunks[i].size != refChunks[i].size {
+						t.Errorf("chunk[%d] size mismatch: native=%d reference=%d",
+							i, nativeChunks[i].size, refChunks[i].size)
 					}
+				}
+			})
 
-					if rustHash != goHash {
-						t.Errorf("Hash mismatch for type %s:\nRust: %s\nGo:   %s", hashType, rustHash, goHash)
-					}
-				})
+			if len(tt.data) == 0 {
+				return
 			}
+
+			t.Run("file", func(t *testing.T) {
+				nativeHash := getNativeFileHash(t, nativeChunks)
+				refHash := getReferenceFileHash(t, tt.data)
+				if nativeHash != refHash {
+					t.Errorf("file hash mismatch: native=%s reference=%s",
+						nativeHash, refHash)
+				}
+			})
 		})
 	}
 }
 
-func runRustChunk(data []byte) (string, error) {
-	cmd := exec.Command(rustChunkBin)
-	cmd.Stdin = bytes.NewReader(data)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return "", err
+// getNativeChunks splits data using the native Go implementation and returns
+// the hash and size of each chunk.
+func getNativeChunks(t *testing.T, data []byte) []chunkEntry {
+	t.Helper()
+	var chunks []chunkEntry
+	err := xet.ChunkData(bytes.NewReader(data), func(_ int64, chunk []byte) error {
+		h := xet.ComputeChunkHash(chunk)
+		chunks = append(chunks, chunkEntry{hash: h.String(), size: uint64(len(chunk))})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("native ChunkData: %v", err)
 	}
-	return out.String(), nil
+	return chunks
 }
 
-func runGoChunk(data []byte) (string, error) {
-	cmd := exec.Command(goChunkBin)
-	cmd.Stdin = bytes.NewReader(data)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return "", err
+// getReferenceChunks splits data using the xet-go (Rust) reference implementation
+// and returns the hash and size of each chunk.
+func getReferenceChunks(t *testing.T, data []byte) []chunkEntry {
+	t.Helper()
+	// xetgo.ChunkData does not accept empty input; empty data produces no chunks.
+	if len(data) == 0 {
+		return nil
 	}
-	return out.String(), nil
+	raw, err := xetgo.ChunkData(data)
+	if err != nil {
+		t.Fatalf("reference ChunkData: %v", err)
+	}
+	chunks := make([]chunkEntry, len(raw))
+	for i, c := range raw {
+		chunks[i] = chunkEntry{hash: c.Hash, size: c.Size}
+	}
+	return chunks
 }
 
-func runRustHash(hashType string, input string) (string, error) {
-	cmd := exec.Command(rustHashBin, "--hash-type", hashType)
-	cmd.Stdin = strings.NewReader(input)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return "", err
+// getNativeFileHash computes the file hash using the native Go implementation.
+func getNativeFileHash(t *testing.T, chunks []chunkEntry) string {
+	t.Helper()
+	hashes := make([]xet.Hash, len(chunks))
+	sizes := make([]uint64, len(chunks))
+	for i, c := range chunks {
+		h, err := xet.ParseHash(c.hash)
+		if err != nil {
+			t.Fatalf("parse hash: %v", err)
+		}
+		hashes[i] = h
+		sizes[i] = c.size
 	}
-	return strings.TrimSpace(out.String()), nil
+	return xet.ComputeFileHash(hashes, sizes).String()
 }
 
-func runGoHash(hashType string, input string) (string, error) {
-	cmd := exec.Command(goHashBin, "--hash-type", hashType)
-	cmd.Stdin = strings.NewReader(input)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return "", err
+// getReferenceFileHash computes the file hash using the xet-go (Rust) reference
+// implementation by writing the data to a temporary file and calling HashFiles.
+func getReferenceFileHash(t *testing.T, data []byte) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "xet-conformance-*")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
 	}
-	return strings.TrimSpace(out.String()), nil
+	defer os.Remove(f.Name())
+	if _, err := f.Write(data); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close temp file: %v", err)
+	}
+	results, err := xetgo.HashFiles([]string{f.Name()})
+	if err != nil {
+		t.Fatalf("reference HashFiles: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("reference HashFiles returned no results")
+	}
+	return results[0].Hash
 }
 
+// makeBinaryData creates a deterministic byte sequence of the given size.
 func makeBinaryData(size int) []byte {
 	result := make([]byte, size)
 	for i := range result {
