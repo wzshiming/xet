@@ -58,9 +58,9 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Build Rust conformance tools
-      working-directory: test/conformance
+      working-directory: test/conformance/encoding
       run: cargo build --release
 
     - name: Run conformance tests
       working-directory: test/conformance
-      run: go test -v
+      run: go test ./... -v
