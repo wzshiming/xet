@@ -183,12 +183,12 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	x.Hash = xet.ComputeXorbHash(x.ChunkHashes, chunkSizes)
 
 	// Main Header: XETBLOB ident (7 bytes), version (1), xorb hash (32 bytes)
-	buf.Write([]byte("XETBLOB"))
+	buf.Write([]byte(xet.XorbIdentifier))
 	buf.WriteByte(1) // version - MUST be 1 per spec
 	buf.Write(x.Hash[:])
 
 	// Hash Section: XBLBHSH ident (7 bytes), version (1), num_chunks (4 bytes), chunk hashes
-	buf.Write([]byte("XBLBHSH"))
+	buf.Write([]byte(xet.HashSectionIdent))
 	buf.WriteByte(0) // version
 
 	numChunks := uint32(len(x.Chunks))
@@ -199,7 +199,7 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	}
 
 	// Boundary Section: XBLBBND ident (7 bytes), version (1), num_chunks (4 bytes), chunk offsets
-	buf.Write([]byte("XBLBBND"))
+	buf.Write([]byte(xet.BoundarySectionIdent))
 	buf.WriteByte(1) // version - MUST be 1 per spec
 	binary.Write(&buf, binary.LittleEndian, numChunks)
 
@@ -250,7 +250,7 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 		}
 
 		// Check if we've hit the start of a footer (XETBLOB identifier)
-		if offset+7 <= len(data) && string(data[offset:offset+7]) == "XETBLOB" {
+		if offset+7 <= len(data) && string(data[offset:offset+7]) == xet.XorbIdentifier {
 			// We've hit a footer, stop parsing chunks
 			break
 		}
@@ -345,7 +345,7 @@ func (x *Xorb) parseFooter(data []byte) error {
 		return fmt.Errorf("footer too short for main header")
 	}
 
-	if string(data[offset:offset+7]) != "XETBLOB" {
+	if string(data[offset:offset+7]) != xet.XorbIdentifier {
 		return fmt.Errorf("invalid xorb identifier")
 	}
 	offset += 7
@@ -364,7 +364,7 @@ func (x *Xorb) parseFooter(data []byte) error {
 		return fmt.Errorf("footer too short for hash section header")
 	}
 
-	if string(data[offset:offset+7]) != "XBLBHSH" {
+	if string(data[offset:offset+7]) != xet.HashSectionIdent {
 		return fmt.Errorf("invalid hash section identifier")
 	}
 	offset += 7

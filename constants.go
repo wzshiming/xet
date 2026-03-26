@@ -67,8 +67,8 @@ const (
 )
 
 // Binary format identifiers
-var (
-	XorbIdentifier       = []byte("XETBLOB")
-	HashSectionIdent     = []byte("XBLBHSH")
-	BoundarySectionIdent = []byte("XBLBBND")
+const (
+	XorbIdentifier       = "XETBLOB"
+	HashSectionIdent     = "XBLBHSH"
+	BoundarySectionIdent = "XBLBBND"
 )
