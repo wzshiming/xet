@@ -48,7 +48,7 @@ func TestServerXorbUpload(t *testing.T) {
 	}
 
 	// Test xorb upload
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
+	req := httptest.NewRequest(http.MethodPost, "/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -68,7 +68,7 @@ func TestServerXorbUpload(t *testing.T) {
 	}
 
 	// Test uploading the same xorb again
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
+	req = httptest.NewRequest(http.MethodPost, "/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w = httptest.NewRecorder()
 
@@ -161,7 +161,7 @@ func TestServerShardUpload(t *testing.T) {
 	}
 
 	// Test shard upload
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/shards", bytes.NewReader(shardData))
+	req := httptest.NewRequest(http.MethodPost, "/shards", bytes.NewReader(shardData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -264,7 +264,7 @@ func TestServerGetReconstruction(t *testing.T) {
 	}
 
 	// Test reconstruction query
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/reconstructions/"+fileInfo.FileHash.String(), nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/reconstructions/"+fileInfo.FileHash.String(), nil)
 	w := httptest.NewRecorder()
 
 	srv.ServeHTTP(w, req)
@@ -325,7 +325,7 @@ func TestServerXorbDownload(t *testing.T) {
 	}
 
 	// Test xorb download
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/xorbs/default/"+xorbObj.Hash.String()+"/data", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/xorbs/default/"+xorbObj.Hash.String()+"/data", nil)
 	w := httptest.NewRecorder()
 
 	srv.ServeHTTP(w, req)
@@ -373,7 +373,7 @@ func TestServerAuthentication(t *testing.T) {
 	xorbData, _ := xorbObj.Serialize()
 
 	// Test without authentication - should fail
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
+	req := httptest.NewRequest(http.MethodPost, "/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	w := httptest.NewRecorder()
 
@@ -384,7 +384,7 @@ func TestServerAuthentication(t *testing.T) {
 	}
 
 	// Test with wrong token - should fail
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
+	req = httptest.NewRequest(http.MethodPost, "/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer wrong-token")
 	w = httptest.NewRecorder()
@@ -396,7 +396,7 @@ func TestServerAuthentication(t *testing.T) {
 	}
 
 	// Test with correct token - should succeed
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
+	req = httptest.NewRequest(http.MethodPost, "/v1/xorbs/default/"+xorbObj.Hash.String(), bytes.NewReader(xorbData))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+expectedToken)
 	w = httptest.NewRecorder()

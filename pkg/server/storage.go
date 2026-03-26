@@ -271,7 +271,7 @@ func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string
 func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.Hash) string {
 	if fs.baseURL == "" {
 		// If no base URL is configured, return a relative path
-		return fmt.Sprintf("/api/v1/xorbs/%s/%s/data", namespace, xorbHash.String())
+		return fmt.Sprintf("/v1/xorbs/%s/%s/data", namespace, xorbHash.String())
 	}
-	return fmt.Sprintf("%s/api/v1/xorbs/%s/%s/data", fs.baseURL, namespace, xorbHash.String())
+	return fmt.Sprintf("%s/v1/xorbs/%s/%s/data", fs.baseURL, namespace, xorbHash.String())
 }
