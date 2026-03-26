@@ -5,28 +5,28 @@ import (
 	"fmt"
 )
 
-// Tree represents a Merkle tree with variable fan-out
-type Tree struct {
+// merkleTree represents a Merkle tree with variable fan-out
+type merkleTree struct {
 	leaves []Hash
 	sizes  []uint64 // Size in bytes of each leaf chunk
 }
 
 // newTree creates a new Merkle tree
-func newTree() *Tree {
-	return &Tree{
+func newTree() *merkleTree {
+	return &merkleTree{
 		leaves: make([]Hash, 0),
 		sizes:  make([]uint64, 0),
 	}
 }
 
 // AddLeaf adds a leaf (chunk hash and size) to the tree
-func (t *Tree) AddLeaf(hash Hash, size uint64) {
+func (t *merkleTree) AddLeaf(hash Hash, size uint64) {
 	t.leaves = append(t.leaves, hash)
 	t.sizes = append(t.sizes, size)
 }
 
 // ComputeRoot computes the Merkle tree root hash
-func (t *Tree) ComputeRoot() Hash {
+func (t *merkleTree) ComputeRoot() Hash {
 	if len(t.leaves) == 0 {
 		// Return ZERO_HASH (32 zero bytes)
 		return Hash{}
@@ -99,7 +99,7 @@ func nextMergeCut(nodes []node) int {
 }
 
 // mergeNodes merges a sequence of nodes into a single parent node
-func (t *Tree) mergeNodes(nodes []node) node {
+func (t *merkleTree) mergeNodes(nodes []node) node {
 	// Build the input for the internal node hash
 	// Format: "{hash_hex} : {size}\n" for each child
 	var input []byte

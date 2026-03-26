@@ -268,7 +268,7 @@ func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uin
 			break
 		}
 		// Stop at XETBLOB footer (Go-client full format)
-		if int(offset)+7 <= len(data) && string(data[offset:offset+7]) == xet.XorbIdentifier {
+		if int(offset)+7 <= len(data) && string(data[offset:offset+7]) == xorb.XorbIdentifier {
 			break
 		}
 

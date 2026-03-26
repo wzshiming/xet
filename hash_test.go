@@ -1,54 +1,53 @@
 package xet
 
 import (
-	"encoding/hex"
 	"testing"
 )
 
-func TestChunkHash(t *testing.T) {
-	// Test vector from specification: "Hello World!" should hash to specific value
+/*
+Input (ASCII): Hello World!
+
+	Input (hex): 48656c6c6f20576f726c6421
+
+	Hash (raw hex, bytes 0-31):
+	  a29cfb08e608d4d8726dd8659a90b9134b3240d5d8e42d5fcb28e2a6e763a3e8
+
+	Hash (XET string representation):
+	  d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb
+*/
+func TestChunkHashWithKnownInput(t *testing.T) {
 	data := []byte("Hello World!")
 	hash := ComputeChunkHash(data)
 
-	// Convert to hex string
-	hashStr := hash.String()
+	expectedHash, _ := ParseHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
 
-	t.Logf("Chunk hash of 'Hello World!': %s", hashStr)
-
-	// The hash should be deterministic
-	hash2 := ComputeChunkHash(data)
-	if hash != hash2 {
-		t.Errorf("Hash is not deterministic")
+	if hash != expectedHash {
+		t.Errorf("Chunk hash does not match expected value. Got %s, want %s", hash.String(), expectedHash.String())
 	}
 }
 
-func TestHashToStringAndBack(t *testing.T) {
-	originalHash := [32]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+/*
+The XET hash string format interprets the 32-byte hash as four
+little-endian 64-bit unsigned values and prints each as 16
+hexadecimal digits.
+
+Hash bytes [0..31]:
+
+	00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+	10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
+
+Expected XET string:
+
+	07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918
+*/
+func TestHashToStringFormat(t *testing.T) {
+	hash := [32]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 		16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
 
-	wantHex := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
+	expected := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
 
-	got := hashToString(originalHash)
-	if got != wantHex {
-		t.Errorf("Expected hash string %s, got %s", wantHex, got)
+	got := hashToString(hash)
+	if got != expected {
+		t.Errorf("HashToString output does not match expected format. Got %s, want %s", got, expected)
 	}
-
-	// Now convert back to hash
-	parsedHash, err := ParseHash(got)
-	if err != nil {
-		t.Fatalf("Failed to parse hash string: %v", err)
-	}
-
-	if parsedHash != originalHash {
-		t.Errorf("Parsed hash does not match original. Got %v, want %v", parsedHash, originalHash)
-	}
-}
-
-func TestDataKey(t *testing.T) {
-	// Verify the DATA_KEY has the correct size
-	if len(DataKey) != 32 {
-		t.Errorf("DATA_KEY should be 32 bytes, got %d", len(DataKey))
-	}
-
-	t.Logf("DATA_KEY: %s", hex.EncodeToString(DataKey))
 }

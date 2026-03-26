@@ -8,7 +8,7 @@ import (
 )
 
 // Hash represents a 32-byte BLAKE3 hash
-type Hash [HashSize]byte
+type Hash [hashSize]byte
 
 // ParseHash converts an XET hash string back to a 32-byte hash
 func ParseHash(hexStr string) (Hash, error) {
@@ -35,7 +35,7 @@ func (h Hash) String() string {
 
 // ComputeChunkHash computes the hash of a chunk using DATA_KEY
 func ComputeChunkHash(data []byte) Hash {
-	hasher, err := blake3.NewKeyed(DataKey)
+	hasher, err := blake3.NewKeyed(dataKey[:])
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
 	}
@@ -47,7 +47,7 @@ func ComputeChunkHash(data []byte) Hash {
 
 // computeInternalNodeHash computes the hash of an internal node using INTERNAL_NODE_KEY
 func computeInternalNodeHash(data []byte) Hash {
-	hasher, err := blake3.NewKeyed(InternalNodeKey)
+	hasher, err := blake3.NewKeyed(internalNodeKey[:])
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
 	}
@@ -59,7 +59,7 @@ func computeInternalNodeHash(data []byte) Hash {
 
 // computeFileHash computes the final file hash using ZERO_KEY
 func computeFileHash(data []byte) Hash {
-	hasher, err := blake3.NewKeyed(ZeroKey)
+	hasher, err := blake3.NewKeyed(zeroKey[:])
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
 	}
@@ -71,7 +71,7 @@ func computeFileHash(data []byte) Hash {
 
 // ComputeVerificationHash computes a term verification hash using VERIFICATION_KEY
 func ComputeVerificationHash(chunkHashes []Hash) Hash {
-	hasher, err := blake3.NewKeyed(VerificationKey)
+	hasher, err := blake3.NewKeyed(verificationKey[:])
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())
 	}
