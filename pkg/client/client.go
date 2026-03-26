@@ -51,7 +51,7 @@ func NewClient(opts ClientOptions) *Client {
 
 // GetReconstruction retrieves reconstruction information for a file
 func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*ReconstructionResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/reconstructions/%s", c.baseURL, fileHash.String())
+	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -83,7 +83,7 @@ func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*Rec
 
 // GetReconstructionRange retrieves reconstruction information for a byte range
 func (c *Client) GetReconstructionRange(ctx context.Context, fileHash xet.Hash, start, end int64) (*ReconstructionResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/reconstructions/%s", c.baseURL, fileHash.String())
+	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -117,7 +117,7 @@ func (c *Client) GetReconstructionRange(ctx context.Context, fileHash xet.Hash, 
 
 // UploadXorb uploads a serialized xorb to the server
 func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []byte) (*XorbUploadResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(xorbData))
 	if err != nil {
@@ -150,7 +150,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []b
 
 // UploadShard uploads a serialized shard to the server
 func (c *Client) UploadShard(ctx context.Context, shardData []byte) (*ShardUploadResponse, error) {
-	url := fmt.Sprintf("%s/api/v1/shards", c.baseURL)
+	url := fmt.Sprintf("%s/shards", c.baseURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(shardData))
 	if err != nil {
@@ -183,7 +183,7 @@ func (c *Client) UploadShard(ctx context.Context, shardData []byte) (*ShardUploa
 
 // QueryChunkDeduplication checks if a chunk exists in the global deduplication index
 func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*shard.Shard, error) {
-	url := fmt.Sprintf("%s/api/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
+	url := fmt.Sprintf("%s/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

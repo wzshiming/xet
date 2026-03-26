@@ -48,7 +48,7 @@ func TestNewClientDefaults(t *testing.T) {
 func TestGetReconstruction(t *testing.T) {
 	// Create a test hash
 	testHash := xet.Hash([32]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2})
-	expectedPath := "/api/v1/reconstructions/" + testHash.String()
+	expectedPath := "/v1/reconstructions/" + testHash.String()
 
 	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +199,7 @@ func TestUploadXorb(t *testing.T) {
 
 func TestUploadShard(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/shards" {
+		if r.URL.Path != "/shards" {
 			t.Errorf("Unexpected path: %s", r.URL.Path)
 		}
 		if r.Method != http.MethodPost {

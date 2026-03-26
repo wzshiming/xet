@@ -47,19 +47,11 @@ func NewServer(opts ServerOptions) *Server {
 }
 
 // registerRoutes sets up all HTTP routes.
-// Routes are registered for both the spec-defined /api/v1/... prefix and the
-// /v1/... prefix used by the xet-core reference client (xet-go).  The shard
-// upload endpoint is also registered at /shards for compatibility with
-// xet-core's legacy path.
 func (s *Server) registerRoutes() {
-	for _, prefix := range []string{"/api/v1", "/v1"} {
-		s.router.HandleFunc(prefix+"/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-		s.router.HandleFunc(prefix+"/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-		s.router.HandleFunc(prefix+"/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
-		s.router.HandleFunc(prefix+"/shards", s.handleUploadShard).Methods(http.MethodPost)
-		s.router.HandleFunc(prefix+"/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
-	}
-	// xet-core also POSTs to /shards directly (no version prefix).
+	s.router.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
+	s.router.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.router.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 }
 
@@ -95,7 +87,7 @@ func (s *Server) authenticate(r *http.Request) bool {
 	return s.authFn(parts[1])
 }
 
-// handleGetReconstruction handles GET /api/v1/reconstructions/{file_hash}
+// handleGetReconstruction handles GET /v1/reconstructions/{file_hash}
 func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
 	// Extract file hash from path using mux
 	vars := mux.Vars(r)
@@ -295,7 +287,7 @@ func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uin
 	return spans[chunkStart].start, spans[chunkEnd-1].end
 }
 
-// handleUploadXorb handles POST /api/v1/xorbs/{namespace}/{xorb_hash}
+// handleUploadXorb handles POST /v1/xorbs/{namespace}/{xorb_hash}
 func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
@@ -356,7 +348,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleDownloadXorb handles GET /api/v1/xorbs/{namespace}/{xorb_hash}/data
+// handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}/data
 func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
@@ -432,7 +424,7 @@ func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, data
 	w.Write(rangeData)
 }
 
-// handleUploadShard handles POST /api/v1/shards
+// handleUploadShard handles POST /shards
 func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
@@ -475,7 +467,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleQueryChunk handles GET /api/v1/chunks/{namespace}/{chunk_hash}
+// handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}
 func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)

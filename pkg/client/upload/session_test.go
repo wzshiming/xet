@@ -109,7 +109,7 @@ func TestUploadFilesSimple(t *testing.T) {
 	uploadedXorbs := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/shards" {
+		if r.URL.Path == "/shards" {
 			uploadedShards++
 			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
@@ -159,7 +159,7 @@ func TestUploadFilesSimple(t *testing.T) {
 
 func TestUploadFilesWithDeduplication(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/shards" {
+		if r.URL.Path == "/shards" {
 			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
 		} else if r.Method == http.MethodPost {
@@ -209,7 +209,7 @@ func TestUploadFilesWithDeduplication(t *testing.T) {
 
 func TestUploadEmptyFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/shards" {
+		if r.URL.Path == "/shards" {
 			resp := client.ShardUploadResponse{Result: 1}
 			json.NewEncoder(w).Encode(resp)
 		}
