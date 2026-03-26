@@ -46,13 +46,21 @@ func NewServer(opts ServerOptions) *Server {
 	return s
 }
 
-// registerRoutes sets up all HTTP routes
+// registerRoutes sets up all HTTP routes.
+// Routes are registered for both the spec-defined /api/v1/... prefix and the
+// /v1/... prefix used by the xet-core reference client (xet-go).  The shard
+// upload endpoint is also registered at /shards for compatibility with
+// xet-core's legacy path.
 func (s *Server) registerRoutes() {
-	s.router.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
-	s.router.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
-	s.router.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	for _, prefix := range []string{"/api/v1", "/v1"} {
+		s.router.HandleFunc(prefix+"/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+		s.router.HandleFunc(prefix+"/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+		s.router.HandleFunc(prefix+"/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
+		s.router.HandleFunc(prefix+"/shards", s.handleUploadShard).Methods(http.MethodPost)
+		s.router.HandleFunc(prefix+"/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	}
+	// xet-core also POSTs to /shards directly (no version prefix).
+	s.router.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 }
 
 // ServeHTTP implements http.Handler
@@ -117,7 +125,14 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(response)
 }
 
-// buildReconstructionResponse builds a reconstruction response from a shard
+// buildReconstructionResponse builds a reconstruction response from a shard.
+//
+// URL ranges within the fetch_info entries point into the compressed-data
+// stream of the stored xorb (i.e. the raw compressed bytes for each chunk,
+// concatenated without the 8-byte per-chunk headers).  This matches the
+// convention used by xet-core: ByteRangeStart is an offset into the
+// header-stripped stream, and range requests to the xorb download endpoint
+// are served from the same stripped stream (see handleDownloadXorb).
 func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponse, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
@@ -199,19 +214,12 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 		}
 		response.Terms = append(response.Terms, term)
 
-		// Build fetch info - calculate byte range for the chunks
-		var startByte, endByte int64
-		for i := uint32(0); i < entry.ChunkIndexEnd; i++ {
-			if int(i) < len(casBlock.Chunks) {
-				// ByteRangeStart gives us the cumulative offset
-				if i == entry.ChunkIndexStart {
-					startByte = int64(casBlock.Chunks[i].ByteRangeStart)
-				}
-				if i == entry.ChunkIndexEnd-1 {
-					endByte = int64(casBlock.Chunks[i].ByteRangeStart + casBlock.Chunks[i].UnpackedSegBytes - 1)
-				}
-			}
-		}
+		// Build fetch info.
+		//
+		// URL ranges are byte offsets within the compressed-data stream of the
+		// stored xorb (headers stripped).  Load the stored xorb and compute
+		// the accurate ranges from the actual compressed chunk sizes.
+		startByte, endByte := s.compressedDataRange(entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
 		xorbURL := s.storage.GetXorbURL("default", entry.CASHash)
 
@@ -234,6 +242,57 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 	}
 
 	return response, nil
+}
+
+// compressedDataRange returns the [start, end] byte range (inclusive) within
+// the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
+// The returned range includes the 8-byte chunk header for each chunk, so that
+// xet-core can parse the header (version, compressed/uncompressed size,
+// compression type) when it downloads that byte range.
+func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
+	xorbData, err := s.storage.GetXorb(context.Background(), "default", xorbHash)
+	if err != nil {
+		return 0, 0
+	}
+
+	// Parse chunks to find byte offsets in the stored xorb.
+	// The stored format for xet-core uploads is [header0(8)][data0][header1(8)][data1]...
+	// where header = version(1) + compressedSize(3 LE) + comprType(1) + uncompressedSize(3 LE).
+	type chunkSpan struct{ start, end int64 }
+	var spans []chunkSpan
+	offset := int64(0)
+	data := xorbData
+
+	for int(offset) < len(data) {
+		if int(offset)+8 > len(data) {
+			break
+		}
+		// Stop at XETBLOB footer (Go-client full format)
+		if int(offset)+7 <= len(data) && string(data[offset:offset+7]) == "XETBLOB" {
+			break
+		}
+
+		headerStart := offset
+
+		// Read compressed size (3-byte LE, bytes 1-3 of the 8-byte header)
+		compressedSize := int64(data[offset+1]) | int64(data[offset+2])<<8 | int64(data[offset+3])<<16
+		offset += 8 // skip header
+
+		if int(offset)+int(compressedSize) > len(data) {
+			break
+		}
+
+		offset += compressedSize
+
+		// The chunk span includes the header and the compressed payload.
+		spans = append(spans, chunkSpan{start: headerStart, end: offset - 1})
+	}
+
+	if int(chunkStart) >= len(spans) || int(chunkEnd) > len(spans) || chunkStart >= chunkEnd {
+		return 0, 0
+	}
+
+	return spans[chunkStart].start, spans[chunkEnd-1].end
 }
 
 // handleUploadXorb handles POST /api/v1/xorbs/{namespace}/{xorb_hash}
@@ -263,15 +322,21 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify xorb format and hash
+	// Verify xorb format and hash.
+	// xet-core uploads xorbs without the CasObjectInfo footer (chunks-only
+	// format), while the Go client uses the full format with XETBLOB footer.
+	// Try the full format first; fall back to chunks-only.
 	deserializedXorb, err := xorb.Deserialize(xorbData)
 	if err != nil {
-		http.Error(w, "Invalid xorb format", http.StatusBadRequest)
-		return
+		deserializedXorb, err = xorb.DeserializeChunksOnly(xorbData)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 
 	if deserializedXorb.Hash != xorbHash {
-		http.Error(w, "Hash mismatch", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Hash mismatch: xorb has %s, URL has %s", deserializedXorb.Hash.String(), xorbHash.String()), http.StatusBadRequest)
 		return
 	}
 
@@ -312,7 +377,12 @@ func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle range requests
+	// Handle range requests.
+	//
+	// Serve the raw stored xorb bytes.  The URL ranges produced by
+	// buildReconstructionResponse / compressedDataRange account for the 8-byte
+	// per-chunk headers, so xet-core receives [header|compressed-data] pairs
+	// that it can parse and decompress independently.
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader != "" {
 		s.handleRangeRequest(w, r, xorbData, rangeHeader)

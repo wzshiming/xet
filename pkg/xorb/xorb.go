@@ -442,7 +442,33 @@ func (x *Xorb) parseChunks(data []byte) error {
 	return nil
 }
 
-// computeXorbHashFromChunks computes xorb hash using Merkle tree with variable fan-out
+// CompressedDataStream returns a slice containing the raw compressed bytes for
+// all chunks in an xorb, concatenated in order.  The 8-byte chunk header that
+// precedes each chunk in the on-disk "chunks-only" serialization is stripped;
+// only the actual compressed payload is included.
+//
+// Also returned is a slice of per-chunk byte offsets within the resulting
+// stream (i.e. chunkOffsets[i] is the position at which chunk i begins).
+//
+// The function handles both the full XETBLOB format (with footer) and the
+// chunks-only upload format (without footer) by delegating to
+// DeserializeChunksOnly, which stops at the XETBLOB magic bytes.
+func CompressedDataStream(data []byte) (stream []byte, chunkOffsets []int, err error) {
+	x, err := DeserializeChunksOnly(data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	chunkOffsets = make([]int, len(x.Chunks))
+	var buf []byte
+	for i, chunk := range x.Chunks {
+		chunkOffsets[i] = len(buf)
+		buf = append(buf, chunk.CompressedData...)
+	}
+
+	return buf, chunkOffsets, nil
+}
+
 func computeXorbHashFromChunks(hashes []xet.Hash, sizes []uint64) xet.Hash {
 	if len(hashes) != len(sizes) {
 		panic("chunk hashes and sizes length mismatch")
