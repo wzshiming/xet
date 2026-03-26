@@ -100,10 +100,6 @@ func nextMergeCut(nodes []node) int {
 
 // mergeNodes merges a sequence of nodes into a single parent node
 func (t *Tree) mergeNodes(nodes []node) node {
-	if len(nodes) == 1 {
-		return nodes[0]
-	}
-
 	// Build the input for the internal node hash
 	// Format: "{hash_hex} : {size}\n" for each child
 	var input []byte
