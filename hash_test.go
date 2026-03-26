@@ -34,7 +34,7 @@ func TestHashToStringAndBack(t *testing.T) {
 	}
 
 	// Now convert back to hash
-	parsedHash, err := HashFrom(got)
+	parsedHash, err := ParseHash(got)
 	if err != nil {
 		t.Fatalf("Failed to parse hash string: %v", err)
 	}

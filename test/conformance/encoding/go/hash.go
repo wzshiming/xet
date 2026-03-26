@@ -99,7 +99,7 @@ func readChunksList(input io.Reader) ([]xet.Hash, []uint64) {
 			fmt.Fprintf(os.Stderr, "Failed to parse line: %s\n", line)
 			os.Exit(1)
 		}
-		hash, err := xet.HashFrom(matches[1])
+		hash, err := xet.ParseHash(matches[1])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to parse hash: %v\n", err)
 			os.Exit(1)

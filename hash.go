@@ -10,6 +10,24 @@ import (
 // Hash represents a 32-byte BLAKE3 hash
 type Hash [HashSize]byte
 
+// ParseHash converts an XET hash string back to a 32-byte hash
+func ParseHash(hexStr string) (Hash, error) {
+	var hash [32]byte
+	if len(hexStr) != 64 {
+		return hash, fmt.Errorf("invalid hash string length: %d", len(hexStr))
+	}
+	for seg := range 4 {
+		start := seg * 16
+		var val uint64
+		_, err := fmt.Sscanf(hexStr[start:start+16], "%016x", &val)
+		if err != nil {
+			return hash, fmt.Errorf("invalid hex segment %d: %w", seg, err)
+		}
+		binary.LittleEndian.PutUint64(hash[seg*8:], val)
+	}
+	return hash, nil
+}
+
 // String returns the hash as a hex string (byte-swapped for XET format)
 func (h Hash) String() string {
 	return hashToString(h)
@@ -80,27 +98,4 @@ func hashToString(hash Hash) string {
 		copy(out[seg*16:], s)
 	}
 	return string(out[:])
-}
-
-// HashFrom converts an XET hash string back to a 32-byte hash
-func HashFrom(hexStr string) (Hash, error) {
-	var hash [32]byte
-	if len(hexStr) != 64 {
-		return hash, fmt.Errorf("invalid hash string length: %d", len(hexStr))
-	}
-	for seg := range 4 {
-		start := seg * 16
-		var val uint64
-		_, err := fmt.Sscanf(hexStr[start:start+16], "%016x", &val)
-		if err != nil {
-			return hash, fmt.Errorf("invalid hex segment %d: %w", seg, err)
-		}
-		binary.LittleEndian.PutUint64(hash[seg*8:], val)
-	}
-	return hash, nil
-}
-
-// ParseHash is an alias for StringToHash
-func ParseHash(hexStr string) (Hash, error) {
-	return HashFrom(hexStr)
 }

@@ -26,12 +26,12 @@ func TestNewShard(t *testing.T) {
 	}
 
 	// Verify magic sequence
-	if !bytes.Equal(s.Header.Tag[15:32], ShardMagicSequence[:]) {
+	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
 		t.Error("magic sequence mismatch")
 	}
 
 	// Verify HF application ID
-	if !bytes.Equal(s.Header.Tag[:14], HFApplicationID[:]) {
+	if !bytes.Equal(s.Header.Tag[:14], hfApplicationID[:]) {
 		t.Error("application ID mismatch")
 	}
 
@@ -565,7 +565,7 @@ func TestMagicSequence(t *testing.T) {
 		0x83, 0xa5, 0xbd, 0xd9, 0x5c, 0xcd, 0xd1, 0x4a, 0xa9,
 	}
 
-	if !bytes.Equal(ShardMagicSequence[:], expected) {
+	if !bytes.Equal(shardMagicSequence[:], expected) {
 		t.Error("magic sequence does not match spec")
 	}
 }
@@ -577,14 +577,14 @@ func TestApplicationID(t *testing.T) {
 		0x74, 0x61, 0x44, 0x61, 0x74, 0x61,
 	}
 
-	if !bytes.Equal(HFApplicationID[:], expected) {
+	if !bytes.Equal(hfApplicationID[:], expected) {
 		t.Error("HF application ID does not match spec")
 	}
 
 	// Verify it's "HFRepoMetaData"
 	expectedStr := "HFRepoMetaData"
-	if string(HFApplicationID[:]) != expectedStr {
-		t.Errorf("expected %q, got %q", expectedStr, string(HFApplicationID[:]))
+	if string(hfApplicationID[:]) != expectedStr {
+		t.Errorf("expected %q, got %q", expectedStr, string(hfApplicationID[:]))
 	}
 }
 

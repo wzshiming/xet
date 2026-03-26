@@ -100,13 +100,13 @@ type Footer struct {
 }
 
 // Shard magic sequence (bytes 15-31 of the tag)
-var ShardMagicSequence = [17]byte{
+var shardMagicSequence = [17]byte{
 	0x55, 0x69, 0x67, 0x45, 0x6a, 0x7b, 0x81, 0x57,
 	0x83, 0xa5, 0xbd, 0xd9, 0x5c, 0xcd, 0xd1, 0x4a, 0xa9,
 }
 
 // Default application identifier for Hugging Face deployments
-var HFApplicationID = [14]byte{
+var hfApplicationID = [14]byte{
 	0x48, 0x46, 0x52, 0x65, 0x70, 0x6f, 0x4d, 0x65,
 	0x74, 0x61, 0x44, 0x61, 0x74, 0x61,
 }
@@ -115,9 +115,9 @@ var HFApplicationID = [14]byte{
 func NewShard() *Shard {
 	// Build default tag with HF application ID
 	var tag [32]byte
-	copy(tag[:14], HFApplicationID[:])
+	copy(tag[:14], hfApplicationID[:])
 	tag[14] = 0x00 // Null byte
-	copy(tag[15:], ShardMagicSequence[:])
+	copy(tag[15:], shardMagicSequence[:])
 
 	return &Shard{
 		Header: Header{
@@ -405,7 +405,7 @@ func (s *Shard) readHeader(data []byte, offset *int) error {
 	*offset += 32
 
 	// Verify magic sequence (bytes 15-31 of tag)
-	if !bytes.Equal(s.Header.Tag[15:32], ShardMagicSequence[:]) {
+	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
 		return fmt.Errorf("invalid shard magic sequence")
 	}
 
