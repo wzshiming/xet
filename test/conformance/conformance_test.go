@@ -2,7 +2,9 @@ package conformance_test
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,19 +78,23 @@ func TestChunkConformance(t *testing.T) {
 		},
 		{
 			name: "1KB",
-			data: makeRepeatedData(1024),
+			data: makeBinaryData(1024),
 		},
 		{
 			name: "10KB",
-			data: makeRepeatedData(10 * 1024),
+			data: makeBinaryData(10 * 1024),
 		},
 		{
 			name: "100KB",
-			data: makeRepeatedData(100 * 1024),
+			data: makeBinaryData(100 * 1024),
 		},
 		{
 			name: "1MB",
-			data: makeRepeatedData(1024 * 1024),
+			data: makeBinaryData(1024 * 1024),
+		},
+		{
+			name: "10MB",
+			data: makeBinaryData(10 * 1024 * 1024),
 		},
 	}
 
@@ -114,7 +120,7 @@ func TestChunkConformance(t *testing.T) {
 }
 
 func TestHashConformance(t *testing.T) {
-	testData := makeRepeatedData(100 * 1024)
+	testData := makeBinaryData(10 * 1024 * 1024)
 
 	rustChunks, err := runRustChunk(testData)
 	if err != nil {
@@ -160,8 +166,11 @@ func TestChunkHashConformance(t *testing.T) {
 	}{
 		{"Empty", []byte{}},
 		{"Hello World", []byte("Hello World!")},
-		{"1KB", makeRepeatedData(1024)},
-		{"64KB", makeRepeatedData(64 * 1024)},
+		{"1KB", makeBinaryData(1024)},
+		{"64KB", makeBinaryData(64 * 1024)},
+		{"100KB", makeBinaryData(100 * 1024)},
+		{"1MB", makeBinaryData(1024 * 1024)},
+		{"10MB", makeBinaryData(10 * 1024 * 1024)},
 	}
 
 	for _, tt := range tests {
@@ -200,11 +209,15 @@ func TestXorbCheckConformance(t *testing.T) {
 		},
 		{
 			name: "100KB file",
-			data: makeRepeatedData(100 * 1024),
+			data: makeBinaryData(100 * 1024),
 		},
 		{
 			name: "1MB file",
-			data: makeRepeatedData(1024 * 1024),
+			data: makeBinaryData(1024 * 1024),
+		},
+		{
+			name: "10MB file",
+			data: makeBinaryData(10 * 1024 * 1024),
 		},
 	}
 
@@ -344,11 +357,8 @@ func runGoHash(hashType string, input string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-func makeRepeatedData(size int) []byte {
-	pattern := []byte("XET Protocol Test Pattern - Conformance Testing - ")
+func makeBinaryData(size int) []byte {
 	result := make([]byte, size)
-	for i := range size {
-		result[i] = pattern[i%len(pattern)]
-	}
+	io.ReadFull(rand.Reader, result)
 	return result
 }
