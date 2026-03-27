@@ -91,7 +91,7 @@ func TestDownloadFile(t *testing.T) {
 	})
 
 	// Download file
-	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFileV1(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestDownloadFileRange(t *testing.T) {
 	})
 
 	// Download file range
-	reader, _, err := session.DownloadFile(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
+	reader, _, err := session.DownloadFileV1(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
 		t.Fatalf("DownloadFileRange failed: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestDownloadFileWithCache(t *testing.T) {
 	})
 
 	// Download file
-	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFileV1(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestDownloadFileWithOffset(t *testing.T) {
 	})
 
 	// Download file
-	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFileV1(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestDownloadFileWithLength(t *testing.T) {
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFileV1(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileWithLength failed: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestDownloadFileRangeWithLength(t *testing.T) {
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFile(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
+	reader, length, err := session.DownloadFileV1(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -1058,7 +1058,7 @@ func TestDownloadFileWithOffsetLength(t *testing.T) {
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFileV1(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileWithLength failed: %v", err)
 	}

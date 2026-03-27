@@ -104,7 +104,13 @@ func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash, opts 
 	return &reconstruction, nil
 }
 
+var errNotFound = fmt.Errorf("404 not found")
+
 func reqError(req *http.Request, resp *http.Response) error {
+	if resp.StatusCode == http.StatusNotFound {
+		return errNotFound
+	}
+
 	hasRange := req.Header.Get("Range") != ""
 
 	if hasRange {

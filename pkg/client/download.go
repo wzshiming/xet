@@ -35,8 +35,20 @@ func NewDownloadSession(opts DownloadSessionOptions) *DownloadSession {
 	}
 }
 
-// DownloadFile downloads and reconstructs a file from its hash
+// DownloadFile downloads and reconstructs a file from its hash, automatically falling back to V1 if V2 is not supported
 func (s *DownloadSession) DownloadFile(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (io.Reader, int64, error) {
+	r, size, err := s.DownloadFileV2(ctx, fileHash, opts...)
+	if err != nil {
+		if err == errNotFound {
+			return s.DownloadFileV1(ctx, fileHash, opts...)
+		}
+		return nil, 0, err
+	}
+	return r, size, nil
+}
+
+// DownloadFileV1 downloads and reconstructs a file from its hash
+func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (io.Reader, int64, error) {
 	// Step 1: Query reconstruction
 	reconstruction, err := s.client.GetReconstruction(ctx, fileHash, opts...)
 	if err != nil {

@@ -373,7 +373,7 @@ func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xe
 
 	// Build CAS blocks by collecting chunk information from all chunks
 	xorbChunksMap := make(map[xet.Hash][]shard.CASChunkSequenceEntry)
-	xorbBytesMap := make(map[xet.Hash]uint32)       // total uncompressed bytes per xorb
+	xorbBytesMap := make(map[xet.Hash]uint32)              // total uncompressed bytes per xorb
 	xorbSeenChunks := make(map[xet.Hash]map[xet.Hash]bool) // track added chunks per xorb
 
 	for _, chunk := range allChunks {

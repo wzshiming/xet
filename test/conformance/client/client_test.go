@@ -521,20 +521,6 @@ func hasEquivalentRequest(reqType string, requests map[string][]RequestRecord) b
 	if _, ok := requests[reqType]; ok {
 		return true
 	}
-
-	// Check for v1/v2 API version differences
-	if strings.Contains(reqType, "/v1/") {
-		v2Type := strings.Replace(reqType, "/v1/", "/v2/", 1)
-		if _, ok := requests[v2Type]; ok {
-			return true
-		}
-	} else if strings.Contains(reqType, "/v2/") {
-		v1Type := strings.Replace(reqType, "/v2/", "/v1/", 1)
-		if _, ok := requests[v1Type]; ok {
-			return true
-		}
-	}
-
 	return false
 }
 
