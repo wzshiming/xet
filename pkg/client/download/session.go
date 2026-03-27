@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
@@ -37,11 +38,21 @@ func NewSession(opts SessionOptions) *Session {
 
 // DownloadFile downloads and reconstructs a file from its hash
 func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) (io.Reader, error) {
+	reader, _, err := s.DownloadFileWithLength(ctx, fileHash)
+	return reader, err
+}
+
+// DownloadFileWithLength downloads a file and returns a reader and the expected length.
+// The length is computed from the reconstruction response, so it is available
+// before any data is streamed to the caller.
+func (s *Session) DownloadFileWithLength(ctx context.Context, fileHash xet.Hash) (io.Reader, int64, error) {
 	// Step 1: Query reconstruction
 	reconstruction, err := s.client.GetReconstruction(ctx, fileHash)
 	if err != nil {
-		return nil, fmt.Errorf("query reconstruction: %w", err)
+		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 	}
+
+	expectedLength := expectedLength(reconstruction)
 
 	pr, pw := io.Pipe()
 
@@ -54,16 +65,25 @@ func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) (io.Reade
 		}
 	}()
 
-	return pr, nil
+	return pr, expectedLength, nil
 }
 
 // DownloadFileRange downloads and reconstructs a byte range of a file from its hash
 func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, start, end int64) (io.Reader, error) {
+	reader, _, err := s.DownloadFileRangeWithLength(ctx, fileHash, start, end)
+	return reader, err
+}
+
+// DownloadFileRangeWithLength downloads a byte range of a file and returns a reader and the expected length.
+// The length is computed from the reconstruction response for the requested range.
+func (s *Session) DownloadFileRangeWithLength(ctx context.Context, fileHash xet.Hash, start, end int64) (io.Reader, int64, error) {
 	// Step 1: Query reconstruction with range
 	reconstruction, err := s.client.GetReconstructionRange(ctx, fileHash, start, end)
 	if err != nil {
-		return nil, fmt.Errorf("query reconstruction range: %w", err)
+		return nil, 0, fmt.Errorf("query reconstruction range: %w", err)
 	}
+
+	expectedLength := expectedLength(reconstruction)
 
 	pr, pw := io.Pipe()
 
@@ -76,7 +96,7 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 		}
 	}()
 
-	return pr, nil
+	return pr, expectedLength, nil
 }
 
 func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *client.ReconstructionResponse) error {
@@ -172,4 +192,29 @@ func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *clie
 		}
 	}
 	return nil
+}
+
+func expectedLength(reconstruction *client.ReconstructionResponse) int64 {
+	var total uint64
+	for _, term := range reconstruction.Terms {
+		total += term.UnpackedLength
+	}
+
+	if reconstruction.OffsetIntoFirstRange <= 0 {
+		if total > math.MaxInt64 {
+			return math.MaxInt64
+		}
+		return int64(total)
+	}
+
+	if uint64(reconstruction.OffsetIntoFirstRange) >= total {
+		return 0
+	}
+
+	remaining := total - uint64(reconstruction.OffsetIntoFirstRange)
+	if remaining > math.MaxInt64 {
+		return math.MaxInt64
+	}
+
+	return int64(remaining)
 }
