@@ -441,6 +441,15 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 		}
 	}
 
+	// STRICT: When both perform dedup queries, they must target the same chunk hashes
+	xetgoChunkQueries := xetgoByType["GET:/v1/chunks/default/{hash}"]
+	nativeChunkQueries := nativeByType["GET:/v1/chunks/default/{hash}"]
+	if len(xetgoChunkQueries) > 0 && len(nativeChunkQueries) > 0 {
+		compareRequestDetailSets(t, "Chunk query requests", xetgoChunkQueries, nativeChunkQueries, func(r RequestRecord) string {
+			return r.Path
+		})
+	}
+
 	// Compare xorb uploads - validate chunk content
 	if strings.HasPrefix("POST:/v1/xorbs/", "POST:/v1/xorbs/") {
 		xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
@@ -494,6 +503,26 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 			t.Errorf("Request type %s present in xet-go but no equivalent in native", reqType)
 		}
 	}
+
+	// STRICT: Both clients must query the same reconstruction target
+	reconReqsXetgo := append([]RequestRecord{}, xetgoByType["GET:/v1/reconstructions/{hash}"]...)
+	reconReqsXetgo = append(reconReqsXetgo, xetgoByType["GET:/v2/reconstructions/{hash}"]...)
+	reconReqsNative := append([]RequestRecord{}, nativeByType["GET:/v1/reconstructions/{hash}"]...)
+	reconReqsNative = append(reconReqsNative, nativeByType["GET:/v2/reconstructions/{hash}"]...)
+	compareRequestDetailSets(t, "Reconstruction requests", reconReqsXetgo, reconReqsNative, func(r RequestRecord) string {
+		return normalizeAPIVersionPath(r.Path)
+	})
+
+	// STRICT: Both clients must request identical xorb byte ranges
+	xetgoXorbDownloads := xetgoByType["GET:/v1/xorbs/default/{hash}/data"]
+	nativeXorbDownloads := nativeByType["GET:/v1/xorbs/default/{hash}/data"]
+	compareRequestDetails(t, "Xorb data requests", xetgoXorbDownloads, nativeXorbDownloads, func(r RequestRecord) string {
+		rangeHeader := strings.TrimSpace(r.Headers.Get("Range"))
+		if rangeHeader == "" {
+			rangeHeader = "none"
+		}
+		return fmt.Sprintf("%s|range=%s", r.Path, rangeHeader)
+	})
 
 	t.Logf("✓ Download conformance check passed for file %s", fileHash)
 	t.Logf("  xet-go request types: %v", xetgoTypes)
@@ -557,6 +586,17 @@ func normalizePath(path string) string {
 	return strings.Join(parts, "/")
 }
 
+// normalizeAPIVersionPath rewrites v2 paths to v1 to allow equivalence checks.
+func normalizeAPIVersionPath(path string) string {
+	if strings.Contains(path, "/api/v2/") {
+		path = strings.Replace(path, "/api/v2/", "/api/v1/", 1)
+	}
+	if strings.Contains(path, "/v2/") {
+		path = strings.Replace(path, "/v2/", "/v1/", 1)
+	}
+	return path
+}
+
 // isHexString checks if a string is a valid hex string
 func isHexString(s string) bool {
 	for _, c := range s {
@@ -588,6 +628,73 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// compareRequestDetailSets checks equality of the unique keys produced by keyFunc for each request set.
+func compareRequestDetailSets(t *testing.T, name string, xetgoReqs, nativeReqs []RequestRecord, keyFunc func(RequestRecord) string) {
+	t.Helper()
+
+	xetgoKeys := uniqueRequestKeys(xetgoReqs, keyFunc)
+	nativeKeys := uniqueRequestKeys(nativeReqs, keyFunc)
+
+	if !equalStringSlices(xetgoKeys, nativeKeys) {
+		t.Errorf("%s mismatch:\n  xet-go: %v\n  native: %v", name, xetgoKeys, nativeKeys)
+	}
+}
+
+// uniqueRequestKeys extracts sorted, de-duplicated keys from requests.
+func uniqueRequestKeys(reqs []RequestRecord, keyFunc func(RequestRecord) string) []string {
+	keys := make(map[string]struct{})
+	for _, req := range reqs {
+		keys[keyFunc(req)] = struct{}{}
+	}
+
+	result := make([]string, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// compareRequestDetails ensures two sets of requests target the same concrete resources.
+// The keyFunc should return a deterministic key (e.g., path + range header) describing the requested data.
+func compareRequestDetails(t *testing.T, name string, xetgoReqs, nativeReqs []RequestRecord, keyFunc func(RequestRecord) string) {
+	t.Helper()
+
+	xetgoCounts := requestDetailCounts(xetgoReqs, keyFunc)
+	nativeCounts := requestDetailCounts(nativeReqs, keyFunc)
+
+	xetgoOnly := diffRequestDetails(xetgoCounts, nativeCounts)
+	nativeOnly := diffRequestDetails(nativeCounts, xetgoCounts)
+
+	if len(xetgoOnly) > 0 || len(nativeOnly) > 0 {
+		t.Errorf("%s mismatch:\n  xet-go only: %v\n  native only: %v", name, xetgoOnly, nativeOnly)
+	}
+}
+
+// requestDetailCounts tallies requests by a provided key.
+func requestDetailCounts(reqs []RequestRecord, keyFunc func(RequestRecord) string) map[string]int {
+	counts := make(map[string]int)
+	for _, req := range reqs {
+		counts[keyFunc(req)]++
+	}
+	return counts
+}
+
+// diffRequestDetails returns entries present more times in a than in b.
+func diffRequestDetails(a, b map[string]int) []string {
+	var diff []string
+	for key, countA := range a {
+		countB := b[key]
+		if countA > countB {
+			for i := 0; i < countA-countB; i++ {
+				diff = append(diff, key)
+			}
+		}
+	}
+	sort.Strings(diff)
+	return diff
 }
 
 // compareXorbRequests compares xorb upload requests by deserializing and comparing chunk content
