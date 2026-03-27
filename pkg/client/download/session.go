@@ -57,6 +57,28 @@ func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) (io.Reade
 	return pr, nil
 }
 
+// DownloadFileRange downloads and reconstructs a byte range of a file from its hash
+func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, start, end int64) (io.Reader, error) {
+	// Step 1: Query reconstruction with range
+	reconstruction, err := s.client.GetReconstructionRange(ctx, fileHash, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("query reconstruction range: %w", err)
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		defer pw.Close()
+
+		err := s.wrtieTo(ctx, pw, reconstruction)
+		if err != nil {
+			pw.CloseWithError(err)
+		}
+	}()
+
+	return pr, nil
+}
+
 func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *client.ReconstructionResponse) error {
 	// Step 2: Download and process terms
 
@@ -78,20 +100,38 @@ func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *clie
 
 		// Download xorb data
 		fetchInfo := fetchInfoList[0] // Usually only one entry per xorb
-		// Note: We download the full xorb, not just the URLRange, because we need to deserialize it
-		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, nil)
+
+		// Determine if we should use URLRange for efficient partial download
+		// URLRange points to the exact byte range in the compressed xorb data
+		var byteRange *client.ByteRange
+		useChunksOnly := false
+
+		// Use URLRange if it's non-zero (indicating a partial range request)
+		if fetchInfo.URLRange.Start != 0 || fetchInfo.URLRange.End != 0 {
+			byteRange = &fetchInfo.URLRange
+			useChunksOnly = true
+		}
+
+		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, byteRange)
 		if err != nil {
 			return fmt.Errorf("download xorb data: %w", err)
 		}
 
 		// Deserialize xorb
-		xorbObj, err := xorb.Deserialize(xorbData)
+		var xorbObj *xorb.Xorb
+		if useChunksOnly {
+			// When downloading a range, we get only the chunk data without footer
+			xorbObj, err = xorb.DeserializeChunksOnly(xorbData)
+		} else {
+			// Full xorb with footer
+			xorbObj, err = xorb.Deserialize(xorbData)
+		}
 		if err != nil {
 			return fmt.Errorf("deserialize xorb: %w", err)
 		}
 
-		// Verify xorb hash
-		if xorbObj.Hash != xorbHash {
+		// Verify xorb hash only when we have the full xorb
+		if !useChunksOnly && xorbObj.Hash != xorbHash {
 			return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
 		}
 
