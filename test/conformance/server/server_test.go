@@ -3,6 +3,10 @@ package server_test
 import (
 	"bytes"
 	"context"
+
+	// "crypto/rand"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -134,9 +138,14 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				downloadSession := download.NewSession(download.SessionOptions{
 					Client: nativeClient,
 				})
-				downloadedData, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
+				}
+
+				downloadedData, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("Failed to read downloaded data: %v", err)
 				}
 
 				// Verify downloaded content matches original
@@ -161,23 +170,16 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
-				fileInfo, err := upload.ComputeFileInfo(f)
-				if err != nil {
-					f.Close()
-					t.Fatalf("Failed to compute file info: %v", err)
-				}
-				f.Close()
-				fileInfo.Path = uploadFile
 
 				uploadSession := upload.NewSession(upload.SessionOptions{
 					Client: nativeClient,
 				})
-				err = uploadSession.UploadFiles(context.Background(), []upload.FileUploadInfo{fileInfo})
+				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
-				fileHash := fileInfo.FileHash
+				fileHash := fileHashes[0]
 
 				// Download using xet-go client
 				downloadFile := filepath.Join(tempDir, "download-xetgo.bin")
@@ -267,19 +269,12 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to open test file: %v", err)
 				}
-				fileInfo, err := upload.ComputeFileInfo(f)
-				if err != nil {
-					f.Close()
-					t.Fatalf("Failed to compute file info: %v", err)
-				}
-				f.Close()
-				fileInfo.Path = testFile
 
 				// Upload using native client
 				uploadSession := upload.NewSession(upload.SessionOptions{
 					Client: nativeClient,
 				})
-				err = uploadSession.UploadFiles(context.Background(), []upload.FileUploadInfo{fileInfo})
+				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
@@ -295,7 +290,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Compare hashes
-				nativeHash := fileInfo.FileHash.String()
+				nativeHash := fileHashes[0].String()
 				refHash := refResults[0].Hash
 
 				if nativeHash != refHash {
@@ -319,31 +314,29 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
-				fileInfo, err := upload.ComputeFileInfo(f)
-				if err != nil {
-					f.Close()
-					t.Fatalf("Failed to compute file info: %v", err)
-				}
-				f.Close()
-				fileInfo.Path = uploadFile
 
 				uploadSession := upload.NewSession(upload.SessionOptions{
 					Client: nativeClient,
 				})
-				err = uploadSession.UploadFiles(context.Background(), []upload.FileUploadInfo{fileInfo})
+				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
-				fileHash := fileInfo.FileHash
+				fileHash := fileHashes[0]
 
 				// Download using native client
 				downloadSession := download.NewSession(download.SessionOptions{
 					Client: nativeClient,
 				})
-				downloadedData, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file: %v", err)
+				}
+
+				downloadedData, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("Failed to read downloaded data: %v", err)
 				}
 
 				// Verify downloaded content matches original
@@ -381,11 +374,13 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 	}
 }
 
+var seed = rand.NewSource(0)
+
 // makeBinaryData creates a deterministic byte sequence of the given size.
 func makeBinaryData(size int) []byte {
 	result := make([]byte, size)
 	for i := range result {
-		result[i] = byte(i % 256)
+		result[i] = byte(seed.Int63() % 256)
 	}
 	return result
 }

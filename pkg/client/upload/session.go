@@ -2,10 +2,8 @@ package upload
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
@@ -50,15 +48,8 @@ func NewSession(opts SessionOptions) *Session {
 	}
 }
 
-// FileUploadInfo contains information about a file to upload
-type FileUploadInfo struct {
-	Path     string
-	FileHash xet.Hash
-	SHA256   [32]byte
-}
-
-// ChunkInfo contains information about a chunk within a file
-type ChunkInfo struct {
+// chunkInfo contains information about a chunk within a file
+type chunkInfo struct {
 	FileIndex int
 	Data      []byte
 	Hash      xet.Hash
@@ -66,44 +57,53 @@ type ChunkInfo struct {
 	Dedup     *DeduplicationResult
 }
 
-// UploadFiles uploads one or more files to the CAS server
-func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error {
+// UploadFiles uploads multiple files and returns their hashes
+func (s *Session) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
 	// Step 1: Chunk all files and deduplicate
-	var allChunks []ChunkInfo
+	var allChunks []chunkInfo
+	var fileHashes []xet.Hash
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
-	for fileIdx, file := range files {
-		f, err := os.Open(file.Path)
-		if err != nil {
-			return fmt.Errorf("open file %s: %w", file.Path, err)
-		}
+	for index, reader := range readers {
+		// Compute chunk hashes
+		chunkHashes := []xet.Hash{}
 
-		err = xet.ChunkData(f, func(offset int64, chunk xet.ChunkBytes) error {
+		// Compute chunk sizes
+		chunkSizes := []uint64{}
+
+		err := xet.ChunkData(reader, func(offset int64, chunk xet.ChunkBytes) error {
 			chunkHash := chunk.Hash()
+
+			chunkHashes = append(chunkHashes, chunkHash)
+			chunkSizes = append(chunkSizes, chunk.Size())
 
 			// Deduplicate
 			dedupResult := s.deduplicateChunk(ctx, chunkHash)
 
 			chunkIdx := len(allChunks)
-			allChunks = append(allChunks, ChunkInfo{
-				FileIndex: fileIdx,
+			allChunks = append(allChunks, chunkInfo{
+				FileIndex: index,
 				Data:      chunk.Bytes(),
 				Hash:      chunkHash,
 				Offset:    uint64(offset),
 				Dedup:     dedupResult,
 			})
 
-			fileChunkRanges[fileIdx] = append(fileChunkRanges[fileIdx], chunkIdx)
+			fileChunkRanges[index] = append(fileChunkRanges[index], chunkIdx)
 			return nil
 		})
-		_ = f.Close()
+
 		if err != nil {
-			return fmt.Errorf("chunk file %s: %w", file.Path, err)
+			return nil, fmt.Errorf("chunk data for file %d: %w", index, err)
 		}
+
+		fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
+
+		fileHashes = append(fileHashes, fileHash)
 	}
 
 	// Step 2: Group new chunks into xorbs
-	var newChunks []ChunkInfo
+	var newChunks []chunkInfo
 	for _, chunk := range allChunks {
 		if chunk.Dedup.IsNew {
 			newChunks = append(newChunks, chunk)
@@ -114,15 +114,15 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 
 	// Step 3: Upload xorbs
 	if err := s.uploadXorbs(ctx, xorbs); err != nil {
-		return fmt.Errorf("upload xorbs: %w", err)
+		return nil, fmt.Errorf("upload xorbs: %w", err)
 	}
 
 	// Step 4: Build and upload shard
-	if err := s.buildAndUploadShard(ctx, files, allChunks, fileChunkRanges); err != nil {
-		return fmt.Errorf("build and upload shard: %w", err)
+	if err := s.buildAndUploadShard(ctx, fileHashes, allChunks, fileChunkRanges); err != nil {
+		return nil, fmt.Errorf("build and upload shard: %w", err)
 	}
 
-	return nil
+	return fileHashes, nil
 }
 
 // deduplicateChunk checks if a chunk already exists
@@ -162,8 +162,8 @@ func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *Ded
 	return result
 }
 
-// XorbGroup represents a group of chunks to be packed into a single xorb
-type XorbGroup struct {
+// xorbGroup represents a group of chunks to be packed into a single xorb
+type xorbGroup struct {
 	Chunks      [][]byte
 	ChunkHashes []xet.Hash
 	Xorb        *xorb.Xorb
@@ -172,15 +172,15 @@ type XorbGroup struct {
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size
-func (s *Session) groupChunksIntoXorbs(chunks []ChunkInfo) []*XorbGroup {
-	var groups []*XorbGroup
-	var currentGroup *XorbGroup
+func (s *Session) groupChunksIntoXorbs(chunks []chunkInfo) []*xorbGroup {
+	var groups []*xorbGroup
+	var currentGroup *xorbGroup
 	var currentSize uint64
 	startIndex := 0
 
 	for i, chunk := range chunks {
 		if currentGroup == nil {
-			currentGroup = &XorbGroup{
+			currentGroup = &xorbGroup{
 				Chunks:      make([][]byte, 0),
 				ChunkHashes: make([]xet.Hash, 0),
 				StartIndex:  startIndex,
@@ -209,7 +209,7 @@ func (s *Session) groupChunksIntoXorbs(chunks []ChunkInfo) []*XorbGroup {
 }
 
 // uploadXorbs serializes and uploads all xorbs
-func (s *Session) uploadXorbs(ctx context.Context, groups []*XorbGroup) error {
+func (s *Session) uploadXorbs(ctx context.Context, groups []*xorbGroup) error {
 	for _, group := range groups {
 		// Create xorb
 		xorbObj := xorb.NewXorb()
@@ -250,7 +250,7 @@ func (s *Session) uploadXorbs(ctx context.Context, groups []*XorbGroup) error {
 }
 
 // buildAndUploadShard constructs and uploads the shard
-func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInfo, allChunks []ChunkInfo, fileChunkRanges map[int][]int) error {
+func (s *Session) buildAndUploadShard(ctx context.Context, fileHashes []xet.Hash, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
 	// Create shard with default header
 	sh := shard.NewShard()
 
@@ -258,7 +258,7 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 	xorbMap := make(map[xet.Hash]*shard.CASBlock)
 
 	// Build file blocks
-	for fileIdx, file := range files {
+	for fileIdx, fileHash := range fileHashes {
 		chunkIndices := fileChunkRanges[fileIdx]
 
 		// Collect all chunk hashes for this file
@@ -268,7 +268,7 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 		}
 
 		fileBlock := shard.FileBlock{
-			FileHash:     file.FileHash,
+			FileHash:     fileHash,
 			Flags:        shard.FileWithVerification,
 			Entries:      make([]shard.FileDataSequenceEntry, 0),
 			Verification: make([]xet.Hash, 0),
@@ -388,41 +388,10 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 		return fmt.Errorf("serialize shard: %w", err)
 	}
 
-	if s.client != nil {
-		_, err = s.client.UploadShard(ctx, serialized)
-		if err != nil {
-			return fmt.Errorf("upload shard: %w", err)
-		}
+	_, err = s.client.UploadShard(ctx, serialized)
+	if err != nil {
+		return fmt.Errorf("upload shard: %w", err)
 	}
 
 	return nil
-}
-
-// ComputeFileInfo computes hash information for a file
-func ComputeFileInfo(r io.Reader) (FileUploadInfo, error) {
-	// Compute chunk hashes
-	chunkHashes := []xet.Hash{}
-
-	// Compute chunk sizes
-	chunkSizes := []uint64{}
-
-	sha256Hash := sha256.New()
-
-	reader := io.TeeReader(r, sha256Hash)
-
-	err := xet.ChunkData(reader, func(offset int64, chunk xet.ChunkBytes) error {
-		chunkHashes = append(chunkHashes, chunk.Hash())
-		chunkSizes = append(chunkSizes, chunk.Size())
-		return nil
-	})
-	if err != nil {
-		return FileUploadInfo{}, fmt.Errorf("chunk data: %w", err)
-	}
-
-	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
-
-	return FileUploadInfo{
-		FileHash: fileHash,
-		SHA256:   [32]byte(sha256Hash.Sum(nil)),
-	}, nil
 }
