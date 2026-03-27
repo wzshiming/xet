@@ -15,14 +15,14 @@ Input (ASCII): Hello World!
 	Hash (XET string representation):
 	  d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb
 */
-func TestChunkHashWithKnownInput(t *testing.T) {
+func TestChunkBytesHash(t *testing.T) {
 	data := ChunkBytes("Hello World!")
 	hash := data.Hash()
 
-	expectedHash, _ := ParseHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
+	expected, _ := ParseHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
 
-	if hash != expectedHash {
-		t.Errorf("Chunk hash does not match expected value. Got %s, want %s", hash.String(), expectedHash.String())
+	if hash != expected {
+		t.Errorf("Chunk hash does not match expected value. Got %s, want %s", hash, expected)
 	}
 }
 
@@ -40,13 +40,17 @@ Expected XET string:
 
 	07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918
 */
-func TestHashToStringFormat(t *testing.T) {
-	hash := [32]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-		16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}
+func TestHashString(t *testing.T) {
+	hash := Hash{
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	}
 
 	expected := "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
 
-	got := hashToString(hash)
+	got := hash.String()
 	if got != expected {
 		t.Errorf("HashToString output does not match expected format. Got %s, want %s", got, expected)
 	}
