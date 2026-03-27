@@ -1,4 +1,4 @@
-package download
+package client
 
 import (
 	"bytes"
@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -54,21 +53,21 @@ func TestDownloadFile(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
 			// Return reconstruction response
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 2},
+							Range:    ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 0, End: 0}, // Zero indicates full download
+							URLRange: ByteRange{Start: 0, End: 0}, // Zero indicates full download
 						},
 					},
 				},
@@ -84,15 +83,15 @@ func TestDownloadFile(t *testing.T) {
 	defer server.Close()
 
 	// Create client and session
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
 	// Download file
-	reader, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -136,21 +135,21 @@ func TestDownloadFileRange(t *testing.T) {
 
 			// Return partial reconstruction response
 			// Server should return only chunk 2 (index 1) with offset
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: 0, // No offset within the first chunk of the range
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(chunk2Data)),
-						Range:          client.ChunkRange{Start: 0, End: 1}, // Only chunk 2, but indexed from 0 in the partial xorb
+						Range:          ChunkRange{Start: 0, End: 1}, // Only chunk 2, but indexed from 0 in the partial xorb
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 1}, // Matching the term range
+							Range:    ChunkRange{Start: 0, End: 1}, // Matching the term range
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 100, End: 200}, // Non-zero indicates range download
+							URLRange: ByteRange{Start: 100, End: 200}, // Non-zero indicates range download
 						},
 					},
 				},
@@ -188,15 +187,15 @@ func TestDownloadFileRange(t *testing.T) {
 	defer server.Close()
 
 	// Create client and session
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
 	// Download file range
-	reader, err := session.DownloadFileRange(context.Background(), xorbHash, rangeStart, rangeEnd)
+	reader, _, err := session.DownloadFile(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
 		t.Fatalf("DownloadFileRange failed: %v", err)
 	}
@@ -237,21 +236,21 @@ func TestDownloadFileWithCache(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 2},
+							Range:    ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 0, End: 0},
+							URLRange: ByteRange{Start: 0, End: 0},
 						},
 					},
 				},
@@ -266,16 +265,16 @@ func TestDownloadFileWithCache(t *testing.T) {
 	defer server.Close()
 
 	// Create client and session with caching enabled
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client:        c,
 		EnableCaching: true,
 	})
 
 	// Download file
-	reader, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -331,21 +330,21 @@ func TestDownloadFileWithOffset(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: offset,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(allData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 2},
+							Range:    ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 0, End: 0},
+							URLRange: ByteRange{Start: 0, End: 0},
 						},
 					},
 				},
@@ -360,15 +359,15 @@ func TestDownloadFileWithOffset(t *testing.T) {
 	defer server.Close()
 
 	// Create client and session
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
 	// Download file
-	reader, err := session.DownloadFile(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFile(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFile failed: %v", err)
 	}
@@ -396,21 +395,21 @@ func TestDownloadFileWithLength(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 2},
+							Range:    ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 0, End: 0},
+							URLRange: ByteRange{Start: 0, End: 0},
 						},
 					},
 				},
@@ -424,14 +423,14 @@ func TestDownloadFileWithLength(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileWithLength(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFile(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileWithLength failed: %v", err)
 	}
@@ -469,21 +468,21 @@ func TestDownloadFileRangeWithLength(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
 			rangeHeaderSent = r.Header.Get("Range")
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(chunk2Data)),
-						Range:          client.ChunkRange{Start: 0, End: 1},
+						Range:          ChunkRange{Start: 0, End: 1},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 1},
+							Range:    ChunkRange{Start: 0, End: 1},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 100, End: 200},
+							URLRange: ByteRange{Start: 100, End: 200},
 						},
 					},
 				},
@@ -510,16 +509,16 @@ func TestDownloadFileRangeWithLength(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileRangeWithLength(context.Background(), xorbHash, rangeStart, rangeEnd)
+	reader, length, err := session.DownloadFile(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
-		t.Fatalf("DownloadFileRangeWithLength failed: %v", err)
+		t.Fatalf("DownloadFile failed: %v", err)
 	}
 
 	if length != int64(len(expectedRangeData)) {
@@ -554,23 +553,23 @@ func TestDownloadFileV2(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 2},
-									Bytes:  client.ByteRange{Start: 0, End: 0}, // Zero indicates full download
+									Chunks: ChunkRange{Start: 0, End: 2},
+									Bytes:  ByteRange{Start: 0, End: 0}, // Zero indicates full download
 								},
 							},
 						},
@@ -586,14 +585,14 @@ func TestDownloadFileV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, err := session.DownloadFileV2(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFileV2(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileV2 failed: %v", err)
 	}
@@ -618,23 +617,23 @@ func TestDownloadFileWithLengthV2(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 2},
-									Bytes:  client.ByteRange{Start: 0, End: 0},
+									Chunks: ChunkRange{Start: 0, End: 2},
+									Bytes:  ByteRange{Start: 0, End: 0},
 								},
 							},
 						},
@@ -650,14 +649,14 @@ func TestDownloadFileWithLengthV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileWithLengthV2(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFileV2(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileWithLengthV2 failed: %v", err)
 	}
@@ -695,23 +694,23 @@ func TestDownloadFileRangeV2(t *testing.T) {
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
 			rangeHeaderSent = r.Header.Get("Range")
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(chunk2Data)),
-						Range:          client.ChunkRange{Start: 0, End: 1},
+						Range:          ChunkRange{Start: 0, End: 1},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 1},
-									Bytes:  client.ByteRange{Start: 100, End: 200},
+									Chunks: ChunkRange{Start: 0, End: 1},
+									Bytes:  ByteRange{Start: 100, End: 200},
 								},
 							},
 						},
@@ -738,14 +737,14 @@ func TestDownloadFileRangeV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, err := session.DownloadFileRangeV2(context.Background(), xorbHash, rangeStart, rangeEnd)
+	reader, _, err := session.DownloadFileV2(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
 		t.Fatalf("DownloadFileRangeV2 failed: %v", err)
 	}
@@ -783,23 +782,23 @@ func TestDownloadFileRangeWithLengthV2(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(chunk2Data)),
-						Range:          client.ChunkRange{Start: 0, End: 1},
+						Range:          ChunkRange{Start: 0, End: 1},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 1},
-									Bytes:  client.ByteRange{Start: 100, End: 200},
+									Chunks: ChunkRange{Start: 0, End: 1},
+									Bytes:  ByteRange{Start: 100, End: 200},
 								},
 							},
 						},
@@ -826,16 +825,16 @@ func TestDownloadFileRangeWithLengthV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileRangeWithLengthV2(context.Background(), xorbHash, rangeStart, rangeEnd)
+	reader, length, err := session.DownloadFileV2(context.Background(), xorbHash, WithRange(rangeStart, rangeEnd))
 	if err != nil {
-		t.Fatalf("DownloadFileRangeWithLengthV2 failed: %v", err)
+		t.Fatalf("DownloadFileV2 failed: %v", err)
 	}
 
 	if length != int64(len(expectedRangeData)) {
@@ -866,23 +865,23 @@ func TestDownloadFileV2WithOffset(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: offset,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(allData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 2},
-									Bytes:  client.ByteRange{Start: 0, End: 0},
+									Chunks: ChunkRange{Start: 0, End: 2},
+									Bytes:  ByteRange{Start: 0, End: 0},
 								},
 							},
 						},
@@ -898,16 +897,16 @@ func TestDownloadFileV2WithOffset(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileWithLengthV2(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFileV2(context.Background(), xorbHash)
 	if err != nil {
-		t.Fatalf("DownloadFileWithLengthV2 failed: %v", err)
+		t.Fatalf("DownloadFileV2 failed: %v", err)
 	}
 
 	if length != int64(len(expectedData)) {
@@ -935,23 +934,23 @@ func TestDownloadFileV2WithCache(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponseV2{
+			resp := ReconstructionResponseV2{
 				OffsetIntoFirstRange: 0,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(expectedData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				Xorbs: map[string][]client.XorbMultiRangeFetch{
+				Xorbs: map[string][]XorbMultiRangeFetch{
 					xorbHash.String(): {
 						{
 							URL: server.URL + "/xorbs/" + xorbHash.String(),
-							Ranges: []client.XorbRangeDescriptor{
+							Ranges: []XorbRangeDescriptor{
 								{
-									Chunks: client.ChunkRange{Start: 0, End: 2},
-									Bytes:  client.ByteRange{Start: 0, End: 0},
+									Chunks: ChunkRange{Start: 0, End: 2},
+									Bytes:  ByteRange{Start: 0, End: 0},
 								},
 							},
 						},
@@ -967,15 +966,15 @@ func TestDownloadFileV2WithCache(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client:        c,
 		EnableCaching: true,
 	})
 
-	reader, err := session.DownloadFileV2(context.Background(), xorbHash)
+	reader, _, err := session.DownloadFileV2(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileV2 failed: %v", err)
 	}
@@ -1024,21 +1023,21 @@ func TestDownloadFileWithOffsetLength(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/reconstructions/"+xorbHash.String() {
-			resp := client.ReconstructionResponse{
+			resp := ReconstructionResponse{
 				OffsetIntoFirstRange: offset,
-				Terms: []client.Term{
+				Terms: []Term{
 					{
 						Hash:           xorbHash.String(),
 						UnpackedLength: uint64(len(allData)),
-						Range:          client.ChunkRange{Start: 0, End: 2},
+						Range:          ChunkRange{Start: 0, End: 2},
 					},
 				},
-				FetchInfo: map[string][]client.FetchInfoEntry{
+				FetchInfo: map[string][]FetchInfoEntry{
 					xorbHash.String(): {
 						{
-							Range:    client.ChunkRange{Start: 0, End: 2},
+							Range:    ChunkRange{Start: 0, End: 2},
 							URL:      server.URL + "/xorbs/" + xorbHash.String(),
-							URLRange: client.ByteRange{Start: 0, End: 0},
+							URLRange: ByteRange{Start: 0, End: 0},
 						},
 					},
 				},
@@ -1052,14 +1051,14 @@ func TestDownloadFileWithOffsetLength(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := client.NewClient(client.ClientOptions{
+	c := NewClient(ClientOptions{
 		BaseURL: server.URL,
 	})
-	session := NewSession(SessionOptions{
+	session := NewDownloadSession(DownloadSessionOptions{
 		Client: c,
 	})
 
-	reader, length, err := session.DownloadFileWithLength(context.Background(), xorbHash)
+	reader, length, err := session.DownloadFile(context.Background(), xorbHash)
 	if err != nil {
 		t.Fatalf("DownloadFileWithLength failed: %v", err)
 	}

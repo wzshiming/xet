@@ -49,8 +49,28 @@ func NewClient(opts ClientOptions) *Client {
 	}
 }
 
+type ReqOpt func(req *http.Request)
+
+func WithRange(start, end int64) ReqOpt {
+	return func(req *http.Request) {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	}
+}
+
+func WithRangeStart(start int64) ReqOpt {
+	return func(req *http.Request) {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+	}
+}
+
+func WithRangeEnd(end int64) ReqOpt {
+	return func(req *http.Request) {
+		req.Header.Set("Range", fmt.Sprintf("bytes=-%d", end))
+	}
+}
+
 // GetReconstruction retrieves reconstruction information for a file
-func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*ReconstructionResponse, error) {
+func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*ReconstructionResponse, error) {
 	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -62,15 +82,18 @@ func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*Rec
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
+	for _, opt := range opts {
+		opt(req)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	var reconstruction ReconstructionResponse
@@ -81,38 +104,21 @@ func (c *Client) GetReconstruction(ctx context.Context, fileHash xet.Hash) (*Rec
 	return &reconstruction, nil
 }
 
-// GetReconstructionRange retrieves reconstruction information for a byte range
-func (c *Client) GetReconstructionRange(ctx context.Context, fileHash xet.Hash, start, end int64) (*ReconstructionResponse, error) {
-	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
+func reqError(req *http.Request, resp *http.Response) error {
+	hasRange := req.Header.Get("Range") != ""
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	if hasRange {
+		if resp.StatusCode != http.StatusPartialContent {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		}
+	} else {
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		}
 	}
-
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var reconstruction ReconstructionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &reconstruction, nil
+	return nil
 }
 
 // UploadXorb uploads a serialized xorb to the server
@@ -135,9 +141,8 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []b
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	var uploadResp XorbUploadResponse
@@ -168,9 +173,8 @@ func (c *Client) UploadShard(ctx context.Context, shardData []byte) (*ShardUploa
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	var uploadResp ShardUploadResponse
@@ -205,9 +209,8 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, nil
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	// Read shard data
@@ -226,7 +229,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 }
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
-func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash) (*ReconstructionResponseV2, error) {
+func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*ReconstructionResponseV2, error) {
 	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -238,39 +241,9 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash) (*R
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
+	for _, opt := range opts {
+		opt(req)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var reconstruction ReconstructionResponseV2
-	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &reconstruction, nil
-}
-
-// GetReconstructionRangeV2 retrieves V2 reconstruction information for a byte range
-func (c *Client) GetReconstructionRangeV2(ctx context.Context, fileHash xet.Hash, start, end int64) (*ReconstructionResponseV2, error) {
-	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -278,9 +251,8 @@ func (c *Client) GetReconstructionRangeV2(ctx context.Context, fileHash xet.Hash
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	var reconstruction ReconstructionResponseV2
@@ -292,14 +264,14 @@ func (c *Client) GetReconstructionRangeV2(ctx context.Context, fileHash xet.Hash
 }
 
 // DownloadXorbData downloads xorb data from a URL with optional byte range
-func (c *Client) DownloadXorbData(ctx context.Context, url string, byteRange *ByteRange) ([]byte, error) {
+func (c *Client) DownloadXorbData(ctx context.Context, url string, opts ...ReqOpt) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	if byteRange != nil {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
+	for _, opt := range opts {
+		opt(req)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -308,9 +280,8 @@ func (c *Client) DownloadXorbData(ctx context.Context, url string, byteRange *By
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("download error (status %d): %s", resp.StatusCode, string(body))
+	if err := reqError(req, resp); err != nil {
+		return nil, err
 	}
 
 	data, err := io.ReadAll(resp.Body)

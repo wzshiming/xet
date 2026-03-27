@@ -18,8 +18,6 @@ import (
 	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/client/download"
-	"github.com/wzshiming/xet/pkg/client/upload"
 	"github.com/wzshiming/xet/pkg/server"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
@@ -255,7 +253,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					}
 				}()
 
-				uploadSession := upload.NewSession(upload.SessionOptions{
+				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
 					Client: nativeClient,
 				})
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
@@ -317,7 +315,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := upload.NewSession(upload.SessionOptions{
+				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
 					Client: nativeClient,
 				})
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
@@ -348,10 +346,10 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Download with native client
 				proxy.ClearRequests()
-				downloadSession := download.NewSession(download.SessionOptions{
+				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
 					Client: nativeClient,
 				})
-				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}

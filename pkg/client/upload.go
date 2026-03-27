@@ -1,4 +1,4 @@
-package upload
+package client
 
 import (
 	"context"
@@ -6,14 +6,13 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
-// Session represents an upload session
-type Session struct {
-	client            *client.Client
+// UploadSession represents an upload session
+type UploadSession struct {
+	client            *Client
 	localChunkCache   map[xet.Hash]*DeduplicationResult
 	targetXorbSize    uint64
 	enableGlobalDedup bool
@@ -27,23 +26,18 @@ type DeduplicationResult struct {
 	ChunkIndex uint32
 }
 
-// SessionOptions configures an upload session
-type SessionOptions struct {
-	Client            *client.Client
-	TargetXorbSize    uint64
+// UploadSessionOptions configures an upload session
+type UploadSessionOptions struct {
+	Client            *Client
 	EnableGlobalDedup bool
 }
 
-// NewSession creates a new upload session
-func NewSession(opts SessionOptions) *Session {
-	if opts.TargetXorbSize == 0 {
-		opts.TargetXorbSize = xet.MaxXorbSerializedSize
-	}
-
-	return &Session{
+// NewUploadSession creates a new upload session
+func NewUploadSession(opts UploadSessionOptions) *UploadSession {
+	return &UploadSession{
 		client:            opts.Client,
 		localChunkCache:   make(map[xet.Hash]*DeduplicationResult),
-		targetXorbSize:    opts.TargetXorbSize,
+		targetXorbSize:    xet.MaxXorbSerializedSize,
 		enableGlobalDedup: opts.EnableGlobalDedup,
 	}
 }
@@ -58,7 +52,7 @@ type chunkInfo struct {
 }
 
 // UploadFiles uploads multiple files and returns their hashes
-func (s *Session) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
+func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
 	// Step 1: Chunk all files and deduplicate
 	var allChunks []chunkInfo
 	var fileHashes []xet.Hash
@@ -126,7 +120,7 @@ func (s *Session) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.
 }
 
 // deduplicateChunk checks if a chunk already exists
-func (s *Session) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *DeduplicationResult {
+func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *DeduplicationResult {
 	// Check local session cache first
 	if result, ok := s.localChunkCache[chunkHash]; ok {
 		return result
@@ -172,7 +166,7 @@ type xorbGroup struct {
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size
-func (s *Session) groupChunksIntoXorbs(chunks []chunkInfo) []*xorbGroup {
+func (s *UploadSession) groupChunksIntoXorbs(chunks []chunkInfo) []*xorbGroup {
 	var groups []*xorbGroup
 	var currentGroup *xorbGroup
 	var currentSize uint64
@@ -209,7 +203,7 @@ func (s *Session) groupChunksIntoXorbs(chunks []chunkInfo) []*xorbGroup {
 }
 
 // uploadXorbs serializes and uploads all xorbs
-func (s *Session) uploadXorbs(ctx context.Context, groups []*xorbGroup) error {
+func (s *UploadSession) uploadXorbs(ctx context.Context, groups []*xorbGroup) error {
 	for _, group := range groups {
 		// Create xorb
 		xorbObj := xorb.NewXorb()
@@ -250,7 +244,7 @@ func (s *Session) uploadXorbs(ctx context.Context, groups []*xorbGroup) error {
 }
 
 // buildAndUploadShard constructs and uploads the shard
-func (s *Session) buildAndUploadShard(ctx context.Context, fileHashes []xet.Hash, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
+func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xet.Hash, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
 	// Create shard with default header
 	sh := shard.NewShard()
 

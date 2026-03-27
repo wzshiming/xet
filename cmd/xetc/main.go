@@ -10,8 +10,6 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/client/download"
-	"github.com/wzshiming/xet/pkg/client/upload"
 )
 
 var ctx = context.Background()
@@ -95,7 +93,7 @@ func uploadCommand() {
 	defer f.Close()
 
 	// Create API client
-	client := client.NewClient(client.ClientOptions{
+	cli := client.NewClient(client.ClientOptions{
 		BaseURL:   *url,
 		Token:     *token,
 		Namespace: *namespace,
@@ -103,14 +101,13 @@ func uploadCommand() {
 	})
 
 	// Create upload session
-	session := upload.NewSession(upload.SessionOptions{
-		Client:            client,
-		TargetXorbSize:    64 * 1024 * 1024,
+	session := client.NewUploadSession(client.UploadSessionOptions{
+		Client:            cli,
 		EnableGlobalDedup: !*noDedup,
 	})
 
 	// Upload the file
-	fmt.Printf("%s Uploading file: %s\n", filename)
+	fmt.Printf("%s Uploading file\n", filename)
 	filehashs, err := session.UploadFiles(ctx, f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
@@ -151,22 +148,22 @@ func downloadCommand() {
 	}
 
 	// Create API client
-	client := client.NewClient(client.ClientOptions{
+	cli := client.NewClient(client.ClientOptions{
 		BaseURL: *url,
 		Token:   *token,
 		Timeout: 5 * time.Minute,
 	})
 
 	// Create download session
-	session := download.NewSession(download.SessionOptions{
-		Client:        client,
+	session := client.NewDownloadSession(client.DownloadSessionOptions{
+		Client:        cli,
 		EnableCaching: *enableCache,
 	})
 
 	// Download the file
 
 	fmt.Printf("%s Downloading file with hash: %s\n", outputFile, fileHash.String())
-	reader, err := session.DownloadFile(ctx, fileHash)
+	reader, _, err := session.DownloadFile(ctx, fileHash)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
 		os.Exit(1)

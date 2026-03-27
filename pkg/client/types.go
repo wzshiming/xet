@@ -1,6 +1,8 @@
 package client
 
-import "github.com/wzshiming/xet"
+import (
+	"github.com/wzshiming/xet"
+)
 
 // ReconstructionResponse represents the response from the file reconstruction API
 type ReconstructionResponse struct {
@@ -55,14 +57,14 @@ type DeduplicationInfo struct {
 // ReconstructionResponseV2 represents the V2 response from the file reconstruction API
 // It uses a multi-range optimized format for fetching xorb data
 type ReconstructionResponseV2 struct {
-	OffsetIntoFirstRange int64                          `json:"offset_into_first_range"`
-	Terms                []Term                         `json:"terms"`
+	OffsetIntoFirstRange int64                            `json:"offset_into_first_range"`
+	Terms                []Term                           `json:"terms"`
 	Xorbs                map[string][]XorbMultiRangeFetch `json:"xorbs"`
 }
 
 // XorbMultiRangeFetch represents a signed multi-range fetch entry covering multiple byte ranges for a xorb
 type XorbMultiRangeFetch struct {
-	URL    string               `json:"url"`
+	URL    string                `json:"url"`
 	Ranges []XorbRangeDescriptor `json:"ranges"`
 }
 

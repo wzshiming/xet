@@ -146,7 +146,7 @@ func TestGetReconstructionRange(t *testing.T) {
 	})
 
 	hash := xet.Hash{}
-	reconstruction, err := client.GetReconstructionRange(context.Background(), hash, 1000, 2000)
+	reconstruction, err := client.GetReconstruction(context.Background(), hash, WithRange(1000, 2000))
 	if err != nil {
 		t.Fatalf("GetReconstructionRange failed: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	})
 
 	hash := xet.Hash{}
-	reconstruction, err := c.GetReconstructionRangeV2(context.Background(), hash, 1000, 2000)
+	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, WithRange(1000, 2000))
 	if err != nil {
 		t.Fatalf("GetReconstructionRangeV2 failed: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestDownloadXorbData(t *testing.T) {
 		BaseURL: "https://unused.example.com",
 	})
 
-	data, err := client.DownloadXorbData(context.Background(), server.URL, nil)
+	data, err := client.DownloadXorbData(context.Background(), server.URL)
 	if err != nil {
 		t.Fatalf("DownloadXorbData failed: %v", err)
 	}
@@ -434,8 +434,7 @@ func TestDownloadXorbDataWithRange(t *testing.T) {
 		BaseURL: "https://unused.example.com",
 	})
 
-	byteRange := &ByteRange{Start: 100, End: 200}
-	data, err := client.DownloadXorbData(context.Background(), server.URL, byteRange)
+	data, err := client.DownloadXorbData(context.Background(), server.URL, WithRange(100, 200))
 	if err != nil {
 		t.Fatalf("DownloadXorbData failed: %v", err)
 	}

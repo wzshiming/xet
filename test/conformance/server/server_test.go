@@ -14,8 +14,6 @@ import (
 	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/client/download"
-	"github.com/wzshiming/xet/pkg/client/upload"
 	"github.com/wzshiming/xet/pkg/server"
 )
 
@@ -133,10 +131,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Download using native client to verify
-				downloadSession := download.NewSession(download.SessionOptions{
+				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
 					Client: nativeClient,
 				})
-				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}
@@ -169,7 +167,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := upload.NewSession(upload.SessionOptions{
+				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
 					Client: nativeClient,
 				})
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
@@ -269,7 +267,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Upload using native client
-				uploadSession := upload.NewSession(upload.SessionOptions{
+				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
 					Client: nativeClient,
 				})
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
@@ -313,7 +311,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := upload.NewSession(upload.SessionOptions{
+				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
 					Client: nativeClient,
 				})
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
@@ -324,10 +322,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				fileHash := fileHashes[0]
 
 				// Download using native client
-				downloadSession := download.NewSession(download.SessionOptions{
+				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
 					Client: nativeClient,
 				})
-				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file: %v", err)
 				}
