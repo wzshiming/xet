@@ -4,7 +4,7 @@ go 1.24.13
 
 require (
 	github.com/wzshiming/xet v0.0.0
-	github.com/wzshiming/xet-go v0.0.0-20260326084846-e1dc29026759
+	github.com/wzshiming/xet-go v0.0.0-20260327045759-3147b59f65e2
 )
 
 require (
