@@ -3,8 +3,6 @@ package server_test
 import (
 	"bytes"
 	"context"
-
-	// "crypto/rand"
 	"io"
 	"math/rand"
 	"net/http"

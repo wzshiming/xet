@@ -37,7 +37,7 @@ type SessionOptions struct {
 // NewSession creates a new upload session
 func NewSession(opts SessionOptions) *Session {
 	if opts.TargetXorbSize == 0 {
-		opts.TargetXorbSize = xet.TargetChunkSize
+		opts.TargetXorbSize = xet.MaxXorbSerializedSize
 	}
 
 	return &Session{
