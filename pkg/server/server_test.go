@@ -287,6 +287,137 @@ func TestServerGetReconstruction(t *testing.T) {
 	}
 }
 
+func TestServerGetReconstructionV2(t *testing.T) {
+	// Create storage
+	storage, err := NewFileStorage(FileStorageOptions{
+		BasePath: t.TempDir(),
+		BaseURL:  "http://localhost:8080",
+	})
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+
+	// Create server
+	srv := NewServer(ServerOptions{
+		Storage: storage,
+	})
+
+	// Create test data and upload xorb + shard
+	testData := []byte("Hello, XET Protocol! This is a test file for V2 reconstruction.")
+	fileInfo, err := upload.ComputeFileInfo(bytes.NewReader(testData))
+	if err != nil {
+		t.Fatalf("Failed to compute file info: %v", err)
+	}
+
+	// Create chunks and xorb manually
+	chunks := chunkData(t, testData)
+	xorbObj := xorb.NewXorb()
+	for _, chunk := range chunks {
+		if err := xorbObj.AddChunk(chunk.Data); err != nil {
+			t.Fatalf("Failed to add chunk: %v", err)
+		}
+	}
+
+	// Upload xorb first
+	xorbData, err := xorbObj.Serialize()
+	if err != nil {
+		t.Fatalf("Failed to serialize xorb: %v", err)
+	}
+
+	_, err = storage.StoreXorb(context.Background(), "default", xorbObj.Hash, xorbData)
+	if err != nil {
+		t.Fatalf("Failed to store xorb: %v", err)
+	}
+
+	// Build and upload shard
+	testShard := shard.NewShard()
+	testShard.AddFile(shard.FileBlock{
+		FileHash: fileInfo.FileHash,
+		Flags:    0,
+		Entries: []shard.FileDataSequenceEntry{
+			{
+				CASHash:          xorbObj.Hash,
+				CASFlags:         0,
+				UnpackedSegBytes: uint32(len(testData)),
+				ChunkIndexStart:  0,
+				ChunkIndexEnd:    uint32(len(xorbObj.Chunks)),
+			},
+		},
+	})
+
+	// Add CAS block
+	casBlock := shard.CASBlock{
+		CASHash:  xorbObj.Hash,
+		CASFlags: 0,
+		Chunks:   []shard.CASChunkSequenceEntry{},
+	}
+
+	var byteOffset uint32
+	for _, chunk := range xorbObj.Chunks {
+		casBlock.Chunks = append(casBlock.Chunks, shard.CASChunkSequenceEntry{
+			ChunkHash:        chunk.Hash,
+			ByteRangeStart:   byteOffset,
+			UnpackedSegBytes: uint32(len(chunk.UncompressedData)),
+			Flags:            shard.ChunkGlobalDedupEligible,
+		})
+		byteOffset += uint32(len(chunk.UncompressedData))
+	}
+	testShard.AddCASBlock(casBlock)
+
+	_, err = storage.StoreShard(context.Background(), testShard)
+	if err != nil {
+		t.Fatalf("Failed to store shard: %v", err)
+	}
+
+	// Test V2 reconstruction query with /v2/reconstructions path
+	req := httptest.NewRequest(http.MethodGet, "/v2/reconstructions/"+fileInfo.FileHash.String(), nil)
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response client.ReconstructionResponseV2
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if len(response.Terms) == 0 {
+		t.Errorf("Expected at least one term in response")
+	}
+
+	if len(response.Xorbs) == 0 {
+		t.Errorf("Expected xorbs in response")
+	}
+
+	// Verify xorbs structure
+	for xorbHashStr, multiRangeFetches := range response.Xorbs {
+		if len(multiRangeFetches) == 0 {
+			t.Errorf("Expected at least one multi-range fetch for xorb %s", xorbHashStr)
+		}
+		for _, mrf := range multiRangeFetches {
+			if mrf.URL == "" {
+				t.Errorf("Expected non-empty URL in multi-range fetch")
+			}
+			if len(mrf.Ranges) == 0 {
+				t.Errorf("Expected at least one range in multi-range fetch")
+			}
+		}
+	}
+
+	// Test V2 reconstruction query with /v2/reconstructions path
+	req = httptest.NewRequest(http.MethodGet, "/v2/reconstructions/"+fileInfo.FileHash.String(), nil)
+	w = httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200 for /v2 path, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestServerXorbDownload(t *testing.T) {
 	// Create storage
 	storage, err := NewFileStorage(FileStorageOptions{

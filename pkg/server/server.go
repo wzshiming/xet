@@ -51,16 +51,23 @@ func (s *Server) registerRoutes() {
 	// Defined in specification
 	s.router.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Used by xet-core but not defined in spec
+	s.router.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+
+	// /v1/shards is defined in the spec as the upload endpoint for shards,
+	// but xet-core actually uploads shards to /shards, so we support both.
+	s.router.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.router.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
+
+	// Download endpoint for xorb data, used by xet-core and the Go client.
+	// Not defined in the spec, but we can support it without much effort since it's just serving raw stored xorb bytes.
+	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 }
 
 // ServeHTTP implements http.Handler
@@ -293,6 +300,175 @@ func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uin
 	}
 
 	return spans[chunkStart].start, spans[chunkEnd-1].end
+}
+
+// handleGetReconstructionV2 handles GET /v2/reconstructions/{file_hash}
+func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Request) {
+	// Extract file hash from path using mux
+	vars := mux.Vars(r)
+	fileHashStr := vars["file_hash"]
+
+	fileHash, err := xet.ParseHash(fileHashStr)
+	if err != nil {
+		http.Error(w, "Invalid file hash", http.StatusBadRequest)
+		return
+	}
+
+	// Get shard for this file
+	shard, err := s.storage.GetShardByFileHash(r.Context(), fileHash)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Build V2 reconstruction response
+	response, err := s.buildReconstructionResponseV2(shard, fileHash, r.Header.Get("Range"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// buildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
+// The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
+// into multi-range fetch entries for more efficient downloading.
+func (s *Server) buildReconstructionResponseV2(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponseV2, error) {
+	// Find the file block for this file hash
+	var fileBlock *shard.FileBlock
+	for i := range sh.Files {
+		if sh.Files[i].FileHash == fileHash {
+			fileBlock = &sh.Files[i]
+			break
+		}
+	}
+
+	if fileBlock == nil {
+		return nil, fmt.Errorf("file not found in shard")
+	}
+
+	// Parse range header if present
+	var requestedStart, requestedEnd int64
+	hasRange := false
+	if rangeHeader != "" {
+		hasRange = true
+		rangeHeader = strings.TrimPrefix(rangeHeader, "bytes=")
+		parts := strings.Split(rangeHeader, "-")
+		if len(parts) == 2 {
+			fmt.Sscanf(parts[0], "%d", &requestedStart)
+			fmt.Sscanf(parts[1], "%d", &requestedEnd)
+		}
+	}
+
+	response := &client.ReconstructionResponseV2{
+		OffsetIntoFirstRange: 0,
+		Terms:                []client.Term{},
+		Xorbs:                make(map[string][]client.XorbMultiRangeFetch),
+	}
+
+	// Calculate cumulative byte positions for each term
+	var currentByteOffset int64
+
+	// Build terms and group fetch info by xorb
+	type fetchInfo struct {
+		chunkStart uint32
+		chunkEnd   uint32
+		startByte  int64
+		endByte    int64
+	}
+	xorbFetchRanges := make(map[string][]fetchInfo)
+
+	for _, entry := range fileBlock.Entries {
+		termStart := currentByteOffset
+		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
+
+		// Skip terms that are completely outside the requested range
+		if hasRange {
+			if termEnd <= requestedStart {
+				currentByteOffset = termEnd
+				continue
+			}
+			if termStart > requestedEnd {
+				break
+			}
+		}
+
+		// Find the CAS block
+		var casBlock *shard.CASBlock
+		for i := range sh.CASInfos {
+			if sh.CASInfos[i].CASHash == entry.CASHash {
+				casBlock = &sh.CASInfos[i]
+				break
+			}
+		}
+
+		if casBlock == nil {
+			currentByteOffset = termEnd
+			continue
+		}
+
+		// Calculate offset into first term if this is the first included term
+		if len(response.Terms) == 0 && hasRange && termStart < requestedStart {
+			response.OffsetIntoFirstRange = requestedStart - termStart
+		}
+
+		term := client.Term{
+			Hash:           entry.CASHash.String(),
+			UnpackedLength: uint64(entry.UnpackedSegBytes),
+			Range: client.ChunkRange{
+				Start: entry.ChunkIndexStart,
+				End:   entry.ChunkIndexEnd,
+			},
+		}
+		response.Terms = append(response.Terms, term)
+
+		// Calculate byte ranges for this term
+		startByte, endByte := s.compressedDataRange(entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+
+		// Collect fetch info grouped by xorb
+		xorbHashStr := entry.CASHash.String()
+		xorbFetchRanges[xorbHashStr] = append(xorbFetchRanges[xorbHashStr], fetchInfo{
+			chunkStart: entry.ChunkIndexStart,
+			chunkEnd:   entry.ChunkIndexEnd,
+			startByte:  startByte,
+			endByte:    endByte,
+		})
+
+		currentByteOffset = termEnd
+	}
+
+	// Convert grouped fetch info into V2 format
+	// For now, we create one XorbMultiRangeFetch per xorb with all ranges
+	// A more sophisticated implementation could group consecutive/nearby ranges
+	for xorbHashStr, ranges := range xorbFetchRanges {
+		xorbHash, _ := xet.ParseHash(xorbHashStr)
+		xorbURL := s.storage.GetXorbURL("default", xorbHash)
+
+		var descriptors []client.XorbRangeDescriptor
+		for _, r := range ranges {
+			descriptors = append(descriptors, client.XorbRangeDescriptor{
+				Chunks: client.ChunkRange{
+					Start: r.chunkStart,
+					End:   r.chunkEnd,
+				},
+				Bytes: client.ByteRange{
+					Start: r.startByte,
+					End:   r.endByte,
+				},
+			})
+		}
+
+		multiRangeFetch := client.XorbMultiRangeFetch{
+			URL:    xorbURL,
+			Ranges: descriptors,
+		}
+
+		response.Xorbs[xorbHashStr] = []client.XorbMultiRangeFetch{multiRangeFetch}
+	}
+
+	return response, nil
 }
 
 // handleUploadXorb handles POST /v1/xorbs/{namespace}/{xorb_hash}
