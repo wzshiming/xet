@@ -19,6 +19,7 @@ import (
 	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/server"
+	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -440,11 +441,14 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 	}
 
 	// Compare xorb uploads - validate chunk content
-	if strings.HasPrefix("POST:/v1/xorbs/", "POST:/v1/xorbs/") {
-		xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
-		nativeXorbReqs := nativeByType["POST:/v1/xorbs/default/{hash}"]
-		compareXorbRequests(t, xetgoXorbReqs, nativeXorbReqs)
-	}
+	xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
+	nativeXorbReqs := nativeByType["POST:/v1/xorbs/default/{hash}"]
+	compareXorbRequests(t, xetgoXorbReqs, nativeXorbReqs)
+
+	// STRICT: Compare shard content
+	xetgoShardReqs := append(xetgoByType["POST:/shards"], xetgoByType["POST:/v1/shards"]...)
+	nativeShardReqs := append(nativeByType["POST:/shards"], nativeByType["POST:/v1/shards"]...)
+	compareShardRequests(t, xetgoShardReqs, nativeShardReqs)
 }
 
 // compareDownloadRequests compares HTTP requests from xet-go and native clients for downloads
@@ -479,6 +483,20 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 		t.Errorf("native client did not download any xorb data")
 	}
 
+	// STRICT: Both must download the same number of xorbs
+	if xetgoXorbDownloadCount != nativeXorbDownloadCount {
+		t.Errorf("Xorb download count mismatch: xet-go=%d native=%d",
+			xetgoXorbDownloadCount, nativeXorbDownloadCount)
+	}
+
+	// STRICT: Compare reconstruction query paths (must use same file hash)
+	compareReconstructionPaths(t, xetgoReqs, nativeReqs, fileHash)
+
+	// STRICT: Compare xorb download Range headers
+	xetgoXorbReqs := xetgoByType["GET:/v1/xorbs/default/{hash}/data"]
+	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}/data"]
+	compareXorbDownloadRanges(t, xetgoXorbReqs, nativeXorbReqs)
+
 	// Symmetric validation - allowing for v1/v2 API version differences
 	for reqType := range nativeByType {
 		// Check if this request type exists in xetgo, allowing v1/v2 API version differences
@@ -503,20 +521,6 @@ func hasEquivalentRequest(reqType string, requests map[string][]RequestRecord) b
 	if _, ok := requests[reqType]; ok {
 		return true
 	}
-
-	// Check for v1/v2 API version differences
-	if strings.Contains(reqType, "/v1/") {
-		v2Type := strings.Replace(reqType, "/v1/", "/v2/", 1)
-		if _, ok := requests[v2Type]; ok {
-			return true
-		}
-	} else if strings.Contains(reqType, "/v2/") {
-		v1Type := strings.Replace(reqType, "/v2/", "/v1/", 1)
-		if _, ok := requests[v1Type]; ok {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -592,9 +596,23 @@ func equalStringSlices(a, b []string) bool {
 func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
+	// STRICT: Both clients must upload the same number of xorbs
+	if len(xetgoReqs) != len(nativeReqs) {
+		t.Errorf("Xorb upload count mismatch: xet-go=%d native=%d", len(xetgoReqs), len(nativeReqs))
+	}
+
 	// Collect all chunk hashes from both clients by deserializing xorbs
 	xetgoChunkHashes := make(map[xet.Hash]bool)
 	nativeChunkHashes := make(map[xet.Hash]bool)
+
+	// Also collect ordered chunk sequences per xorb for detailed comparison
+	type xorbInfo struct {
+		hash        string
+		chunkHashes []xet.Hash
+		chunkSizes  []int // uncompressed chunk sizes
+	}
+	var xetgoXorbs []xorbInfo
+	var nativeXorbs []xorbInfo
 
 	for _, req := range xetgoReqs {
 		// Try to deserialize the xorb
@@ -608,10 +626,15 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 			}
 		}
 
-		// Collect chunk hashes
-		for _, chunkHash := range xorbObj.ChunkHashes {
+		info := xorbInfo{hash: req.Path}
+		for i, chunkHash := range xorbObj.ChunkHashes {
 			xetgoChunkHashes[chunkHash] = true
+			info.chunkHashes = append(info.chunkHashes, chunkHash)
+			if i < len(xorbObj.Chunks) {
+				info.chunkSizes = append(info.chunkSizes, len(xorbObj.Chunks[i].UncompressedData))
+			}
 		}
+		xetgoXorbs = append(xetgoXorbs, info)
 	}
 
 	for _, req := range nativeReqs {
@@ -626,10 +649,15 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 			}
 		}
 
-		// Collect chunk hashes
-		for _, chunkHash := range xorbObj.ChunkHashes {
+		info := xorbInfo{hash: req.Path}
+		for i, chunkHash := range xorbObj.ChunkHashes {
 			nativeChunkHashes[chunkHash] = true
+			info.chunkHashes = append(info.chunkHashes, chunkHash)
+			if i < len(xorbObj.Chunks) {
+				info.chunkSizes = append(info.chunkSizes, len(xorbObj.Chunks[i].UncompressedData))
+			}
 		}
+		nativeXorbs = append(nativeXorbs, info)
 	}
 
 	// STRICT: Both clients must upload the same set of chunk hashes
@@ -655,9 +683,245 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 		t.Errorf("native uploaded %d chunks that xet-go did not: %v", len(nativeOnly), nativeOnly)
 	}
 
+	// STRICT: Compare chunk ordering within corresponding xorbs
+	if len(xetgoXorbs) == len(nativeXorbs) {
+		for i := range xetgoXorbs {
+			if len(xetgoXorbs[i].chunkHashes) != len(nativeXorbs[i].chunkHashes) {
+				t.Errorf("Xorb %d chunk count mismatch: xet-go=%d native=%d",
+					i, len(xetgoXorbs[i].chunkHashes), len(nativeXorbs[i].chunkHashes))
+				continue
+			}
+			for j := range xetgoXorbs[i].chunkHashes {
+				if xetgoXorbs[i].chunkHashes[j] != nativeXorbs[i].chunkHashes[j] {
+					t.Errorf("Xorb %d chunk %d hash mismatch: xet-go=%s native=%s",
+						i, j, xetgoXorbs[i].chunkHashes[j], nativeXorbs[i].chunkHashes[j])
+				}
+			}
+			// STRICT: Compare chunk sizes
+			if len(xetgoXorbs[i].chunkSizes) != len(nativeXorbs[i].chunkSizes) {
+				t.Errorf("Xorb %d chunk size count mismatch: xet-go=%d native=%d",
+					i, len(xetgoXorbs[i].chunkSizes), len(nativeXorbs[i].chunkSizes))
+			} else {
+				for j := range xetgoXorbs[i].chunkSizes {
+					if xetgoXorbs[i].chunkSizes[j] != nativeXorbs[i].chunkSizes[j] {
+						t.Errorf("Xorb %d chunk %d size mismatch: xet-go=%d native=%d",
+							i, j, xetgoXorbs[i].chunkSizes[j], nativeXorbs[i].chunkSizes[j])
+					}
+				}
+			}
+		}
+	}
+
 	// Log success
 	if len(xetgoOnly) == 0 && len(nativeOnly) == 0 {
 		t.Logf("✓ Both clients uploaded identical chunk sets (%d chunks)", len(xetgoChunkHashes))
+	}
+}
+
+// compareShardRequests compares shard upload bodies between clients
+func compareShardRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+	t.Helper()
+
+	if len(xetgoReqs) == 0 || len(nativeReqs) == 0 {
+		return // already reported by count checks
+	}
+
+	// Deserialize both shards
+	xetgoShard, err := shard.Deserialize(xetgoReqs[0].Body)
+	if err != nil {
+		t.Errorf("Failed to deserialize xet-go shard: %v", err)
+		return
+	}
+
+	nativeShard, err := shard.Deserialize(nativeReqs[0].Body)
+	if err != nil {
+		t.Errorf("Failed to deserialize native shard: %v", err)
+		return
+	}
+
+	// STRICT: Both shards must have the same number of files
+	if len(xetgoShard.Files) != len(nativeShard.Files) {
+		t.Errorf("Shard file count mismatch: xet-go=%d native=%d",
+			len(xetgoShard.Files), len(nativeShard.Files))
+		return
+	}
+
+	// STRICT: Compare file blocks
+	for i := range xetgoShard.Files {
+		xetgoFile := xetgoShard.Files[i]
+		nativeFile := nativeShard.Files[i]
+
+		// STRICT: File hashes must match
+		if xetgoFile.FileHash != nativeFile.FileHash {
+			t.Errorf("Shard file %d hash mismatch: xet-go=%s native=%s",
+				i, xetgoFile.FileHash, nativeFile.FileHash)
+			continue
+		}
+
+		// STRICT: Same number of reconstruction entries
+		if len(xetgoFile.Entries) != len(nativeFile.Entries) {
+			t.Errorf("Shard file %d entry count mismatch: xet-go=%d native=%d",
+				i, len(xetgoFile.Entries), len(nativeFile.Entries))
+			continue
+		}
+
+		// STRICT: Compare reconstruction entries
+		for j := range xetgoFile.Entries {
+			xetgoEntry := xetgoFile.Entries[j]
+			nativeEntry := nativeFile.Entries[j]
+
+			if xetgoEntry.CASHash != nativeEntry.CASHash {
+				t.Errorf("Shard file %d entry %d CASHash mismatch: xet-go=%s native=%s",
+					i, j, xetgoEntry.CASHash, nativeEntry.CASHash)
+			}
+			if xetgoEntry.ChunkIndexStart != nativeEntry.ChunkIndexStart {
+				t.Errorf("Shard file %d entry %d ChunkIndexStart mismatch: xet-go=%d native=%d",
+					i, j, xetgoEntry.ChunkIndexStart, nativeEntry.ChunkIndexStart)
+			}
+			if xetgoEntry.ChunkIndexEnd != nativeEntry.ChunkIndexEnd {
+				t.Errorf("Shard file %d entry %d ChunkIndexEnd mismatch: xet-go=%d native=%d",
+					i, j, xetgoEntry.ChunkIndexEnd, nativeEntry.ChunkIndexEnd)
+			}
+			if xetgoEntry.UnpackedSegBytes != nativeEntry.UnpackedSegBytes {
+				t.Errorf("Shard file %d entry %d UnpackedSegBytes mismatch: xet-go=%d native=%d",
+					i, j, xetgoEntry.UnpackedSegBytes, nativeEntry.UnpackedSegBytes)
+			}
+		}
+	}
+
+	// STRICT: Both shards must have the same number of CAS blocks
+	if len(xetgoShard.CASInfos) != len(nativeShard.CASInfos) {
+		t.Errorf("Shard CAS block count mismatch: xet-go=%d native=%d",
+			len(xetgoShard.CASInfos), len(nativeShard.CASInfos))
+		return
+	}
+
+	// STRICT: Compare CAS blocks
+	for i := range xetgoShard.CASInfos {
+		xetgoCAS := xetgoShard.CASInfos[i]
+		nativeCAS := nativeShard.CASInfos[i]
+
+		if xetgoCAS.CASHash != nativeCAS.CASHash {
+			t.Errorf("Shard CAS %d hash mismatch: xet-go=%s native=%s",
+				i, xetgoCAS.CASHash, nativeCAS.CASHash)
+			continue
+		}
+
+		if xetgoCAS.NumBytesInCAS != nativeCAS.NumBytesInCAS {
+			t.Errorf("Shard CAS %d NumBytesInCAS mismatch: xet-go=%d native=%d",
+				i, xetgoCAS.NumBytesInCAS, nativeCAS.NumBytesInCAS)
+		}
+
+		if len(xetgoCAS.Chunks) != len(nativeCAS.Chunks) {
+			t.Errorf("Shard CAS %d chunk count mismatch: xet-go=%d native=%d",
+				i, len(xetgoCAS.Chunks), len(nativeCAS.Chunks))
+			continue
+		}
+
+		// STRICT: Compare individual chunk entries in CAS
+		for j := range xetgoCAS.Chunks {
+			xetgoChunk := xetgoCAS.Chunks[j]
+			nativeChunk := nativeCAS.Chunks[j]
+
+			if xetgoChunk.ChunkHash != nativeChunk.ChunkHash {
+				t.Errorf("Shard CAS %d chunk %d hash mismatch: xet-go=%s native=%s",
+					i, j, xetgoChunk.ChunkHash, nativeChunk.ChunkHash)
+			}
+			if xetgoChunk.UnpackedSegBytes != nativeChunk.UnpackedSegBytes {
+				t.Errorf("Shard CAS %d chunk %d UnpackedSegBytes mismatch: xet-go=%d native=%d",
+					i, j, xetgoChunk.UnpackedSegBytes, nativeChunk.UnpackedSegBytes)
+			}
+			if xetgoChunk.ByteRangeStart != nativeChunk.ByteRangeStart {
+				t.Errorf("Shard CAS %d chunk %d ByteRangeStart mismatch: xet-go=%d native=%d",
+					i, j, xetgoChunk.ByteRangeStart, nativeChunk.ByteRangeStart)
+			}
+		}
+	}
+
+	t.Logf("✓ Shard content matches between clients (%d files, %d CAS blocks)",
+		len(xetgoShard.Files), len(xetgoShard.CASInfos))
+}
+
+// compareReconstructionPaths verifies both clients query reconstruction for the same file hash
+func compareReconstructionPaths(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, expectedFileHash string) {
+	t.Helper()
+
+	for _, req := range xetgoReqs {
+		if strings.Contains(req.Path, "/reconstructions/") {
+			parts := strings.Split(req.Path, "/")
+			for _, part := range parts {
+				if len(part) == 64 && isHexString(part) {
+					if part != expectedFileHash {
+						t.Errorf("xet-go reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
+					}
+				}
+			}
+		}
+	}
+
+	for _, req := range nativeReqs {
+		if strings.Contains(req.Path, "/reconstructions/") {
+			parts := strings.Split(req.Path, "/")
+			for _, part := range parts {
+				if len(part) == 64 && isHexString(part) {
+					if part != expectedFileHash {
+						t.Errorf("native reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
+					}
+				}
+			}
+		}
+	}
+}
+
+// compareXorbDownloadRanges compares Range headers on xorb download requests between clients
+func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+	t.Helper()
+
+	// Group download requests by xorb path (actual path, not normalized)
+	xetgoRangesByPath := make(map[string][]string)
+	nativeRangesByPath := make(map[string][]string)
+
+	for _, req := range xetgoReqs {
+		rangeHeader := req.Headers.Get("Range")
+		xetgoRangesByPath[req.Path] = append(xetgoRangesByPath[req.Path], rangeHeader)
+	}
+
+	for _, req := range nativeReqs {
+		rangeHeader := req.Headers.Get("Range")
+		nativeRangesByPath[req.Path] = append(nativeRangesByPath[req.Path], rangeHeader)
+	}
+
+	// STRICT: For each xorb path, compare the Range headers
+	for path, xetgoRanges := range xetgoRangesByPath {
+		nativeRanges, ok := nativeRangesByPath[path]
+		if !ok {
+			t.Errorf("xet-go downloaded xorb %s but native did not", path)
+			continue
+		}
+
+		if len(xetgoRanges) != len(nativeRanges) {
+			t.Errorf("Xorb %s download count mismatch: xet-go=%d native=%d",
+				path, len(xetgoRanges), len(nativeRanges))
+			continue
+		}
+
+		// Sort ranges for stable comparison
+		sort.Strings(xetgoRanges)
+		sort.Strings(nativeRanges)
+
+		for i := range xetgoRanges {
+			if xetgoRanges[i] != nativeRanges[i] {
+				t.Errorf("Xorb %s download %d Range header mismatch: xet-go=%q native=%q",
+					path, i, xetgoRanges[i], nativeRanges[i])
+			}
+		}
+	}
+
+	// Check for native-only xorb downloads
+	for path := range nativeRangesByPath {
+		if _, ok := xetgoRangesByPath[path]; !ok {
+			t.Errorf("native downloaded xorb %s but xet-go did not", path)
+		}
 	}
 }
 
