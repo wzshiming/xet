@@ -219,14 +219,8 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, err
 	}
 
-	// Read shard data
-	shardData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	// Deserialize shard
-	shard, err := shard.Deserialize(shardData)
+	// Deserialize shard directly from response body
+	shard, err := shard.Deserialize(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}

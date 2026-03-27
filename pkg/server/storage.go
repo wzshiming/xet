@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -102,7 +103,7 @@ func (fs *FileStorage) loadShards() error {
 			continue // Skip files we can't read
 		}
 
-		s, err := shard.Deserialize(data)
+		s, err := shard.DeserializeBytes(data)
 		if err != nil {
 			continue // Skip invalid shards
 		}
@@ -201,9 +202,15 @@ func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, er
 	}
 
 	// Serialize shard with footer for storage
-	data, err := s.SerializeWithFooter()
+	r, err := s.SerializeWithFooter()
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
+	}
+
+	// Read all data from the reader
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return false, fmt.Errorf("read serialized shard: %w", err)
 	}
 
 	// Generate a unique filename (use first file hash)

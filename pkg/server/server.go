@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -638,7 +640,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deserialize shard
-	shard, err := shard.Deserialize(shardData)
+	shard, err := shard.Deserialize(bytes.NewReader(shardData))
 	if err != nil {
 		http.Error(w, "Invalid shard format", http.StatusBadRequest)
 		return
@@ -686,15 +688,19 @@ func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serialize shard without footer (for API responses)
-	shardData, err := shard.Serialize()
+	// Serialize shard without footer (for API responses) and stream directly
+	reader, err := shard.Serialize()
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Write(shardData)
+	_, err = io.Copy(w, reader)
+	if err != nil {
+		// Error writing response, but headers already sent
+		fmt.Fprintf(os.Stderr, "Error writing shard response: %v\n", err)
+	}
 }
 
 // ListenAndServe starts the server
