@@ -294,6 +294,7 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 			chunk := allChunks[chunkIdx]
 			xorbHash := chunk.Dedup.XorbHash
 			chunkSize := uint32(len(chunk.Data))
+			chunkIndexInXorb := chunk.Dedup.ChunkIndex
 
 			if i == 0 || xorbHash != currentXorbHash {
 				// Start new term
@@ -308,11 +309,32 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 					})
 				}
 				currentXorbHash = xorbHash
-				currentStart = chunk.Dedup.ChunkIndex
+				currentStart = chunkIndexInXorb
 				currentBytes = chunkSize
 				currentChunkStart = i
 			} else {
-				currentBytes += chunkSize
+				// Same xorb - chunks should be consecutive
+				// Verify the chunk index is consecutive
+				expectedIndex := currentStart + uint32(i-currentChunkStart)
+				if chunkIndexInXorb != expectedIndex {
+					// Non-consecutive chunks in same xorb - this shouldn't happen
+					// unless there's deduplication within the file
+					// For now, start a new term
+					terms = append(terms, termInfo{
+						xorbHash:   currentXorbHash,
+						startIndex: currentStart,
+						endIndex:   currentStart + uint32(i-currentChunkStart),
+						bytes:      currentBytes,
+						chunkStart: currentChunkStart,
+						chunkEnd:   i,
+					})
+					currentXorbHash = xorbHash
+					currentStart = chunkIndexInXorb
+					currentBytes = chunkSize
+					currentChunkStart = i
+				} else {
+					currentBytes += chunkSize
+				}
 			}
 
 			// Track this xorb

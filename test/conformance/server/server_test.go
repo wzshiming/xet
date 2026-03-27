@@ -139,10 +139,8 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Logf("Successfully uploaded file with hash %s", nativeHash)
 			})
 
-			// Only test download for files that fit in a single xorb (< ~128KB)
-			// Larger files require multi-xorb support which needs additional server fixes
-			if len(tt.data) <= 100*1024 {
-				t.Run("download", func(t *testing.T) {
+			// Test download for all file sizes now that multi-xorb support is fixed
+			t.Run("download", func(t *testing.T) {
 					// First upload the file
 					tempDir := t.TempDir()
 					uploadFile := filepath.Join(tempDir, "upload.bin")
@@ -278,7 +276,6 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 					t.Logf("Successfully downloaded file using xet-go client with hash %s", fileHash.String())
 				})
-			}
 		})
 	}
 }
