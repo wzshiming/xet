@@ -1,10 +1,11 @@
 package upload
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
@@ -52,7 +53,6 @@ func NewSession(opts SessionOptions) *Session {
 // FileUploadInfo contains information about a file to upload
 type FileUploadInfo struct {
 	Path     string
-	Data     []byte
 	FileHash xet.Hash
 	SHA256   [32]byte
 }
@@ -73,18 +73,21 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
 	for fileIdx, file := range files {
-		err := xet.ChunkData(bytes.NewReader(file.Data), func(offset int64, chunk []byte) error {
-			chunkHash := xet.ComputeChunkHash(chunk)
+		f, err := os.Open(file.Path)
+		if err != nil {
+			return fmt.Errorf("open file %s: %w", file.Path, err)
+		}
+
+		err = xet.ChunkData(f, func(offset int64, chunk xet.ChunkBytes) error {
+			chunkHash := chunk.Hash()
 
 			// Deduplicate
 			dedupResult := s.deduplicateChunk(ctx, chunkHash)
 
-			newChunk := make([]byte, len(chunk))
-			copy(newChunk, chunk)
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, ChunkInfo{
 				FileIndex: fileIdx,
-				Data:      newChunk,
+				Data:      chunk.Bytes(),
 				Hash:      chunkHash,
 				Offset:    uint64(offset),
 				Dedup:     dedupResult,
@@ -93,6 +96,7 @@ func (s *Session) UploadFiles(ctx context.Context, files []FileUploadInfo) error
 			fileChunkRanges[fileIdx] = append(fileChunkRanges[fileIdx], chunkIdx)
 			return nil
 		})
+		_ = f.Close()
 		if err != nil {
 			return fmt.Errorf("chunk file %s: %w", file.Path, err)
 		}
@@ -373,16 +377,20 @@ func (s *Session) buildAndUploadShard(ctx context.Context, files []FileUploadInf
 }
 
 // ComputeFileInfo computes hash information for a file
-func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
+func ComputeFileInfo(r io.Reader) (FileUploadInfo, error) {
 	// Compute chunk hashes
 	chunkHashes := []xet.Hash{}
 
 	// Compute chunk sizes
 	chunkSizes := []uint64{}
 
-	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		chunkHashes = append(chunkHashes, xet.ComputeChunkHash(chunk))
-		chunkSizes = append(chunkSizes, uint64(len(chunk)))
+	sha256Hash := sha256.New()
+
+	reader := io.TeeReader(r, sha256Hash)
+
+	err := xet.ChunkData(reader, func(offset int64, chunk xet.ChunkBytes) error {
+		chunkHashes = append(chunkHashes, chunk.Hash())
+		chunkSizes = append(chunkSizes, chunk.Size())
 		return nil
 	})
 	if err != nil {
@@ -391,12 +399,8 @@ func ComputeFileInfo(data []byte) (FileUploadInfo, error) {
 
 	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 
-	// Compute SHA-256
-	sha256Hash := sha256.Sum256(data)
-
 	return FileUploadInfo{
-		Data:     data,
 		FileHash: fileHash,
-		SHA256:   sha256Hash,
+		SHA256:   [32]byte(sha256Hash.Sum(nil)),
 	}, nil
 }

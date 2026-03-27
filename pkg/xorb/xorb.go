@@ -48,9 +48,11 @@ func NewXorb() *Xorb {
 }
 
 // AddChunk adds a chunk to the xorb
-func (x *Xorb) AddChunk(data []byte) error {
+func (x *Xorb) AddChunk(chunk xet.ChunkBytes) error {
 	// Compute chunk hash
-	chunkHash := xet.ComputeChunkHash(data)
+	chunkHash := chunk.Hash()
+
+	data := chunk.Bytes()
 
 	// Compress the chunk
 	compressed, compressionType, err := SelectBestCompression(data)
@@ -289,7 +291,7 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 		}
 
 		// Compute chunk hash
-		chunkHash := xet.ComputeChunkHash(uncompressedData)
+		chunkHash := xet.ChunkBytes(uncompressedData).Hash()
 
 		xorb.Chunks = append(xorb.Chunks, ChunkData{
 			UncompressedData: uncompressedData,

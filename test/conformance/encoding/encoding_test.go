@@ -97,9 +97,8 @@ func TestConformance(t *testing.T) {
 func getNativeChunks(t *testing.T, data []byte) []chunkEntry {
 	t.Helper()
 	var chunks []chunkEntry
-	err := xet.ChunkData(bytes.NewReader(data), func(_ int64, chunk []byte) error {
-		h := xet.ComputeChunkHash(chunk)
-		chunks = append(chunks, chunkEntry{hash: h.String(), size: uint64(len(chunk))})
+	err := xet.ChunkData(bytes.NewReader(data), func(_ int64, chunk xet.ChunkBytes) error {
+		chunks = append(chunks, chunkEntry{hash: chunk.Hash().String(), size: chunk.Size()})
 		return nil
 	})
 	if err != nil {

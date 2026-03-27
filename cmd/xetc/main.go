@@ -74,13 +74,14 @@ func infoCommand() {
 
 	filename := os.Args[2]
 
-	data, err := os.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
+	defer f.Close()
 
-	info, err := upload.ComputeFileInfo(data)
+	info, err := upload.ComputeFileInfo(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error computing file info: %v\n", err)
 		os.Exit(1)
@@ -111,16 +112,14 @@ func uploadCommand() {
 	filename := fs.Arg(0)
 
 	// Read file
-	data, err := os.ReadFile(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Uploading: %s (%d bytes)\n", filename, len(data))
-
 	// Compute file info
-	fileInfo, err := upload.ComputeFileInfo(data)
+	fileInfo, err := upload.ComputeFileInfo(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error computing file info: %v\n", err)
 		os.Exit(1)

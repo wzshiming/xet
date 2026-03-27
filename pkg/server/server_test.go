@@ -104,7 +104,7 @@ func TestServerShardUpload(t *testing.T) {
 
 	// Create test data
 	testData := []byte("Hello, XET Protocol! This is a test file for shard upload.")
-	fileInfo, err := upload.ComputeFileInfo(testData)
+	fileInfo, err := upload.ComputeFileInfo(bytes.NewReader(testData))
 	if err != nil {
 		t.Fatalf("Failed to compute file info: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestServerGetReconstruction(t *testing.T) {
 
 	// Create test data and upload xorb + shard
 	testData := []byte("Hello, XET Protocol! This is a test file for reconstruction.")
-	fileInfo, err := upload.ComputeFileInfo(testData)
+	fileInfo, err := upload.ComputeFileInfo(bytes.NewReader(testData))
 	if err != nil {
 		t.Fatalf("Failed to compute file info: %v", err)
 	}
@@ -417,10 +417,8 @@ func chunkData(t *testing.T, data []byte) []chunk {
 	t.Helper()
 
 	var chunks []chunk
-	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk []byte) error {
-		newChunk := make([]byte, len(dataChunk))
-		copy(newChunk, dataChunk)
-		chunks = append(chunks, chunk{Data: newChunk, Offset: offset})
+	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, dataChunk xet.ChunkBytes) error {
+		chunks = append(chunks, chunk{Data: dataChunk.Bytes(), Offset: offset})
 		return nil
 	})
 	if err != nil {
