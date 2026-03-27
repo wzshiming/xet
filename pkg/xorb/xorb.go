@@ -77,19 +77,24 @@ func (x *Xorb) AddChunk(chunk xet.ChunkBytes) error {
 //
 // The returned io.Reader streams the data directly without buffering everything in memory.
 func Serialize(x *Xorb, chunkOnly bool) (io.Reader, error) {
-	pr, pw := io.Pipe()
+	if chunkOnly {
+		return &xorbChunksOnlyReader{
+			xorb: x,
+		}, nil
+	}
 
-	go func() {
-		var err error
-		if chunkOnly {
-			err = serializeChunksOnlyToWriter(x, pw)
-		} else {
-			err = serializeToWriter(x, pw)
-		}
-		pw.CloseWithError(err)
-	}()
+	// Build footer for full serialization
+	footer, chunkOffsets, unpackedOffsets, err := x.buildFooterData()
+	if err != nil {
+		return nil, err
+	}
 
-	return pr, nil
+	return &xorbReader{
+		xorb:             x,
+		footer:           footer,
+		chunkOffsets:     chunkOffsets,
+		unpackedOffsets:  unpackedOffsets,
+	}, nil
 }
 
 // SerializeBytes is a helper that returns the serialized bytes.
@@ -102,58 +107,173 @@ func SerializeBytes(x *Xorb, chunkOnly bool) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-// serializeChunksOnlyToWriter writes only the chunk data region without footer
-func serializeChunksOnlyToWriter(x *Xorb, w io.Writer) error {
-	// Write chunk data region
-	for _, chunk := range x.Chunks {
-		// Write chunk header (8 bytes)
-		header := ChunkHeader{
-			Version:          0,
-			CompressedSize:   uint32(len(chunk.CompressedData)),
-			CompressionType:  chunk.CompressionType,
-			UncompressedSize: uint32(len(chunk.UncompressedData)),
+// xorbChunksOnlyReader implements io.Reader for chunk-only serialization
+type xorbChunksOnlyReader struct {
+	xorb       *Xorb
+	chunkIdx   int
+	buffer     []byte
+	bufOffset  int
+}
+
+func (r *xorbChunksOnlyReader) Read(p []byte) (n int, err error) {
+	for n < len(p) {
+		// Check if we're done with all chunks
+		if r.chunkIdx >= len(r.xorb.Chunks) {
+			if n > 0 {
+				return n, nil
+			}
+			return 0, io.EOF
 		}
 
-		if err := writeChunkHeader(w, header); err != nil {
-			return fmt.Errorf("failed to write chunk header: %w", err)
+		// If buffer is empty or consumed, prepare next chunk
+		if len(r.buffer) == 0 || r.bufOffset >= len(r.buffer) {
+			chunk := r.xorb.Chunks[r.chunkIdx]
+
+			// Build chunk header (8 bytes)
+			header := ChunkHeader{
+				Version:          0,
+				CompressedSize:   uint32(len(chunk.CompressedData)),
+				CompressionType:  chunk.CompressionType,
+				UncompressedSize: uint32(len(chunk.UncompressedData)),
+			}
+
+			headerBuf := make([]byte, 8)
+			headerBuf[0] = header.Version
+			headerBuf[1] = byte(header.CompressedSize & 0xFF)
+			headerBuf[2] = byte((header.CompressedSize >> 8) & 0xFF)
+			headerBuf[3] = byte((header.CompressedSize >> 16) & 0xFF)
+			headerBuf[4] = byte(header.CompressionType)
+			headerBuf[5] = byte(header.UncompressedSize & 0xFF)
+			headerBuf[6] = byte((header.UncompressedSize >> 8) & 0xFF)
+			headerBuf[7] = byte((header.UncompressedSize >> 16) & 0xFF)
+
+			// Combine header and compressed data into a new buffer
+			r.buffer = make([]byte, 0, 8+len(chunk.CompressedData))
+			r.buffer = append(r.buffer, headerBuf...)
+			r.buffer = append(r.buffer, chunk.CompressedData...)
+			r.bufOffset = 0
 		}
 
-		// Write compressed data
-		if _, err := w.Write(chunk.CompressedData); err != nil {
-			return fmt.Errorf("failed to write chunk data: %w", err)
+		// Copy from buffer to output
+		copied := copy(p[n:], r.buffer[r.bufOffset:])
+		n += copied
+		r.bufOffset += copied
+
+		// If we've consumed the entire buffer, move to next chunk
+		if r.bufOffset >= len(r.buffer) {
+			r.chunkIdx++
+			r.buffer = nil
+			r.bufOffset = 0
 		}
 	}
 
-	return nil
+	return n, nil
 }
 
-// serializeToWriter writes the xorb to binary format with CasObjectInfo footer
-func serializeToWriter(x *Xorb, w io.Writer) error {
+// xorbReader implements io.Reader for full xorb serialization (with footer)
+type xorbReader struct {
+	xorb            *Xorb
+	footer          []byte
+	chunkOffsets    []uint64
+	unpackedOffsets []uint64
+	chunkIdx        int
+	buffer          []byte
+	bufOffset       int
+	footerWritten   bool
+}
+
+func (r *xorbReader) Read(p []byte) (n int, err error) {
+	for n < len(p) {
+		// Write chunks first
+		if r.chunkIdx < len(r.xorb.Chunks) {
+			// If buffer is empty or consumed, prepare next chunk
+			if len(r.buffer) == 0 || r.bufOffset >= len(r.buffer) {
+				chunk := r.xorb.Chunks[r.chunkIdx]
+
+				// Build chunk header (8 bytes)
+				header := ChunkHeader{
+					Version:          0,
+					CompressedSize:   uint32(len(chunk.CompressedData)),
+					CompressionType:  chunk.CompressionType,
+					UncompressedSize: uint32(len(chunk.UncompressedData)),
+				}
+
+				headerBuf := make([]byte, 8)
+				headerBuf[0] = header.Version
+				headerBuf[1] = byte(header.CompressedSize & 0xFF)
+				headerBuf[2] = byte((header.CompressedSize >> 8) & 0xFF)
+				headerBuf[3] = byte((header.CompressedSize >> 16) & 0xFF)
+				headerBuf[4] = byte(header.CompressionType)
+				headerBuf[5] = byte(header.UncompressedSize & 0xFF)
+				headerBuf[6] = byte((header.UncompressedSize >> 8) & 0xFF)
+				headerBuf[7] = byte((header.UncompressedSize >> 16) & 0xFF)
+
+				// Combine header and compressed data into a new buffer
+				r.buffer = make([]byte, 0, 8+len(chunk.CompressedData))
+				r.buffer = append(r.buffer, headerBuf...)
+				r.buffer = append(r.buffer, chunk.CompressedData...)
+				r.bufOffset = 0
+			}
+
+			// Copy from buffer to output
+			copied := copy(p[n:], r.buffer[r.bufOffset:])
+			n += copied
+			r.bufOffset += copied
+
+			// If we've consumed the entire buffer, move to next chunk
+			if r.bufOffset >= len(r.buffer) {
+				r.chunkIdx++
+				r.buffer = nil
+				r.bufOffset = 0
+			}
+			continue
+		}
+
+		// Write footer
+		if !r.footerWritten || (r.footerWritten && r.bufOffset < len(r.buffer)) {
+			if !r.footerWritten {
+				// Prepare footer buffer
+				footerLenBuf := make([]byte, 4)
+				binary.LittleEndian.PutUint32(footerLenBuf, uint32(len(r.footer)))
+
+				r.buffer = make([]byte, 0, len(r.footer)+4)
+				r.buffer = append(r.buffer, r.footer...)
+				r.buffer = append(r.buffer, footerLenBuf...)
+				r.bufOffset = 0
+				r.footerWritten = true
+			}
+
+			// Copy from buffer to output
+			copied := copy(p[n:], r.buffer[r.bufOffset:])
+			n += copied
+			r.bufOffset += copied
+
+			// If we haven't finished the footer buffer, keep going
+			if r.bufOffset < len(r.buffer) {
+				continue
+			}
+		}
+
+		// All done - we've written all chunks and footer
+		if n > 0 {
+			return n, nil
+		}
+		return 0, io.EOF
+	}
+
+	return n, nil
+}
+
+// buildFooterData builds the footer bytes and returns them along with offset arrays
+func (x *Xorb) buildFooterData() ([]byte, []uint64, []uint64, error) {
 	// Track chunk offsets for boundary section
 	chunkOffsets := make([]uint64, len(x.Chunks))
 	unpackedOffsets := make([]uint64, len(x.Chunks))
 	currentOffset := uint64(0)
 	currentUnpacked := uint64(0)
 
-	// Write chunk data region
+	// Calculate offsets
 	for i, chunk := range x.Chunks {
-		// Write chunk header (8 bytes)
-		header := ChunkHeader{
-			Version:          0,
-			CompressedSize:   uint32(len(chunk.CompressedData)),
-			CompressionType:  chunk.CompressionType,
-			UncompressedSize: uint32(len(chunk.UncompressedData)),
-		}
-
-		if err := writeChunkHeader(w, header); err != nil {
-			return fmt.Errorf("failed to write chunk header: %w", err)
-		}
-
-		// Write compressed data
-		if _, err := w.Write(chunk.CompressedData); err != nil {
-			return fmt.Errorf("failed to write chunk data: %w", err)
-		}
-
 		currentOffset += 8 + uint64(len(chunk.CompressedData))
 		currentUnpacked += uint64(len(chunk.UncompressedData))
 
@@ -165,43 +285,10 @@ func serializeToWriter(x *Xorb, w io.Writer) error {
 	// Build CasObjectInfo footer
 	footer, err := x.buildFooter(chunkOffsets, unpackedOffsets)
 	if err != nil {
-		return fmt.Errorf("failed to build footer: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to build footer: %w", err)
 	}
 
-	// Write footer
-	if _, err := w.Write(footer); err != nil {
-		return fmt.Errorf("failed to write footer: %w", err)
-	}
-
-	// Write footer length (4-byte little-endian)
-	footerLen := make([]byte, 4)
-	binary.LittleEndian.PutUint32(footerLen, uint32(len(footer)))
-	if _, err := w.Write(footerLen); err != nil {
-		return fmt.Errorf("failed to write footer length: %w", err)
-	}
-
-	return nil
-}
-
-// writeChunkHeader writes a chunk header to the buffer
-func writeChunkHeader(w io.Writer, h ChunkHeader) error {
-	buf := make([]byte, 8)
-	buf[0] = h.Version
-
-	// CompressedSize (3 bytes, little-endian)
-	buf[1] = byte(h.CompressedSize & 0xFF)
-	buf[2] = byte((h.CompressedSize >> 8) & 0xFF)
-	buf[3] = byte((h.CompressedSize >> 16) & 0xFF)
-
-	buf[4] = byte(h.CompressionType)
-
-	// UncompressedSize (3 bytes, little-endian)
-	buf[5] = byte(h.UncompressedSize & 0xFF)
-	buf[6] = byte((h.UncompressedSize >> 8) & 0xFF)
-	buf[7] = byte((h.UncompressedSize >> 16) & 0xFF)
-
-	_, err := w.Write(buf)
-	return err
+	return footer, chunkOffsets, unpackedOffsets, nil
 }
 
 // buildFooter builds the CasObjectInfo footer
