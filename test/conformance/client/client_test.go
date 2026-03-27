@@ -712,10 +712,15 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 				}
 			}
 			// STRICT: Compare chunk sizes
-			for j := range xetgoXorbs[i].chunkSizes {
-				if j < len(nativeXorbs[i].chunkSizes) && xetgoXorbs[i].chunkSizes[j] != nativeXorbs[i].chunkSizes[j] {
-					t.Errorf("Xorb %d chunk %d size mismatch: xet-go=%d native=%d",
-						i, j, xetgoXorbs[i].chunkSizes[j], nativeXorbs[i].chunkSizes[j])
+			if len(xetgoXorbs[i].chunkSizes) != len(nativeXorbs[i].chunkSizes) {
+				t.Errorf("Xorb %d chunk size count mismatch: xet-go=%d native=%d",
+					i, len(xetgoXorbs[i].chunkSizes), len(nativeXorbs[i].chunkSizes))
+			} else {
+				for j := range xetgoXorbs[i].chunkSizes {
+					if xetgoXorbs[i].chunkSizes[j] != nativeXorbs[i].chunkSizes[j] {
+						t.Errorf("Xorb %d chunk %d size mismatch: xet-go=%d native=%d",
+							i, j, xetgoXorbs[i].chunkSizes[j], nativeXorbs[i].chunkSizes[j])
+					}
 				}
 			}
 		}

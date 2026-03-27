@@ -373,27 +373,22 @@ func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xe
 
 	// Build CAS blocks by collecting chunk information from all chunks
 	xorbChunksMap := make(map[xet.Hash][]shard.CASChunkSequenceEntry)
-	xorbBytesMap := make(map[xet.Hash]uint32) // total uncompressed bytes per xorb
+	xorbBytesMap := make(map[xet.Hash]uint32)       // total uncompressed bytes per xorb
+	xorbSeenChunks := make(map[xet.Hash]map[xet.Hash]bool) // track added chunks per xorb
 
 	for _, chunk := range allChunks {
 		xorbHash := chunk.Dedup.XorbHash
 		chunkSize := uint32(len(chunk.Data))
 
-		if _, exists := xorbChunksMap[xorbHash]; !exists {
+		if _, exists := xorbSeenChunks[xorbHash]; !exists {
 			xorbChunksMap[xorbHash] = make([]shard.CASChunkSequenceEntry, 0)
 			xorbBytesMap[xorbHash] = 0
+			xorbSeenChunks[xorbHash] = make(map[xet.Hash]bool)
 		}
 
-		// Only add each chunk once (by checking if chunk index is already added)
-		alreadyAdded := false
-		for _, existing := range xorbChunksMap[xorbHash] {
-			if existing.ChunkHash == chunk.Hash {
-				alreadyAdded = true
-				break
-			}
-		}
-
-		if !alreadyAdded {
+		// Only add each chunk once
+		if !xorbSeenChunks[xorbHash][chunk.Hash] {
+			xorbSeenChunks[xorbHash][chunk.Hash] = true
 			entry := shard.CASChunkSequenceEntry{
 				ChunkHash:        chunk.Hash,
 				ByteRangeStart:   xorbBytesMap[xorbHash],
