@@ -57,116 +57,170 @@ func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash,
 
 	expectedLength := expectedLength(reconstruction)
 
-	pr, pw := io.Pipe()
+	// Create a reader that reconstructs the file on-demand
+	reader := &reconstructionReaderV1{
+		session:        s,
+		ctx:            ctx,
+		reconstruction: reconstruction,
+		skipBytes:      reconstruction.OffsetIntoFirstRange,
+	}
 
-	go func() {
-		defer pw.Close()
-
-		err := s.wrtieTo(ctx, pw, reconstruction)
-		if err != nil {
-			pw.CloseWithError(err)
-		}
-	}()
-
-	return pr, expectedLength, nil
+	return reader, expectedLength, nil
 }
 
-func (s *DownloadSession) wrtieTo(ctx context.Context, w io.Writer, reconstruction *ReconstructionResponse) error {
-	// Step 2: Download and process terms
+// reconstructionReaderV1 implements io.Reader for V1 reconstruction
+type reconstructionReaderV1 struct {
+	session        *DownloadSession
+	ctx            context.Context
+	reconstruction *ReconstructionResponse
+	skipBytes      int64
 
-	skipBytes := reconstruction.OffsetIntoFirstRange
+	// State for reading
+	termIdx     int
+	chunkIdx    uint32
+	chunkOffset int
+	currentTerm *Term
+	currentXorb *xorb.Xorb
+	err         error
+}
 
-	for termIdx, term := range reconstruction.Terms {
-		// Parse xorb hash
-		xorbHashStr := term.Hash
-		xorbHash, err := xet.ParseHash(xorbHashStr)
-		if err != nil {
-			return fmt.Errorf("parse xorb hash: %w", err)
+func (r *reconstructionReaderV1) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	for n < len(p) {
+		// Check if we're done with all terms
+		if r.termIdx >= len(r.reconstruction.Terms) {
+			return n, io.EOF
 		}
 
-		// Get fetch info for this xorb
-		fetchInfoList, ok := reconstruction.FetchInfo[xorbHashStr]
-		if !ok || len(fetchInfoList) == 0 {
-			return fmt.Errorf("no fetch info for xorb %s", xorbHashStr)
+		// Load next term if needed
+		if r.currentTerm == nil {
+			if err := r.loadTerm(); err != nil {
+				r.err = err
+				if n > 0 {
+					return n, nil
+				}
+				return 0, err
+			}
 		}
 
-		// Download xorb data
-		fetchInfo := fetchInfoList[0] // Usually only one entry per xorb
-
-		// Determine if we should use URLRange for efficient partial download
-		// URLRange points to the exact byte range in the compressed xorb data
-		var byteRange *ByteRange
-		useChunksOnly := false
-
-		// Use URLRange if it's non-zero (indicating a partial range request)
-		if fetchInfo.URLRange.Start != 0 || fetchInfo.URLRange.End != 0 {
-			byteRange = &fetchInfo.URLRange
-			useChunksOnly = true
+		// Check if we're done with current term's chunks
+		if r.chunkIdx >= r.currentTerm.Range.End {
+			r.currentTerm = nil
+			r.currentXorb = nil
+			r.termIdx++
+			continue
 		}
 
-		reqOpts := []ReqOpt{}
-		if byteRange != nil {
-			reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
-		}
-		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, reqOpts...)
-		if err != nil {
-			return fmt.Errorf("download xorb data: %w", err)
+		// Read from current chunk
+		chunk := r.currentXorb.Chunks[r.chunkIdx]
+
+		// Apply skip for first chunk of first term
+		data := chunk.UncompressedData
+		if r.termIdx == 0 && r.chunkIdx == r.currentTerm.Range.Start && r.skipBytes > 0 {
+			if r.skipBytes >= int64(len(data)) {
+				r.skipBytes -= int64(len(data))
+				r.chunkIdx++
+				r.chunkOffset = 0
+				continue
+			}
+			data = data[r.skipBytes:]
+			r.skipBytes = 0
 		}
 
-		// Deserialize xorb
-		var xorbObj *xorb.Xorb
-		if useChunksOnly {
-			// When downloading a range, we get only the chunk data without footer
-			xorbObj, err = xorb.DeserializeBytes(xorbData, true)
+		// Copy data from current position
+		if r.chunkOffset < len(data) {
+			copied := copy(p[n:], data[r.chunkOffset:])
+			n += copied
+			r.chunkOffset += copied
+
+			// If we've consumed this chunk, move to next
+			if r.chunkOffset >= len(data) {
+				r.chunkIdx++
+				r.chunkOffset = 0
+			}
 		} else {
-			// Full xorb with footer
-			xorbObj, err = xorb.DeserializeBytes(xorbData, false)
-		}
-		if err != nil {
-			return fmt.Errorf("deserialize xorb: %w", err)
-		}
-
-		// Verify xorb hash only when we have the full xorb
-		if !useChunksOnly && xorbObj.Hash != xorbHash {
-			return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
-		}
-
-		// Extract chunks in the range
-		chunkStart := term.Range.Start
-		chunkEnd := term.Range.End
-
-		if chunkEnd > uint32(len(xorbObj.Chunks)) {
-			return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", chunkStart, chunkEnd, len(xorbObj.Chunks))
-		}
-
-		// Concatenate chunks
-		for i := chunkStart; i < chunkEnd; i++ {
-			chunk := xorbObj.Chunks[i]
-
-			// Cache if enabled
-			if s.chunkCache != nil {
-				s.chunkCache[chunk.Hash] = chunk.UncompressedData
-			}
-
-			// Apply skip for first term
-			if termIdx == 0 && skipBytes > 0 {
-				if skipBytes >= int64(len(chunk.UncompressedData)) {
-					skipBytes -= int64(len(chunk.UncompressedData))
-					continue
-				}
-				_, err := w.Write(chunk.UncompressedData[skipBytes:])
-				if err != nil {
-					return fmt.Errorf("write to output: %w", err)
-				}
-				skipBytes = 0
-			} else {
-				_, err := w.Write(chunk.UncompressedData)
-				if err != nil {
-					return fmt.Errorf("write to output: %w", err)
-				}
-			}
+			// Move to next chunk
+			r.chunkIdx++
+			r.chunkOffset = 0
 		}
 	}
+
+	return n, nil
+}
+
+func (r *reconstructionReaderV1) loadTerm() error {
+	term := &r.reconstruction.Terms[r.termIdx]
+	r.currentTerm = term
+
+	// Parse xorb hash
+	xorbHash, err := xet.ParseHash(term.Hash)
+	if err != nil {
+		return fmt.Errorf("parse xorb hash: %w", err)
+	}
+
+	// Get fetch info for this xorb
+	fetchInfoList, ok := r.reconstruction.FetchInfo[term.Hash]
+	if !ok || len(fetchInfoList) == 0 {
+		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
+	}
+
+	fetchInfo := fetchInfoList[0]
+
+	// Determine if we should use URLRange for efficient partial download
+	var byteRange *ByteRange
+	useChunksOnly := false
+
+	if fetchInfo.URLRange.Start != 0 || fetchInfo.URLRange.End != 0 {
+		byteRange = &fetchInfo.URLRange
+		useChunksOnly = true
+	}
+
+	reqOpts := []ReqOpt{}
+	if byteRange != nil {
+		reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
+	}
+
+	xorbData, err := r.session.client.DownloadXorbData(r.ctx, fetchInfo.URL, reqOpts...)
+	if err != nil {
+		return fmt.Errorf("download xorb data: %w", err)
+	}
+
+	// Deserialize xorb
+	var xorbObj *xorb.Xorb
+	if useChunksOnly {
+		xorbObj, err = xorb.DeserializeBytes(xorbData, true)
+	} else {
+		xorbObj, err = xorb.DeserializeBytes(xorbData, false)
+	}
+	if err != nil {
+		return fmt.Errorf("deserialize xorb: %w", err)
+	}
+
+	// Verify xorb hash only when we have the full xorb
+	if !useChunksOnly && xorbObj.Hash != xorbHash {
+		return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
+	}
+
+	// Validate chunk range
+	if term.Range.End > uint32(len(xorbObj.Chunks)) {
+		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", term.Range.Start, term.Range.End, len(xorbObj.Chunks))
+	}
+
+	// Cache chunks if enabled
+	if r.session.chunkCache != nil {
+		for i := term.Range.Start; i < term.Range.End; i++ {
+			chunk := xorbObj.Chunks[i]
+			r.session.chunkCache[chunk.Hash] = chunk.UncompressedData
+		}
+	}
+
+	r.currentXorb = xorbObj
+	r.chunkIdx = term.Range.Start
+	r.chunkOffset = 0
+
 	return nil
 }
 
@@ -179,119 +233,195 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 
 	expectedLength := expectedLengthV2(reconstruction)
 
-	pr, pw := io.Pipe()
+	// Create a reader that reconstructs the file on-demand
+	reader := &reconstructionReaderV2{
+		session:        s,
+		ctx:            ctx,
+		reconstruction: reconstruction,
+		skipBytes:      reconstruction.OffsetIntoFirstRange,
+	}
 
-	go func() {
-		defer pw.Close()
-
-		err := s.writeToV2(ctx, pw, reconstruction)
-		if err != nil {
-			pw.CloseWithError(err)
-		}
-	}()
-
-	return pr, expectedLength, nil
+	return reader, expectedLength, nil
 }
 
-func (s *DownloadSession) writeToV2(ctx context.Context, w io.Writer, reconstruction *ReconstructionResponseV2) error {
-	skipBytes := reconstruction.OffsetIntoFirstRange
+// reconstructionReaderV2 implements io.Reader for V2 reconstruction
+type reconstructionReaderV2 struct {
+	session        *DownloadSession
+	ctx            context.Context
+	reconstruction *ReconstructionResponseV2
+	skipBytes      int64
 
-	for termIdx, term := range reconstruction.Terms {
-		xorbHashStr := term.Hash
-		xorbHash, err := xet.ParseHash(xorbHashStr)
-		if err != nil {
-			return fmt.Errorf("parse xorb hash: %w", err)
+	// State for reading
+	termIdx     int
+	chunkIdx    uint32
+	chunkOffset int
+	currentTerm *Term
+	currentXorb *xorb.Xorb
+	localStart  uint32
+	localEnd    uint32
+	err         error
+}
+
+func (r *reconstructionReaderV2) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	for n < len(p) {
+		// Check if we're done with all terms
+		if r.termIdx >= len(r.reconstruction.Terms) {
+			return n, io.EOF
 		}
 
-		// Get fetch info for this xorb
-		fetchList, ok := reconstruction.Xorbs[xorbHashStr]
-		if !ok || len(fetchList) == 0 {
-			return fmt.Errorf("no fetch info for xorb %s", xorbHashStr)
-		}
-
-		fetchEntry := fetchList[0]
-
-		// Find the range descriptor that covers this term's chunk range
-		var matchedRange *XorbRangeDescriptor
-		for i := range fetchEntry.Ranges {
-			if fetchEntry.Ranges[i].Chunks.Start == term.Range.Start &&
-				fetchEntry.Ranges[i].Chunks.End == term.Range.End {
-				matchedRange = &fetchEntry.Ranges[i]
-				break
+		// Load next term if needed
+		if r.currentTerm == nil {
+			if err := r.loadTerm(); err != nil {
+				r.err = err
+				if n > 0 {
+					return n, nil
+				}
+				return 0, err
 			}
 		}
 
-		// Determine whether to issue a ranged download
-		var byteRange *ByteRange
-		useChunksOnly := false
-
-		if matchedRange != nil && (matchedRange.Bytes.Start != 0 || matchedRange.Bytes.End != 0) {
-			byteRange = &matchedRange.Bytes
-			useChunksOnly = true
-		}
-		reqOpts := []ReqOpt{}
-		if byteRange != nil {
-			reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
-		}
-		xorbData, err := s.client.DownloadXorbData(ctx, fetchEntry.URL, reqOpts...)
-		if err != nil {
-			return fmt.Errorf("download xorb data: %w", err)
+		// Check if we're done with current term's chunks
+		if r.chunkIdx >= r.localEnd {
+			r.currentTerm = nil
+			r.currentXorb = nil
+			r.termIdx++
+			continue
 		}
 
-		var xorbObj *xorb.Xorb
-		if useChunksOnly {
-			xorbObj, err = xorb.DeserializeBytes(xorbData, true)
+		// Read from current chunk
+		chunk := r.currentXorb.Chunks[r.chunkIdx]
+
+		// Apply skip for first chunk of first term
+		data := chunk.UncompressedData
+		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
+			if r.skipBytes >= int64(len(data)) {
+				r.skipBytes -= int64(len(data))
+				r.chunkIdx++
+				r.chunkOffset = 0
+				continue
+			}
+			data = data[r.skipBytes:]
+			r.skipBytes = 0
+		}
+
+		// Copy data from current position
+		if r.chunkOffset < len(data) {
+			copied := copy(p[n:], data[r.chunkOffset:])
+			n += copied
+			r.chunkOffset += copied
+
+			// If we've consumed this chunk, move to next
+			if r.chunkOffset >= len(data) {
+				r.chunkIdx++
+				r.chunkOffset = 0
+			}
 		} else {
-			xorbObj, err = xorb.DeserializeBytes(xorbData, false)
-		}
-		if err != nil {
-			return fmt.Errorf("deserialize xorb: %w", err)
-		}
-
-		if !useChunksOnly && xorbObj.Hash != xorbHash {
-			return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
-		}
-
-		// When downloading a partial byte range the returned chunks are
-		// re-indexed from 0, so map the term's absolute range to local indices.
-		var localStart, localEnd uint32
-		if useChunksOnly {
-			localStart = 0
-			localEnd = term.Range.End - term.Range.Start
-		} else {
-			localStart = term.Range.Start
-			localEnd = term.Range.End
-		}
-
-		if localEnd > uint32(len(xorbObj.Chunks)) {
-			return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
-		}
-
-		for i := localStart; i < localEnd; i++ {
-			chunk := xorbObj.Chunks[i]
-
-			if s.chunkCache != nil {
-				s.chunkCache[chunk.Hash] = chunk.UncompressedData
-			}
-
-			if termIdx == 0 && skipBytes > 0 {
-				if skipBytes >= int64(len(chunk.UncompressedData)) {
-					skipBytes -= int64(len(chunk.UncompressedData))
-					continue
-				}
-				_, err := w.Write(chunk.UncompressedData[skipBytes:])
-				if err != nil {
-					return fmt.Errorf("write to output: %w", err)
-				}
-				skipBytes = 0
-			} else {
-				_, err := w.Write(chunk.UncompressedData)
-				if err != nil {
-					return fmt.Errorf("write to output: %w", err)
-				}
-			}
+			// Move to next chunk
+			r.chunkIdx++
+			r.chunkOffset = 0
 		}
 	}
+
+	return n, nil
+}
+
+func (r *reconstructionReaderV2) loadTerm() error {
+	term := &r.reconstruction.Terms[r.termIdx]
+	r.currentTerm = term
+
+	// Parse xorb hash
+	xorbHash, err := xet.ParseHash(term.Hash)
+	if err != nil {
+		return fmt.Errorf("parse xorb hash: %w", err)
+	}
+
+	// Get fetch info for this xorb
+	fetchList, ok := r.reconstruction.Xorbs[term.Hash]
+	if !ok || len(fetchList) == 0 {
+		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
+	}
+
+	fetchEntry := fetchList[0]
+
+	// Find the range descriptor that covers this term's chunk range
+	var matchedRange *XorbRangeDescriptor
+	for i := range fetchEntry.Ranges {
+		if fetchEntry.Ranges[i].Chunks.Start == term.Range.Start &&
+			fetchEntry.Ranges[i].Chunks.End == term.Range.End {
+			matchedRange = &fetchEntry.Ranges[i]
+			break
+		}
+	}
+
+	// Determine whether to issue a ranged download
+	var byteRange *ByteRange
+	useChunksOnly := false
+
+	if matchedRange != nil && (matchedRange.Bytes.Start != 0 || matchedRange.Bytes.End != 0) {
+		byteRange = &matchedRange.Bytes
+		useChunksOnly = true
+	}
+
+	reqOpts := []ReqOpt{}
+	if byteRange != nil {
+		reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
+	}
+
+	xorbData, err := r.session.client.DownloadXorbData(r.ctx, fetchEntry.URL, reqOpts...)
+	if err != nil {
+		return fmt.Errorf("download xorb data: %w", err)
+	}
+
+	// Deserialize xorb
+	var xorbObj *xorb.Xorb
+	if useChunksOnly {
+		xorbObj, err = xorb.DeserializeBytes(xorbData, true)
+	} else {
+		xorbObj, err = xorb.DeserializeBytes(xorbData, false)
+	}
+	if err != nil {
+		return fmt.Errorf("deserialize xorb: %w", err)
+	}
+
+	// Verify xorb hash only when we have the full xorb
+	if !useChunksOnly && xorbObj.Hash != xorbHash {
+		return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
+	}
+
+	// When downloading a partial byte range the returned chunks are
+	// re-indexed from 0, so map the term's absolute range to local indices.
+	var localStart, localEnd uint32
+	if useChunksOnly {
+		localStart = 0
+		localEnd = term.Range.End - term.Range.Start
+	} else {
+		localStart = term.Range.Start
+		localEnd = term.Range.End
+	}
+
+	// Validate chunk range
+	if localEnd > uint32(len(xorbObj.Chunks)) {
+		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
+	}
+
+	// Cache chunks if enabled
+	if r.session.chunkCache != nil {
+		for i := localStart; i < localEnd; i++ {
+			chunk := xorbObj.Chunks[i]
+			r.session.chunkCache[chunk.Hash] = chunk.UncompressedData
+		}
+	}
+
+	r.currentXorb = xorbObj
+	r.localStart = localStart
+	r.localEnd = localEnd
+	r.chunkIdx = localStart
+	r.chunkOffset = 0
+
 	return nil
 }
 
