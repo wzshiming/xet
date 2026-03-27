@@ -51,20 +51,23 @@ func (s *Server) registerRoutes() {
 	// Defined in specification
 	s.router.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.router.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
-	// V2 endpoints
-	s.router.HandleFunc("/api/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
-	s.router.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
-
 	// Used by xet-core but not defined in spec
+	s.router.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.router.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+
+	// /v1/shards is defined in the spec as the upload endpoint for shards,
+	// but xet-core actually uploads shards to /shards, so we support both.
+	s.router.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.router.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
+
+	// Download endpoint for xorb data, used by xet-core and the Go client.
+	// Not defined in the spec, but we can support it without much effort since it's just serving raw stored xorb bytes.
+	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 }
 
 // ServeHTTP implements http.Handler

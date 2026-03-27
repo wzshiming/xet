@@ -407,14 +407,14 @@ func TestServerGetReconstructionV2(t *testing.T) {
 		}
 	}
 
-	// Test V2 reconstruction query with /api/v2/reconstructions path
-	req = httptest.NewRequest(http.MethodGet, "/api/v2/reconstructions/"+fileInfo.FileHash.String(), nil)
+	// Test V2 reconstruction query with /v2/reconstructions path
+	req = httptest.NewRequest(http.MethodGet, "/v2/reconstructions/"+fileInfo.FileHash.String(), nil)
 	w = httptest.NewRecorder()
 
 	srv.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Fatalf("Expected status 200 for /api/v2 path, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("Expected status 200 for /v2 path, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
