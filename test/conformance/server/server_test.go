@@ -18,8 +18,9 @@ import (
 )
 
 // TestServerUploadDownloadConformance tests that files uploaded through the native
-// Go client can be verified with the xet-go reference implementation, and that
-// files can be downloaded using the xet-go client.
+// Go client can be verified with the xet-go reference implementation, that files
+// can be uploaded using the xet-go client, and that files can be downloaded using
+// both the native client and the xet-go client.
 func TestServerUploadDownloadConformance(t *testing.T) {
 	tests := []struct {
 		name string
@@ -218,6 +219,57 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				t.Logf("Successfully downloaded and verified file with hash %s", expectedHash)
+			})
+
+			t.Run("upload_with_xetgo", func(t *testing.T) {
+				// Create temp directory and write test file
+				tempDir := t.TempDir()
+				uploadFile := filepath.Join(tempDir, "upload.bin")
+				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+					t.Fatalf("Failed to write upload file: %v", err)
+				}
+
+				// Upload using xet-go client
+				uploadResults, err := xetgo.UploadFiles(
+					[]string{uploadFile},
+					httpSrv.URL,
+					nil,   // token
+					nil,   // sha256s (computed automatically)
+					false, // skipSHA256
+				)
+				if err != nil {
+					t.Fatalf("Failed to upload file with xet-go: %v", err)
+				}
+
+				if len(uploadResults) != 1 {
+					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
+				}
+
+				xetgoHash := uploadResults[0].Hash
+				t.Logf("xet-go uploaded file with hash %s", xetgoHash)
+
+				// Parse the hash for download
+				fileHash, err := xet.ParseHash(xetgoHash)
+				if err != nil {
+					t.Fatalf("Failed to parse hash from xet-go: %v", err)
+				}
+
+				// Download using native client to verify
+				downloadSession := download.NewSession(download.SessionOptions{
+					Client: nativeClient,
+				})
+				downloadedData, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				if err != nil {
+					t.Fatalf("Failed to download file with native client: %v", err)
+				}
+
+				// Verify downloaded content matches original
+				if !bytes.Equal(downloadedData, tt.data) {
+					t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
+						len(downloadedData), len(tt.data))
+				}
+
+				t.Logf("Successfully uploaded with xet-go and downloaded with native client")
 			})
 
 			t.Run("download_with_xetgo", func(t *testing.T) {
