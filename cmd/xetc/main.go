@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -13,6 +13,8 @@ import (
 	"github.com/wzshiming/xet/pkg/client/download"
 	"github.com/wzshiming/xet/pkg/client/upload"
 )
+
+var ctx = context.Background()
 
 func main() {
 	if len(os.Args) < 2 {
@@ -23,8 +25,6 @@ func main() {
 	command := os.Args[1]
 
 	switch command {
-	case "info":
-		infoCommand()
 	case "upload":
 		uploadCommand()
 	case "download":
@@ -66,31 +66,6 @@ func printUsage() {
 	fmt.Println("  xetc download a1b2c3d4... output.txt --url https://xet.example.com")
 }
 
-func infoCommand() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: xetc info <file>")
-		os.Exit(1)
-	}
-
-	filename := os.Args[2]
-
-	f, err := os.Open(filename)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
-
-	info, err := upload.ComputeFileInfo(f)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error computing file info: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("File Hash: %s\n", info.FileHash.String())
-	fmt.Printf("SHA256: %s\n", hex.EncodeToString(info.SHA256[:]))
-}
-
 func uploadCommand() {
 	fs := flag.NewFlagSet("upload", flag.ExitOnError)
 	url := fs.String("url", "", "CAS server URL")
@@ -117,16 +92,7 @@ func uploadCommand() {
 		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Compute file info
-	fileInfo, err := upload.ComputeFileInfo(f)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error computing file info: %v\n", err)
-		os.Exit(1)
-	}
-	fileInfo.Path = filename
-
-	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())
+	defer f.Close()
 
 	// Create API client
 	client := client.NewClient(client.ClientOptions{
@@ -144,16 +110,17 @@ func uploadCommand() {
 	})
 
 	// Upload the file
-	ctx := context.Background()
-	fmt.Println("Uploading...")
-	err = session.UploadFiles(ctx, []upload.FileUploadInfo{fileInfo})
+	fmt.Printf("%s Uploading file: %s\n", filename)
+	filehashs, err := session.UploadFiles(ctx, f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Println("✓ Upload complete!")
-	fmt.Printf("File hash: %s\n", fileInfo.FileHash.String())
+	for _, h := range filehashs {
+		fmt.Printf("File hash: %s\n", h.String())
+	}
 }
 
 func downloadCommand() {
@@ -183,8 +150,6 @@ func downloadCommand() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Downloading file: %s\n", hashStr)
-
 	// Create API client
 	client := client.NewClient(client.ClientOptions{
 		BaseURL: *url,
@@ -199,21 +164,28 @@ func downloadCommand() {
 	})
 
 	// Download the file
-	ctx := context.Background()
-	fmt.Println("Downloading...")
-	data, err := session.DownloadFile(ctx, fileHash)
+
+	fmt.Printf("%s Downloading file with hash: %s\n", outputFile, fileHash.String())
+	reader, err := session.DownloadFile(ctx, fileHash)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Write to output file
-	err = os.WriteFile(outputFile, data, 0644)
+	file, err := os.Create(outputFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	// Write downloaded content to output file
+	n, err := io.Copy(file, reader)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing to output file: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ Download complete! (%d bytes)\n", len(data))
+	fmt.Printf("✓ Download complete! (%d bytes)\n", n)
 	fmt.Printf("Saved to: %s\n", outputFile)
 }

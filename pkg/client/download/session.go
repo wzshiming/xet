@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
@@ -35,29 +36,30 @@ func NewSession(opts SessionOptions) *Session {
 }
 
 // DownloadFile downloads and reconstructs a file from its hash
-func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) ([]byte, error) {
-	return s.DownloadFileRange(ctx, fileHash, 0, -1)
-}
-
-// DownloadFileRange downloads a byte range from a file
-func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, start, length int64) ([]byte, error) {
+func (s *Session) DownloadFile(ctx context.Context, fileHash xet.Hash) (io.Reader, error) {
 	// Step 1: Query reconstruction
-	var reconstruction *client.ReconstructionResponse
-	var err error
-
-	if length > 0 {
-		end := start + length - 1
-		reconstruction, err = s.client.GetReconstructionRange(ctx, fileHash, start, end)
-	} else {
-		reconstruction, err = s.client.GetReconstruction(ctx, fileHash)
-	}
-
+	reconstruction, err := s.client.GetReconstruction(ctx, fileHash)
 	if err != nil {
 		return nil, fmt.Errorf("query reconstruction: %w", err)
 	}
 
+	pr, pw := io.Pipe()
+
+	go func() {
+		defer pw.Close()
+
+		err := s.wrtieTo(ctx, pw, reconstruction)
+		if err != nil {
+			pw.CloseWithError(err)
+		}
+	}()
+
+	return pr, nil
+}
+
+func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *client.ReconstructionResponse) error {
 	// Step 2: Download and process terms
-	var result []byte
+
 	skipBytes := reconstruction.OffsetIntoFirstRange
 
 	for termIdx, term := range reconstruction.Terms {
@@ -65,13 +67,13 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 		xorbHashStr := term.Hash
 		xorbHash, err := xet.ParseHash(xorbHashStr)
 		if err != nil {
-			return nil, fmt.Errorf("parse xorb hash: %w", err)
+			return fmt.Errorf("parse xorb hash: %w", err)
 		}
 
 		// Get fetch info for this xorb
 		fetchInfoList, ok := reconstruction.FetchInfo[xorbHashStr]
 		if !ok || len(fetchInfoList) == 0 {
-			return nil, fmt.Errorf("no fetch info for xorb %s", xorbHashStr)
+			return fmt.Errorf("no fetch info for xorb %s", xorbHashStr)
 		}
 
 		// Download xorb data
@@ -79,18 +81,18 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 		// Note: We download the full xorb, not just the URLRange, because we need to deserialize it
 		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("download xorb data: %w", err)
+			return fmt.Errorf("download xorb data: %w", err)
 		}
 
 		// Deserialize xorb
 		xorbObj, err := xorb.Deserialize(xorbData)
 		if err != nil {
-			return nil, fmt.Errorf("deserialize xorb: %w", err)
+			return fmt.Errorf("deserialize xorb: %w", err)
 		}
 
 		// Verify xorb hash
 		if xorbObj.Hash != xorbHash {
-			return nil, fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
+			return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
 		}
 
 		// Extract chunks in the range
@@ -98,7 +100,7 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 		chunkEnd := term.Range.End
 
 		if chunkEnd > uint32(len(xorbObj.Chunks)) {
-			return nil, fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", chunkStart, chunkEnd, len(xorbObj.Chunks))
+			return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", chunkStart, chunkEnd, len(xorbObj.Chunks))
 		}
 
 		// Concatenate chunks
@@ -116,18 +118,18 @@ func (s *Session) DownloadFileRange(ctx context.Context, fileHash xet.Hash, star
 					skipBytes -= int64(len(chunk.UncompressedData))
 					continue
 				}
-				result = append(result, chunk.UncompressedData[skipBytes:]...)
+				_, err := w.Write(chunk.UncompressedData[skipBytes:])
+				if err != nil {
+					return fmt.Errorf("write to output: %w", err)
+				}
 				skipBytes = 0
 			} else {
-				result = append(result, chunk.UncompressedData...)
+				_, err := w.Write(chunk.UncompressedData)
+				if err != nil {
+					return fmt.Errorf("write to output: %w", err)
+				}
 			}
 		}
 	}
-
-	// Step 3: Truncate to requested length if needed
-	if length > 0 && int64(len(result)) > length {
-		result = result[:length]
-	}
-
-	return result, nil
+	return nil
 }
