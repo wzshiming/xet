@@ -15,10 +15,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/pkg/client"
+	"github.com/wzshiming/xet/pkg/client/download"
 	"github.com/wzshiming/xet/pkg/client/upload"
 	"github.com/wzshiming/xet/pkg/server"
+	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 // RequestRecord captures details of an HTTP request
@@ -50,9 +53,15 @@ func NewRecordingProxy(backend http.Handler) *RecordingProxy {
 func (p *RecordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Read the body
 	var bodyBytes []byte
+	var err error
 	if r.Body != nil {
-		bodyBytes, _ = io.ReadAll(r.Body)
+		bodyBytes, err = io.ReadAll(r.Body)
 		r.Body.Close()
+		if err != nil {
+			// Surface read failures deterministically instead of forwarding
+			http.Error(w, "failed to read request body", http.StatusBadGateway)
+			return
+		}
 		// Restore the body for the backend
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
@@ -105,7 +114,7 @@ func (p *RecordingProxy) ClearRequests() {
 }
 
 // TestClientUploadDownloadRequestConformance tests that xet-go and native clients
-// generate the same HTTP requests for upload and download operations
+// generate compatible HTTP requests for upload and download operations
 func TestClientUploadDownloadRequestConformance(t *testing.T) {
 	tests := []struct {
 		name string
@@ -135,56 +144,50 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create temporary directory for storage
-			storageDir := t.TempDir()
-
-			// Create the actual backend server
-			var storage server.Storage
-			var srv *server.Server
-			var proxy *RecordingProxy
-			var httpSrv *httptest.Server
-
-			// Create a placeholder handler that will be replaced
-			httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if proxy != nil {
-					proxy.ServeHTTP(w, r)
-				} else {
-					http.Error(w, "server not initialized", http.StatusInternalServerError)
-				}
-			}))
-			defer httpSrv.Close()
-
-			// Now create storage with the correct base URL
-			var err error
-			storage, err = server.NewFileStorage(server.FileStorageOptions{
-				BasePath: storageDir,
-				BaseURL:  httpSrv.URL,
-			})
-			if err != nil {
-				t.Fatalf("Failed to create storage: %v", err)
-			}
-
-			srv = server.NewServer(server.ServerOptions{
-				Storage: storage,
-			})
-
-			// Wrap server with recording proxy
-			proxy = NewRecordingProxy(srv)
-
 			t.Run("upload_conformance", func(t *testing.T) {
-				// Upload with xet-go
-				proxy.ClearRequests()
+				// Create separate temp directories for each client's storage
+				xetgoStorageDir := t.TempDir()
+				nativeStorageDir := t.TempDir()
 
+				// Setup server for xet-go
+				var xetgoStorage server.Storage
+				var xetgoSrv *server.Server
+				var xetgoProxy *RecordingProxy
+				var xetgoHttpSrv *httptest.Server
+
+				xetgoHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if xetgoProxy != nil {
+						xetgoProxy.ServeHTTP(w, r)
+					} else {
+						http.Error(w, "server not initialized", http.StatusInternalServerError)
+					}
+				}))
+				defer xetgoHttpSrv.Close()
+
+				var err error
+				xetgoStorage, err = server.NewFileStorage(server.FileStorageOptions{
+					BasePath: xetgoStorageDir,
+					BaseURL:  xetgoHttpSrv.URL,
+				})
+				if err != nil {
+					t.Fatalf("Failed to create xet-go storage: %v", err)
+				}
+
+				xetgoSrv = server.NewServer(server.ServerOptions{
+					Storage: xetgoStorage,
+				})
+				xetgoProxy = NewRecordingProxy(xetgoSrv)
+
+				// Upload with xet-go
 				tempDir := t.TempDir()
 				xetgoFile := filepath.Join(tempDir, "xetgo-upload.bin")
 				if err := os.WriteFile(xetgoFile, tt.data, 0644); err != nil {
 					t.Fatalf("Failed to write xet-go upload file: %v", err)
 				}
 
-				// Upload using xet-go client
 				uploadResults, err := xetgo.UploadFiles(
 					[]string{xetgoFile},
-					httpSrv.URL,
+					xetgoHttpSrv.URL,
 					nil,   // token
 					nil,   // sha256s (computed automatically)
 					false, // skipSHA256
@@ -197,27 +200,39 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
 				}
 
-				xetgoRequests := proxy.GetRequests()
-				t.Logf("xet-go generated %d requests", len(xetgoRequests))
+				xetgoRequests := xetgoProxy.GetRequests()
 
-				// Clear storage and requests for native client test
-				os.RemoveAll(storageDir)
-				storage, err = server.NewFileStorage(server.FileStorageOptions{
-					BasePath: storageDir,
-					BaseURL:  httpSrv.URL,
+				// Setup server for native client
+				var nativeStorage server.Storage
+				var nativeSrv *server.Server
+				var nativeProxy *RecordingProxy
+				var nativeHttpSrv *httptest.Server
+
+				nativeHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if nativeProxy != nil {
+						nativeProxy.ServeHTTP(w, r)
+					} else {
+						http.Error(w, "server not initialized", http.StatusInternalServerError)
+					}
+				}))
+				defer nativeHttpSrv.Close()
+
+				nativeStorage, err = server.NewFileStorage(server.FileStorageOptions{
+					BasePath: nativeStorageDir,
+					BaseURL:  nativeHttpSrv.URL,
 				})
 				if err != nil {
-					t.Fatalf("Failed to recreate storage: %v", err)
+					t.Fatalf("Failed to create native storage: %v", err)
 				}
-				srv = server.NewServer(server.ServerOptions{
-					Storage: storage,
+
+				nativeSrv = server.NewServer(server.ServerOptions{
+					Storage: nativeStorage,
 				})
-				proxy.backend = srv
-				proxy.ClearRequests()
+				nativeProxy = NewRecordingProxy(nativeSrv)
 
 				// Upload with native client
 				nativeClient := client.NewClient(client.ClientOptions{
-					BaseURL:   httpSrv.URL,
+					BaseURL:   nativeHttpSrv.URL,
 					Namespace: "default",
 				})
 
@@ -230,6 +245,11 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to open native upload file: %v", err)
 				}
+				defer func() {
+					if err := f.Close(); err != nil {
+						t.Fatalf("Failed to close native upload file: %v", err)
+					}
+				}()
 
 				uploadSession := upload.NewSession(upload.SessionOptions{
 					Client: nativeClient,
@@ -239,80 +259,263 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to upload file with native client: %v", err)
 				}
 
-				nativeRequests := proxy.GetRequests()
-				t.Logf("native client generated %d requests", len(nativeRequests))
+				nativeRequests := nativeProxy.GetRequests()
 
 				// Compare requests
-				compareRequests(t, xetgoRequests, nativeRequests, uploadResults[0].Hash, fileHashes[0].String())
+				compareUploadRequests(t, xetgoRequests, nativeRequests, uploadResults[0].Hash, fileHashes[0].String())
+			})
+
+			t.Run("download_conformance", func(t *testing.T) {
+				// Setup shared server
+				storageDir := t.TempDir()
+				var storage server.Storage
+				var srv *server.Server
+				var proxy *RecordingProxy
+				var httpSrv *httptest.Server
+
+				httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if proxy != nil {
+						proxy.ServeHTTP(w, r)
+					} else {
+						http.Error(w, "server not initialized", http.StatusInternalServerError)
+					}
+				}))
+				defer httpSrv.Close()
+
+				var err error
+				storage, err = server.NewFileStorage(server.FileStorageOptions{
+					BasePath: storageDir,
+					BaseURL:  httpSrv.URL,
+				})
+				if err != nil {
+					t.Fatalf("Failed to create storage: %v", err)
+				}
+
+				srv = server.NewServer(server.ServerOptions{
+					Storage: storage,
+				})
+				proxy = NewRecordingProxy(srv)
+
+				// First upload file using native client
+				nativeClient := client.NewClient(client.ClientOptions{
+					BaseURL:   httpSrv.URL,
+					Namespace: "default",
+				})
+
+				tempDir := t.TempDir()
+				uploadFile := filepath.Join(tempDir, "upload.bin")
+				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+					t.Fatalf("Failed to write upload file: %v", err)
+				}
+
+				f, err := os.Open(uploadFile)
+				if err != nil {
+					t.Fatalf("Failed to open upload file: %v", err)
+				}
+
+				uploadSession := upload.NewSession(upload.SessionOptions{
+					Client: nativeClient,
+				})
+				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				f.Close()
+				if err != nil {
+					t.Fatalf("Failed to upload file: %v", err)
+				}
+
+				fileHash := fileHashes[0]
+
+				// Download with xet-go
+				proxy.ClearRequests()
+				xetgoDownloadFile := filepath.Join(tempDir, "xetgo-download.bin")
+				downloadReq := []xetgo.DownloadRequest{
+					{
+						DestinationPath: xetgoDownloadFile,
+						Hash:            fileHash.String(),
+						FileSize:        int64(len(tt.data)),
+					},
+				}
+
+				_, err = xetgo.DownloadFiles(downloadReq, httpSrv.URL, nil)
+				if err != nil {
+					t.Fatalf("Failed to download file with xet-go: %v", err)
+				}
+
+				xetgoRequests := proxy.GetRequests()
+
+				// Download with native client
+				proxy.ClearRequests()
+				downloadSession := download.NewSession(download.SessionOptions{
+					Client: nativeClient,
+				})
+				reader, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				if err != nil {
+					t.Fatalf("Failed to download file with native client: %v", err)
+				}
+
+				nativeDownloadedData, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("Failed to read downloaded data: %v", err)
+				}
+
+				nativeRequests := proxy.GetRequests()
+
+				// Verify downloaded content matches
+				xetgoDownloadedData, err := os.ReadFile(xetgoDownloadFile)
+				if err != nil {
+					t.Fatalf("Failed to read xet-go downloaded file: %v", err)
+				}
+
+				if !bytes.Equal(xetgoDownloadedData, tt.data) {
+					t.Errorf("xet-go downloaded data mismatch: got %d bytes, want %d bytes", len(xetgoDownloadedData), len(tt.data))
+				}
+
+				if !bytes.Equal(nativeDownloadedData, tt.data) {
+					t.Errorf("native downloaded data mismatch: got %d bytes, want %d bytes", len(nativeDownloadedData), len(tt.data))
+				}
+
+				// Compare download requests
+				compareDownloadRequests(t, xetgoRequests, nativeRequests, fileHash.String())
 			})
 		})
 	}
 }
 
-// compareRequests compares HTTP requests from xet-go and native clients
-func compareRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, xetgoHash, nativeHash string) {
+// compareUploadRequests compares HTTP requests from xet-go and native clients for uploads
+func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, xetgoHash, nativeHash string) {
 	t.Helper()
 
-	// First, verify that file hashes match
+	// STRICT: Verify that file hashes match
 	if xetgoHash != nativeHash {
 		t.Errorf("File hash mismatch: xet-go=%s native=%s", xetgoHash, nativeHash)
 		return
 	}
-	t.Logf("✓ File hashes match: %s", nativeHash)
 
-	// Group requests by type (method + path pattern)
+	// Group requests by type
 	xetgoByType := groupRequestsByType(xetgoReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// Compare request types
+	// Get request types
 	xetgoTypes := getSortedKeys(xetgoByType)
 	nativeTypes := getSortedKeys(nativeByType)
 
-	t.Logf("xet-go request types: %v", xetgoTypes)
-	t.Logf("native request types: %v", nativeTypes)
-
-	// Check for major differences in request types
-	// Note: xet-go may make deduplication queries that native doesn't
+	// Filter core requests (exclude dedup queries which are optional)
 	coreXetgoTypes := filterCoreRequests(xetgoTypes)
 	coreNativeTypes := filterCoreRequests(nativeTypes)
 
+	// STRICT: Both clients must make core uploads (xorb + shard)
 	if !equalStringSlices(coreXetgoTypes, coreNativeTypes) {
-		t.Logf("Core request type difference (excluding dedup queries):\n  xet-go:  %v\n  native:  %v",
+		t.Errorf("Core request type mismatch:\n  xet-go:  %v\n  native:  %v",
 			coreXetgoTypes, coreNativeTypes)
-	} else {
-		t.Logf("✓ Core request types match (both upload xorbs and shards)")
 	}
 
-	// For each request type, compare the number of requests
-	for reqType, xetgoTypeReqs := range xetgoByType {
-		nativeTypeReqs, ok := nativeByType[reqType]
-		if !ok {
-			if strings.HasPrefix(reqType, "GET:/v1/chunks/") {
-				// xet-go makes deduplication queries, native might not - this is acceptable
-				t.Logf("  xet-go made %d deduplication query/queries", len(xetgoTypeReqs))
-			} else {
-				t.Logf("Request type %s present in xet-go but not in native", reqType)
+	// STRICT: Both must upload at least one xorb
+	xetgoXorbCount := len(xetgoByType["POST:/v1/xorbs/default/{hash}"])
+	nativeXorbCount := len(nativeByType["POST:/v1/xorbs/default/{hash}"])
+	if xetgoXorbCount == 0 {
+		t.Errorf("xet-go did not upload any xorbs")
+	}
+	if nativeXorbCount == 0 {
+		t.Errorf("native client did not upload any xorbs")
+	}
+
+	// STRICT: Both must upload exactly one shard
+	xetgoShardCount := len(xetgoByType["POST:/shards"]) + len(xetgoByType["POST:/v1/shards"])
+	nativeShardCount := len(nativeByType["POST:/shards"]) + len(nativeByType["POST:/v1/shards"])
+	if xetgoShardCount != 1 {
+		t.Errorf("xet-go uploaded %d shards, expected exactly 1", xetgoShardCount)
+	}
+	if nativeShardCount != 1 {
+		t.Errorf("native client uploaded %d shards, expected exactly 1", nativeShardCount)
+	}
+
+	// Symmetric validation: check for native-only request types
+	for reqType := range nativeByType {
+		if !strings.HasPrefix(reqType, "GET:/v1/chunks/") {
+			if _, ok := xetgoByType[reqType]; !ok {
+				t.Errorf("Request type %s present in native but not in xet-go", reqType)
 			}
-			continue
-		}
-
-		if len(xetgoTypeReqs) != len(nativeTypeReqs) {
-			t.Logf("Request count differs for %s: xet-go=%d native=%d",
-				reqType, len(xetgoTypeReqs), len(nativeTypeReqs))
-			// This is informational, not necessarily an error
-			// Different chunking strategies might lead to different xorb counts
-		}
-
-		// For upload xorb requests, verify that bodies match (same chunks uploaded)
-		if strings.HasPrefix(reqType, "POST:/v1/xorbs/") {
-			compareXorbRequests(t, xetgoTypeReqs, nativeTypeReqs)
-		}
-
-		// For shard upload requests, compare structure
-		if reqType == "POST:/shards" || reqType == "POST:/v1/shards" {
-			compareShardRequests(t, xetgoTypeReqs, nativeTypeReqs)
 		}
 	}
+
+	// Compare xorb uploads - validate chunk content
+	if strings.HasPrefix("POST:/v1/xorbs/", "POST:/v1/xorbs/") {
+		xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
+		nativeXorbReqs := nativeByType["POST:/v1/xorbs/default/{hash}"]
+		compareXorbRequests(t, xetgoXorbReqs, nativeXorbReqs)
+	}
+}
+
+// compareDownloadRequests compares HTTP requests from xet-go and native clients for downloads
+func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHash string) {
+	t.Helper()
+
+	// Group requests by type
+	xetgoByType := groupRequestsByType(xetgoReqs)
+	nativeByType := groupRequestsByType(nativeReqs)
+
+	// Get request types
+	xetgoTypes := getSortedKeys(xetgoByType)
+	nativeTypes := getSortedKeys(nativeByType)
+
+	// STRICT: Both must query reconstruction (v1 or v2)
+	xetgoReconCount := len(xetgoByType["GET:/v1/reconstructions/{hash}"]) + len(xetgoByType["GET:/v2/reconstructions/{hash}"])
+	nativeReconCount := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
+	if xetgoReconCount == 0 {
+		t.Errorf("xet-go did not query reconstruction")
+	}
+	if nativeReconCount == 0 {
+		t.Errorf("native client did not query reconstruction")
+	}
+
+	// STRICT: Both must download xorb data
+	xetgoXorbDownloadCount := len(xetgoByType["GET:/v1/xorbs/default/{hash}/data"])
+	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}/data"])
+	if xetgoXorbDownloadCount == 0 {
+		t.Errorf("xet-go did not download any xorb data")
+	}
+	if nativeXorbDownloadCount == 0 {
+		t.Errorf("native client did not download any xorb data")
+	}
+
+	// Symmetric validation - allowing for v1/v2 API version differences
+	for reqType := range nativeByType {
+		// Check if this request type exists in xetgo, allowing v1/v2 API version differences
+		if !hasEquivalentRequest(reqType, xetgoByType) {
+			t.Errorf("Request type %s present in native but no equivalent in xet-go", reqType)
+		}
+	}
+	for reqType := range xetgoByType {
+		// Check if this request type exists in native, allowing v1/v2 API version differences
+		if !hasEquivalentRequest(reqType, nativeByType) {
+			t.Errorf("Request type %s present in xet-go but no equivalent in native", reqType)
+		}
+	}
+
+	t.Logf("✓ Download conformance check passed for file %s", fileHash)
+	t.Logf("  xet-go request types: %v", xetgoTypes)
+	t.Logf("  native request types: %v", nativeTypes)
+}
+
+// hasEquivalentRequest checks if a request type or its v1/v2 equivalent exists in the map
+func hasEquivalentRequest(reqType string, requests map[string][]RequestRecord) bool {
+	if _, ok := requests[reqType]; ok {
+		return true
+	}
+
+	// Check for v1/v2 API version differences
+	if strings.Contains(reqType, "/v1/") {
+		v2Type := strings.Replace(reqType, "/v1/", "/v2/", 1)
+		if _, ok := requests[v2Type]; ok {
+			return true
+		}
+	} else if strings.Contains(reqType, "/v2/") {
+		v1Type := strings.Replace(reqType, "/v2/", "/v1/", 1)
+		if _, ok := requests[v1Type]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // filterCoreRequests filters out deduplication queries to focus on core upload operations
@@ -383,97 +586,77 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
-// compareXorbRequests compares xorb upload requests
+// compareXorbRequests compares xorb upload requests by deserializing and comparing chunk content
 func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
-	// Collect all xorb bodies from both clients
-	xetgoBodies := make(map[string][]byte)
-	nativeBodies := make(map[string][]byte)
+	// Collect all chunk hashes from both clients by deserializing xorbs
+	xetgoChunkHashes := make(map[xet.Hash]bool)
+	nativeChunkHashes := make(map[xet.Hash]bool)
 
 	for _, req := range xetgoReqs {
-		// Extract hash from path
-		parts := strings.Split(req.Path, "/")
-		if len(parts) >= 4 {
-			hash := parts[len(parts)-1]
-			xetgoBodies[hash] = req.Body
+		// Try to deserialize the xorb
+		xorbObj, err := xorb.Deserialize(req.Body)
+		if err != nil {
+			// Try chunks-only format
+			xorbObj, err = xorb.DeserializeChunksOnly(req.Body)
+			if err != nil {
+				t.Errorf("Failed to deserialize xet-go xorb: %v", err)
+				continue
+			}
+		}
+
+		// Collect chunk hashes
+		for _, chunkHash := range xorbObj.ChunkHashes {
+			xetgoChunkHashes[chunkHash] = true
 		}
 	}
 
 	for _, req := range nativeReqs {
-		// Extract hash from path
-		parts := strings.Split(req.Path, "/")
-		if len(parts) >= 4 {
-			hash := parts[len(parts)-1]
-			nativeBodies[hash] = req.Body
+		// Try to deserialize the xorb
+		xorbObj, err := xorb.Deserialize(req.Body)
+		if err != nil {
+			// Try chunks-only format
+			xorbObj, err = xorb.DeserializeChunksOnly(req.Body)
+			if err != nil {
+				t.Errorf("Failed to deserialize native xorb: %v", err)
+				continue
+			}
+		}
+
+		// Collect chunk hashes
+		for _, chunkHash := range xorbObj.ChunkHashes {
+			nativeChunkHashes[chunkHash] = true
 		}
 	}
 
-	// Since both clients should produce the same chunks (same chunking algorithm),
-	// they should upload the same xorbs
-	t.Logf("xet-go uploaded %d xorbs, native uploaded %d xorbs",
-		len(xetgoBodies), len(nativeBodies))
-
-	// Compare xorb hashes - both should have uploaded xorbs with the same hashes
-	xetgoHashes := getSortedMapKeys(xetgoBodies)
-	nativeHashes := getSortedMapKeys(nativeBodies)
-
-	if !equalStringSlices(xetgoHashes, nativeHashes) {
-		t.Logf("Xorb hash sets differ:")
-		t.Logf("  xet-go:  %v", xetgoHashes)
-		t.Logf("  native:  %v", nativeHashes)
-		// This might be acceptable if chunking produces different results
-		// but we should at least log it
-	}
-
-	// For matching hashes, verify both uploaded xorbs for the same chunk hash
-	// Note: The serialization format might differ (e.g., with/without footer),
-	// but both should be valid xorb representations
-	for hash := range xetgoBodies {
-		if _, ok := nativeBodies[hash]; ok {
-			t.Logf("✓ Both clients uploaded xorb for chunk hash %s", hash)
-			// Both clients uploaded xorb with this hash - this is the key conformance point
+	// STRICT: Both clients must upload the same set of chunk hashes
+	// (same chunking algorithm should produce same chunks)
+	xetgoOnly := []xet.Hash{}
+	for hash := range xetgoChunkHashes {
+		if !nativeChunkHashes[hash] {
+			xetgoOnly = append(xetgoOnly, hash)
 		}
 	}
 
-	// Report any xorbs that were only uploaded by one client
-	for hash := range xetgoBodies {
-		if _, ok := nativeBodies[hash]; !ok {
-			t.Logf("  xet-go uploaded xorb %s but native did not", hash)
+	nativeOnly := []xet.Hash{}
+	for hash := range nativeChunkHashes {
+		if !xetgoChunkHashes[hash] {
+			nativeOnly = append(nativeOnly, hash)
 		}
 	}
-	for hash := range nativeBodies {
-		if _, ok := xetgoBodies[hash]; !ok {
-			t.Logf("  native uploaded xorb %s but xet-go did not", hash)
-		}
+
+	if len(xetgoOnly) > 0 {
+		t.Errorf("xet-go uploaded %d chunks that native did not: %v", len(xetgoOnly), xetgoOnly)
 	}
-}
-
-// compareShardRequests compares shard upload requests
-func compareShardRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
-	t.Helper()
-
-	if len(xetgoReqs) == 0 || len(nativeReqs) == 0 {
-		t.Logf("Shard upload count: xet-go=%d native=%d", len(xetgoReqs), len(nativeReqs))
-		return
+	if len(nativeOnly) > 0 {
+		t.Errorf("native uploaded %d chunks that xet-go did not: %v", len(nativeOnly), nativeOnly)
 	}
 
-	// Just verify that both clients uploaded shards
-	t.Logf("Both clients uploaded shards: xet-go=%d bytes, native=%d bytes",
-		len(xetgoReqs[0].Body), len(nativeReqs[0].Body))
-
-	// We don't compare shard bodies directly because the internal structure
-	// might differ, but both should reference the same file hash
-}
-
-// getSortedMapKeys returns sorted keys from a map
-func getSortedMapKeys(m map[string][]byte) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	// Log success
+	if len(xetgoOnly) == 0 && len(nativeOnly) == 0 {
+		t.Logf("✓ Both clients uploaded identical chunk sets (%d chunks)", len(xetgoChunkHashes))
 	}
-	sort.Strings(keys)
-	return keys
 }
 
 var seed = rand.NewSource(0)
