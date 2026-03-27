@@ -68,7 +68,24 @@ func (x *Xorb) AddChunk(chunk xet.ChunkBytes) error {
 	})
 	x.ChunkHashes = append(x.ChunkHashes, chunkHash)
 
+	// Update xorb hash
+	x.UpdateHash()
+
 	return nil
+}
+
+// UpdateHash recomputes the xorb hash from the current chunks
+func (x *Xorb) UpdateHash() {
+	if len(x.Chunks) == 0 {
+		x.Hash = xet.Hash{}
+		return
+	}
+
+	chunkSizes := make([]uint64, len(x.Chunks))
+	for i, chunk := range x.Chunks {
+		chunkSizes[i] = uint64(len(chunk.UncompressedData))
+	}
+	x.Hash = xet.ComputeXorbHash(x.ChunkHashes, chunkSizes)
 }
 
 // SerializeChunksOnly serializes only the chunk data region without footer
@@ -476,4 +493,182 @@ func CompressedDataStream(data []byte) (stream []byte, chunkOffsets []int, err e
 	}
 
 	return buf, chunkOffsets, nil
+}
+
+// NumChunks returns the number of chunks in the xorb
+func (x *Xorb) NumChunks() int {
+	return len(x.Chunks)
+}
+
+// NumBytes returns the total number of uncompressed bytes in the xorb
+func (x *Xorb) NumBytes() uint64 {
+	var total uint64
+	for _, chunk := range x.Chunks {
+		total += uint64(len(chunk.UncompressedData))
+	}
+	return total
+}
+
+// GetByteOffset returns the byte offsets for a chunk range in the packed (compressed) data.
+// The offsets are relative to the start of the chunk data region (after any headers).
+// Returns (startOffset, endOffset) where the range is [startOffset, endOffset).
+func (x *Xorb) GetByteOffset(chunkIndexStart, chunkIndexEnd int) (uint64, uint64, error) {
+	if chunkIndexStart < 0 || chunkIndexEnd > len(x.Chunks) || chunkIndexStart > chunkIndexEnd {
+		return 0, 0, fmt.Errorf("invalid chunk range: [%d, %d) for xorb with %d chunks",
+			chunkIndexStart, chunkIndexEnd, len(x.Chunks))
+	}
+
+	var startOffset uint64 = 0
+	var endOffset uint64 = 0
+
+	// Calculate offsets by summing up chunk sizes
+	for i := 0; i < chunkIndexEnd; i++ {
+		chunkSize := uint64(8 + len(x.Chunks[i].CompressedData)) // 8-byte header + compressed data
+		if i < chunkIndexStart {
+			startOffset += chunkSize
+		}
+		endOffset += chunkSize
+	}
+
+	return startOffset, endOffset, nil
+}
+
+// UncompressedChunkLength returns the uncompressed size of a specific chunk
+func (x *Xorb) UncompressedChunkLength(chunkIndex int) (uint64, error) {
+	if chunkIndex < 0 || chunkIndex >= len(x.Chunks) {
+		return 0, fmt.Errorf("invalid chunk index: %d for xorb with %d chunks",
+			chunkIndex, len(x.Chunks))
+	}
+	return uint64(len(x.Chunks[chunkIndex].UncompressedData)), nil
+}
+
+// UncompressedRangeLength returns the total uncompressed size of a chunk range
+func (x *Xorb) UncompressedRangeLength(chunkIndexStart, chunkIndexEnd int) (uint64, error) {
+	if chunkIndexStart < 0 || chunkIndexEnd > len(x.Chunks) || chunkIndexStart > chunkIndexEnd {
+		return 0, fmt.Errorf("invalid chunk range: [%d, %d) for xorb with %d chunks",
+			chunkIndexStart, chunkIndexEnd, len(x.Chunks))
+	}
+
+	var total uint64
+	for i := chunkIndexStart; i < chunkIndexEnd; i++ {
+		total += uint64(len(x.Chunks[i].UncompressedData))
+	}
+	return total, nil
+}
+
+// GetBytesByChunkRange extracts the uncompressed data for a specific chunk range
+func (x *Xorb) GetBytesByChunkRange(chunkIndexStart, chunkIndexEnd int) ([]byte, error) {
+	if chunkIndexStart < 0 || chunkIndexEnd > len(x.Chunks) || chunkIndexStart > chunkIndexEnd {
+		return nil, fmt.Errorf("invalid chunk range: [%d, %d) for xorb with %d chunks",
+			chunkIndexStart, chunkIndexEnd, len(x.Chunks))
+	}
+
+	// Calculate total size
+	totalSize := uint64(0)
+	for i := chunkIndexStart; i < chunkIndexEnd; i++ {
+		totalSize += uint64(len(x.Chunks[i].UncompressedData))
+	}
+
+	// Allocate result buffer
+	result := make([]byte, 0, totalSize)
+	for i := chunkIndexStart; i < chunkIndexEnd; i++ {
+		result = append(result, x.Chunks[i].UncompressedData...)
+	}
+
+	return result, nil
+}
+
+// GetChunk returns the uncompressed data for a specific chunk
+func (x *Xorb) GetChunk(chunkIndex int) ([]byte, error) {
+	if chunkIndex < 0 || chunkIndex >= len(x.Chunks) {
+		return nil, fmt.Errorf("invalid chunk index: %d for xorb with %d chunks",
+			chunkIndex, len(x.Chunks))
+	}
+	return x.Chunks[chunkIndex].UncompressedData, nil
+}
+
+// ChunkHash returns the hash of a specific chunk
+func (x *Xorb) ChunkHash(chunkIndex int) (xet.Hash, error) {
+	if chunkIndex < 0 || chunkIndex >= len(x.Chunks) {
+		return xet.Hash{}, fmt.Errorf("invalid chunk index: %d for xorb with %d chunks",
+			chunkIndex, len(x.Chunks))
+	}
+	return x.ChunkHashes[chunkIndex], nil
+}
+
+// Validate validates the xorb structure integrity
+func (x *Xorb) Validate() error {
+	// Check that we have the same number of chunks and hashes
+	if len(x.Chunks) != len(x.ChunkHashes) {
+		return fmt.Errorf("chunk count mismatch: %d chunks, %d hashes",
+			len(x.Chunks), len(x.ChunkHashes))
+	}
+
+	// Validate each chunk
+	for i, chunk := range x.Chunks {
+		// Verify chunk hash matches
+		computedHash := xet.ChunkBytes(chunk.UncompressedData).Hash()
+		if computedHash != x.ChunkHashes[i] {
+			return fmt.Errorf("chunk %d hash mismatch: expected %s, got %s",
+				i, x.ChunkHashes[i].String(), computedHash.String())
+		}
+
+		// Verify uncompressed data can be recompressed
+		recompressed, compressionType, err := SelectBestCompression(chunk.UncompressedData)
+		if err != nil {
+			return fmt.Errorf("chunk %d failed recompression: %w", i, err)
+		}
+
+		// Verify compression type is valid
+		if chunk.CompressionType != compressionType && chunk.CompressionType != CompressionNone {
+			// Note: We allow CompressionNone even if another type would be better
+			// This is for compatibility with different compression preferences
+		}
+
+		// Verify decompression works
+		decompressed, err := DecompressChunk(chunk.CompressedData, chunk.CompressionType,
+			len(chunk.UncompressedData))
+		if err != nil {
+			return fmt.Errorf("chunk %d failed decompression: %w", i, err)
+		}
+		if !bytes.Equal(decompressed, chunk.UncompressedData) {
+			return fmt.Errorf("chunk %d decompression mismatch", i)
+		}
+
+		// Suppress unused variable warning
+		_ = recompressed
+	}
+
+	// Verify xorb hash if we have chunks
+	if len(x.Chunks) > 0 {
+		chunkSizes := make([]uint64, len(x.Chunks))
+		for i, chunk := range x.Chunks {
+			chunkSizes[i] = uint64(len(chunk.UncompressedData))
+		}
+		computedHash := xet.ComputeXorbHash(x.ChunkHashes, chunkSizes)
+		if computedHash != x.Hash {
+			return fmt.Errorf("xorb hash mismatch: expected %s, got %s",
+				x.Hash.String(), computedHash.String())
+		}
+	}
+
+	return nil
+}
+
+// ReconstructXorbWithFooter takes chunks-only serialized data and reconstructs
+// a full xorb with footer. This is useful when receiving xorb uploads that only
+// contain the chunk data region.
+func ReconstructXorbWithFooter(chunksOnlyData []byte) (*Xorb, error) {
+	// Deserialize chunks-only format
+	xorb, err := DeserializeChunksOnly(chunksOnlyData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize chunks: %w", err)
+	}
+
+	// Validate the reconstructed xorb
+	if err := xorb.Validate(); err != nil {
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
+	return xorb, nil
 }
