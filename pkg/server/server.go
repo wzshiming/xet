@@ -503,12 +503,14 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	// format), while the Go client uses the full format with XETBLOB footer.
 	// Try the full format first; fall back to chunks-only.
 	deserializedXorb, err := xorb.Deserialize(xorbData)
+	isChunksOnly := false
 	if err != nil {
 		deserializedXorb, err = xorb.DeserializeChunksOnly(xorbData)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
 			return
 		}
+		isChunksOnly = true
 	}
 
 	if deserializedXorb.Hash != xorbHash {
@@ -516,8 +518,20 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Normalize to full format with footer for storage.
+	// If we received chunks-only format from xet-core/xet-go, re-serialize
+	// it with the footer so that all clients can download consistently.
+	dataToStore := xorbData
+	if isChunksOnly {
+		dataToStore, err = deserializedXorb.Serialize()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to serialize xorb with footer: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
 	// Store xorb
-	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, xorbHash, xorbData)
+	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, xorbHash, dataToStore)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
