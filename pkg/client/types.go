@@ -51,3 +51,23 @@ type DeduplicationInfo struct {
 	ChunkIndex uint32
 	Found      bool
 }
+
+// ReconstructionResponseV2 represents the V2 response from the file reconstruction API
+// It uses a multi-range optimized format for fetching xorb data
+type ReconstructionResponseV2 struct {
+	OffsetIntoFirstRange int64                          `json:"offset_into_first_range"`
+	Terms                []Term                         `json:"terms"`
+	Xorbs                map[string][]XorbMultiRangeFetch `json:"xorbs"`
+}
+
+// XorbMultiRangeFetch represents a signed multi-range fetch entry covering multiple byte ranges for a xorb
+type XorbMultiRangeFetch struct {
+	URL    string               `json:"url"`
+	Ranges []XorbRangeDescriptor `json:"ranges"`
+}
+
+// XorbRangeDescriptor describes a chunk/byte range within a xorb
+type XorbRangeDescriptor struct {
+	Chunks ChunkRange `json:"chunks"`
+	Bytes  ByteRange  `json:"bytes"`
+}
