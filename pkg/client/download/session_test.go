@@ -544,6 +544,473 @@ func TestDownloadFileRangeWithLength(t *testing.T) {
 	}
 }
 
+func TestDownloadFileV2(t *testing.T) {
+	chunk1Data := []byte("Hello, ")
+	chunk2Data := []byte("World!")
+	expectedData := append(chunk1Data, chunk2Data...)
+
+	xorbHash, xorbSerialized, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: 0,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(expectedData)),
+						Range:          client.ChunkRange{Start: 0, End: 2},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 2},
+									Bytes:  client.ByteRange{Start: 0, End: 0}, // Zero indicates full download
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			w.Write(xorbSerialized)
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client: c,
+	})
+
+	reader, err := session.DownloadFileV2(context.Background(), xorbHash)
+	if err != nil {
+		t.Fatalf("DownloadFileV2 failed: %v", err)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedData) {
+		t.Errorf("Downloaded data mismatch: got %q, want %q", downloadedData, expectedData)
+	}
+}
+
+func TestDownloadFileWithLengthV2(t *testing.T) {
+	chunk1Data := []byte("Hello, ")
+	chunk2Data := []byte("World!")
+	expectedData := append(chunk1Data, chunk2Data...)
+
+	xorbHash, xorbSerialized, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: 0,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(expectedData)),
+						Range:          client.ChunkRange{Start: 0, End: 2},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 2},
+									Bytes:  client.ByteRange{Start: 0, End: 0},
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			w.Write(xorbSerialized)
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client: c,
+	})
+
+	reader, length, err := session.DownloadFileWithLengthV2(context.Background(), xorbHash)
+	if err != nil {
+		t.Fatalf("DownloadFileWithLengthV2 failed: %v", err)
+	}
+
+	if length != int64(len(expectedData)) {
+		t.Fatalf("Expected length %d, got %d", len(expectedData), length)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedData) {
+		t.Errorf("Downloaded data mismatch: got %q, want %q", downloadedData, expectedData)
+	}
+}
+
+func TestDownloadFileRangeV2(t *testing.T) {
+	chunk1Data := []byte("AAAAAAA") // 7 bytes
+	chunk2Data := []byte("BBBBBBB") // 7 bytes
+	chunk3Data := []byte("CCCCCCC") // 7 bytes
+	allData := append(append(chunk1Data, chunk2Data...), chunk3Data...)
+
+	rangeStart := int64(7)
+	rangeEnd := int64(13)
+	expectedRangeData := allData[rangeStart : rangeEnd+1]
+
+	xorbHash, _, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data, chunk3Data})
+
+	var rangeHeaderSent string
+	var xorbRangeHeaderSent string
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			rangeHeaderSent = r.Header.Get("Range")
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: 0,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(chunk2Data)),
+						Range:          client.ChunkRange{Start: 0, End: 1},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 1},
+									Bytes:  client.ByteRange{Start: 100, End: 200},
+								},
+							},
+						},
+					},
+				},
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			xorbRangeHeaderSent = r.Header.Get("Range")
+			if xorbRangeHeaderSent != "" {
+				w.WriteHeader(http.StatusPartialContent)
+				tempXorb := xorb.NewXorb()
+				chunk := xet.ChunkBytes(chunk2Data)
+				tempXorb.AddChunk(chunk)
+				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				w.Write(tempChunksOnly)
+			} else {
+				http.Error(w, "Not found", http.StatusNotFound)
+			}
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client: c,
+	})
+
+	reader, err := session.DownloadFileRangeV2(context.Background(), xorbHash, rangeStart, rangeEnd)
+	if err != nil {
+		t.Fatalf("DownloadFileRangeV2 failed: %v", err)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedRangeData) {
+		t.Errorf("Downloaded range data mismatch: got %q (len=%d), want %q (len=%d)",
+			downloadedData, len(downloadedData), expectedRangeData, len(expectedRangeData))
+	}
+
+	if rangeHeaderSent == "" {
+		t.Error("Expected Range header to be sent to reconstruction endpoint")
+	}
+	if xorbRangeHeaderSent == "" {
+		t.Error("Expected Range header to be sent to xorb download endpoint")
+	}
+}
+
+func TestDownloadFileRangeWithLengthV2(t *testing.T) {
+	chunk1Data := []byte("AAAAAAA") // 7 bytes
+	chunk2Data := []byte("BBBBBBB") // 7 bytes
+	chunk3Data := []byte("CCCCCCC") // 7 bytes
+	allData := append(append(chunk1Data, chunk2Data...), chunk3Data...)
+
+	rangeStart := int64(7)
+	rangeEnd := int64(13)
+	expectedRangeData := allData[rangeStart : rangeEnd+1]
+
+	xorbHash, _, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data, chunk3Data})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: 0,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(chunk2Data)),
+						Range:          client.ChunkRange{Start: 0, End: 1},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 1},
+									Bytes:  client.ByteRange{Start: 100, End: 200},
+								},
+							},
+						},
+					},
+				},
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader != "" {
+				w.WriteHeader(http.StatusPartialContent)
+				tempXorb := xorb.NewXorb()
+				chunk := xet.ChunkBytes(chunk2Data)
+				tempXorb.AddChunk(chunk)
+				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				w.Write(tempChunksOnly)
+			} else {
+				http.Error(w, "Not found", http.StatusNotFound)
+			}
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client: c,
+	})
+
+	reader, length, err := session.DownloadFileRangeWithLengthV2(context.Background(), xorbHash, rangeStart, rangeEnd)
+	if err != nil {
+		t.Fatalf("DownloadFileRangeWithLengthV2 failed: %v", err)
+	}
+
+	if length != int64(len(expectedRangeData)) {
+		t.Fatalf("Expected range length %d, got %d", len(expectedRangeData), length)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedRangeData) {
+		t.Errorf("Downloaded range data mismatch: got %q (len=%d), want %q (len=%d)",
+			downloadedData, len(downloadedData), expectedRangeData, len(expectedRangeData))
+	}
+}
+
+func TestDownloadFileV2WithOffset(t *testing.T) {
+	chunk1Data := []byte("AAAAAAA") // 7 bytes
+	chunk2Data := []byte("BBBBBBB") // 7 bytes
+	allData := append(chunk1Data, chunk2Data...)
+
+	offset := int64(3)
+	expectedData := allData[offset:]
+
+	xorbHash, xorbSerialized, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: offset,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(allData)),
+						Range:          client.ChunkRange{Start: 0, End: 2},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 2},
+									Bytes:  client.ByteRange{Start: 0, End: 0},
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			w.Write(xorbSerialized)
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client: c,
+	})
+
+	reader, length, err := session.DownloadFileWithLengthV2(context.Background(), xorbHash)
+	if err != nil {
+		t.Fatalf("DownloadFileWithLengthV2 failed: %v", err)
+	}
+
+	if length != int64(len(expectedData)) {
+		t.Fatalf("Expected length %d, got %d", len(expectedData), length)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedData) {
+		t.Errorf("Downloaded data with offset mismatch: got %q (len=%d), want %q (len=%d)",
+			downloadedData, len(downloadedData), expectedData, len(expectedData))
+	}
+}
+
+func TestDownloadFileV2WithCache(t *testing.T) {
+	chunk1Data := []byte("Cached ")
+	chunk2Data := []byte("Chunks!")
+	expectedData := append(chunk1Data, chunk2Data...)
+
+	xorbHash, xorbSerialized, _ := createTestXorb(t, [][]byte{chunk1Data, chunk2Data})
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/reconstructions/"+xorbHash.String() {
+			resp := client.ReconstructionResponseV2{
+				OffsetIntoFirstRange: 0,
+				Terms: []client.Term{
+					{
+						Hash:           xorbHash.String(),
+						UnpackedLength: uint64(len(expectedData)),
+						Range:          client.ChunkRange{Start: 0, End: 2},
+					},
+				},
+				Xorbs: map[string][]client.XorbMultiRangeFetch{
+					xorbHash.String(): {
+						{
+							URL: server.URL + "/xorbs/" + xorbHash.String(),
+							Ranges: []client.XorbRangeDescriptor{
+								{
+									Chunks: client.ChunkRange{Start: 0, End: 2},
+									Bytes:  client.ByteRange{Start: 0, End: 0},
+								},
+							},
+						},
+					},
+				},
+			}
+			json.NewEncoder(w).Encode(resp)
+		} else if r.URL.Path == "/xorbs/"+xorbHash.String() {
+			w.Write(xorbSerialized)
+		} else {
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := client.NewClient(client.ClientOptions{
+		BaseURL: server.URL,
+	})
+	session := NewSession(SessionOptions{
+		Client:        c,
+		EnableCaching: true,
+	})
+
+	reader, err := session.DownloadFileV2(context.Background(), xorbHash)
+	if err != nil {
+		t.Fatalf("DownloadFileV2 failed: %v", err)
+	}
+
+	downloadedData, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("Failed to read downloaded data: %v", err)
+	}
+
+	if !bytes.Equal(downloadedData, expectedData) {
+		t.Errorf("Downloaded data mismatch: got %q, want %q", downloadedData, expectedData)
+	}
+
+	if len(session.chunkCache) != 2 {
+		t.Errorf("Expected 2 chunks in cache, got %d", len(session.chunkCache))
+	}
+
+	chunk1Hash := xet.ChunkBytes(chunk1Data).Hash()
+	chunk2Hash := xet.ChunkBytes(chunk2Data).Hash()
+
+	cachedChunk1, ok := session.chunkCache[chunk1Hash]
+	if !ok {
+		t.Error("Chunk 1 not found in cache")
+	} else if !bytes.Equal(cachedChunk1, chunk1Data) {
+		t.Errorf("Cached chunk 1 data mismatch")
+	}
+
+	cachedChunk2, ok := session.chunkCache[chunk2Hash]
+	if !ok {
+		t.Error("Chunk 2 not found in cache")
+	} else if !bytes.Equal(cachedChunk2, chunk2Data) {
+		t.Errorf("Cached chunk 2 data mismatch")
+	}
+}
+
 func TestDownloadFileWithOffsetLength(t *testing.T) {
 	chunk1Data := []byte("AAAAAAA") // 7 bytes
 	chunk2Data := []byte("BBBBBBB") // 7 bytes

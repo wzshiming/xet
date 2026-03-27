@@ -225,6 +225,72 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	return shard, nil
 }
 
+// GetReconstructionV2 retrieves V2 reconstruction information for a file
+func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash) (*ReconstructionResponseV2, error) {
+	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var reconstruction ReconstructionResponseV2
+	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &reconstruction, nil
+}
+
+// GetReconstructionRangeV2 retrieves V2 reconstruction information for a byte range
+func (c *Client) GetReconstructionRangeV2(ctx context.Context, fileHash xet.Hash, start, end int64) (*ReconstructionResponseV2, error) {
+	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var reconstruction ReconstructionResponseV2
+	if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	return &reconstruction, nil
+}
+
 // DownloadXorbData downloads xorb data from a URL with optional byte range
 func (c *Client) DownloadXorbData(ctx context.Context, url string, byteRange *ByteRange) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
