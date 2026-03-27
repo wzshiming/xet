@@ -37,7 +37,11 @@ type SessionOptions struct {
 // NewSession creates a new upload session
 func NewSession(opts SessionOptions) *Session {
 	if opts.TargetXorbSize == 0 {
-		opts.TargetXorbSize = xet.TargetChunkSize
+		// Use MaxXorbSerializedSize to match xet-go behavior:
+		// xet-go uploads all chunks in a single large xorb per file,
+		// while previous native client split into multiple small xorbs.
+		// This change ensures consistent xorb grouping between implementations.
+		opts.TargetXorbSize = xet.MaxXorbSerializedSize
 	}
 
 	return &Session{
