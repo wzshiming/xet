@@ -408,7 +408,7 @@ func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xe
 	}
 
 	// Serialize and upload
-	serialized, err := sh.Serialize()
+	serialized, err := sh.SerializeBytes()
 	if err != nil {
 		return fmt.Errorf("serialize shard: %w", err)
 	}

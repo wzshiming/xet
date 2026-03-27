@@ -258,8 +258,8 @@ func TestQueryChunkDeduplicationFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return a minimal valid shard
 		shard := shard.NewShard()
-		serialized, _ := shard.Serialize()
-		w.Write(serialized)
+		reader, _ := shard.Serialize()
+		io.Copy(w, reader)
 	}))
 	defer server.Close()
 
