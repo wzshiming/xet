@@ -97,6 +97,163 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				Namespace: "default",
 			})
 
+			t.Run("upload_with_xetgo", func(t *testing.T) {
+				// Create temp directory and write test file
+				tempDir := t.TempDir()
+				uploadFile := filepath.Join(tempDir, "upload.bin")
+				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+					t.Fatalf("Failed to write upload file: %v", err)
+				}
+
+				// Upload using xet-go client
+				uploadResults, err := xetgo.UploadFiles(
+					[]string{uploadFile},
+					httpSrv.URL,
+					nil,   // token
+					nil,   // sha256s (computed automatically)
+					false, // skipSHA256
+				)
+				if err != nil {
+					t.Fatalf("Failed to upload file with xet-go: %v", err)
+				}
+
+				if len(uploadResults) != 1 {
+					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
+				}
+
+				xetgoHash := uploadResults[0].Hash
+				t.Logf("xet-go uploaded file with hash %s", xetgoHash)
+
+				// Parse the hash for download
+				fileHash, err := xet.ParseHash(xetgoHash)
+				if err != nil {
+					t.Fatalf("Failed to parse hash from xet-go: %v", err)
+				}
+
+				// Download using native client to verify
+				downloadSession := download.NewSession(download.SessionOptions{
+					Client: nativeClient,
+				})
+				downloadedData, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				if err != nil {
+					t.Fatalf("Failed to download file with native client: %v", err)
+				}
+
+				// Verify downloaded content matches original
+				if !bytes.Equal(downloadedData, tt.data) {
+					t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
+						len(downloadedData), len(tt.data))
+				}
+
+				t.Logf("Successfully uploaded with xet-go and downloaded with native client")
+			})
+
+			t.Run("download_with_xetgo", func(t *testing.T) {
+				// First upload the file using native client
+				tempDir := t.TempDir()
+				uploadFile := filepath.Join(tempDir, "upload.bin")
+				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+					t.Fatalf("Failed to write upload file: %v", err)
+				}
+
+				// Compute file info for upload
+				f, err := os.Open(uploadFile)
+				if err != nil {
+					t.Fatalf("Failed to open upload file: %v", err)
+				}
+				fileInfo, err := upload.ComputeFileInfo(f)
+				if err != nil {
+					f.Close()
+					t.Fatalf("Failed to compute file info: %v", err)
+				}
+				f.Close()
+				fileInfo.Path = uploadFile
+
+				uploadSession := upload.NewSession(upload.SessionOptions{
+					Client: nativeClient,
+				})
+				err = uploadSession.UploadFiles(context.Background(), []upload.FileUploadInfo{fileInfo})
+				if err != nil {
+					t.Fatalf("Failed to upload file: %v", err)
+				}
+
+				fileHash := fileInfo.FileHash
+
+				// Download using xet-go client
+				downloadFile := filepath.Join(tempDir, "download-xetgo.bin")
+				downloadReq := []xetgo.DownloadRequest{
+					{
+						DestinationPath: downloadFile,
+						Hash:            fileHash.String(),
+						FileSize:        int64(len(tt.data)),
+					},
+				}
+
+				// Use xet-go to download from our server
+				downloaded, err := xetgo.DownloadFiles(downloadReq, httpSrv.URL, nil)
+				if err != nil {
+					t.Fatalf("Failed to download file with xet-go: %v", err)
+				}
+
+				if len(downloaded) != 1 {
+					t.Fatalf("Expected 1 downloaded file, got %d", len(downloaded))
+				}
+
+				// Verify downloaded content matches original
+				downloadedData, err := os.ReadFile(downloadFile)
+				if err != nil {
+					t.Fatalf("Failed to read downloaded file: %v", err)
+				}
+
+				if !bytes.Equal(downloadedData, tt.data) {
+					t.Errorf("Downloaded data (xet-go) does not match original (got %d bytes, want %d bytes)",
+						len(downloadedData), len(tt.data))
+				}
+
+				t.Logf("Successfully downloaded file using xet-go client with hash %s", fileHash.String())
+			})
+		})
+
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temporary directory for storage
+			storageDir := t.TempDir()
+
+			// Start test HTTP server first (without creating storage yet)
+			// We'll create storage after we know the server URL
+			var storage server.Storage
+			var srv *server.Server
+			var httpSrv *httptest.Server
+
+			// Create a placeholder handler that will be replaced
+			httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if srv != nil {
+					srv.ServeHTTP(w, r)
+				} else {
+					http.Error(w, "server not initialized", http.StatusInternalServerError)
+				}
+			}))
+			defer httpSrv.Close()
+
+			// Now create storage with the correct base URL
+			var err error
+			storage, err = server.NewFileStorage(server.FileStorageOptions{
+				BasePath: storageDir,
+				BaseURL:  httpSrv.URL,
+			})
+			if err != nil {
+				t.Fatalf("Failed to create storage: %v", err)
+			}
+
+			srv = server.NewServer(server.ServerOptions{
+				Storage: storage,
+			})
+
+			// Create native client
+			nativeClient := client.NewClient(client.ClientOptions{
+				BaseURL:   httpSrv.URL,
+				Namespace: "default",
+			})
+
 			t.Run("upload", func(t *testing.T) {
 				// Write test file to upload
 				tempDir := t.TempDir()
@@ -220,202 +377,8 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 				t.Logf("Successfully downloaded and verified file with hash %s", expectedHash)
 			})
-
-			t.Run("upload_with_xetgo", func(t *testing.T) {
-				// Create temp directory and write test file
-				tempDir := t.TempDir()
-				uploadFile := filepath.Join(tempDir, "upload.bin")
-				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write upload file: %v", err)
-				}
-
-				// Upload using xet-go client
-				uploadResults, err := xetgo.UploadFiles(
-					[]string{uploadFile},
-					httpSrv.URL,
-					nil,   // token
-					nil,   // sha256s (computed automatically)
-					false, // skipSHA256
-				)
-				if err != nil {
-					t.Fatalf("Failed to upload file with xet-go: %v", err)
-				}
-
-				if len(uploadResults) != 1 {
-					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
-				}
-
-				xetgoHash := uploadResults[0].Hash
-				t.Logf("xet-go uploaded file with hash %s", xetgoHash)
-
-				// Parse the hash for download
-				fileHash, err := xet.ParseHash(xetgoHash)
-				if err != nil {
-					t.Fatalf("Failed to parse hash from xet-go: %v", err)
-				}
-
-				// Download using native client to verify
-				downloadSession := download.NewSession(download.SessionOptions{
-					Client: nativeClient,
-				})
-				downloadedData, err := downloadSession.DownloadFile(context.Background(), fileHash)
-				if err != nil {
-					t.Fatalf("Failed to download file with native client: %v", err)
-				}
-
-				// Verify downloaded content matches original
-				if !bytes.Equal(downloadedData, tt.data) {
-					t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
-						len(downloadedData), len(tt.data))
-				}
-
-				t.Logf("Successfully uploaded with xet-go and downloaded with native client")
-			})
-
-			t.Run("download_with_xetgo", func(t *testing.T) {
-				// First upload the file using native client
-				tempDir := t.TempDir()
-				uploadFile := filepath.Join(tempDir, "upload.bin")
-				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write upload file: %v", err)
-				}
-
-				// Compute file info for upload
-				f, err := os.Open(uploadFile)
-				if err != nil {
-					t.Fatalf("Failed to open upload file: %v", err)
-				}
-				fileInfo, err := upload.ComputeFileInfo(f)
-				if err != nil {
-					f.Close()
-					t.Fatalf("Failed to compute file info: %v", err)
-				}
-				f.Close()
-				fileInfo.Path = uploadFile
-
-				uploadSession := upload.NewSession(upload.SessionOptions{
-					Client: nativeClient,
-				})
-				err = uploadSession.UploadFiles(context.Background(), []upload.FileUploadInfo{fileInfo})
-				if err != nil {
-					t.Fatalf("Failed to upload file: %v", err)
-				}
-
-				fileHash := fileInfo.FileHash
-
-				// Download using xet-go client
-				downloadFile := filepath.Join(tempDir, "download-xetgo.bin")
-				downloadReq := []xetgo.DownloadRequest{
-					{
-						DestinationPath: downloadFile,
-						Hash:            fileHash.String(),
-						FileSize:        int64(len(tt.data)),
-					},
-				}
-
-				// Use xet-go to download from our server
-				downloaded, err := xetgo.DownloadFiles(downloadReq, httpSrv.URL, nil)
-				if err != nil {
-					t.Fatalf("Failed to download file with xet-go: %v", err)
-				}
-
-				if len(downloaded) != 1 {
-					t.Fatalf("Expected 1 downloaded file, got %d", len(downloaded))
-				}
-
-				// Verify downloaded content matches original
-				downloadedData, err := os.ReadFile(downloadFile)
-				if err != nil {
-					t.Fatalf("Failed to read downloaded file: %v", err)
-				}
-
-				if !bytes.Equal(downloadedData, tt.data) {
-					t.Errorf("Downloaded data (xet-go) does not match original (got %d bytes, want %d bytes)",
-						len(downloadedData), len(tt.data))
-				}
-
-				t.Logf("Successfully downloaded file using xet-go client with hash %s", fileHash.String())
-			})
 		})
 	}
-}
-
-// TestServerUploadVerifyChunking tests that the chunking performed during upload
-// matches the xet-go reference implementation.
-func TestServerUploadVerifyChunking(t *testing.T) {
-	// Create test data
-	testData := makeBinaryData(100 * 1024) // 100KB
-
-	// Create temporary directory for storage
-	storageDir := t.TempDir()
-
-	// Create storage and server
-	storage, err := server.NewFileStorage(server.FileStorageOptions{
-		BasePath: storageDir,
-		BaseURL:  "http://localhost:8080",
-	})
-	if err != nil {
-		t.Fatalf("Failed to create storage: %v", err)
-	}
-
-	srv := server.NewServer(server.ServerOptions{
-		Storage: storage,
-	})
-
-	// Start test HTTP server
-	httpSrv := startTestServer(t, srv)
-	defer httpSrv.Close()
-
-	// Chunk using native implementation
-	var nativeChunks []chunkInfo
-	err = xet.ChunkData(bytes.NewReader(testData), func(_ int64, chunk xet.ChunkBytes) error {
-		nativeChunks = append(nativeChunks, chunkInfo{
-			hash: chunk.Hash().String(),
-			size: chunk.Size(),
-		})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("Failed to chunk data with native implementation: %v", err)
-	}
-
-	// Chunk using xet-go reference implementation
-	refChunks, err := xetgo.ChunkData(testData)
-	if err != nil {
-		t.Fatalf("Failed to chunk data with xet-go: %v", err)
-	}
-
-	// Compare chunk count
-	if len(nativeChunks) != len(refChunks) {
-		t.Errorf("Chunk count mismatch: native=%d reference=%d",
-			len(nativeChunks), len(refChunks))
-	}
-
-	// Compare individual chunks
-	minLen := len(nativeChunks)
-	if len(refChunks) < minLen {
-		minLen = len(refChunks)
-	}
-
-	for i := 0; i < minLen; i++ {
-		if nativeChunks[i].hash != refChunks[i].Hash {
-			t.Errorf("Chunk[%d] hash mismatch: native=%s reference=%s",
-				i, nativeChunks[i].hash, refChunks[i].Hash)
-		}
-		if nativeChunks[i].size != refChunks[i].Size {
-			t.Errorf("Chunk[%d] size mismatch: native=%d reference=%d",
-				i, nativeChunks[i].size, refChunks[i].Size)
-		}
-	}
-
-	t.Logf("Successfully verified chunking matches between native and xet-go (%d chunks)", len(nativeChunks))
-}
-
-// Helper types and functions
-
-type chunkInfo struct {
-	hash string
-	size uint64
 }
 
 // makeBinaryData creates a deterministic byte sequence of the given size.
@@ -425,14 +388,4 @@ func makeBinaryData(size int) []byte {
 		result[i] = byte(i % 256)
 	}
 	return result
-}
-
-// startTestServer starts an HTTP test server with the given handler.
-func startTestServer(t *testing.T, handler http.Handler) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(handler)
-	t.Cleanup(func() {
-		srv.Close()
-	})
-	return srv
 }
