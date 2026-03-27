@@ -214,7 +214,7 @@ func (s *UploadSession) uploadXorbs(ctx context.Context, groups []*xorbGroup) er
 		}
 
 		// Serialize
-		serialized, err := xorbObj.Serialize()
+		serialized, err := xorb.SerializeBytes(xorbObj, false)
 		if err != nil {
 			return fmt.Errorf("serialize xorb: %w", err)
 		}

@@ -71,11 +71,39 @@ func (x *Xorb) AddChunk(chunk xet.ChunkBytes) error {
 	return nil
 }
 
-// SerializeChunksOnly serializes only the chunk data region without footer
-// This is used for conformance testing with tools that expect raw chunk data
-func (x *Xorb) SerializeChunksOnly() ([]byte, error) {
-	var buf bytes.Buffer
+// Serialize returns a streaming reader for the xorb serialization.
+// If chunkOnly is true, only the chunk data region is written (without footer).
+// If chunkOnly is false, the full XETBLOB format with footer is written.
+//
+// The returned io.Reader streams the data directly without buffering everything in memory.
+func Serialize(x *Xorb, chunkOnly bool) (io.Reader, error) {
+	pr, pw := io.Pipe()
 
+	go func() {
+		var err error
+		if chunkOnly {
+			err = serializeChunksOnlyToWriter(x, pw)
+		} else {
+			err = serializeToWriter(x, pw)
+		}
+		pw.CloseWithError(err)
+	}()
+
+	return pr, nil
+}
+
+// SerializeBytes is a helper that returns the serialized bytes.
+// This wraps Serialize and reads all data into memory.
+func SerializeBytes(x *Xorb, chunkOnly bool) ([]byte, error) {
+	r, err := Serialize(x, chunkOnly)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
+}
+
+// serializeChunksOnlyToWriter writes only the chunk data region without footer
+func serializeChunksOnlyToWriter(x *Xorb, w io.Writer) error {
 	// Write chunk data region
 	for _, chunk := range x.Chunks {
 		// Write chunk header (8 bytes)
@@ -86,23 +114,21 @@ func (x *Xorb) SerializeChunksOnly() ([]byte, error) {
 			UncompressedSize: uint32(len(chunk.UncompressedData)),
 		}
 
-		if err := writeChunkHeader(&buf, header); err != nil {
-			return nil, fmt.Errorf("failed to write chunk header: %w", err)
+		if err := writeChunkHeader(w, header); err != nil {
+			return fmt.Errorf("failed to write chunk header: %w", err)
 		}
 
 		// Write compressed data
-		if _, err := buf.Write(chunk.CompressedData); err != nil {
-			return nil, fmt.Errorf("failed to write chunk data: %w", err)
+		if _, err := w.Write(chunk.CompressedData); err != nil {
+			return fmt.Errorf("failed to write chunk data: %w", err)
 		}
 	}
 
-	return buf.Bytes(), nil
+	return nil
 }
 
-// Serialize serializes the xorb to binary format with CasObjectInfo footer
-func (x *Xorb) Serialize() ([]byte, error) {
-	var buf bytes.Buffer
-
+// serializeToWriter writes the xorb to binary format with CasObjectInfo footer
+func serializeToWriter(x *Xorb, w io.Writer) error {
 	// Track chunk offsets for boundary section
 	chunkOffsets := make([]uint64, len(x.Chunks))
 	unpackedOffsets := make([]uint64, len(x.Chunks))
@@ -119,13 +145,13 @@ func (x *Xorb) Serialize() ([]byte, error) {
 			UncompressedSize: uint32(len(chunk.UncompressedData)),
 		}
 
-		if err := writeChunkHeader(&buf, header); err != nil {
-			return nil, fmt.Errorf("failed to write chunk header: %w", err)
+		if err := writeChunkHeader(w, header); err != nil {
+			return fmt.Errorf("failed to write chunk header: %w", err)
 		}
 
 		// Write compressed data
-		if _, err := buf.Write(chunk.CompressedData); err != nil {
-			return nil, fmt.Errorf("failed to write chunk data: %w", err)
+		if _, err := w.Write(chunk.CompressedData); err != nil {
+			return fmt.Errorf("failed to write chunk data: %w", err)
 		}
 
 		currentOffset += 8 + uint64(len(chunk.CompressedData))
@@ -139,22 +165,22 @@ func (x *Xorb) Serialize() ([]byte, error) {
 	// Build CasObjectInfo footer
 	footer, err := x.buildFooter(chunkOffsets, unpackedOffsets)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build footer: %w", err)
+		return fmt.Errorf("failed to build footer: %w", err)
 	}
 
 	// Write footer
-	if _, err := buf.Write(footer); err != nil {
-		return nil, fmt.Errorf("failed to write footer: %w", err)
+	if _, err := w.Write(footer); err != nil {
+		return fmt.Errorf("failed to write footer: %w", err)
 	}
 
 	// Write footer length (4-byte little-endian)
 	footerLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(footerLen, uint32(len(footer)))
-	if _, err := buf.Write(footerLen); err != nil {
-		return nil, fmt.Errorf("failed to write footer length: %w", err)
+	if _, err := w.Write(footerLen); err != nil {
+		return fmt.Errorf("failed to write footer length: %w", err)
 	}
 
-	return buf.Bytes(), nil
+	return nil
 }
 
 // writeChunkHeader writes a chunk header to the buffer
@@ -245,9 +271,36 @@ func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, erro
 	return buf.Bytes(), nil
 }
 
-// DeserializeChunksOnly deserializes only the chunk data region without expecting a footer
+// Deserialize deserializes an xorb from an io.Reader.
+// If chunkOnly is true, only the chunk data region is expected (without footer).
+// If chunkOnly is false, the full XETBLOB format with footer is expected.
+//
+// This reads from the stream progressively and deserializes the xorb.
+func Deserialize(r io.Reader, chunkOnly bool) (*Xorb, error) {
+	// For true streaming, we need to read all data first to parse the footer
+	// (footer is at the end, so we need the full data)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+
+	if chunkOnly {
+		return deserializeChunksOnlyFromBytes(data)
+	}
+	return deserializeFromBytes(data)
+}
+
+// DeserializeBytes is a helper that deserializes from a byte slice.
+func DeserializeBytes(data []byte, chunkOnly bool) (*Xorb, error) {
+	if chunkOnly {
+		return deserializeChunksOnlyFromBytes(data)
+	}
+	return deserializeFromBytes(data)
+}
+
+// deserializeChunksOnlyFromBytes deserializes only the chunk data region without expecting a footer
 // This matches the Rust deserialize_chunks() function behavior
-func DeserializeChunksOnly(data []byte) (*Xorb, error) {
+func deserializeChunksOnlyFromBytes(data []byte) (*Xorb, error) {
 	xorb := NewXorb()
 	offset := 0
 
@@ -314,8 +367,8 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 	return xorb, nil
 }
 
-// Deserialize deserializes an xorb from binary format
-func Deserialize(data []byte) (*Xorb, error) {
+// deserializeFromBytes deserializes an xorb from binary format
+func deserializeFromBytes(data []byte) (*Xorb, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("data too short for xorb")
 	}
@@ -461,9 +514,9 @@ func (x *Xorb) parseChunks(data []byte) error {
 //
 // The function handles both the full XETBLOB format (with footer) and the
 // chunks-only upload format (without footer) by delegating to
-// DeserializeChunksOnly, which stops at the XETBLOB magic bytes.
+// deserializeChunksOnlyFromBytes, which stops at the XETBLOB magic bytes.
 func CompressedDataStream(data []byte) (stream []byte, chunkOffsets []int, err error) {
-	x, err := DeserializeChunksOnly(data)
+	x, err := deserializeChunksOnlyFromBytes(data)
 	if err != nil {
 		return nil, nil, err
 	}

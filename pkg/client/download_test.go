@@ -26,13 +26,13 @@ func createTestXorb(t *testing.T, chunkData [][]byte) (xet.Hash, []byte, []byte)
 	}
 
 	// Serialize full xorb with footer
-	serialized, err := x.Serialize()
+	serialized, err := xorb.SerializeBytes(x, false)
 	if err != nil {
 		t.Fatalf("Failed to serialize xorb: %v", err)
 	}
 
 	// Also create chunks-only serialization for range tests
-	chunksOnly, err := x.SerializeChunksOnly()
+	chunksOnly, err := xorb.SerializeBytes(x, true)
 	if err != nil {
 		t.Fatalf("Failed to serialize chunks only: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestDownloadFileRange(t *testing.T) {
 				tempXorb := xorb.NewXorb()
 				chunk := xet.ChunkBytes(chunk2Data)
 				tempXorb.AddChunk(chunk)
-				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				tempChunksOnly, _ := xorb.SerializeBytes(tempXorb, true)
 				w.Write(tempChunksOnly)
 			} else {
 				w.Write(xorbSerialized)
@@ -498,7 +498,7 @@ func TestDownloadFileRangeWithLength(t *testing.T) {
 				tempXorb := xorb.NewXorb()
 				chunk := xet.ChunkBytes(chunk2Data)
 				tempXorb.AddChunk(chunk)
-				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				tempChunksOnly, _ := xorb.SerializeBytes(tempXorb, true)
 				w.Write(tempChunksOnly)
 			} else {
 				w.Write(xorbSerialized)
@@ -726,7 +726,7 @@ func TestDownloadFileRangeV2(t *testing.T) {
 				tempXorb := xorb.NewXorb()
 				chunk := xet.ChunkBytes(chunk2Data)
 				tempXorb.AddChunk(chunk)
-				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				tempChunksOnly, _ := xorb.SerializeBytes(tempXorb, true)
 				w.Write(tempChunksOnly)
 			} else {
 				http.Error(w, "Not found", http.StatusNotFound)
@@ -814,7 +814,7 @@ func TestDownloadFileRangeWithLengthV2(t *testing.T) {
 				tempXorb := xorb.NewXorb()
 				chunk := xet.ChunkBytes(chunk2Data)
 				tempXorb.AddChunk(chunk)
-				tempChunksOnly, _ := tempXorb.SerializeChunksOnly()
+				tempChunksOnly, _ := xorb.SerializeBytes(tempXorb, true)
 				w.Write(tempChunksOnly)
 			} else {
 				http.Error(w, "Not found", http.StatusNotFound)
