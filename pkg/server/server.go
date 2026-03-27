@@ -502,7 +502,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	// xet-core uploads xorbs without the CasObjectInfo footer (chunks-only
 	// format), while the Go client uses the full format with XETBLOB footer.
 	// Try the full format first; fall back to chunks-only.
-	deserializedXorb, err := xorb.Deserialize(xorbData)
+	deserializedXorb, err := xorb.DeserializeBytes(xorbData, false)
 	isChunksOnly := false
 	if err != nil {
 		deserializedXorb, err = xorb.DeserializeChunksOnly(xorbData)

@@ -600,7 +600,7 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range xetgoReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.Deserialize(req.Body)
+		xorbObj, err := xorb.DeserializeBytes(req.Body, false)
 		if err != nil {
 			// Try chunks-only format
 			xorbObj, err = xorb.DeserializeChunksOnly(req.Body)
@@ -618,7 +618,7 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range nativeReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.Deserialize(req.Body)
+		xorbObj, err := xorb.DeserializeBytes(req.Body, false)
 		if err != nil {
 			// Try chunks-only format
 			xorbObj, err = xorb.DeserializeChunksOnly(req.Body)
