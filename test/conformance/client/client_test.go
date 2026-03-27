@@ -26,12 +26,12 @@ import (
 
 // RequestRecord captures details of an HTTP request
 type RequestRecord struct {
-	Method      string
-	Path        string
-	Headers     http.Header
-	Body        []byte
-	ClientType  string // "xet-go" or "native"
-	RequestID   string // Unique identifier for matching corresponding requests
+	Method     string
+	Path       string
+	Headers    http.Header
+	Body       []byte
+	ClientType string // "xet-go" or "native"
+	RequestID  string // Unique identifier for matching corresponding requests
 }
 
 // RecordingProxy is an HTTP proxy that records all requests
@@ -139,6 +139,10 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 		{
 			name: "1MB",
 			data: makeBinaryData(1024 * 1024),
+		},
+		{
+			name: "10MB",
+			data: makeBinaryData(10 * 1024 * 1024),
 		},
 	}
 
@@ -659,9 +663,9 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	}
 }
 
-var seed = rand.NewSource(0)
+var seed = rand.NewSource(1)
 
-// makeBinaryData creates a deterministic byte sequence of the given size
+// makeBinaryData creates a deterministic byte sequence of the given size.
 func makeBinaryData(size int) []byte {
 	result := make([]byte, size)
 	for i := range result {
