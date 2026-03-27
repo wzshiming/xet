@@ -73,39 +73,48 @@ func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *clie
 		// Get fetch info for this xorb
 		fetchInfoList, ok := reconstruction.FetchInfo[xorbHashStr]
 		if !ok || len(fetchInfoList) == 0 {
-			return fmt.Errorf("no fetch info for xorb %s", xorbHashStr)
+			return fmt.Errorf("no fetch info for xorb %s", xorbHash)
 		}
 
-		// Download xorb data
-		fetchInfo := fetchInfoList[0] // Usually only one entry per xorb
-		// Note: We download the full xorb, not just the URLRange, because we need to deserialize it
-		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, nil)
-		if err != nil {
-			return fmt.Errorf("download xorb data: %w", err)
-		}
-
-		// Deserialize xorb
-		xorbObj, err := xorb.Deserialize(xorbData)
-		if err != nil {
-			return fmt.Errorf("deserialize xorb: %w", err)
-		}
-
-		// Verify xorb hash
-		if xorbObj.Hash != xorbHash {
-			return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
-		}
-
-		// Extract chunks in the range
 		chunkStart := term.Range.Start
 		chunkEnd := term.Range.End
 
-		if chunkEnd > uint32(len(xorbObj.Chunks)) {
-			return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", chunkStart, chunkEnd, len(xorbObj.Chunks))
+		// Download only the needed byte range for this term
+		fetchInfo, err := findFetchInfo(fetchInfoList, chunkStart, chunkEnd)
+		if err != nil {
+			return fmt.Errorf("select fetch info for xorb %s: %w", xorbHash, err)
+		}
+
+		xorbData, err := s.client.DownloadXorbData(ctx, fetchInfo.URL, &fetchInfo.URLRange)
+		if err != nil {
+			return fmt.Errorf("download xorb %s data: %w", xorbHash, err)
+		}
+
+		// Deserialize chunk data from the ranged response (no footer expected)
+		xorbObj, err := xorb.DeserializeChunksOnly(xorbData)
+		if err != nil {
+			return fmt.Errorf("deserialize xorb %s range: %w", xorbHash, err)
+		}
+
+		// Ensure the ranged payload covers the expected chunk span
+		chunkOffset := fetchInfo.Range.Start
+		expectedChunks := int(fetchInfo.Range.End - fetchInfo.Range.Start)
+		if len(xorbObj.Chunks) < expectedChunks {
+			return fmt.Errorf("xorb %s range contained %d chunks, expected at least %d", xorbHash, len(xorbObj.Chunks), expectedChunks)
+		}
+
+		if int(chunkEnd-chunkOffset) > len(xorbObj.Chunks) {
+			return fmt.Errorf("xorb %s range missing chunks for [%d, %d), have %d starting at %d", xorbHash, chunkStart, chunkEnd, len(xorbObj.Chunks), chunkOffset)
 		}
 
 		// Concatenate chunks
 		for i := chunkStart; i < chunkEnd; i++ {
-			chunk := xorbObj.Chunks[i]
+			relativeIdx := int(i - chunkOffset)
+			if relativeIdx < 0 || relativeIdx >= len(xorbObj.Chunks) {
+				return fmt.Errorf("chunk index %d out of range for xorb %s fetched data [%d, %d)", i, xorbHash, fetchInfo.Range.Start, fetchInfo.Range.End)
+			}
+
+			chunk := xorbObj.Chunks[relativeIdx]
 
 			// Cache if enabled
 			if s.chunkCache != nil {
@@ -132,4 +141,14 @@ func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *clie
 		}
 	}
 	return nil
+}
+
+func findFetchInfo(entries []client.FetchInfoEntry, chunkStart, chunkEnd uint32) (*client.FetchInfoEntry, error) {
+	for i := range entries {
+		entry := &entries[i]
+		if entry.Range.Start <= chunkStart && entry.Range.End >= chunkEnd {
+			return entry, nil
+		}
+	}
+	return nil, fmt.Errorf("no fetch info covers chunk range [%d, %d)", chunkStart, chunkEnd)
 }

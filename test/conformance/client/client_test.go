@@ -495,9 +495,37 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 		}
 	}
 
+	// STRICT: Both clients must request identical byte ranges for xorb data downloads
+	compareXorbRangeHeaders(t, xetgoReqs, nativeReqs)
+
 	t.Logf("✓ Download conformance check passed for file %s", fileHash)
 	t.Logf("  xet-go request types: %v", xetgoTypes)
 	t.Logf("  native request types: %v", nativeTypes)
+}
+
+// compareXorbRangeHeaders ensures both clients request the same byte ranges when downloading xorb data
+func compareXorbRangeHeaders(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+	t.Helper()
+
+	xetgoRanges := extractXorbRanges(xetgoReqs)
+	nativeRanges := extractXorbRanges(nativeReqs)
+
+	for path, xr := range xetgoRanges {
+		nr, ok := nativeRanges[path]
+		if !ok {
+			t.Errorf("Range headers for %s present in xet-go but missing in native", path)
+			continue
+		}
+		if !equalStringSlices(xr, nr) {
+			t.Errorf("Range header mismatch for %s:\n  xet-go: %v\n  native: %v", path, xr, nr)
+		}
+	}
+
+	for path := range nativeRanges {
+		if _, ok := xetgoRanges[path]; !ok {
+			t.Errorf("Range headers for %s present in native but missing in xet-go", path)
+		}
+	}
 }
 
 // hasEquivalentRequest checks if a request type or its v1/v2 equivalent exists in the map
@@ -661,6 +689,32 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	if len(xetgoOnly) == 0 && len(nativeOnly) == 0 {
 		t.Logf("✓ Both clients uploaded identical chunk sets (%d chunks)", len(xetgoChunkHashes))
 	}
+}
+
+// extractXorbRanges collects the Range headers (or "FULL" for no range) for xorb data download requests
+func extractXorbRanges(reqs []RequestRecord) map[string][]string {
+	result := make(map[string][]string)
+	for _, req := range reqs {
+		if req.Method != http.MethodGet {
+			continue
+		}
+		if !strings.Contains(req.Path, "/xorbs/") || !strings.HasSuffix(req.Path, "/data") {
+			continue
+		}
+
+		reqType := fmt.Sprintf("%s:%s", req.Method, normalizePath(req.Path))
+		rangeHeader := req.Headers.Get("Range")
+		if rangeHeader == "" {
+			rangeHeader = "FULL"
+		}
+		result[reqType] = append(result[reqType], rangeHeader)
+	}
+
+	for k := range result {
+		sort.Strings(result[k])
+	}
+
+	return result
 }
 
 var seed = rand.NewSource(1)
