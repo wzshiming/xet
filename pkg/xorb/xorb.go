@@ -99,6 +99,30 @@ func (x *Xorb) SerializeChunksOnly() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Serialize serializes the xorb either as chunks-only (without footer) or as
+// the full XETBLOB format. A reader is returned so callers can stream the
+// serialized bytes without an extra copy.
+func Serialize(x *Xorb, chunkOnly bool) (io.Reader, error) {
+	if x == nil {
+		return nil, fmt.Errorf("xorb is nil")
+	}
+
+	if chunkOnly {
+		data, err := x.SerializeChunksOnly()
+		if err != nil {
+			return nil, err
+		}
+		return bytes.NewReader(data), nil
+	}
+
+	data, err := x.Serialize()
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes.NewReader(data), nil
+}
+
 // Serialize serializes the xorb to binary format with CasObjectInfo footer
 func (x *Xorb) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
@@ -314,8 +338,38 @@ func DeserializeChunksOnly(data []byte) (*Xorb, error) {
 	return xorb, nil
 }
 
-// Deserialize deserializes an xorb from binary format
-func Deserialize(data []byte) (*Xorb, error) {
+// Deserialize deserializes an xorb from the provided reader. If chunkOnly is
+// true, it expects the chunks-only upload format (no footer). Otherwise it
+// parses the full XETBLOB format with footer.
+func Deserialize(r io.Reader, chunkOnly bool) (*Xorb, error) {
+	if r == nil {
+		return nil, fmt.Errorf("reader is nil")
+	}
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read xorb data: %w", err)
+	}
+
+	return deserializeData(data, chunkOnly)
+}
+
+// DeserializeBytes deserializes an xorb from a byte slice, allowing callers
+// with in-memory data to avoid an extra copy through a reader.
+func DeserializeBytes(data []byte, chunkOnly bool) (*Xorb, error) {
+	return deserializeData(data, chunkOnly)
+}
+
+func deserializeData(data []byte, chunkOnly bool) (*Xorb, error) {
+	if chunkOnly {
+		return DeserializeChunksOnly(data)
+	}
+
+	return deserializeWithFooter(data)
+}
+
+// deserializeWithFooter deserializes an xorb from binary format with footer.
+func deserializeWithFooter(data []byte) (*Xorb, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("data too short for xorb")
 	}

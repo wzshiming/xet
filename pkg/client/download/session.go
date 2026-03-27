@@ -141,10 +141,10 @@ func (s *Session) wrtieTo(ctx context.Context, w io.Writer, reconstruction *clie
 		var xorbObj *xorb.Xorb
 		if useChunksOnly {
 			// When downloading a range, we get only the chunk data without footer
-			xorbObj, err = xorb.DeserializeChunksOnly(xorbData)
+			xorbObj, err = xorb.DeserializeBytes(xorbData, true)
 		} else {
 			// Full xorb with footer
-			xorbObj, err = xorb.Deserialize(xorbData)
+			xorbObj, err = xorb.DeserializeBytes(xorbData, false)
 		}
 		if err != nil {
 			return fmt.Errorf("deserialize xorb: %w", err)
