@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -246,15 +245,8 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read shard data
-	shardData, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-
 	// Deserialize shard
-	shard, err := shard.Decode(bytes.NewReader(shardData))
+	shard, err := shard.Decode(r.Body)
 	if err != nil {
 		http.Error(w, "Invalid shard format", http.StatusBadRequest)
 		return
