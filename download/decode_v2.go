@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net/http"
 
@@ -121,15 +120,13 @@ func (r *ReaderV2) loadTerm() error {
 	var fetchURL string
 loop:
 	for _, fetchEntry := range fetchList {
-		for i, ranges := range fetchEntry.Ranges {
+		for _, ranges := range fetchEntry.Ranges {
 			if ranges.Chunks.Start <= term.Range.Start &&
 				ranges.Chunks.End >= term.Range.End {
 				matchedRange = &ranges
 				fetchURL = fetchEntry.URL
 				break loop
 			}
-
-			log.Printf("Debug: Checking fetch entry URL %s with chunk range [%d, %d) against term chunk range [%d, %d)", fetchEntry.URL, fetchEntry.Ranges[i].Chunks.Start, fetchEntry.Ranges[i].Chunks.End, term.Range.Start, term.Range.End)
 		}
 	}
 
