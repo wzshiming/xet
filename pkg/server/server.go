@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -543,73 +542,15 @@ func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get xorb object
-	xorbObj, err := s.storage.GetXorb(r.Context(), namespace, xorbHash)
+	xorbReader, err := s.storage.GetXorbReadSeekCloser(r.Context(), namespace, xorbHash)
 	if err != nil {
 		http.Error(w, "Xorb not found", http.StatusNotFound)
 		return
 	}
-
-	// Serialize xorb to bytes for download.
-	// The stored format is always full with footer (chunkOnly=false).
-	xorbData, err := xorb.SerializeBytes(xorbObj, false)
-	if err != nil {
-		http.Error(w, "Failed to serialize xorb", http.StatusInternalServerError)
-		return
-	}
-
-	// Handle range requests.
-	//
-	// Serve the raw stored xorb bytes.  The URL ranges produced by
-	// buildReconstructionResponse / compressedDataRange account for the 8-byte
-	// per-chunk headers, so xet-core receives [header|compressed-data] pairs
-	// that it can parse and decompress independently.
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		s.handleRangeRequest(w, r, xorbData, rangeHeader)
-		return
-	}
-
-	// Return full xorb
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(xorbData)))
-	w.Write(xorbData)
-}
-
-// handleRangeRequest handles HTTP range requests
-func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, data []byte, rangeHeader string) {
-	// Parse range header (simple implementation for bytes=start-end)
-	rangeHeader = strings.TrimPrefix(rangeHeader, "bytes=")
-	parts := strings.Split(rangeHeader, "-")
-
-	if len(parts) != 2 {
-		http.Error(w, "Invalid range", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-
-	start, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid range", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-
-	end, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid range", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-
-	if start < 0 || end >= int64(len(data)) || start > end {
-		http.Error(w, "Range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-
-	rangeData := data[start : end+1]
+	defer xorbReader.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-	w.Header().Set("Content-Length", strconv.Itoa(len(rangeData)))
-	w.WriteHeader(http.StatusPartialContent)
-	w.Write(rangeData)
+	http.ServeContent(w, r, xorbHashStr, time.Time{}, xorbReader)
 }
 
 // handleUploadShard handles POST /shards

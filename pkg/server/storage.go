@@ -22,6 +22,9 @@ type Storage interface {
 	// GetXorb retrieves an xorb by its hash
 	GetXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (*xorb.Xorb, error)
 
+	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
+	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadSeekCloser, error)
+
 	// StoreShard stores a shard
 	StoreShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
@@ -196,6 +199,21 @@ func (fs *FileStorage) GetXorb(ctx context.Context, namespace string, xorbHash x
 	}
 
 	return xorbObj, nil
+}
+
+// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
+func (fs *FileStorage) GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadSeekCloser, error) {
+	xorbPath := filepath.Join(fs.basePath, "xorbs", namespace, xorbHash.String())
+
+	f, err := os.Open(xorbPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("xorb not found")
+		}
+		return nil, fmt.Errorf("open xorb file: %w", err)
+	}
+
+	return f, nil
 }
 
 // StoreShard stores a shard
