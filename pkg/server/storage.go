@@ -37,8 +37,8 @@ type Storage interface {
 	// GetXorbURL generates a URL for accessing xorb data
 	GetXorbURL(namespace string, xorbHash xet.Hash) string
 
-	// CompressedDataRange returns the byte range within the stored xorb for the given chunk range
-	CompressedDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
+	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
+	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
 }
 
 // FileStorage implements Storage using the filesystem
@@ -351,21 +351,22 @@ func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.Hash) string {
 	return fmt.Sprintf("%s/v1/xorbs/%s/%s/data", fs.baseURL, namespace, xorbHash.String())
 }
 
-// CompressedDataRange returns the [start, end] byte range (inclusive) within
+// GetXorbDataRange returns the [start, end] byte range (inclusive) within
 // the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
 // The returned range includes the 8-byte chunk header for each chunk, so that
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
-func (fs *FileStorage) CompressedDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
-	xorbReader, err := fs.GetXorbReadSeekCloser(ctx, namespace, xorbHash)
+func (fs *FileStorage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
+	xorbPath := filepath.Join(fs.basePath, "xorbs", namespace, xorbHash.String())
+	f, err := os.Open(xorbPath)
 	if err != nil {
 		return 0, 0
 	}
-	defer xorbReader.Close()
+	defer f.Close()
 
-	// Serialize to bytes to compute chunk offsets in the stored format.
+	// Read xorb data to compute chunk offsets in the stored format.
 	// We need the actual byte layout to calculate ranges for HTTP range requests.
-	xorbData, err := io.ReadAll(xorbReader)
+	xorbData, err := io.ReadAll(f)
 	if err != nil {
 		return 0, 0
 	}

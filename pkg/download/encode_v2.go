@@ -102,7 +102,7 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		response.Terms = append(response.Terms, term)
 
 		// Calculate byte ranges for this term
-		startByte, endByte := storage.CompressedDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte := storage.GetXorbDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
 		// Collect fetch info grouped by xorb
 		xorbHashStr := entry.CASHash.String()
