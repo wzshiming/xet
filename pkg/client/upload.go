@@ -211,14 +211,8 @@ func (s *UploadSession) uploadXorbs(ctx context.Context, groups []*xorbGroup) er
 			}
 		}
 
-		// Serialize
-		serialized, err := xorb.SerializeBytes(xorbObj, false)
-		if err != nil {
-			return fmt.Errorf("serialize xorb: %w", err)
-		}
-
 		// Upload
-		_, err = s.client.UploadXorb(ctx, xorbObj.Hash, serialized)
+		_, err := s.client.UploadXorb(ctx, xorbObj)
 		if err != nil {
 			return fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
 		}
