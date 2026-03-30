@@ -154,7 +154,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Setup server for xet-go
 				var xetgoStorage server.Storage
-				var xetgoSrv *server.Server
+				var xetgoSrv *server.Handler
 				var xetgoProxy *RecordingProxy
 				var xetgoHttpSrv *httptest.Server
 
@@ -176,9 +176,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create xet-go storage: %v", err)
 				}
 
-				xetgoSrv = server.NewHandler(server.HandlerOptions{
-					Storage: xetgoStorage,
-				})
+				xetgoSrv = server.NewHandler(server.WithStorage(xetgoStorage))
 				xetgoProxy = NewRecordingProxy(xetgoSrv)
 
 				// Upload with xet-go
@@ -207,7 +205,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Setup server for native client
 				var nativeStorage server.Storage
-				var nativeSrv *server.Server
+				var nativeSrv *server.Handler
 				var nativeProxy *RecordingProxy
 				var nativeHttpSrv *httptest.Server
 
@@ -228,9 +226,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create native storage: %v", err)
 				}
 
-				nativeSrv = server.NewHandler(server.HandlerOptions{
-					Storage: nativeStorage,
-				})
+				nativeSrv = server.NewHandler(server.WithStorage(nativeStorage))
 				nativeProxy = NewRecordingProxy(nativeSrv)
 
 				// Upload with native client
@@ -270,7 +266,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				// Setup shared server
 				storageDir := t.TempDir()
 				var storage server.Storage
-				var srv *server.Server
+				var srv *server.Handler
 				var proxy *RecordingProxy
 				var httpSrv *httptest.Server
 
@@ -292,9 +288,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create storage: %v", err)
 				}
 
-				srv = server.NewHandler(server.HandlerOptions{
-					Storage: storage,
-				})
+				srv = server.NewHandler(server.WithStorage(storage))
 				proxy = NewRecordingProxy(srv)
 
 				// First upload file using native client

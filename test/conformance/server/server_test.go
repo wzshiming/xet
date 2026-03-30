@@ -64,7 +64,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			// Start test HTTP server first (without creating storage yet)
 			// We'll create storage after we know the server URL
 			var storage server.Storage
-			var srv *server.Server
+			var srv *server.Handler
 			var httpSrv *httptest.Server
 
 			// Create a placeholder handler that will be replaced
@@ -87,9 +87,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewHandler(server.HandlerOptions{
-				Storage: storage,
-			})
+			srv = server.NewHandler(server.WithStorage(storage))
 
 			// Create native client
 			nativeClient := client.NewClient(client.ClientOptions{
@@ -215,7 +213,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			// Start test HTTP server first (without creating storage yet)
 			// We'll create storage after we know the server URL
 			var storage server.Storage
-			var srv *server.Server
+			var srv *server.Handler
 			var httpSrv *httptest.Server
 
 			// Create a placeholder handler that will be replaced
@@ -238,9 +236,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewHandler(server.HandlerOptions{
-				Storage: storage,
-			})
+			srv = server.NewHandler(server.WithStorage(storage))
 
 			// Create native client
 			nativeClient := client.NewClient(client.ClientOptions{

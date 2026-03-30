@@ -15,10 +15,11 @@ import (
 	"github.com/wzshiming/xet/pkg/upload"
 )
 
-// Server represents an XET CAS server
-type Server struct {
+// Handler represents an XET CAS server
+type Handler struct {
 	storage Storage
-	router  *mux.Router
+	root    *mux.Router
+	next    http.Handler
 	authFn  AuthFunc
 }
 
@@ -26,18 +27,40 @@ type Server struct {
 // It returns true if the token is valid
 type AuthFunc func(token string) bool
 
-// HandlerOptions configures the server
-type HandlerOptions struct {
-	Storage Storage
-	AuthFn  AuthFunc // Optional authentication function
+// Option defines a functional option for configuring the Handler.
+type Option func(*Handler)
+
+// WithAuthFunc sets the authentication function for the server. If not set, the server will allow all requests.
+func WithAuthFunc(authFn AuthFunc) Option {
+	return func(h *Handler) {
+		h.authFn = authFn
+	}
+}
+
+// WithNext sets the next http.Handler to call if a request does not match any of the server's routes.
+func WithNext(next http.Handler) Option {
+	return func(h *Handler) {
+		h.next = next
+	}
+}
+
+// WithStorage sets the storage backend for the server. This is required for the server to function.
+func WithStorage(storage Storage) Option {
+	return func(h *Handler) {
+		h.storage = storage
+	}
 }
 
 // NewHandler creates a new XET CAS server
-func NewHandler(opts HandlerOptions) *Server {
-	s := &Server{
-		storage: opts.Storage,
-		router:  mux.NewRouter(),
-		authFn:  opts.AuthFn,
+func NewHandler(opts ...Option) *Handler {
+	s := &Handler{
+		storage: nil,
+		root:    mux.NewRouter(),
+		authFn:  nil,
+	}
+
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	s.registerRoutes()
@@ -45,36 +68,38 @@ func NewHandler(opts HandlerOptions) *Server {
 }
 
 // registerRoutes sets up all HTTP routes.
-func (s *Server) registerRoutes() {
+func (s *Handler) registerRoutes() {
 	// Defined in specification
-	s.router.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-	s.router.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
-	s.router.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
+	s.root.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	s.root.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.root.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	s.root.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Used by xet-core but not defined in spec
-	s.router.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
-	s.router.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.router.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	s.root.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 
 	// /v1/shards is defined in the spec as the upload endpoint for shards,
 	// but xet-core actually uploads shards to /shards, so we support both.
-	s.router.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
-	s.router.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
+	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Download endpoint for xorb data, used by xet-core and the Go client.
 	// Not defined in the spec, but we can support it without much effort since it's just serving raw stored xorb bytes.
-	s.router.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
+
+	s.root.NotFoundHandler = s.next
 }
 
 // ServeHTTP implements http.Handler
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.router.ServeHTTP(w, r)
+func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.root.ServeHTTP(w, r)
 }
 
 // authenticate checks if a request is authenticated
-func (s *Server) authenticate(r *http.Request) bool {
+func (s *Handler) authenticate(r *http.Request) bool {
 	if s.authFn == nil {
 		return true // No authentication required
 	}
@@ -94,7 +119,7 @@ func (s *Server) authenticate(r *http.Request) bool {
 }
 
 // handleGetReconstruction handles GET /v1/reconstructions/{file_hash}
-func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
 	// Extract file hash from path using mux
 	vars := mux.Vars(r)
 	fileHashStr := vars["file_hash"]
@@ -124,7 +149,7 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 }
 
 // handleGetReconstructionV2 handles GET /v2/reconstructions/{file_hash}
-func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Request) {
 	// Extract file hash from path using mux
 	vars := mux.Vars(r)
 	fileHashStr := vars["file_hash"]
@@ -154,7 +179,7 @@ func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reques
 }
 
 // handleUploadXorb handles POST /v1/xorbs/{namespace}/{xorb_hash}
-func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -196,7 +221,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}/data
-func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
@@ -222,7 +247,7 @@ func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUploadShard handles POST /shards
-func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -258,7 +283,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}
-func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
+func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]

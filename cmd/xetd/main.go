@@ -39,10 +39,7 @@ func main() {
 	}
 
 	// Create server
-	srv := server.NewHandler(server.HandlerOptions{
-		Storage: storage,
-		AuthFn:  authFn,
-	})
+	srv := server.NewHandler(server.WithStorage(storage), server.WithAuthFunc(authFn))
 
 	err = http.ListenAndServe(*addr, srv)
 	if err != nil {
