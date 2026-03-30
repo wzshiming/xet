@@ -7,7 +7,6 @@ import (
 	"math"
 	"net/http"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -108,12 +107,6 @@ func (r *ReaderV1) loadTerm() error {
 	term := &r.reconstruction.Terms[r.termIdx]
 	r.currentTerm = term
 
-	// Parse xorb hash
-	xorbHash, err := xet.ParseHash(term.Hash)
-	if err != nil {
-		return fmt.Errorf("parse xorb hash: %w", err)
-	}
-
 	// Get fetch info for this xorb
 	fetchInfoList, ok := r.reconstruction.FetchInfo[term.Hash]
 	if !ok || len(fetchInfoList) == 0 {
@@ -123,30 +116,17 @@ func (r *ReaderV1) loadTerm() error {
 	fetchInfo := fetchInfoList[0]
 
 	// Determine if we should use URLRange for efficient partial download
-	var byteRange *ByteRange
-	useChunksOnly := false
-
-	if fetchInfo.URLRange.Start != 0 || fetchInfo.URLRange.End != 0 {
-		byteRange = &fetchInfo.URLRange
-		useChunksOnly = true
-	}
+	byteRange := &fetchInfo.URLRange
 
 	// We need to pass the request opts to the client, but the interface expects interface{}
 	// This will be handled by the actual client implementation
-	var header http.Header
-	if byteRange != nil {
-		header = http.Header{}
-		header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
+	header := http.Header{
+		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End)},
 	}
 
 	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchInfo.URL, header)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
-	}
-
-	// Verify xorb hash only when we have the full xorb
-	if !useChunksOnly && xorbObj.Hash != xorbHash {
-		return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
 	}
 
 	// Validate chunk range

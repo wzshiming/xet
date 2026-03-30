@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -110,65 +110,47 @@ func (r *ReaderV2) loadTerm() error {
 	term := &r.reconstruction.Terms[r.termIdx]
 	r.currentTerm = term
 
-	// Parse xorb hash
-	xorbHash, err := xet.ParseHash(term.Hash)
-	if err != nil {
-		return fmt.Errorf("parse xorb hash: %w", err)
-	}
-
 	// Get fetch info for this xorb
 	fetchList, ok := r.reconstruction.Xorbs[term.Hash]
 	if !ok || len(fetchList) == 0 {
 		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
 	}
 
-	fetchEntry := fetchList[0]
-
 	// Find the range descriptor that covers this term's chunk range
 	var matchedRange *XorbRangeDescriptor
-	for i := range fetchEntry.Ranges {
-		if fetchEntry.Ranges[i].Chunks.Start == term.Range.Start &&
-			fetchEntry.Ranges[i].Chunks.End == term.Range.End {
-			matchedRange = &fetchEntry.Ranges[i]
-			break
+	var fetchURL string
+loop:
+	for _, fetchEntry := range fetchList {
+		for i, ranges := range fetchEntry.Ranges {
+			if ranges.Chunks.Start <= term.Range.Start &&
+				ranges.Chunks.End >= term.Range.End {
+				matchedRange = &ranges
+				fetchURL = fetchEntry.URL
+				break loop
+			}
+
+			log.Printf("Debug: Checking fetch entry URL %s with chunk range [%d, %d) against term chunk range [%d, %d)", fetchEntry.URL, fetchEntry.Ranges[i].Chunks.Start, fetchEntry.Ranges[i].Chunks.End, term.Range.Start, term.Range.End)
 		}
 	}
 
+	if matchedRange == nil {
+		return fmt.Errorf("no matching range descriptor for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
+	}
+
 	// Determine whether to issue a ranged download
-	var byteRange *ByteRange
-	useChunksOnly := false
+	byteRange := &matchedRange.Bytes
 
-	if matchedRange != nil && (matchedRange.Bytes.Start != 0 || matchedRange.Bytes.End != 0) {
-		byteRange = &matchedRange.Bytes
-		useChunksOnly = true
+	header := http.Header{
+		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End)},
 	}
 
-	var header http.Header
-	if byteRange != nil {
-		header = http.Header{}
-		header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
-	}
-
-	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchEntry.URL, header)
+	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchURL, header)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	// Verify xorb hash only when we have the full xorb
-	if !useChunksOnly && xorbObj.Hash != xorbHash {
-		return fmt.Errorf("xorb hash mismatch: expected %s, got %s", xorbHash.String(), xorbObj.Hash.String())
-	}
-
-	// When downloading a partial byte range the returned chunks are
-	// re-indexed from 0, so map the term's absolute range to local indices.
-	var localStart, localEnd uint32
-	if useChunksOnly {
-		localStart = 0
-		localEnd = term.Range.End - term.Range.Start
-	} else {
-		localStart = term.Range.Start
-		localEnd = term.Range.End
-	}
+	localStart := term.Range.Start
+	localEnd := term.Range.End
 
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {

@@ -82,5 +82,4 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	}
 
 	return xorbObj, nil
-
 }
