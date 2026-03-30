@@ -205,8 +205,8 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store xorb directly. StoreXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, deserializedXorb)
+	// Store xorb directly. PutXorb will normalize to full format with footer.
+	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, deserializedXorb)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
@@ -263,7 +263,7 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store shard
-	wasInserted, err := s.storage.StoreShard(r.Context(), shard)
+	wasInserted, err := s.storage.PutShard(r.Context(), shard)
 	if err != nil {
 		http.Error(w, "Failed to store shard", http.StatusInternalServerError)
 		return

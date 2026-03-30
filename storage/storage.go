@@ -16,29 +16,29 @@ import (
 
 // Storage defines the interface for storing and retrieving XET data
 type Storage interface {
-	// StoreXorb stores an xorb by its hash
-	StoreXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error)
+	// PutXorb stores an xorb by its hash
+	PutXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error)
 
 	// GetXorb retrieves an xorb by its hash
 	GetXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (*xorb.Xorb, error)
 
+	// GetXorbURL generates a URL for accessing xorb data
+	GetXorbURL(namespace string, xorbHash xet.Hash) string
+
 	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
 	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadSeekCloser, error)
 
-	// StoreShard stores a shard
-	StoreShard(ctx context.Context, shard *shard.Shard) (bool, error)
+	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
+	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
+
+	// PutShard stores a shard by its hash
+	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
 	// GetShardByFileHash retrieves a shard by file hash
 	GetShardByFileHash(ctx context.Context, fileHash xet.Hash) (*shard.Shard, error)
 
 	// GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
 	GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.Hash) (*shard.Shard, error)
-
-	// GetXorbURL generates a URL for accessing xorb data
-	GetXorbURL(namespace string, xorbHash xet.Hash) string
-
-	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
-	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
 }
 
 // FileStorage implements Storage using the filesystem
@@ -143,8 +143,8 @@ func (fs *FileStorage) loadShards() error {
 	return nil
 }
 
-// StoreXorb stores an xorb
-func (fs *FileStorage) StoreXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error) {
+// PutXorb stores an xorb
+func (fs *FileStorage) PutXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error) {
 	xorbDir := filepath.Join(fs.basePath, "xorbs", namespace)
 	if err := os.MkdirAll(xorbDir, 0755); err != nil {
 		return false, fmt.Errorf("create xorb directory: %w", err)
@@ -203,7 +203,7 @@ func (fs *FileStorage) GetXorb(ctx context.Context, namespace string, xorbHash x
 
 	// Deserialize xorb from file using streaming.
 	// The stored format always has the full XETBLOB footer (chunkOnly=false)
-	// because StoreXorb normalizes all uploads to this format.
+	// because PutXorb normalizes all uploads to this format.
 	xorbObj, err := xorb.Decode(f, false)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize xorb: %w", err)
@@ -227,8 +227,8 @@ func (fs *FileStorage) GetXorbReadSeekCloser(ctx context.Context, namespace stri
 	return f, nil
 }
 
-// StoreShard stores a shard
-func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, error) {
+// PutShard stores a shard
+func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 	// Generate a unique filename (use first file hash)
 	if len(s.Files) == 0 {
 		return false, fmt.Errorf("shard has no file blocks")
