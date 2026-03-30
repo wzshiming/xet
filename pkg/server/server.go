@@ -14,7 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/reconstruction"
+	"github.com/wzshiming/xet/pkg/download"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
@@ -124,7 +124,7 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Build reconstruction response
-	response, err := reconstruction.BuildReconstructionResponse(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -154,7 +154,7 @@ func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Build V2 reconstruction response
-	response, err := reconstruction.BuildReconstructionResponseV2(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV2(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -6,11 +6,11 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/reconstruction"
+	"github.com/wzshiming/xet/pkg/download"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
-// clientAdapter adapts the Client to the reconstruction.ClientAdapter interface
+// clientAdapter adapts the Client to the download.ClientAdapter interface
 type clientAdapter struct {
 	client *Client
 }
@@ -19,7 +19,7 @@ func (ca *clientAdapter) DownloadXorb(ctx context.Context, url string, reqOpts .
 	// Convert interface{} reqOpts to ReqOpt
 	var opts []ReqOpt
 	for _, opt := range reqOpts {
-		if byteRange, ok := opt.(*reconstruction.ByteRange); ok {
+		if byteRange, ok := opt.(*download.ByteRange); ok {
 			opts = append(opts, WithRange(byteRange.Start, byteRange.End))
 		}
 	}
@@ -81,13 +81,13 @@ func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash,
 		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 	}
 
-	expectedLength := reconstruction.ExpectedLength(reconstructionResp)
+	expectedLength := download.ExpectedLengthV1(reconstructionResp)
 
 	// Create adapter
 	adapter := &clientAdapter{client: s.client}
 
 	// Create a reader that reconstructs the file on-demand
-	reader := reconstruction.NewReaderV1(ctx, adapter, reconstructionResp, s.chunkCache)
+	reader := download.NewReaderV1(ctx, adapter, reconstructionResp, s.chunkCache)
 
 	return reader, expectedLength, nil
 }
@@ -99,13 +99,13 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 		return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
 	}
 
-	expectedLength := reconstruction.ExpectedLengthV2(reconstructionResp)
+	expectedLength := download.ExpectedLengthV2(reconstructionResp)
 
 	// Create adapter
 	adapter := &clientAdapter{client: s.client}
 
 	// Create a reader that reconstructs the file on-demand
-	reader := reconstruction.NewReaderV2(ctx, adapter, reconstructionResp, s.chunkCache)
+	reader := download.NewReaderV2(ctx, adapter, reconstructionResp, s.chunkCache)
 
 	return reader, expectedLength, nil
 }

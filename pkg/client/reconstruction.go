@@ -7,11 +7,11 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/reconstruction"
+	"github.com/wzshiming/xet/pkg/download"
 )
 
 // GetReconstructionV1 retrieves reconstruction information for a file
-func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*reconstruction.ReconstructionResponse, error) {
+func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*download.ReconstructionResponse, error) {
 	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -37,7 +37,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 		return nil, err
 	}
 
-	var reconstructionResp reconstruction.ReconstructionResponse
+	var reconstructionResp download.ReconstructionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&reconstructionResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
@@ -46,7 +46,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 }
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
-func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*reconstruction.ReconstructionResponseV2, error) {
+func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*download.ReconstructionResponseV2, error) {
 	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -72,7 +72,7 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 		return nil, err
 	}
 
-	var reconstructionResp reconstruction.ReconstructionResponseV2
+	var reconstructionResp download.ReconstructionResponseV2
 	if err := json.NewDecoder(resp.Body).Decode(&reconstructionResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
