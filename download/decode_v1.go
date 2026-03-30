@@ -8,13 +8,14 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/cache"
 	"github.com/wzshiming/xet/xorb"
 )
 
 // ReaderV1 implements io.Reader for V1 reconstruction
 type ReaderV1 struct {
 	client         ClientAdapter
-	chunkCache     map[xet.Hash][]byte
+	chunkCache     cache.ChunkCache
 	ctx            context.Context
 	reconstruction *ReconstructionResponse
 	skipBytes      int64
@@ -29,7 +30,7 @@ type ReaderV1 struct {
 }
 
 // NewReaderV1 creates a new V1 reconstruction reader
-func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponse, chunkCache map[xet.Hash][]byte) io.Reader {
+func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponse, chunkCache cache.ChunkCache) io.Reader {
 	return &ReaderV1{
 		client:         client,
 		chunkCache:     chunkCache,
@@ -160,7 +161,7 @@ func (r *ReaderV1) loadTerm() error {
 	if r.chunkCache != nil {
 		for i := term.Range.Start; i < term.Range.End; i++ {
 			chunk := xorbObj.Chunks[i]
-			r.chunkCache[chunk.Hash] = chunk.UncompressedData
+			_ = r.chunkCache.Put(chunk.Hash, chunk.UncompressedData)
 		}
 	}
 
