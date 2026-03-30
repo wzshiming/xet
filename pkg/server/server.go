@@ -493,43 +493,29 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read xorb data
-	xorbData, err := io.ReadAll(r.Body)
+	// Deserialize xorb using streaming deserialization.
+	// xet-core uploads xorbs without the CasObjectInfo footer (chunks-only
+	// format), while the Go client uses the full format with XETBLOB footer.
+	// Using chunkOnly=true handles both cases: it reads chunks until EOF
+	// (for xet-core) or until the XETBLOB footer marker (for Go client).
+	deserializedXorb, err := xorb.Deserialize(r.Body, true)
 	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	// Verify xorb format and hash.
-	// xet-core uploads xorbs without the CasObjectInfo footer (chunks-only
-	// format), while the Go client uses the full format with XETBLOB footer.
-	// Try the full format first; fall back to chunks-only.
-	deserializedXorb, err := xorb.DeserializeBytes(xorbData, false)
-	isChunksOnly := false
-	if err != nil {
-		deserializedXorb, err = xorb.DeserializeBytes(xorbData, true)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
-			return
-		}
-		isChunksOnly = true
-	}
-
+	// Verify hash matches URL parameter
 	if deserializedXorb.Hash != xorbHash {
 		http.Error(w, fmt.Sprintf("Hash mismatch: xorb has %s, URL has %s", deserializedXorb.Hash.String(), xorbHash.String()), http.StatusBadRequest)
 		return
 	}
 
 	// Normalize to full format with footer for storage.
-	// If we received chunks-only format from xet-core/xet-go, re-serialize
-	// it with the footer so that all clients can download consistently.
-	dataToStore := xorbData
-	if isChunksOnly {
-		dataToStore, err = xorb.SerializeBytes(deserializedXorb, false)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to serialize xorb with footer: %v", err), http.StatusInternalServerError)
-			return
-		}
+	// This ensures all clients can download the same format consistently.
+	dataToStore, err := xorb.SerializeBytes(deserializedXorb, false)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to serialize xorb with footer: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	// Store xorb
