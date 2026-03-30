@@ -57,6 +57,11 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
+	// Set Authorization header if token is present
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
 	for _, opt := range opts {
 		opt(req)
 	}

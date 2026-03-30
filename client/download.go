@@ -21,7 +21,12 @@ func (ca *clientAdapter) DownloadXorb(ctx context.Context, url string, header ht
 	var opts []ReqOpt
 	if len(header) != 0 {
 		opts = append(opts, func(req *http.Request) {
-			req.Header = header
+			// Merge headers instead of replacing them to preserve Authorization
+			for key, values := range header {
+				for _, value := range values {
+					req.Header.Add(key, value)
+				}
+			}
 		})
 	}
 	return ca.client.DownloadXorb(ctx, url, opts...)
