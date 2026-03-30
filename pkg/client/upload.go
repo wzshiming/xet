@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pkg/reconstruction"
 	"github.com/wzshiming/xet/pkg/shard"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
@@ -235,164 +236,43 @@ func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xe
 	// Create shard with default header
 	sh := shard.NewShard()
 
-	// Track unique xorbs
-	xorbMap := make(map[xet.Hash]*shard.CASBlock)
-
-	// Build file blocks
+	// Build file blocks for each file
 	for fileIdx, fileHash := range fileHashes {
 		chunkIndices := fileChunkRanges[fileIdx]
 
-		// Collect all chunk hashes for this file
-		fileChunkHashes := make([]xet.Hash, len(chunkIndices))
-		for i, chunkIdx := range chunkIndices {
-			fileChunkHashes[i] = allChunks[chunkIdx].Hash
-		}
-
-		fileBlock := shard.FileBlock{
-			FileHash:     fileHash,
-			Flags:        shard.FileWithVerification,
-			Entries:      make([]shard.FileDataSequenceEntry, 0),
-			Verification: make([]xet.Hash, 0),
-		}
-
-		// Group consecutive chunks by xorb to create terms
-		type termInfo struct {
-			xorbHash   xet.Hash
-			startIndex uint32
-			endIndex   uint32
-			bytes      uint32
-			chunkStart int // start in fileChunkHashes
-			chunkEnd   int // end in fileChunkHashes
-		}
-
-		var terms []termInfo
-		var currentXorbHash xet.Hash
-		var currentStart uint32
-		var currentBytes uint32
-		var currentChunkStart int
-
+		// Convert chunkInfo to reconstruction.ChunkInfo
+		reconChunks := make([]reconstruction.ChunkInfo, len(chunkIndices))
 		for i, chunkIdx := range chunkIndices {
 			chunk := allChunks[chunkIdx]
-			xorbHash := chunk.Dedup.XorbHash
-			chunkSize := uint32(len(chunk.Data))
-			chunkIndexInXorb := chunk.Dedup.ChunkIndex
-
-			if i == 0 || xorbHash != currentXorbHash {
-				// Start new term
-				if i > 0 {
-					terms = append(terms, termInfo{
-						xorbHash:   currentXorbHash,
-						startIndex: currentStart,
-						endIndex:   currentStart + uint32(i-currentChunkStart),
-						bytes:      currentBytes,
-						chunkStart: currentChunkStart,
-						chunkEnd:   i,
-					})
-				}
-				currentXorbHash = xorbHash
-				currentStart = chunkIndexInXorb
-				currentBytes = chunkSize
-				currentChunkStart = i
-			} else {
-				// Same xorb - chunks should be consecutive
-				// Verify the chunk index is consecutive
-				expectedIndex := currentStart + uint32(i-currentChunkStart)
-				if chunkIndexInXorb != expectedIndex {
-					// Non-consecutive chunks in same xorb - this shouldn't happen
-					// unless there's deduplication within the file
-					// For now, start a new term
-					terms = append(terms, termInfo{
-						xorbHash:   currentXorbHash,
-						startIndex: currentStart,
-						endIndex:   currentStart + uint32(i-currentChunkStart),
-						bytes:      currentBytes,
-						chunkStart: currentChunkStart,
-						chunkEnd:   i,
-					})
-					currentXorbHash = xorbHash
-					currentStart = chunkIndexInXorb
-					currentBytes = chunkSize
-					currentChunkStart = i
-				} else {
-					currentBytes += chunkSize
-				}
-			}
-
-			// Track this xorb
-			if _, exists := xorbMap[xorbHash]; !exists {
-				xorbMap[xorbHash] = &shard.CASBlock{
-					CASHash: xorbHash,
-					Chunks:  make([]shard.CASChunkSequenceEntry, 0),
-				}
+			reconChunks[i] = reconstruction.ChunkInfo{
+				Hash:      chunk.Hash,
+				Data:      chunk.Data,
+				XorbHash:  chunk.Dedup.XorbHash,
+				ChunkIdx:  chunk.Dedup.ChunkIndex,
+				FileIndex: chunk.FileIndex,
 			}
 		}
 
-		// Add final term
-		if len(chunkIndices) > 0 {
-			terms = append(terms, termInfo{
-				xorbHash:   currentXorbHash,
-				startIndex: currentStart,
-				endIndex:   currentStart + uint32(len(chunkIndices)-currentChunkStart),
-				bytes:      currentBytes,
-				chunkStart: currentChunkStart,
-				chunkEnd:   len(chunkIndices),
-			})
-		}
-
-		// Build entries and verification hashes for each term
-		for _, term := range terms {
-			fileBlock.Entries = append(fileBlock.Entries, shard.FileDataSequenceEntry{
-				CASHash:          term.xorbHash,
-				CASFlags:         0,
-				UnpackedSegBytes: term.bytes,
-				ChunkIndexStart:  term.startIndex,
-				ChunkIndexEnd:    term.endIndex,
-			})
-
-			// Compute verification hash for this term's chunk range
-			termChunkHashes := fileChunkHashes[term.chunkStart:term.chunkEnd]
-			verificationHash := xet.ComputeVerificationHash(termChunkHashes)
-			fileBlock.Verification = append(fileBlock.Verification, verificationHash)
-		}
-
+		// Build file block using reconstruction package
+		fileBlock := reconstruction.BuildFileBlock(fileHash, reconChunks)
 		sh.Files = append(sh.Files, fileBlock)
 	}
 
-	// Build CAS blocks by collecting chunk information from all chunks
-	xorbChunksMap := make(map[xet.Hash][]shard.CASChunkSequenceEntry)
-	xorbBytesMap := make(map[xet.Hash]uint32)              // total uncompressed bytes per xorb
-	xorbSeenChunks := make(map[xet.Hash]map[xet.Hash]bool) // track added chunks per xorb
-
-	for _, chunk := range allChunks {
-		xorbHash := chunk.Dedup.XorbHash
-		chunkSize := uint32(len(chunk.Data))
-
-		if _, exists := xorbSeenChunks[xorbHash]; !exists {
-			xorbChunksMap[xorbHash] = make([]shard.CASChunkSequenceEntry, 0)
-			xorbBytesMap[xorbHash] = 0
-			xorbSeenChunks[xorbHash] = make(map[xet.Hash]bool)
-		}
-
-		// Only add each chunk once
-		if !xorbSeenChunks[xorbHash][chunk.Hash] {
-			xorbSeenChunks[xorbHash][chunk.Hash] = true
-			entry := shard.CASChunkSequenceEntry{
-				ChunkHash:        chunk.Hash,
-				ByteRangeStart:   xorbBytesMap[xorbHash],
-				UnpackedSegBytes: chunkSize,
-			}
-			xorbChunksMap[xorbHash] = append(xorbChunksMap[xorbHash], entry)
-			xorbBytesMap[xorbHash] += chunkSize
+	// Convert all chunks to reconstruction.ChunkInfo for CAS blocks
+	reconAllChunks := make([]reconstruction.ChunkInfo, len(allChunks))
+	for i, chunk := range allChunks {
+		reconAllChunks[i] = reconstruction.ChunkInfo{
+			Hash:      chunk.Hash,
+			Data:      chunk.Data,
+			XorbHash:  chunk.Dedup.XorbHash,
+			ChunkIdx:  chunk.Dedup.ChunkIndex,
+			FileIndex: chunk.FileIndex,
 		}
 	}
 
-	for _, casBlock := range xorbMap {
-		if chunks, ok := xorbChunksMap[casBlock.CASHash]; ok {
-			casBlock.Chunks = chunks
-			casBlock.NumBytesInCAS = xorbBytesMap[casBlock.CASHash]
-		}
-		sh.CASInfos = append(sh.CASInfos, *casBlock)
-	}
+	// Build CAS blocks using reconstruction package
+	casBlocks := reconstruction.BuildCASBlocks(reconAllChunks)
+	sh.CASInfos = casBlocks
 
 	_, err := s.client.UploadShard(ctx, sh)
 	if err != nil {
