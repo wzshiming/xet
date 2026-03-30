@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -42,16 +43,6 @@ func Resolve(ctx context.Context, resolveURL string) (Resolved, error) {
 		return Resolved{}, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
 
-	hashStr := resp.Header.Get("X-Xet-Hash")
-	if hashStr == "" {
-		return Resolved{}, fmt.Errorf("missing X-Xet-Hash header in resolve response")
-	}
-
-	fileHash, err := xet.ParseHash(hashStr)
-	if err != nil {
-		return Resolved{}, fmt.Errorf("parse X-Xet-Hash: %w", err)
-	}
-
 	linkMap := parseLinkHeaders(resp.Header.Values("Link"))
 	reconURLStr := linkMap["xet-reconstruction-info"]
 	if reconURLStr == "" {
@@ -64,6 +55,19 @@ func Resolve(ctx context.Context, resolveURL string) (Resolved, error) {
 	}
 	if reconURL.Scheme == "" || reconURL.Host == "" {
 		return Resolved{}, fmt.Errorf("invalid reconstruction link: %s", reconURLStr)
+	}
+
+	hashStr := path.Base(reconURL.Path)
+	if hashStr == "" {
+		hashStr := resp.Header.Get("X-Xet-Hash")
+		if hashStr == "" {
+			return Resolved{}, fmt.Errorf("missing X-Xet-Hash header in resolve response")
+		}
+	}
+
+	fileHash, err := xet.ParseHash(hashStr)
+	if err != nil {
+		return Resolved{}, fmt.Errorf("parse X-Xet-Hash: %w", err)
 	}
 
 	result := Resolved{
