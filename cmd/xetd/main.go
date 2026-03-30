@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/wzshiming/xet/pkg/server"
+	"github.com/wzshiming/xet/pkg/storage"
 )
 
 func main() {
@@ -18,10 +19,10 @@ func main() {
 	flag.Parse()
 
 	// Create storage
-	storage, err := server.NewFileStorage(server.FileStorageOptions{
-		BasePath: *storageDir,
-		BaseURL:  *baseURL,
-	})
+	storage, err := storage.NewFileStorage(
+		storage.WithBasePath(*storageDir),
+		storage.WithBaseURL(*baseURL),
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create storage: %v\n", err)
 		os.Exit(1)
@@ -39,7 +40,10 @@ func main() {
 	}
 
 	// Create server
-	srv := server.NewHandler(server.WithStorage(storage), server.WithAuthFunc(authFn))
+	srv := server.NewHandler(
+		server.WithStorage(storage),
+		server.WithAuthFunc(authFn),
+	)
 
 	err = http.ListenAndServe(*addr, srv)
 	if err != nil {

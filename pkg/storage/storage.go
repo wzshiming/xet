@@ -1,4 +1,4 @@
-package server
+package storage
 
 import (
 	"context"
@@ -50,35 +50,43 @@ type FileStorage struct {
 	chunkIndex map[xet.Hash]map[xet.Hash]struct{} // chunk hash -> set of file hashes
 }
 
-// FileStorageOptions configures the file storage
-type FileStorageOptions struct {
-	BasePath string // Base directory for storage
-	BaseURL  string // Base URL for serving xorb data
+type Option func(*FileStorage)
+
+func WithBasePath(basePath string) Option {
+	return func(fs *FileStorage) {
+		fs.basePath = basePath
+	}
+}
+
+func WithBaseURL(baseURL string) Option {
+	return func(fs *FileStorage) {
+		fs.baseURL = baseURL
+	}
 }
 
 // NewFileStorage creates a new filesystem-based storage
-func NewFileStorage(opts FileStorageOptions) (*FileStorage, error) {
-	if opts.BasePath == "" {
-		opts.BasePath = "./xet-data"
+func NewFileStorage(opts ...Option) (*FileStorage, error) {
+	fs := &FileStorage{
+		basePath:   "./xet",
+		baseURL:    "",
+		shardIndex: make(map[xet.Hash]*shard.Shard),
+		chunkIndex: make(map[xet.Hash]map[xet.Hash]struct{}),
+	}
+
+	for _, opt := range opts {
+		opt(fs)
 	}
 
 	// Create directories
 	dirs := []string{
-		filepath.Join(opts.BasePath, "xorbs"),
-		filepath.Join(opts.BasePath, "shards"),
+		filepath.Join(fs.basePath, "xorbs"),
+		filepath.Join(fs.basePath, "shards"),
 	}
 
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("create directory %s: %w", dir, err)
 		}
-	}
-
-	fs := &FileStorage{
-		basePath:   opts.BasePath,
-		baseURL:    opts.BaseURL,
-		shardIndex: make(map[xet.Hash]*shard.Shard),
-		chunkIndex: make(map[xet.Hash]map[xet.Hash]struct{}),
 	}
 
 	// Load existing shards into memory for fast lookup

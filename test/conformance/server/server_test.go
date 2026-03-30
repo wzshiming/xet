@@ -15,6 +15,7 @@ import (
 	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/server"
+	"github.com/wzshiming/xet/pkg/storage"
 )
 
 // TestServerUploadDownloadConformance tests that files uploaded through the native
@@ -63,7 +64,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Start test HTTP server first (without creating storage yet)
 			// We'll create storage after we know the server URL
-			var storage server.Storage
+			var stor storage.Storage
 			var srv *server.Handler
 			var httpSrv *httptest.Server
 
@@ -79,15 +80,15 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Now create storage with the correct base URL
 			var err error
-			storage, err = server.NewFileStorage(server.FileStorageOptions{
-				BasePath: storageDir,
-				BaseURL:  httpSrv.URL,
-			})
+			stor, err = storage.NewFileStorage(
+				storage.WithBasePath(storageDir),
+				storage.WithBaseURL(httpSrv.URL),
+			)
 			if err != nil {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewHandler(server.WithStorage(storage))
+			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
 			nativeClient := client.NewClient(client.ClientOptions{
@@ -212,7 +213,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Start test HTTP server first (without creating storage yet)
 			// We'll create storage after we know the server URL
-			var storage server.Storage
+			var stor storage.Storage
 			var srv *server.Handler
 			var httpSrv *httptest.Server
 
@@ -228,15 +229,15 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Now create storage with the correct base URL
 			var err error
-			storage, err = server.NewFileStorage(server.FileStorageOptions{
-				BasePath: storageDir,
-				BaseURL:  httpSrv.URL,
-			})
+			stor, err = storage.NewFileStorage(
+				storage.WithBasePath(storageDir),
+				storage.WithBaseURL(httpSrv.URL),
+			)
 			if err != nil {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewHandler(server.WithStorage(storage))
+			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
 			nativeClient := client.NewClient(client.ClientOptions{

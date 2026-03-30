@@ -12,12 +12,13 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/download"
+	"github.com/wzshiming/xet/pkg/storage"
 	"github.com/wzshiming/xet/pkg/upload"
 )
 
 // Handler represents an XET CAS server
 type Handler struct {
-	storage Storage
+	storage storage.Storage
 	root    *mux.Router
 	next    http.Handler
 	authFn  AuthFunc
@@ -45,7 +46,7 @@ func WithNext(next http.Handler) Option {
 }
 
 // WithStorage sets the storage backend for the server. This is required for the server to function.
-func WithStorage(storage Storage) Option {
+func WithStorage(storage storage.Storage) Option {
 	return func(h *Handler) {
 		h.storage = storage
 	}

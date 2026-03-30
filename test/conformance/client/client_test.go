@@ -20,6 +20,7 @@ import (
 	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/server"
 	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/pkg/storage"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -153,7 +154,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeStorageDir := t.TempDir()
 
 				// Setup server for xet-go
-				var xetgoStorage server.Storage
+				var xetgoStor storage.Storage
 				var xetgoSrv *server.Handler
 				var xetgoProxy *RecordingProxy
 				var xetgoHttpSrv *httptest.Server
@@ -168,15 +169,15 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				defer xetgoHttpSrv.Close()
 
 				var err error
-				xetgoStorage, err = server.NewFileStorage(server.FileStorageOptions{
-					BasePath: xetgoStorageDir,
-					BaseURL:  xetgoHttpSrv.URL,
-				})
+				xetgoStor, err = storage.NewFileStorage(
+					storage.WithBasePath(xetgoStorageDir),
+					storage.WithBaseURL(xetgoHttpSrv.URL),
+				)
 				if err != nil {
 					t.Fatalf("Failed to create xet-go storage: %v", err)
 				}
 
-				xetgoSrv = server.NewHandler(server.WithStorage(xetgoStorage))
+				xetgoSrv = server.NewHandler(server.WithStorage(xetgoStor))
 				xetgoProxy = NewRecordingProxy(xetgoSrv)
 
 				// Upload with xet-go
@@ -204,7 +205,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				xetgoRequests := xetgoProxy.GetRequests()
 
 				// Setup server for native client
-				var nativeStorage server.Storage
+				var nativeStor storage.Storage
 				var nativeSrv *server.Handler
 				var nativeProxy *RecordingProxy
 				var nativeHttpSrv *httptest.Server
@@ -218,15 +219,15 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				}))
 				defer nativeHttpSrv.Close()
 
-				nativeStorage, err = server.NewFileStorage(server.FileStorageOptions{
-					BasePath: nativeStorageDir,
-					BaseURL:  nativeHttpSrv.URL,
-				})
+				nativeStor, err = storage.NewFileStorage(
+					storage.WithBasePath(nativeStorageDir),
+					storage.WithBaseURL(nativeHttpSrv.URL),
+				)
 				if err != nil {
 					t.Fatalf("Failed to create native storage: %v", err)
 				}
 
-				nativeSrv = server.NewHandler(server.WithStorage(nativeStorage))
+				nativeSrv = server.NewHandler(server.WithStorage(nativeStor))
 				nativeProxy = NewRecordingProxy(nativeSrv)
 
 				// Upload with native client
@@ -265,7 +266,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 			t.Run("download_conformance", func(t *testing.T) {
 				// Setup shared server
 				storageDir := t.TempDir()
-				var storage server.Storage
+				var stor storage.Storage
 				var srv *server.Handler
 				var proxy *RecordingProxy
 				var httpSrv *httptest.Server
@@ -280,15 +281,15 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				defer httpSrv.Close()
 
 				var err error
-				storage, err = server.NewFileStorage(server.FileStorageOptions{
-					BasePath: storageDir,
-					BaseURL:  httpSrv.URL,
-				})
+				stor, err = storage.NewFileStorage(
+					storage.WithBasePath(storageDir),
+					storage.WithBaseURL(httpSrv.URL),
+				)
 				if err != nil {
 					t.Fatalf("Failed to create storage: %v", err)
 				}
 
-				srv = server.NewHandler(server.WithStorage(storage))
+				srv = server.NewHandler(server.WithStorage(stor))
 				proxy = NewRecordingProxy(srv)
 
 				// First upload file using native client
