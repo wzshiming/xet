@@ -58,8 +58,10 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 			}
 		}
 
-		// Check if we're done with current term's chunks
-		if r.chunkIdx >= r.currentTerm.Range.End {
+		// Check if we're done with current term's chunks.
+		// chunkIdx is a local (0-based) index within the downloaded partial xorb.
+		localEnd := r.currentTerm.Range.End - r.currentTerm.Range.Start
+		if r.chunkIdx >= localEnd {
 			r.currentTerm = nil
 			r.currentXorb = nil
 			r.termIdx++
@@ -69,9 +71,10 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 		// Read from current chunk
 		chunk := r.currentXorb.Chunks[r.chunkIdx]
 
-		// Apply skip for first chunk of first term
+		// Apply skip for first chunk of first term.
+		// chunkIdx == 0 means we are at the first (local) chunk of this term.
 		data := chunk.UncompressedData
-		if r.termIdx == 0 && r.chunkIdx == r.currentTerm.Range.Start && r.skipBytes > 0 {
+		if r.termIdx == 0 && r.chunkIdx == 0 && r.skipBytes > 0 {
 			if r.skipBytes >= int64(len(data)) {
 				r.skipBytes -= int64(len(data))
 				r.chunkIdx++
@@ -129,13 +132,18 @@ func (r *ReaderV1) loadTerm() error {
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	// Validate chunk range
-	if term.Range.End > uint32(len(xorbObj.Chunks)) {
+	// Validate chunk range using local (0-based) count.
+	// When the xorb is downloaded via a byte-range request, the returned xorb
+	// only contains the requested chunks, indexed locally starting at 0.
+	// term.Range.{Start,End} are global indices within the full xorb, so we
+	// must convert to a local count before comparing against len(xorbObj.Chunks).
+	chunkCount := term.Range.End - term.Range.Start
+	if chunkCount > uint32(len(xorbObj.Chunks)) {
 		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", term.Range.Start, term.Range.End, len(xorbObj.Chunks))
 	}
 
 	r.currentXorb = xorbObj
-	r.chunkIdx = term.Range.Start
+	r.chunkIdx = 0 // Use local 0-based index into the downloaded partial xorb
 	r.chunkOffset = 0
 
 	return nil

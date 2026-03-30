@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net/http"
 
@@ -121,15 +120,13 @@ func (r *ReaderV2) loadTerm() error {
 	var fetchURL string
 loop:
 	for _, fetchEntry := range fetchList {
-		for i, ranges := range fetchEntry.Ranges {
-			if ranges.Chunks.Start <= term.Range.Start &&
-				ranges.Chunks.End >= term.Range.End {
+		for _, ranges := range fetchEntry.Ranges {
+			if ranges.Chunks.Start == term.Range.Start &&
+				ranges.Chunks.End == term.Range.End {
 				matchedRange = &ranges
 				fetchURL = fetchEntry.URL
 				break loop
 			}
-
-			log.Printf("Debug: Checking fetch entry URL %s with chunk range [%d, %d) against term chunk range [%d, %d)", fetchEntry.URL, fetchEntry.Ranges[i].Chunks.Start, fetchEntry.Ranges[i].Chunks.End, term.Range.Start, term.Range.End)
 		}
 	}
 
@@ -149,8 +146,13 @@ loop:
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	localStart := term.Range.Start
-	localEnd := term.Range.End
+	// Convert global chunk indices to local (0-based) indices.
+	// When the xorb is downloaded via a byte-range request, the returned xorb
+	// only contains the requested chunks, indexed locally starting at 0.
+	// term.Range.{Start,End} are global indices within the full xorb, so we
+	// must normalise to a local range before validating and accessing chunks.
+	localStart := uint32(0)
+	localEnd := term.Range.End - term.Range.Start
 
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {
