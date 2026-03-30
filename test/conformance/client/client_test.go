@@ -144,6 +144,14 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 			name: "10MB",
 			data: makeBinaryData(10 * 1024 * 1024),
 		},
+		{
+			name: "100MB",
+			data: makeBinaryData(100 * 1024 * 1024),
+		},
+		{
+			name: "1GB",
+			data: makeBinaryData(1024 * 1024 * 1024),
+		},
 	}
 
 	for _, tt := range tests {
