@@ -71,13 +71,6 @@ func (s *Server) registerRoutes() {
 
 // ServeHTTP implements http.Handler
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Log request
-	start := time.Now()
-	defer func() {
-		duration := time.Since(start)
-		fmt.Printf("[%s] %s %s - %v\n", r.Method, r.URL.Path, r.RemoteAddr, duration)
-	}()
-
 	s.router.ServeHTTP(w, r)
 }
 
