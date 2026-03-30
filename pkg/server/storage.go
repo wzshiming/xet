@@ -148,7 +148,7 @@ func (fs *FileStorage) StoreXorb(ctx context.Context, namespace string, xorbObj 
 
 	// Serialize xorb to full format with footer for storage.
 	// This ensures all clients can download the same format consistently.
-	r, err := xorb.Serialize(xorbObj, false)
+	r, err := xorb.Encode(xorbObj, false)
 	if err != nil {
 		return false, fmt.Errorf("serialize xorb: %w", err)
 	}
@@ -193,7 +193,7 @@ func (fs *FileStorage) GetXorb(ctx context.Context, namespace string, xorbHash x
 	// Deserialize xorb from file using streaming.
 	// The stored format always has the full XETBLOB footer (chunkOnly=false)
 	// because StoreXorb normalizes all uploads to this format.
-	xorbObj, err := xorb.Deserialize(f, false)
+	xorbObj, err := xorb.Decode(f, false)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize xorb: %w", err)
 	}

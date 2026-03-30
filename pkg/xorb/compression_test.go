@@ -148,7 +148,7 @@ func TestSelectBestCompression(t *testing.T) {
 				}
 			}
 
-			compressed, compressionType, err := SelectBestCompression(tc.data)
+			compressed, compressionType, err := selectBestCompression(tc.data)
 			if err != nil {
 				t.Fatalf("SelectBestCompression failed: %v", err)
 			}

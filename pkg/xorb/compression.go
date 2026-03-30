@@ -17,22 +17,8 @@ const (
 	CompressionByteGrouping4 CompressionType = 2 // ByteGrouping4 + LZ4
 )
 
-// CompressChunk compresses a chunk using the specified compression type
-func CompressChunk(data []byte, compressionType CompressionType) ([]byte, error) {
-	switch compressionType {
-	case CompressionNone:
-		return data, nil
-	case CompressionLZ4:
-		return compressLZ4(data)
-	case CompressionByteGrouping4:
-		return compressByteGrouping4LZ4(data)
-	default:
-		return nil, fmt.Errorf("unsupported compression type: %d", compressionType)
-	}
-}
-
-// DecompressChunk decompresses a chunk using the specified compression type
-func DecompressChunk(data []byte, compressionType CompressionType, uncompressedSize int) ([]byte, error) {
+// decompressChunk decompresses a chunk using the specified compression type
+func decompressChunk(data []byte, compressionType CompressionType, uncompressedSize int) ([]byte, error) {
 	switch compressionType {
 	case CompressionNone:
 		return data, nil
@@ -155,8 +141,8 @@ func reverseByteGrouping4(data []byte) []byte {
 	return result
 }
 
-// SelectBestCompression tries different compression methods and returns the best one
-func SelectBestCompression(data []byte) ([]byte, CompressionType, error) {
+// selectBestCompression tries different compression methods and returns the best one
+func selectBestCompression(data []byte) ([]byte, CompressionType, error) {
 	// Try no compression
 	noneSize := len(data)
 	best := data

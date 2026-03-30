@@ -258,14 +258,14 @@ func (s *Server) buildReconstructionResponse(ctx context.Context, namespace stri
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
 func (s *Server) compressedDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
-	xorbObj, err := s.storage.GetXorb(ctx, namespace, xorbHash)
+	xorbReader, err := s.storage.GetXorbReadSeekCloser(ctx, namespace, xorbHash)
 	if err != nil {
 		return 0, 0
 	}
 
 	// Serialize to bytes to compute chunk offsets in the stored format.
 	// We need the actual byte layout to calculate ranges for HTTP range requests.
-	xorbData, err := xorb.SerializeBytes(xorbObj, false)
+	xorbData, err := io.ReadAll(xorbReader)
 	if err != nil {
 		return 0, 0
 	}
@@ -499,7 +499,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deserializedXorb, err := xorb.Deserialize(r.Body, true)
+	deserializedXorb, err := xorb.Decode(r.Body, true)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
 		return

@@ -13,7 +13,7 @@ import (
 // This is a high-level method that handles serialization and upload of a Xorb object.
 func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*XorbUploadResponse, error) {
 	// Serialize the xorb with full format (including footer)
-	reader, err := xorb.Serialize(xorbObj, false)
+	reader, err := xorb.Encode(xorbObj, false)
 	if err != nil {
 		return nil, fmt.Errorf("serialize xorb: %w", err)
 	}
@@ -84,7 +84,7 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	}
 
 	// Deserialize the xorb
-	xorbObj, err := xorb.Deserialize(resp.Body, chunkOnly)
+	xorbObj, err := xorb.Decode(resp.Body, chunkOnly)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize xorb: %w", err)
 	}

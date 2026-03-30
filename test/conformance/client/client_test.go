@@ -616,14 +616,11 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range xetgoReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.DeserializeBytes(req.Body, false)
+		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
 		if err != nil {
-			// Try chunks-only format
-			xorbObj, err = xorb.DeserializeBytes(req.Body, true)
-			if err != nil {
-				t.Errorf("Failed to deserialize xet-go xorb: %v", err)
-				continue
-			}
+			t.Errorf("Failed to deserialize xet-go xorb: %v", err)
+			continue
+
 		}
 
 		info := xorbInfo{hash: req.Path}
@@ -639,14 +636,10 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range nativeReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.DeserializeBytes(req.Body, false)
+		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
 		if err != nil {
-			// Try chunks-only format
-			xorbObj, err = xorb.DeserializeBytes(req.Body, true)
-			if err != nil {
-				t.Errorf("Failed to deserialize native xorb: %v", err)
-				continue
-			}
+			t.Errorf("Failed to deserialize native xorb: %v", err)
+			continue
 		}
 
 		info := xorbInfo{hash: req.Path}
