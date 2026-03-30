@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -16,31 +15,47 @@ type Client struct {
 	namespace  string
 }
 
-// ClientOptions configures the API client
-type ClientOptions struct {
-	BaseURL   string
-	Token     string
-	Namespace string
-	Timeout   time.Duration
+type Options func(*Client)
+
+func WithBaseURL(url string) Options {
+	return func(c *Client) {
+		c.baseURL = url
+	}
+}
+
+func WithHTTPClient(httpClient *http.Client) Options {
+	return func(c *Client) {
+		c.httpClient = httpClient
+	}
+}
+
+func WithToken(token string) Options {
+	return func(c *Client) {
+		c.token = token
+	}
+}
+
+func WithNamespace(namespace string) Options {
+	return func(c *Client) {
+		c.namespace = namespace
+	}
 }
 
 // NewClient creates a new API client
-func NewClient(opts ClientOptions) *Client {
-	if opts.Timeout == 0 {
-		opts.Timeout = 30 * time.Second
+func NewClient(opts ...Options) *Client {
+	c := &Client{
+		namespace: "default",
 	}
-	if opts.Namespace == "" {
-		opts.Namespace = "default"
+	for _, opt := range opts {
+		opt(c)
+	}
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+		}
 	}
 
-	return &Client{
-		baseURL: strings.TrimSuffix(opts.BaseURL, "/"),
-		httpClient: &http.Client{
-			Timeout: opts.Timeout,
-		},
-		token:     opts.Token,
-		namespace: opts.Namespace,
-	}
+	return c
 }
 
 type ReqOpt func(req *http.Request)

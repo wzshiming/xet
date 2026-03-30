@@ -37,10 +37,7 @@ func TestUploadXorb(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-		Token:   "test-token",
-	})
+	client := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
 
 	// Create a test xorb
 	xorbObj := xorb.NewXorb()

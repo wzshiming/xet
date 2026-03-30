@@ -91,10 +91,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient := client.NewClient(client.ClientOptions{
-				BaseURL:   httpSrv.URL,
-				Namespace: "default",
-			})
+			nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
 
 			t.Run("upload_with_xetgo", func(t *testing.T) {
 				// Create temp directory and write test file
@@ -240,10 +237,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient := client.NewClient(client.ClientOptions{
-				BaseURL:   httpSrv.URL,
-				Namespace: "default",
-			})
+			nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
 
 			t.Run("upload", func(t *testing.T) {
 				// Write test file to upload

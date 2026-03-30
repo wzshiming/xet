@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
@@ -38,11 +37,7 @@ func downloadCommand() {
 	}
 
 	// Create API client
-	cli := client.NewClient(client.ClientOptions{
-		BaseURL: *url,
-		Token:   *token,
-		Timeout: 5 * time.Minute,
-	})
+	cli := client.NewClient(client.WithBaseURL(*url), client.WithToken(*token))
 
 	// Create download session
 	session := cli.DownloadSession()

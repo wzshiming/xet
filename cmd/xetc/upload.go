@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/wzshiming/xet/client"
 )
@@ -38,12 +37,7 @@ func uploadCommand() {
 	defer f.Close()
 
 	// Create API client
-	cli := client.NewClient(client.ClientOptions{
-		BaseURL:   *url,
-		Token:     *token,
-		Namespace: *namespace,
-		Timeout:   5 * time.Minute,
-	})
+	cli := client.NewClient(client.WithBaseURL(*url), client.WithToken(*token), client.WithNamespace(*namespace))
 
 	// Create upload session
 	session := cli.UploadSession(client.WithUploadGlobalDedup(!*noDedup))

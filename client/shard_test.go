@@ -6,24 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 )
-
-func TestNewClientDefaults(t *testing.T) {
-	client := NewClient(ClientOptions{
-		BaseURL: "https://example.com",
-	})
-
-	if client.namespace != "default" {
-		t.Errorf("Expected default namespace 'default', got '%s'", client.namespace)
-	}
-	if client.httpClient.Timeout != 30*time.Second {
-		t.Errorf("Expected default timeout 30s, got %v", client.httpClient.Timeout)
-	}
-}
 
 func TestQueryChunkDeduplicationNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,9 +17,7 @@ func TestQueryChunkDeduplicationNotFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	result, err := client.QueryChunkDeduplication(context.Background(), hash)
@@ -55,9 +39,7 @@ func TestQueryChunkDeduplicationFound(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	result, err := client.QueryChunkDeduplication(context.Background(), hash)

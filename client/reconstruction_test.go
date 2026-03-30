@@ -51,10 +51,7 @@ func TestGetReconstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-		Token:   "test-token",
-	})
+	client := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
 
 	reconstruction, err := client.GetReconstructionV1(context.Background(), testHash)
 	if err != nil {
@@ -79,9 +76,7 @@ func TestGetReconstructionError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	_, err := client.GetReconstructionV1(context.Background(), hash)
@@ -107,9 +102,7 @@ func TestGetReconstructionRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	reconstruction, err := client.GetReconstructionV1(context.Background(), hash, WithRange(1000, 2000))
@@ -164,10 +157,7 @@ func TestGetReconstructionV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(ClientOptions{
-		BaseURL: server.URL,
-		Token:   "test-token",
-	})
+	c := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
 
 	reconstruction, err := c.GetReconstructionV2(context.Background(), testHash)
 	if err != nil {
@@ -195,9 +185,7 @@ func TestGetReconstructionV2Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	c := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	_, err := c.GetReconstructionV2(context.Background(), hash)
@@ -223,9 +211,7 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
+	c := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
 	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, WithRange(1000, 2000))
