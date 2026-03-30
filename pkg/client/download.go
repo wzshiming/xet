@@ -50,7 +50,7 @@ func (s *DownloadSession) DownloadFile(ctx context.Context, fileHash xet.Hash, o
 // DownloadFileV1 downloads and reconstructs a file from its hash
 func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (io.Reader, int64, error) {
 	// Step 1: Query reconstruction
-	reconstruction, err := s.client.GetReconstruction(ctx, fileHash, opts...)
+	reconstruction, err := s.client.GetReconstructionV1(ctx, fileHash, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 	}
