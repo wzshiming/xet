@@ -10,7 +10,7 @@ import (
 
 func uploadCommand() {
 	fs := flag.NewFlagSet("upload", flag.ExitOnError)
-	url := fs.String("url", "", "CAS server URL")
+	url := fs.String("url", "https://cas-server.xethub.hf.co", "CAS server URL")
 	token := fs.String("token", "", "Authentication token")
 	namespace := fs.String("namespace", "default", "Storage namespace")
 	noDedup := fs.Bool("no-dedup", false, "Disable global deduplication")
