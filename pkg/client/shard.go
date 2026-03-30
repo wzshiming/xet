@@ -8,13 +8,14 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/pkg/upload"
 )
 
 // UploadShard uploads a serialized shard to the server
-func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*ShardUploadResponse, error) {
+func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, err := shard.Encode(shardObj, false)
+	r, err := upload.EncodeShard(shardObj)
 	if err != nil {
 		return nil, err
 	}
@@ -39,7 +40,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*Shard
 		return nil, err
 	}
 
-	var uploadResp ShardUploadResponse
+	var uploadResp upload.ShardUploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
@@ -76,10 +77,10 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	}
 
 	// Deserialize shard directly from response body
-	shard, err := shard.Decode(resp.Body)
+	shardObj, err := upload.DecodeChunkQueryResponse(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 
-	return shard, nil
+	return shardObj, nil
 }

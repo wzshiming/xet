@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
-func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*XorbUploadResponse, error) {
+func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.XorbUploadResponse, error) {
 	// Serialize the xorb with full format (including footer)
-	reader, err := xorb.Encode(xorbObj, false)
+	reader, err := upload.EncodeXorb(xorbObj)
 	if err != nil {
 		return nil, fmt.Errorf("serialize xorb: %w", err)
 	}
@@ -40,7 +41,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*XorbUploa
 		return nil, err
 	}
 
-	var uploadResp XorbUploadResponse
+	var uploadResp upload.XorbUploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}

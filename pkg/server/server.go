@@ -12,10 +12,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/download"
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/pkg/upload"
 )
 
 // Server represents an XET CAS server
@@ -183,15 +181,9 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deserializedXorb, err := xorb.Decode(r.Body, true)
+	deserializedXorb, err := upload.DecodeXorb(r.Body, xorbHash)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Verify hash matches URL parameter
-	if deserializedXorb.Hash != xorbHash {
-		http.Error(w, fmt.Sprintf("Hash mismatch: xorb has %s, URL has %s", deserializedXorb.Hash.String(), xorbHash.String()), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -203,7 +195,7 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return response
-	response := client.XorbUploadResponse{
+	response := upload.XorbUploadResponse{
 		WasInserted: wasInserted,
 	}
 
@@ -246,7 +238,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deserialize shard
-	shard, err := shard.Decode(r.Body)
+	shard, err := upload.DecodeShard(r.Body)
 	if err != nil {
 		http.Error(w, "Invalid shard format", http.StatusBadRequest)
 		return
@@ -265,7 +257,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		result = 1
 	}
 
-	response := client.ShardUploadResponse{
+	response := upload.ShardUploadResponse{
 		Result: result,
 	}
 
@@ -295,7 +287,7 @@ func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serialize shard without footer (for API responses) and stream directly
-	reader, err := shard.Encode(shardObj, false)
+	reader, err := upload.EncodeChunkQueryResponse(shardObj)
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return
