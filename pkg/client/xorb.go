@@ -72,17 +72,8 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	}
 
 	// Determine if this is a range request (chunks-only format)
-	chunkOnly := false
-	for _, opt := range opts {
-		// Check if any of the opts set a Range header
-		// We can detect this by creating a dummy request and checking if Range is set
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
-		opt(req)
-		if req.Header.Get("Range") != "" {
-			chunkOnly = true
-			break
-		}
-	}
+	// Check if a Range header was set on the actual request
+	chunkOnly := req.Header.Get("Range") != ""
 
 	// Deserialize the xorb
 	xorbObj, err := xorb.Decode(resp.Body, chunkOnly)
