@@ -100,7 +100,7 @@ func Decode(r io.Reader, chunkOnly bool) (*Xorb, error) {
 	return xorb, nil
 }
 
-// readFooterFromStream reads the footer from the stream.
+// readFooterFromStream reads the footer from the stream incrementally.
 // headerBuf contains the first 8 bytes we already read (starting with XETBLOB).
 func (x *Xorb) readFooterFromStream(r io.Reader, headerBuf []byte) error {
 	// We've already read 8 bytes (first 7 are "XETBLOB", 8th is version byte)
@@ -113,34 +113,60 @@ func (x *Xorb) readFooterFromStream(r io.Reader, headerBuf []byte) error {
 	// - num_chunks (4 bytes)
 	// - chunk hashes (32 * num_chunks bytes)
 	// - Boundary section header (7 bytes "XBLBBND")
-	// - ... rest of boundary section
+	// - Boundary section version (1 byte)
+	// - num_chunks (4 bytes)
+	// - chunk offsets (4 * num_chunks bytes)
+	// - unpacked offsets (4 * num_chunks bytes)
 	// - Trailer (28 bytes)
 	// - footer length (4 bytes) at the very end
 
-	// We need to read the entire footer to parse it properly
-	// The footer length is at the very END, so we need to buffer it
-	// Let's read everything remaining and parse from that buffer
-	footerData, err := io.ReadAll(r)
-	if err != nil {
-		return fmt.Errorf("failed to read footer data: %w", err)
+	// Read xorb hash (32 bytes) - completing the main header
+	xorbHashBuf := make([]byte, 32)
+	if _, err := io.ReadFull(r, xorbHashBuf); err != nil {
+		return fmt.Errorf("failed to read xorb hash: %w", err)
 	}
 
-	// Combine headerBuf with footerData
-	fullFooter := make([]byte, 0, len(headerBuf)+len(footerData))
+	// Read hash section header (12 bytes: XBLBHSH + version + num_chunks)
+	hashHeaderBuf := make([]byte, 12)
+	if _, err := io.ReadFull(r, hashHeaderBuf); err != nil {
+		return fmt.Errorf("failed to read hash section header: %w", err)
+	}
+
+	// Verify hash section identifier
+	if string(hashHeaderBuf[:7]) != HashSectionIdent {
+		return fmt.Errorf("invalid hash section identifier: got %q, expected %q", string(hashHeaderBuf[:7]), HashSectionIdent)
+	}
+
+	// Get num_chunks to calculate remaining footer size
+	numChunks := binary.LittleEndian.Uint32(hashHeaderBuf[8:12])
+
+	// Calculate sizes of remaining sections
+	chunkHashesSize := int(numChunks) * 32
+	boundarySectionSize := 8 + 4 + int(numChunks)*4 + int(numChunks)*4 // header + version + num_chunks + offsets*2
+	trailerSize := 28
+	footerLengthSize := 4
+
+	// Read the rest of the footer
+	remainingSize := chunkHashesSize + boundarySectionSize + trailerSize + footerLengthSize
+	remainingBuf := make([]byte, remainingSize)
+	if _, err := io.ReadFull(r, remainingBuf); err != nil {
+		return fmt.Errorf("failed to read remaining footer data: %w", err)
+	}
+
+	// Reconstruct the full footer for parsing
+	fullFooter := make([]byte, 0, 8+32+12+remainingSize)
 	fullFooter = append(fullFooter, headerBuf...)
-	fullFooter = append(fullFooter, footerData...)
+	fullFooter = append(fullFooter, xorbHashBuf...)
+	fullFooter = append(fullFooter, hashHeaderBuf...)
+	fullFooter = append(fullFooter, remainingBuf...)
 
-	// The last 4 bytes should be the footer length
-	if len(fullFooter) < 4 {
-		return fmt.Errorf("footer too short")
-	}
-
+	// Verify footer length field at the end
 	footerLen := binary.LittleEndian.Uint32(fullFooter[len(fullFooter)-4:])
 
-	// Verify the footer length matches what we have
 	// The footer length does NOT include the final 4-byte length field itself
-	if int(footerLen) != len(fullFooter)-4 {
-		return fmt.Errorf("footer length mismatch: expected %d, got %d", len(fullFooter)-4, footerLen)
+	expectedLen := len(fullFooter) - 4
+	if int(footerLen) != expectedLen {
+		return fmt.Errorf("footer length mismatch: expected %d, got %d", expectedLen, footerLen)
 	}
 
 	// Parse the footer (excluding the final 4-byte length)
