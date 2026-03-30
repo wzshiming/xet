@@ -1,21 +1,26 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 
-	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pkg/xorb"
 )
 
-// UploadXorb uploads a serialized xorb to the server
-func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []byte) (*XorbUploadResponse, error) {
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+// UploadXorb serializes and uploads a xorb to the server
+// This is a high-level method that handles serialization and upload of a Xorb object.
+func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*XorbUploadResponse, error) {
+	// Serialize the xorb with full format (including footer)
+	reader, err := xorb.Serialize(xorbObj, false)
+	if err != nil {
+		return nil, fmt.Errorf("serialize xorb: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(xorbData))
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -43,8 +48,9 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []b
 	return &uploadResp, nil
 }
 
-// DownloadXorbData downloads xorb data from a URL with optional byte range
-func (c *Client) DownloadXorbData(ctx context.Context, url string, opts ...ReqOpt) ([]byte, error) {
+// DownloadXorb downloads and deserializes a xorb from a URL
+// This is a high-level method that handles downloading and deserialization of a Xorb object from a given URL.
+func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (*xorb.Xorb, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -64,10 +70,25 @@ func (c *Client) DownloadXorbData(ctx context.Context, url string, opts ...ReqOp
 		return nil, err
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+	// Determine if this is a range request (chunks-only format)
+	chunkOnly := false
+	for _, opt := range opts {
+		// Check if any of the opts set a Range header
+		// We can detect this by creating a dummy request and checking if Range is set
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		opt(req)
+		if req.Header.Get("Range") != "" {
+			chunkOnly = true
+			break
+		}
 	}
 
-	return data, nil
+	// Deserialize the xorb
+	xorbObj, err := xorb.Deserialize(resp.Body, chunkOnly)
+	if err != nil {
+		return nil, fmt.Errorf("deserialize xorb: %w", err)
+	}
+
+	return xorbObj, nil
+
 }

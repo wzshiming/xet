@@ -183,20 +183,9 @@ func (r *reconstructionReaderV1) loadTerm() error {
 		reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
 	}
 
-	xorbData, err := r.session.client.DownloadXorbData(r.ctx, fetchInfo.URL, reqOpts...)
+	xorbObj, err := r.session.client.DownloadXorb(r.ctx, fetchInfo.URL, reqOpts...)
 	if err != nil {
-		return fmt.Errorf("download xorb data: %w", err)
-	}
-
-	// Deserialize xorb
-	var xorbObj *xorb.Xorb
-	if useChunksOnly {
-		xorbObj, err = xorb.DeserializeBytes(xorbData, true)
-	} else {
-		xorbObj, err = xorb.DeserializeBytes(xorbData, false)
-	}
-	if err != nil {
-		return fmt.Errorf("deserialize xorb: %w", err)
+		return fmt.Errorf("download xorb: %w", err)
 	}
 
 	// Verify xorb hash only when we have the full xorb
@@ -371,20 +360,9 @@ func (r *reconstructionReaderV2) loadTerm() error {
 		reqOpts = append(reqOpts, WithRange(byteRange.Start, byteRange.End))
 	}
 
-	xorbData, err := r.session.client.DownloadXorbData(r.ctx, fetchEntry.URL, reqOpts...)
+	xorbObj, err := r.session.client.DownloadXorb(r.ctx, fetchEntry.URL, reqOpts...)
 	if err != nil {
-		return fmt.Errorf("download xorb data: %w", err)
-	}
-
-	// Deserialize xorb
-	var xorbObj *xorb.Xorb
-	if useChunksOnly {
-		xorbObj, err = xorb.DeserializeBytes(xorbData, true)
-	} else {
-		xorbObj, err = xorb.DeserializeBytes(xorbData, false)
-	}
-	if err != nil {
-		return fmt.Errorf("deserialize xorb: %w", err)
+		return fmt.Errorf("download xorb: %w", err)
 	}
 
 	// Verify xorb hash only when we have the full xorb
