@@ -101,10 +101,7 @@ func uploadCommand() {
 	})
 
 	// Create upload session
-	session := client.NewUploadSession(client.UploadSessionOptions{
-		Client:            cli,
-		EnableGlobalDedup: !*noDedup,
-	})
+	session := cli.UploadSession(client.WithUploadGlobalDedup(!*noDedup))
 
 	// Upload the file
 	fmt.Printf("%s Uploading file\n", filename)
@@ -155,10 +152,7 @@ func downloadCommand() {
 	})
 
 	// Create download session
-	session := client.NewDownloadSession(client.DownloadSessionOptions{
-		Client:        cli,
-		EnableCaching: *enableCache,
-	})
+	session := cli.DownloadSession(client.WithDownloadCaching(*enableCache))
 
 	// Download the file
 

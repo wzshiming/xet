@@ -131,9 +131,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Download using native client to verify
-				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
-					Client: nativeClient,
-				})
+				downloadSession := nativeClient.DownloadSession()
 				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
@@ -167,9 +165,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
-					Client: nativeClient,
-				})
+				uploadSession := nativeClient.UploadSession()
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
@@ -267,9 +263,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Upload using native client
-				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
-					Client: nativeClient,
-				})
+				uploadSession := nativeClient.UploadSession()
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
@@ -311,9 +305,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
-					Client: nativeClient,
-				})
+				uploadSession := nativeClient.UploadSession()
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
@@ -322,9 +314,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				fileHash := fileHashes[0]
 
 				// Download using native client
-				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
-					Client: nativeClient,
-				})
+				downloadSession := nativeClient.DownloadSession()
 				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file: %v", err)

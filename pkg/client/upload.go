@@ -26,19 +26,28 @@ type DeduplicationResult struct {
 	ChunkIndex uint32
 }
 
-// UploadSessionOptions configures an upload session
-type UploadSessionOptions struct {
-	Client            *Client
+type uploadSessionOptions struct {
 	EnableGlobalDedup bool
 }
 
-// NewUploadSession creates a new upload session
-func NewUploadSession(opts UploadSessionOptions) *UploadSession {
+// WithUploadGlobalDedup configures whether to check global deduplication before uploading chunks
+func WithUploadGlobalDedup(enabled bool) func(*uploadSessionOptions) {
+	return func(opts *uploadSessionOptions) {
+		opts.EnableGlobalDedup = enabled
+	}
+}
+
+// UploadSession creates a new upload session with optional global deduplication
+func (c *Client) UploadSession(opts ...func(*uploadSessionOptions)) *UploadSession {
+	options := &uploadSessionOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
 	return &UploadSession{
-		client:            opts.Client,
+		client:            c,
 		localChunkCache:   make(map[xet.Hash]*DeduplicationResult),
 		targetXorbSize:    xet.MaxXorbSerializedSize,
-		enableGlobalDedup: opts.EnableGlobalDedup,
+		enableGlobalDedup: options.EnableGlobalDedup,
 	}
 }
 

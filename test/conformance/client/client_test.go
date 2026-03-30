@@ -254,9 +254,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					}
 				}()
 
-				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
-					Client: nativeClient,
-				})
+				uploadSession := nativeClient.UploadSession()
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file with native client: %v", err)
@@ -316,9 +314,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := client.NewUploadSession(client.UploadSessionOptions{
-					Client: nativeClient,
-				})
+				uploadSession := nativeClient.UploadSession()
 				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
 				f.Close()
 				if err != nil {
@@ -347,9 +343,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Download with native client
 				proxy.ClearRequests()
-				downloadSession := client.NewDownloadSession(client.DownloadSessionOptions{
-					Client: nativeClient,
-				})
+				downloadSession := nativeClient.DownloadSession()
 				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)

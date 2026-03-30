@@ -16,21 +16,31 @@ type DownloadSession struct {
 	chunkCache map[xet.Hash][]byte
 }
 
-// DownloadSessionOptions configures a download session
-type DownloadSessionOptions struct {
-	Client        *Client
+type downloadSessionOptions struct {
 	EnableCaching bool
 }
 
-// NewDownloadSession creates a new download session
-func NewDownloadSession(opts DownloadSessionOptions) *DownloadSession {
+// WithDownloadCaching enables or disables chunk caching for a download session
+func WithDownloadCaching(enabled bool) func(*downloadSessionOptions) {
+	return func(opts *downloadSessionOptions) {
+		opts.EnableCaching = enabled
+	}
+}
+
+// DownloadSession creates a new download session with optional caching
+func (c *Client) DownloadSession(opts ...func(*downloadSessionOptions)) *DownloadSession {
+	options := &downloadSessionOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
 	var cache map[xet.Hash][]byte
-	if opts.EnableCaching {
+	if options.EnableCaching {
 		cache = make(map[xet.Hash][]byte)
 	}
 
 	return &DownloadSession{
-		client:     opts.Client,
+		client:     c,
 		chunkCache: cache,
 	}
 }
