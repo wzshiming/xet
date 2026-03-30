@@ -49,7 +49,6 @@ func printUsage() {
 	fmt.Println("Download Options:")
 	fmt.Println("  --url <url>              CAS server URL (required)")
 	fmt.Println("  --token <token>          Authentication token")
-	fmt.Println("  --cache                  Enable chunk caching")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  xetc upload myfile.txt --url https://xet.example.com --token abc123")

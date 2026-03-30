@@ -15,7 +15,6 @@ func downloadCommand() {
 	fs := flag.NewFlagSet("download", flag.ExitOnError)
 	url := fs.String("url", "", "CAS server URL")
 	token := fs.String("token", "", "Authentication token")
-	enableCache := fs.Bool("cache", false, "Enable chunk caching")
 	fs.Parse(os.Args[2:])
 
 	if *url == "" {
@@ -46,7 +45,7 @@ func downloadCommand() {
 	})
 
 	// Create download session
-	session := cli.DownloadSession(client.WithDownloadCaching(*enableCache))
+	session := cli.DownloadSession()
 
 	// Download the file
 	fmt.Printf("%s Downloading file with hash: %s\n", outputFile, fileHash.String())

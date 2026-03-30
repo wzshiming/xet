@@ -29,36 +29,13 @@ func (ca *clientAdapter) DownloadXorb(ctx context.Context, url string, header ht
 
 // DownloadSession represents a download session
 type DownloadSession struct {
-	client     *Client
-	chunkCache map[xet.Hash][]byte
-}
-
-type downloadSessionOptions struct {
-	EnableCaching bool
-}
-
-// WithDownloadCaching enables or disables chunk caching for a download session
-func WithDownloadCaching(enabled bool) func(*downloadSessionOptions) {
-	return func(opts *downloadSessionOptions) {
-		opts.EnableCaching = enabled
-	}
+	client *Client
 }
 
 // DownloadSession creates a new download session with optional caching
-func (c *Client) DownloadSession(opts ...func(*downloadSessionOptions)) *DownloadSession {
-	options := &downloadSessionOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
-
-	var cache map[xet.Hash][]byte
-	if options.EnableCaching {
-		cache = make(map[xet.Hash][]byte)
-	}
-
+func (c *Client) DownloadSession() *DownloadSession {
 	return &DownloadSession{
-		client:     c,
-		chunkCache: cache,
+		client: c,
 	}
 }
 
@@ -88,7 +65,7 @@ func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash,
 	adapter := &clientAdapter{client: s.client}
 
 	// Create a reader that reconstructs the file on-demand
-	reader := download.NewReaderV1(ctx, adapter, reconstructionResp, s.chunkCache)
+	reader := download.NewReaderV1(ctx, adapter, reconstructionResp)
 
 	return reader, expectedLength, nil
 }
@@ -106,7 +83,7 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 	adapter := &clientAdapter{client: s.client}
 
 	// Create a reader that reconstructs the file on-demand
-	reader := download.NewReaderV2(ctx, adapter, reconstructionResp, s.chunkCache)
+	reader := download.NewReaderV2(ctx, adapter, reconstructionResp)
 
 	return reader, expectedLength, nil
 }

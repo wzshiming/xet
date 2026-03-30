@@ -14,7 +14,6 @@ import (
 // ReaderV2 implements io.Reader for V2 reconstruction
 type ReaderV2 struct {
 	client         ClientAdapter
-	chunkCache     map[xet.Hash][]byte
 	ctx            context.Context
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
@@ -31,10 +30,9 @@ type ReaderV2 struct {
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, chunkCache map[xet.Hash][]byte) io.Reader {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2) io.Reader {
 	return &ReaderV2{
 		client:         client,
-		chunkCache:     chunkCache,
 		ctx:            ctx,
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
@@ -175,14 +173,6 @@ func (r *ReaderV2) loadTerm() error {
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {
 		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
-	}
-
-	// Cache chunks if enabled
-	if r.chunkCache != nil {
-		for i := localStart; i < localEnd; i++ {
-			chunk := xorbObj.Chunks[i]
-			r.chunkCache[chunk.Hash] = chunk.UncompressedData
-		}
 	}
 
 	r.currentXorb = xorbObj
