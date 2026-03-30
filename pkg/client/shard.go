@@ -2,49 +2,17 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/pkg/upload"
 )
 
 // UploadShard uploads a serialized shard to the server
-func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*ShardUploadResponse, error) {
-	url := fmt.Sprintf("%s/shards", c.baseURL)
-
-	r, err := shard.Encode(shardObj, false)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, r)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/octet-stream")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := reqError(req, resp); err != nil {
-		return nil, err
-	}
-
-	var uploadResp ShardUploadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &uploadResp, nil
+func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
+	return upload.EncodeAndUploadShard(ctx, c, shardObj)
 }
 
 // QueryChunkDeduplication checks if a chunk exists in the global deduplication index

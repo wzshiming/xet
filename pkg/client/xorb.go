@@ -2,50 +2,37 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
+	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
+// GetBaseURL returns the base URL of the server
+func (c *Client) GetBaseURL() string {
+	return c.baseURL
+}
+
+// GetNamespace returns the namespace for uploads
+func (c *Client) GetNamespace() string {
+	return c.namespace
+}
+
+// GetToken returns the authentication token
+func (c *Client) GetToken() string {
+	return c.token
+}
+
+// GetHTTPClient returns the HTTP client to use for requests
+func (c *Client) GetHTTPClient() *http.Client {
+	return c.httpClient
+}
+
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
-func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*XorbUploadResponse, error) {
-	// Serialize the xorb with full format (including footer)
-	reader, err := xorb.Encode(xorbObj, false)
-	if err != nil {
-		return nil, fmt.Errorf("serialize xorb: %w", err)
-	}
-
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/octet-stream")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := reqError(req, resp); err != nil {
-		return nil, err
-	}
-
-	var uploadResp XorbUploadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &uploadResp, nil
+func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.XorbUploadResponse, error) {
+	return upload.EncodeAndUploadXorb(ctx, c, xorbObj)
 }
 
 // DownloadXorb downloads and deserializes a xorb from a URL

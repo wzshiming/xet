@@ -13,10 +13,9 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/client"
 	"github.com/wzshiming/xet/pkg/download"
 	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/pkg/upload"
 )
 
 // Server represents an XET CAS server
@@ -184,28 +183,11 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deserializedXorb, err := xorb.Decode(r.Body, true)
+	// Use upload package to decode and store
+	response, err := upload.DecodeAndStoreXorb(r.Context(), s.storage, namespace, xorbHash, r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Invalid xorb format: %v", err), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-
-	// Verify hash matches URL parameter
-	if deserializedXorb.Hash != xorbHash {
-		http.Error(w, fmt.Sprintf("Hash mismatch: xorb has %s, URL has %s", deserializedXorb.Hash.String(), xorbHash.String()), http.StatusBadRequest)
-		return
-	}
-
-	// Store xorb directly. StoreXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, deserializedXorb)
-	if err != nil {
-		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
-		return
-	}
-
-	// Return response
-	response := client.XorbUploadResponse{
-		WasInserted: wasInserted,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -253,28 +235,11 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deserialize shard
-	shard, err := shard.Decode(bytes.NewReader(shardData))
+	// Use upload package to decode and store
+	response, err := upload.DecodeAndStoreShard(r.Context(), s.storage, bytes.NewReader(shardData))
 	if err != nil {
-		http.Error(w, "Invalid shard format", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-
-	// Store shard
-	wasInserted, err := s.storage.StoreShard(r.Context(), shard)
-	if err != nil {
-		http.Error(w, "Failed to store shard", http.StatusInternalServerError)
-		return
-	}
-
-	// Return response
-	result := 0
-	if wasInserted {
-		result = 1
-	}
-
-	response := client.ShardUploadResponse{
-		Result: result,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

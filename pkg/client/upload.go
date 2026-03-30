@@ -7,23 +7,16 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
 // UploadSession represents an upload session
 type UploadSession struct {
 	client            *Client
-	localChunkCache   map[xet.Hash]*DeduplicationResult
+	localChunkCache   map[xet.Hash]*upload.DeduplicationResult
 	targetXorbSize    uint64
 	enableGlobalDedup bool
-}
-
-// DeduplicationResult represents the result of deduplication for a chunk
-type DeduplicationResult struct {
-	ChunkHash  xet.Hash
-	IsNew      bool
-	XorbHash   xet.Hash
-	ChunkIndex uint32
 }
 
 type uploadSessionOptions struct {
@@ -45,7 +38,7 @@ func (c *Client) UploadSession(opts ...func(*uploadSessionOptions)) *UploadSessi
 	}
 	return &UploadSession{
 		client:            c,
-		localChunkCache:   make(map[xet.Hash]*DeduplicationResult),
+		localChunkCache:   make(map[xet.Hash]*upload.DeduplicationResult),
 		targetXorbSize:    xet.MaxXorbSerializedSize,
 		enableGlobalDedup: options.EnableGlobalDedup,
 	}
@@ -57,7 +50,7 @@ type chunkInfo struct {
 	Data      []byte
 	Hash      xet.Hash
 	Offset    uint64
-	Dedup     *DeduplicationResult
+	Dedup     *upload.DeduplicationResult
 }
 
 // UploadFiles uploads multiple files and returns their hashes
@@ -129,7 +122,7 @@ func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) (
 }
 
 // deduplicateChunk checks if a chunk already exists
-func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *DeduplicationResult {
+func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash) *upload.DeduplicationResult {
 	// Check local session cache first
 	if result, ok := s.localChunkCache[chunkHash]; ok {
 		return result
@@ -143,7 +136,7 @@ func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash
 			if len(shardData.CASInfos) > 0 {
 				casBlock := shardData.CASInfos[0]
 				if len(casBlock.Chunks) > 0 {
-					result := &DeduplicationResult{
+					result := &upload.DeduplicationResult{
 						ChunkHash:  chunkHash,
 						IsNew:      false,
 						XorbHash:   casBlock.CASHash,
@@ -157,7 +150,7 @@ func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash
 	}
 
 	// Not found - mark as new
-	result := &DeduplicationResult{
+	result := &upload.DeduplicationResult{
 		ChunkHash: chunkHash,
 		IsNew:     true,
 	}
