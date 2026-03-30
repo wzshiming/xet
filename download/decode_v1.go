@@ -115,7 +115,18 @@ func (r *ReaderV1) loadTerm() error {
 		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
 	}
 
-	fetchInfo := fetchInfoList[0]
+	// Find the fetch info entry that covers this term's chunk range
+	var fetchInfo *FetchInfoEntry
+	for i := range fetchInfoList {
+		if fetchInfoList[i].Range.Start == term.Range.Start && fetchInfoList[i].Range.End == term.Range.End {
+			fetchInfo = &fetchInfoList[i]
+			break
+		}
+	}
+
+	if fetchInfo == nil {
+		return fmt.Errorf("no matching fetch info for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
+	}
 
 	// Determine if we should use URLRange for efficient partial download
 	byteRange := &fetchInfo.URLRange

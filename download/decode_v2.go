@@ -121,8 +121,8 @@ func (r *ReaderV2) loadTerm() error {
 loop:
 	for _, fetchEntry := range fetchList {
 		for _, ranges := range fetchEntry.Ranges {
-			if ranges.Chunks.Start <= term.Range.Start &&
-				ranges.Chunks.End >= term.Range.End {
+			if ranges.Chunks.Start == term.Range.Start &&
+				ranges.Chunks.End == term.Range.End {
 				matchedRange = &ranges
 				fetchURL = fetchEntry.URL
 				break loop

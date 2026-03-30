@@ -33,8 +33,7 @@ func downloadCommand() {
 
 	// Hugging Face resolve URL support
 	if isURL(hashStr) {
-		var hfInfo hf.Resolved
-		hfInfo, err = hf.Resolve(ctx, hashStr)
+		hfInfo, err := hf.Resolve(ctx, hashStr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Resolve URL failed: %v\n", err)
 			os.Exit(1)
