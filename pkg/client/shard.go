@@ -11,10 +11,10 @@ import (
 )
 
 // UploadShard uploads a serialized shard to the server
-func (c *Client) UploadShard(ctx context.Context, shard *shard.Shard) (*ShardUploadResponse, error) {
+func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, err := shard.Serialize(false)
+	r, err := shard.Encode(shardObj, false)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	}
 
 	// Deserialize shard directly from response body
-	shard, err := shard.Deserialize(resp.Body)
+	shard, err := shard.Decode(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}

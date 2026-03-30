@@ -569,7 +569,7 @@ func (s *Server) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Deserialize shard
-	shard, err := shard.Deserialize(bytes.NewReader(shardData))
+	shard, err := shard.Decode(bytes.NewReader(shardData))
 	if err != nil {
 		http.Error(w, "Invalid shard format", http.StatusBadRequest)
 		return
@@ -611,14 +611,14 @@ func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Query for chunk
-	shard, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
+	shardObj, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	// Serialize shard without footer (for API responses) and stream directly
-	reader, err := shard.Serialize(false)
+	reader, err := shard.Encode(shardObj, false)
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return

@@ -107,7 +107,7 @@ func (fs *FileStorage) loadShards() error {
 			continue // Skip files we can't read
 		}
 
-		s, err := shard.Deserialize(f)
+		s, err := shard.Decode(f)
 		f.Close()
 		if err != nil {
 			continue // Skip invalid shards
@@ -261,7 +261,7 @@ func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, er
 	}
 
 	// Serialize shard with footer for storage
-	r, err := s.Serialize(true)
+	r, err := shard.Encode(s, true)
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}

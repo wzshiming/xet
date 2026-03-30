@@ -727,13 +727,13 @@ func compareShardRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	}
 
 	// Deserialize both shards
-	xetgoShard, err := shard.Deserialize(bytes.NewReader(xetgoReqs[0].Body))
+	xetgoShard, err := shard.Decode(bytes.NewReader(xetgoReqs[0].Body))
 	if err != nil {
 		t.Errorf("Failed to deserialize xet-go shard: %v", err)
 		return
 	}
 
-	nativeShard, err := shard.Deserialize(bytes.NewReader(nativeReqs[0].Body))
+	nativeShard, err := shard.Decode(bytes.NewReader(nativeReqs[0].Body))
 	if err != nil {
 		t.Errorf("Failed to deserialize native shard: %v", err)
 		return

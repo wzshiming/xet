@@ -46,7 +46,7 @@ func TestNewShard(t *testing.T) {
 func TestSerializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -72,12 +72,12 @@ func TestSerializeEmptyShard(t *testing.T) {
 func TestSerializeDeserializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
 
-	s2, err := Deserialize(r)
+	s2, err := Decode(r)
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestSerializeWithFileBlock(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestSerializeWithFileBlock(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestSerializeWithVerification(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestSerializeWithVerification(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSerializeWithCASBlock(t *testing.T) {
 
 	s.AddCASBlock(cb)
 
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestSerializeWithCASBlock(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestSerializeWithFooter(t *testing.T) {
 		StoredBytes:            100,
 	}
 
-	r, err := s.Serialize(true)
+	r, err := Encode(s, true)
 	if err != nil {
 		t.Fatalf("failed to serialize with footer: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestSerializeWithFooter(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -538,7 +538,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Serialize
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -549,7 +549,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Deserialize(bytes.NewReader(data))
+	s2, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
@@ -567,7 +567,7 @@ func TestSerializeComplexShard(t *testing.T) {
 // TestIsBookend tests the bookend detection function
 func TestIsBookend(t *testing.T) {
 	// Create a valid bookend
-	bookend := make([]byte, 48)
+	var bookend [48]byte
 	for i := range 32 {
 		bookend[i] = 0xFF
 	}
@@ -575,21 +575,16 @@ func TestIsBookend(t *testing.T) {
 		bookend[i] = 0x00
 	}
 
-	if !isBookend(bookend) {
+	if !isBookend(&bookend) {
 		t.Error("failed to detect valid bookend")
 	}
 
-	// Test invalid bookend (wrong length)
-	if isBookend(bookend[:47]) {
-		t.Error("detected bookend with wrong length")
-	}
-
 	// Test invalid bookend (wrong pattern)
-	invalid := make([]byte, 48)
+	var invalid [48]byte
 	for i := range invalid {
 		invalid[i] = 0xFF
 	}
-	if isBookend(invalid) {
+	if isBookend(&invalid) {
 		t.Error("detected invalid bookend pattern")
 	}
 }
@@ -629,7 +624,7 @@ func TestDeserializeInvalidMagicSequence(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -643,7 +638,7 @@ func TestDeserializeInvalidMagicSequence(t *testing.T) {
 	data[20] = 0x00
 
 	// Try to deserialize
-	_, err = Deserialize(bytes.NewReader(data))
+	_, err = Decode(bytes.NewReader(data))
 	if err == nil {
 		t.Error("expected error for invalid magic sequence, got nil")
 	}
@@ -654,7 +649,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := s.Serialize(false)
+	r, err := Encode(s, false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -668,7 +663,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 	data[32] = 99
 
 	// Try to deserialize
-	_, err = Deserialize(bytes.NewReader(data))
+	_, err = Decode(bytes.NewReader(data))
 	if err == nil {
 		t.Error("expected error for invalid version, got nil")
 	}
@@ -678,7 +673,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 func TestDeserializeTooShort(t *testing.T) {
 	data := make([]byte, 10)
 
-	_, err := Deserialize(bytes.NewReader(data))
+	_, err := Decode(bytes.NewReader(data))
 	if err == nil {
 		t.Error("expected error for data too short, got nil")
 	}
