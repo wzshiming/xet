@@ -27,6 +27,8 @@ func main() {
 		uploadCommand()
 	case "download":
 		downloadCommand()
+	case "hash":
+		hashCommand()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -44,6 +46,7 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  upload <file>            Upload a file to XET CAS server")
 	fmt.Println("  download <hash> <output> Download a file from XET CAS server")
+	fmt.Println("  hash <file>              Calculate the XET hash of a file")
 	fmt.Println("  help                     Display this help message")
 	fmt.Println()
 	fmt.Println("Upload Options:")
@@ -60,6 +63,7 @@ func printUsage() {
 	fmt.Println("Examples:")
 	fmt.Println("  xetc upload myfile.txt --url https://xet.example.com --token abc123")
 	fmt.Println("  xetc download a1b2c3d4... output.txt --url https://xet.example.com")
+	fmt.Println("  xetc hash myfile.txt")
 }
 
 func uploadCommand() {
@@ -177,4 +181,41 @@ func downloadCommand() {
 
 	fmt.Printf("✓ Download complete! (%d bytes)\n", n)
 	fmt.Printf("Saved to: %s\n", outputFile)
+}
+
+func hashCommand() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "Usage: xetc hash <file>")
+		os.Exit(1)
+	}
+
+	filename := os.Args[2]
+
+	// Open the file
+	f, err := os.Open(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	// Collect chunk hashes and sizes
+	var chunkHashes []xet.Hash
+	var chunkSizes []uint64
+
+	err = xet.ChunkData(f, func(offset int64, chunk xet.ChunkBytes) error {
+		chunkHashes = append(chunkHashes, chunk.Hash())
+		chunkSizes = append(chunkSizes, chunk.Size())
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error processing file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Compute file hash from chunk hashes and sizes
+	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
+
+	// Output the hash
+	fmt.Println(fileHash.String())
 }
