@@ -146,8 +146,11 @@ loop:
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	localStart := term.Range.Start
-	localEnd := term.Range.End
+	// Convert absolute chunk indices to local indices within the downloaded xorb
+	// The server returns chunks [matchedRange.Chunks.Start, matchedRange.Chunks.End)
+	// which become local indices [0, matchedRange.Chunks.End - matchedRange.Chunks.Start)
+	localStart := term.Range.Start - matchedRange.Chunks.Start
+	localEnd := term.Range.End - matchedRange.Chunks.Start
 
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {
