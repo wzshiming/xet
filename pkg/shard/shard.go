@@ -145,19 +145,9 @@ func (s *Shard) AddCASBlock(cb CASBlock) {
 // Returns an io.Reader that streams the data directly without buffering everything in memory.
 func (s *Shard) Serialize() (io.Reader, error) {
 	return &shardReader{
-		shard:       s,
-		state:       stateHeader,
+		shard: s,
+		state: stateHeader,
 	}, nil
-}
-
-// SerializeBytes is a helper that returns the serialized bytes.
-// This wraps Serialize and reads all data into memory for backward compatibility.
-func (s *Shard) SerializeBytes() ([]byte, error) {
-	r, err := s.Serialize()
-	if err != nil {
-		return nil, err
-	}
-	return io.ReadAll(r)
 }
 
 // SerializeWithFooter serializes the shard with footer (for stored shards).
@@ -172,16 +162,6 @@ func (s *Shard) SerializeWithFooter() (io.Reader, error) {
 		state:         stateHeader,
 		includeFooter: true,
 	}, nil
-}
-
-// SerializeWithFooterBytes is a helper that returns the serialized bytes with footer.
-// This wraps SerializeWithFooter and reads all data into memory for backward compatibility.
-func (s *Shard) SerializeWithFooterBytes() ([]byte, error) {
-	r, err := s.SerializeWithFooter()
-	if err != nil {
-		return nil, err
-	}
-	return io.ReadAll(r)
 }
 
 // shardReader implements io.Reader for shard serialization

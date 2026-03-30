@@ -407,13 +407,7 @@ func (s *UploadSession) buildAndUploadShard(ctx context.Context, fileHashes []xe
 		sh.CASInfos = append(sh.CASInfos, *casBlock)
 	}
 
-	// Serialize and upload
-	serialized, err := sh.SerializeBytes()
-	if err != nil {
-		return fmt.Errorf("serialize shard: %w", err)
-	}
-
-	_, err = s.client.UploadShard(ctx, serialized)
+	_, err := s.client.UploadShard(ctx, sh)
 	if err != nil {
 		return fmt.Errorf("upload shard: %w", err)
 	}

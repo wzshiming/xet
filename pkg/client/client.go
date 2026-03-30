@@ -160,10 +160,15 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, xorbData []b
 }
 
 // UploadShard uploads a serialized shard to the server
-func (c *Client) UploadShard(ctx context.Context, shardData []byte) (*ShardUploadResponse, error) {
+func (c *Client) UploadShard(ctx context.Context, shard *shard.Shard) (*ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(shardData))
+	r, err := shard.Serialize()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, r)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

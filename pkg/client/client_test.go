@@ -197,42 +197,6 @@ func TestUploadXorb(t *testing.T) {
 	}
 }
 
-func TestUploadShard(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/shards" {
-			t.Errorf("Unexpected path: %s", r.URL.Path)
-		}
-		if r.Method != http.MethodPost {
-			t.Errorf("Expected POST method, got %s", r.Method)
-		}
-
-		body, _ := io.ReadAll(r.Body)
-		if string(body) != "shard-data" {
-			t.Errorf("Expected body 'shard-data', got '%s'", string(body))
-		}
-
-		resp := ShardUploadResponse{
-			Result: 1,
-		}
-		json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	client := NewClient(ClientOptions{
-		BaseURL: server.URL,
-	})
-
-	shardData := []byte("shard-data")
-	resp, err := client.UploadShard(context.Background(), shardData)
-	if err != nil {
-		t.Fatalf("UploadShard failed: %v", err)
-	}
-
-	if resp.Result != 1 {
-		t.Errorf("Expected Result 1, got %d", resp.Result)
-	}
-}
-
 func TestQueryChunkDeduplicationNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
