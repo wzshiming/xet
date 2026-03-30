@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pkg/download"
 )
 
 func TestGetReconstruction(t *testing.T) {
@@ -27,21 +28,21 @@ func TestGetReconstruction(t *testing.T) {
 			t.Errorf("Expected Authorization header 'Bearer test-token', got '%s'", r.Header.Get("Authorization"))
 		}
 
-		resp := ReconstructionResponse{
+		resp := download.ReconstructionResponse{
 			OffsetIntoFirstRange: 0,
-			Terms: []Term{
+			Terms: []download.Term{
 				{
 					Hash:           "chunk1",
 					UnpackedLength: 1024,
-					Range:          ChunkRange{Start: 0, End: 1},
+					Range:          download.ChunkRange{Start: 0, End: 1},
 				},
 			},
-			FetchInfo: map[string][]FetchInfoEntry{
+			FetchInfo: map[string][]download.FetchInfoEntry{
 				"xorb1": {
 					{
-						Range:    ChunkRange{Start: 0, End: 1},
+						Range:    download.ChunkRange{Start: 0, End: 1},
 						URL:      "https://example.com/xorb1",
-						URLRange: ByteRange{Start: 0, End: 1023},
+						URLRange: download.ByteRange{Start: 0, End: 1023},
 					},
 				},
 			},
@@ -97,10 +98,10 @@ func TestGetReconstructionRange(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusPartialContent)
-		resp := ReconstructionResponse{
+		resp := download.ReconstructionResponse{
 			OffsetIntoFirstRange: 1000,
-			Terms:                []Term{},
-			FetchInfo:            map[string][]FetchInfoEntry{},
+			Terms:                []download.Term{},
+			FetchInfo:            map[string][]download.FetchInfoEntry{},
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -136,23 +137,23 @@ func TestGetReconstructionV2(t *testing.T) {
 			t.Errorf("Expected Authorization header 'Bearer test-token', got '%s'", r.Header.Get("Authorization"))
 		}
 
-		resp := ReconstructionResponseV2{
+		resp := download.ReconstructionResponseV2{
 			OffsetIntoFirstRange: 0,
-			Terms: []Term{
+			Terms: []download.Term{
 				{
 					Hash:           "xorb1",
 					UnpackedLength: 1024,
-					Range:          ChunkRange{Start: 0, End: 1},
+					Range:          download.ChunkRange{Start: 0, End: 1},
 				},
 			},
-			Xorbs: map[string][]XorbMultiRangeFetch{
+			Xorbs: map[string][]download.XorbMultiRangeFetch{
 				"xorb1": {
 					{
 						URL: "https://example.com/xorb1",
-						Ranges: []XorbRangeDescriptor{
+						Ranges: []download.XorbRangeDescriptor{
 							{
-								Chunks: ChunkRange{Start: 0, End: 1},
-								Bytes:  ByteRange{Start: 0, End: 1023},
+								Chunks: download.ChunkRange{Start: 0, End: 1},
+								Bytes:  download.ByteRange{Start: 0, End: 1023},
 							},
 						},
 					},
@@ -213,10 +214,10 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusPartialContent)
-		resp := ReconstructionResponseV2{
+		resp := download.ReconstructionResponseV2{
 			OffsetIntoFirstRange: 1000,
-			Terms:                []Term{},
-			Xorbs:                map[string][]XorbMultiRangeFetch{},
+			Terms:                []download.Term{},
+			Xorbs:                map[string][]download.XorbMultiRangeFetch{},
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
