@@ -2,17 +2,14 @@ package client
 
 import (
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pkg/upload"
 )
 
-// XorbUploadResponse represents the response from uploading an xorb
-type XorbUploadResponse struct {
-	WasInserted bool `json:"was_inserted"`
-}
+// XorbUploadResponse is an alias for upload.XorbUploadResponse.
+type XorbUploadResponse = upload.XorbUploadResponse
 
-// ShardUploadResponse represents the response from uploading a shard
-type ShardUploadResponse struct {
-	Result int `json:"result"` // 0 = already exists, 1 = was registered
-}
+// ShardUploadResponse is an alias for upload.ShardUploadResponse.
+type ShardUploadResponse = upload.ShardUploadResponse
 
 // DeduplicationInfo represents deduplication information for a chunk
 type DeduplicationInfo struct {
