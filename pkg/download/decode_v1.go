@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
@@ -134,12 +135,13 @@ func (r *ReaderV1) loadTerm() error {
 
 	// We need to pass the request opts to the client, but the interface expects interface{}
 	// This will be handled by the actual client implementation
-	var reqOpts []interface{}
+	var header http.Header
 	if byteRange != nil {
-		reqOpts = append(reqOpts, byteRange)
+		header = http.Header{}
+		header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
 	}
 
-	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchInfo.URL, reqOpts...)
+	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchInfo.URL, header)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
 	}

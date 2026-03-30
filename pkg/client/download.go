@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/download"
@@ -15,13 +16,13 @@ type clientAdapter struct {
 	client *Client
 }
 
-func (ca *clientAdapter) DownloadXorb(ctx context.Context, url string, reqOpts ...interface{}) (*xorb.Xorb, error) {
+func (ca *clientAdapter) DownloadXorb(ctx context.Context, url string, header http.Header) (*xorb.Xorb, error) {
 	// Convert interface{} reqOpts to ReqOpt
 	var opts []ReqOpt
-	for _, opt := range reqOpts {
-		if byteRange, ok := opt.(*download.ByteRange); ok {
-			opts = append(opts, WithRange(byteRange.Start, byteRange.End))
-		}
+	if len(header) != 0 {
+		opts = append(opts, func(req *http.Request) {
+			req.Header = header
+		})
 	}
 	return ca.client.DownloadXorb(ctx, url, opts...)
 }

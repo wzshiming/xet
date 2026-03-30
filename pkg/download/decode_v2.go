@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/pkg/xorb"
@@ -144,12 +145,13 @@ func (r *ReaderV2) loadTerm() error {
 		useChunksOnly = true
 	}
 
-	var reqOpts []interface{}
+	var header http.Header
 	if byteRange != nil {
-		reqOpts = append(reqOpts, byteRange)
+		header = http.Header{}
+		header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End))
 	}
 
-	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchEntry.URL, reqOpts...)
+	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchEntry.URL, header)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
 	}
