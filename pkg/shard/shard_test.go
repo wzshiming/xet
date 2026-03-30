@@ -46,7 +46,7 @@ func TestNewShard(t *testing.T) {
 func TestSerializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestSerializeEmptyShard(t *testing.T) {
 func TestSerializeDeserializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestSerializeWithFileBlock(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestSerializeWithVerification(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestSerializeWithCASBlock(t *testing.T) {
 
 	s.AddCASBlock(cb)
 
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestSerializeWithFooter(t *testing.T) {
 		StoredBytes:            100,
 	}
 
-	r, err := s.SerializeWithFooter()
+	r, err := s.Serialize(true)
 	if err != nil {
 		t.Fatalf("failed to serialize with footer: %v", err)
 	}
@@ -538,7 +538,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Serialize
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestDeserializeInvalidMagicSequence(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -654,7 +654,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := s.Serialize()
+	r, err := s.Serialize(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}

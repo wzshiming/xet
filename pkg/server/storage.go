@@ -261,7 +261,7 @@ func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, er
 	}
 
 	// Serialize shard with footer for storage
-	r, err := s.SerializeWithFooter()
+	r, err := s.Serialize(true)
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}

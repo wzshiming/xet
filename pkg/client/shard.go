@@ -14,7 +14,7 @@ import (
 func (c *Client) UploadShard(ctx context.Context, shard *shard.Shard) (*ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, err := shard.Serialize()
+	r, err := shard.Serialize(false)
 	if err != nil {
 		return nil, err
 	}

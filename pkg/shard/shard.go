@@ -143,24 +143,14 @@ func (s *Shard) AddCASBlock(cb CASBlock) {
 
 // Serialize serializes the shard to binary format (without footer for upload API).
 // Returns an io.Reader that streams the data directly without buffering everything in memory.
-func (s *Shard) Serialize() (io.Reader, error) {
-	return &shardReader{
-		shard: s,
-		state: stateHeader,
-	}, nil
-}
-
-// SerializeWithFooter serializes the shard with footer (for stored shards).
-// Returns an io.Reader that streams the data directly without buffering everything in memory.
-func (s *Shard) SerializeWithFooter() (io.Reader, error) {
-	if s.Footer == nil {
+func (s *Shard) Serialize(includeFooter bool) (io.Reader, error) {
+	if includeFooter && s.Footer == nil {
 		return nil, fmt.Errorf("footer is required but not set")
 	}
-
 	return &shardReader{
 		shard:         s,
 		state:         stateHeader,
-		includeFooter: true,
+		includeFooter: includeFooter,
 	}, nil
 }
 
