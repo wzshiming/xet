@@ -259,7 +259,14 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
 func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
-	xorbData, err := s.storage.GetXorb(context.Background(), "default", xorbHash)
+	xorbObj, err := s.storage.GetXorb(context.Background(), "default", xorbHash)
+	if err != nil {
+		return 0, 0
+	}
+
+	// Serialize to bytes to compute chunk offsets in the stored format.
+	// We need the actual byte layout to calculate ranges for HTTP range requests.
+	xorbData, err := xorb.SerializeBytes(xorbObj, false)
 	if err != nil {
 		return 0, 0
 	}
@@ -510,16 +517,8 @@ func (s *Server) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normalize to full format with footer for storage.
-	// This ensures all clients can download the same format consistently.
-	dataToStore, err := xorb.SerializeBytes(deserializedXorb, false)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to serialize xorb with footer: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Store xorb
-	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, xorbHash, dataToStore)
+	// Store xorb directly. StoreXorb will normalize to full format with footer.
+	wasInserted, err := s.storage.StoreXorb(r.Context(), namespace, deserializedXorb)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
@@ -548,10 +547,18 @@ func (s *Server) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get xorb data
-	xorbData, err := s.storage.GetXorb(r.Context(), namespace, xorbHash)
+	// Get xorb object
+	xorbObj, err := s.storage.GetXorb(r.Context(), namespace, xorbHash)
 	if err != nil {
 		http.Error(w, "Xorb not found", http.StatusNotFound)
+		return
+	}
+
+	// Serialize xorb to bytes for download.
+	// The stored format is always full with footer (chunkOnly=false).
+	xorbData, err := xorb.SerializeBytes(xorbObj, false)
+	if err != nil {
+		http.Error(w, "Failed to serialize xorb", http.StatusInternalServerError)
 		return
 	}
 
