@@ -463,269 +463,128 @@ func (r *shardReader) buildFooter(buf []byte) {
 }
 
 // Deserialize deserializes a shard from an io.Reader.
-// The reader is fully read into memory for parsing.
+// The reader is consumed incrementally without buffering the entire stream.
 func Deserialize(r io.Reader) (*Shard, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read data: %w", err)
-	}
-	return DeserializeBytes(data)
-}
-
-// DeserializeBytes deserializes a shard from binary format.
-// This is a helper for backward compatibility.
-func DeserializeBytes(data []byte) (*Shard, error) {
-	if len(data) < 48 {
-		return nil, fmt.Errorf("data too short for shard header")
-	}
-
 	s := &Shard{}
-	offset := 0
+	buf := make([]byte, 48)
 
-	// Read header
-	if err := s.readHeader(data, &offset); err != nil {
+	// Read 48-byte header
+	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, fmt.Errorf("failed to read header: %w", err)
 	}
+	copy(s.Header.Tag[:], buf[:32])
+	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
+		return nil, fmt.Errorf("invalid shard magic sequence")
+	}
+	s.Header.Version = binary.LittleEndian.Uint64(buf[32:40])
+	if s.Header.Version != 2 {
+		return nil, fmt.Errorf("unsupported shard version: %d", s.Header.Version)
+	}
+	s.Header.FooterSize = binary.LittleEndian.Uint64(buf[40:48])
 
-	// Check if footer is present
-	hasFooter := s.Header.FooterSize > 0
-
-	// Calculate section boundaries
-	var casInfoEnd int
-	if hasFooter {
-		if len(data) < int(s.Header.FooterSize) {
-			return nil, fmt.Errorf("data too short for footer")
+	// Read file blocks until bookend
+	s.Files = make([]FileBlock, 0)
+	for {
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("failed to read file section: %w", err)
 		}
-		casInfoEnd = len(data) - int(s.Header.FooterSize)
-	} else {
-		casInfoEnd = len(data)
+		if isBookend(buf) {
+			break
+		}
+
+		fb := FileBlock{}
+		copy(fb.FileHash[:], buf[:32])
+		fb.Flags = FileFlags(binary.LittleEndian.Uint32(buf[32:36]))
+		numEntries := binary.LittleEndian.Uint32(buf[36:40])
+		// buf[40:48] reserved
+
+		fb.Entries = make([]FileDataSequenceEntry, numEntries)
+		for i := range numEntries {
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return nil, fmt.Errorf("failed to read file entry %d: %w", i, err)
+			}
+			entry := &fb.Entries[i]
+			copy(entry.CASHash[:], buf[:32])
+			entry.CASFlags = binary.LittleEndian.Uint32(buf[32:36])
+			entry.UnpackedSegBytes = binary.LittleEndian.Uint32(buf[36:40])
+			entry.ChunkIndexStart = binary.LittleEndian.Uint32(buf[40:44])
+			entry.ChunkIndexEnd = binary.LittleEndian.Uint32(buf[44:48])
+		}
+
+		if fb.Flags&FileWithVerification != 0 {
+			fb.Verification = make([]xet.Hash, numEntries)
+			for i := range numEntries {
+				if _, err := io.ReadFull(r, buf); err != nil {
+					return nil, fmt.Errorf("failed to read verification entry %d: %w", i, err)
+				}
+				copy(fb.Verification[i][:], buf[:32])
+				// buf[32:48] reserved
+			}
+		}
+
+		if fb.Flags&FileWithMetadataExt != 0 {
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return nil, fmt.Errorf("failed to read metadata ext: %w", err)
+			}
+			fb.MetadataExt = &FileMetadataExt{}
+			copy(fb.MetadataExt.SHA256Hash[:], buf[:32])
+			// buf[32:48] reserved
+		}
+
+		s.Files = append(s.Files, fb)
 	}
 
-	// Read file info section
-	if err := s.readFileInfoSection(data, &offset); err != nil {
-		return nil, fmt.Errorf("failed to read file info section: %w", err)
-	}
+	// Read CAS blocks until bookend
+	s.CASInfos = make([]CASBlock, 0)
+	for {
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, fmt.Errorf("failed to read CAS section: %w", err)
+		}
+		if isBookend(buf) {
+			break
+		}
 
-	// Read CAS info section
-	if err := s.readCASInfoSection(data, &offset, casInfoEnd); err != nil {
-		return nil, fmt.Errorf("failed to read CAS info section: %w", err)
+		cb := CASBlock{}
+		copy(cb.CASHash[:], buf[:32])
+		cb.CASFlags = binary.LittleEndian.Uint32(buf[32:36])
+		numEntries := binary.LittleEndian.Uint32(buf[36:40])
+		cb.NumBytesInCAS = binary.LittleEndian.Uint32(buf[40:44])
+		cb.NumBytesOnDisk = binary.LittleEndian.Uint32(buf[44:48])
+
+		cb.Chunks = make([]CASChunkSequenceEntry, numEntries)
+		for i := range numEntries {
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return nil, fmt.Errorf("failed to read chunk entry %d: %w", i, err)
+			}
+			chunk := &cb.Chunks[i]
+			copy(chunk.ChunkHash[:], buf[:32])
+			chunk.ByteRangeStart = binary.LittleEndian.Uint32(buf[32:36])
+			chunk.UnpackedSegBytes = binary.LittleEndian.Uint32(buf[36:40])
+			chunk.Flags = ChunkFlags(binary.LittleEndian.Uint32(buf[40:44]))
+			// buf[44:48] reserved
+		}
+
+		s.CASInfos = append(s.CASInfos, cb)
 	}
 
 	// Read footer if present
-	if hasFooter {
-		if err := s.readFooter(data, len(data)-int(s.Header.FooterSize)); err != nil {
+	if s.Header.FooterSize > 0 {
+		footerBuf := make([]byte, s.Header.FooterSize)
+		if _, err := io.ReadFull(r, footerBuf); err != nil {
 			return nil, fmt.Errorf("failed to read footer: %w", err)
+		}
+		if err := s.readFooter(footerBuf, 0); err != nil {
+			return nil, fmt.Errorf("failed to parse footer: %w", err)
 		}
 	}
 
 	return s, nil
 }
 
-// readHeader reads the 48-byte header
-func (s *Shard) readHeader(data []byte, offset *int) error {
-	if *offset+48 > len(data) {
-		return fmt.Errorf("data too short for header")
-	}
-
-	// Read tag (32 bytes)
-	copy(s.Header.Tag[:], data[*offset:*offset+32])
-	*offset += 32
-
-	// Verify magic sequence (bytes 15-31 of tag)
-	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
-		return fmt.Errorf("invalid shard magic sequence")
-	}
-
-	// Read version (8 bytes)
-	s.Header.Version = binary.LittleEndian.Uint64(data[*offset : *offset+8])
-	*offset += 8
-
-	if s.Header.Version != 2 {
-		return fmt.Errorf("unsupported shard version: %d", s.Header.Version)
-	}
-
-	// Read footer size (8 bytes)
-	s.Header.FooterSize = binary.LittleEndian.Uint64(data[*offset : *offset+8])
-	*offset += 8
-
-	return nil
-}
-
-// readFileInfoSection reads the file info section
-func (s *Shard) readFileInfoSection(data []byte, offset *int) error {
-	s.Files = make([]FileBlock, 0)
-
-	for {
-		if *offset+48 > len(data) {
-			return fmt.Errorf("data too short for file block header")
-		}
-
-		// Check for bookend (32 bytes of 0xFF followed by 16 bytes of 0x00)
-		if isBookend(data[*offset : *offset+48]) {
-			*offset += 48
-			break
-		}
-
-		fb, err := s.readFileBlock(data, offset)
-		if err != nil {
-			return err
-		}
-		s.Files = append(s.Files, fb)
-	}
-
-	return nil
-}
-
-// readFileBlock reads a single file block
-func (s *Shard) readFileBlock(data []byte, offset *int) (FileBlock, error) {
-	fb := FileBlock{}
-
-	if *offset+48 > len(data) {
-		return fb, fmt.Errorf("data too short for file data sequence header")
-	}
-
-	// Read FileDataSequenceHeader
-	copy(fb.FileHash[:], data[*offset:*offset+32])
-	*offset += 32
-
-	fb.Flags = FileFlags(binary.LittleEndian.Uint32(data[*offset : *offset+4]))
-	*offset += 4
-
-	numEntries := binary.LittleEndian.Uint32(data[*offset : *offset+4])
-	*offset += 4
-
-	*offset += 8 // Skip reserved
-
-	// Read FileDataSequenceEntry entries
-	fb.Entries = make([]FileDataSequenceEntry, numEntries)
-	for i := range numEntries {
-		if *offset+48 > len(data) {
-			return fb, fmt.Errorf("data too short for file data sequence entry %d", i)
-		}
-
-		entry := FileDataSequenceEntry{}
-		copy(entry.CASHash[:], data[*offset:*offset+32])
-		*offset += 32
-
-		entry.CASFlags = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		entry.UnpackedSegBytes = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		entry.ChunkIndexStart = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		entry.ChunkIndexEnd = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		fb.Entries[i] = entry
-	}
-
-	// Read FileVerificationEntry entries if flag set
-	if fb.Flags&FileWithVerification != 0 {
-		fb.Verification = make([]xet.Hash, numEntries)
-		for i := range numEntries {
-			if *offset+48 > len(data) {
-				return fb, fmt.Errorf("data too short for file verification entry %d", i)
-			}
-
-			copy(fb.Verification[i][:], data[*offset:*offset+32])
-			*offset += 32
-			*offset += 16 // Skip reserved
-		}
-	}
-
-	// Read FileMetadataExt if flag set
-	if fb.Flags&FileWithMetadataExt != 0 {
-		if *offset+48 > len(data) {
-			return fb, fmt.Errorf("data too short for file metadata ext")
-		}
-
-		fb.MetadataExt = &FileMetadataExt{}
-		copy(fb.MetadataExt.SHA256Hash[:], data[*offset:*offset+32])
-		*offset += 32
-		*offset += 16 // Skip reserved
-	}
-
-	return fb, nil
-}
-
-// readCASInfoSection reads the CAS info section
-func (s *Shard) readCASInfoSection(data []byte, offset *int, end int) error {
-	s.CASInfos = make([]CASBlock, 0)
-
-	for *offset < end {
-		if *offset+48 > end {
-			return fmt.Errorf("data too short for CAS block header")
-		}
-
-		// Check for bookend
-		if isBookend(data[*offset : *offset+48]) {
-			*offset += 48
-			break
-		}
-
-		cb, err := s.readCASBlock(data, offset)
-		if err != nil {
-			return err
-		}
-		s.CASInfos = append(s.CASInfos, cb)
-	}
-
-	return nil
-}
-
-// readCASBlock reads a single CAS block
-func (s *Shard) readCASBlock(data []byte, offset *int) (CASBlock, error) {
-	cb := CASBlock{}
-
-	if *offset+48 > len(data) {
-		return cb, fmt.Errorf("data too short for CAS chunk sequence header")
-	}
-
-	// Read CASChunkSequenceHeader
-	copy(cb.CASHash[:], data[*offset:*offset+32])
-	*offset += 32
-
-	cb.CASFlags = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-	*offset += 4
-
-	numEntries := binary.LittleEndian.Uint32(data[*offset : *offset+4])
-	*offset += 4
-
-	cb.NumBytesInCAS = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-	*offset += 4
-
-	cb.NumBytesOnDisk = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-	*offset += 4
-
-	// Read CASChunkSequenceEntry entries
-	cb.Chunks = make([]CASChunkSequenceEntry, numEntries)
-	for i := range numEntries {
-		if *offset+48 > len(data) {
-			return cb, fmt.Errorf("data too short for CAS chunk sequence entry %d", i)
-		}
-
-		chunk := CASChunkSequenceEntry{}
-		copy(chunk.ChunkHash[:], data[*offset:*offset+32])
-		*offset += 32
-
-		chunk.ByteRangeStart = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		chunk.UnpackedSegBytes = binary.LittleEndian.Uint32(data[*offset : *offset+4])
-		*offset += 4
-
-		chunk.Flags = ChunkFlags(binary.LittleEndian.Uint32(data[*offset : *offset+4]))
-		*offset += 4
-
-		*offset += 4 // Skip reserved
-
-		cb.Chunks[i] = chunk
-	}
-
-	return cb, nil
+// DeserializeBytes deserializes a shard from a byte slice.
+// This is a helper for backward compatibility.
+func DeserializeBytes(data []byte) (*Shard, error) {
+	return Deserialize(bytes.NewReader(data))
 }
 
 // readFooter reads the 200-byte footer
