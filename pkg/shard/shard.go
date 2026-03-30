@@ -581,12 +581,6 @@ func Deserialize(r io.Reader) (*Shard, error) {
 	return s, nil
 }
 
-// DeserializeBytes deserializes a shard from a byte slice.
-// This is a helper for backward compatibility.
-func DeserializeBytes(data []byte) (*Shard, error) {
-	return Deserialize(bytes.NewReader(data))
-}
-
 // readFooter reads the 200-byte footer
 func (s *Shard) readFooter(data []byte, offset int) error {
 	if offset+200 > len(data) {

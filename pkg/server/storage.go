@@ -98,12 +98,13 @@ func (fs *FileStorage) loadShards() error {
 			continue
 		}
 
-		data, err := os.ReadFile(filepath.Join(shardsDir, entry.Name()))
+		f, err := os.Open(filepath.Join(shardsDir, entry.Name()))
 		if err != nil {
 			continue // Skip files we can't read
 		}
 
-		s, err := shard.DeserializeBytes(data)
+		s, err := shard.Deserialize(f)
+		f.Close()
 		if err != nil {
 			continue // Skip invalid shards
 		}
