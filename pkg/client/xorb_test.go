@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pkg/upload"
 	"github.com/wzshiming/xet/pkg/xorb"
 )
 
@@ -29,7 +30,7 @@ func TestUploadXorb(t *testing.T) {
 			t.Errorf("Failed to deserialize uploaded xorb: %v", err)
 		}
 
-		resp := XorbUploadResponse{
+		resp := upload.XorbUploadResponse{
 			WasInserted: true,
 		}
 		json.NewEncoder(w).Encode(resp)
