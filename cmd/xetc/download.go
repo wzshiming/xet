@@ -41,7 +41,10 @@ func downloadCommand() {
 		}
 		fileHash = hfInfo.Hash
 		baseURL = hfInfo.BaseURL
-		tokenVal = hfInfo.Token
+		// Only override token if HF provides one
+		if hfInfo.Token != "" {
+			tokenVal = hfInfo.Token
+		}
 		fmt.Printf("%s Resolved Hugging Face file hash: %s\n", outputFile, fileHash.String())
 	} else {
 		// Parse file hash
