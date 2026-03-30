@@ -103,7 +103,7 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		// URL ranges are byte offsets within the compressed-data stream of the
 		// stored xorb (headers stripped).  Load the stored xorb and compute
 		// the accurate ranges from the actual compressed chunk sizes.
-		startByte, endByte := compressedDataRange(ctx, storage, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte := storage.GetXorbDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
 		xorbURL := storage.GetXorbURL(namespace, entry.CASHash)
 
