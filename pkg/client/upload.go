@@ -160,8 +160,6 @@ func (s *UploadSession) deduplicateChunk(ctx context.Context, chunkHash xet.Hash
 type xorbGroup struct {
 	Chunks      [][]byte
 	ChunkHashes []xet.Hash
-	Xorb        *xorb.Xorb
-	Serialized  []byte
 	StartIndex  int
 }
 
@@ -219,15 +217,10 @@ func (s *UploadSession) uploadXorbs(ctx context.Context, groups []*xorbGroup) er
 			return fmt.Errorf("serialize xorb: %w", err)
 		}
 
-		group.Xorb = xorbObj
-		group.Serialized = serialized
-
 		// Upload
-		if s.client != nil {
-			_, err = s.client.UploadXorb(ctx, xorbObj.Hash, serialized)
-			if err != nil {
-				return fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
-			}
+		_, err = s.client.UploadXorb(ctx, xorbObj.Hash, serialized)
+		if err != nil {
+			return fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
 		}
 
 		// Update local cache with xorb information
