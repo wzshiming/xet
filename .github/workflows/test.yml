@@ -21,7 +21,7 @@ jobs:
         go-version-file: go.mod
 
     - name: Run Go tests
-      run: go test -v ./pkg/...
+      run: go test ./...
 
     - name: Build xetc
       run: go build -o xetc ./cmd/xetc
@@ -44,4 +44,4 @@ jobs:
 
     - name: Run conformance tests
       working-directory: test/conformance
-      run: go test ./... -v
+      run: go test ./...

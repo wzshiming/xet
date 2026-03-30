@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/shard"
 )
 
 func TestNewClientDefaults(t *testing.T) {

@@ -6,18 +6,13 @@ import (
 	"strings"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
+	"github.com/wzshiming/xet/shard"
 )
 
-// BuildReconstructionResponseV1 builds a reconstruction response from a shard.
-//
-// URL ranges within the fetch_info entries point into the compressed-data
-// stream of the stored xorb (i.e. the raw compressed bytes for each chunk,
-// concatenated without the 8-byte per-chunk headers).  This matches the
-// convention used by xet-core: ByteRangeStart is an offset into the
-// header-stripped stream, and range requests to the xorb download endpoint
-// are served from the same stripped stream (see handleDownloadXorb).
-func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*ReconstructionResponse, error) {
+// BuildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
+// The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
+// into multi-range fetch entries for more efficient downloading.
+func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*ReconstructionResponseV2, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -44,16 +39,24 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		}
 	}
 
-	response := &ReconstructionResponse{
+	response := &ReconstructionResponseV2{
 		OffsetIntoFirstRange: 0,
 		Terms:                []Term{},
-		FetchInfo:            make(map[string][]FetchInfoEntry),
+		Xorbs:                make(map[string][]XorbMultiRangeFetch),
 	}
 
 	// Calculate cumulative byte positions for each term
 	var currentByteOffset int64
 
-	// Build terms from file data sequence entries
+	// Build terms and group fetch info by xorb
+	type fetchInfo struct {
+		chunkStart uint32
+		chunkEnd   uint32
+		startByte  int64
+		endByte    int64
+	}
+	xorbFetchRanges := make(map[string][]fetchInfo)
+
 	for _, entry := range fileBlock.Entries {
 		termStart := currentByteOffset
 		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
@@ -98,31 +101,48 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		}
 		response.Terms = append(response.Terms, term)
 
-		// Build fetch info.
-		//
-		// URL ranges are byte offsets within the compressed-data stream of the
-		// stored xorb (headers stripped).  Load the stored xorb and compute
-		// the accurate ranges from the actual compressed chunk sizes.
+		// Calculate byte ranges for this term
 		startByte, endByte := storage.GetXorbDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
-		xorbURL := storage.GetXorbURL(namespace, entry.CASHash)
-
-		fetchEntry := FetchInfoEntry{
-			Range: ChunkRange{
-				Start: entry.ChunkIndexStart,
-				End:   entry.ChunkIndexEnd,
-			},
-			URL: xorbURL,
-			URLRange: ByteRange{
-				Start: startByte,
-				End:   endByte,
-			},
-		}
-
+		// Collect fetch info grouped by xorb
 		xorbHashStr := entry.CASHash.String()
-		response.FetchInfo[xorbHashStr] = append(response.FetchInfo[xorbHashStr], fetchEntry)
+		xorbFetchRanges[xorbHashStr] = append(xorbFetchRanges[xorbHashStr], fetchInfo{
+			chunkStart: entry.ChunkIndexStart,
+			chunkEnd:   entry.ChunkIndexEnd,
+			startByte:  startByte,
+			endByte:    endByte,
+		})
 
 		currentByteOffset = termEnd
+	}
+
+	// Convert grouped fetch info into V2 format
+	// For now, we create one XorbMultiRangeFetch per xorb with all ranges
+	// A more sophisticated implementation could group consecutive/nearby ranges
+	for xorbHashStr, ranges := range xorbFetchRanges {
+		xorbHash, _ := xet.ParseHash(xorbHashStr)
+		xorbURL := storage.GetXorbURL(namespace, xorbHash)
+
+		var descriptors []XorbRangeDescriptor
+		for _, r := range ranges {
+			descriptors = append(descriptors, XorbRangeDescriptor{
+				Chunks: ChunkRange{
+					Start: r.chunkStart,
+					End:   r.chunkEnd,
+				},
+				Bytes: ByteRange{
+					Start: r.startByte,
+					End:   r.endByte,
+				},
+			})
+		}
+
+		multiRangeFetch := XorbMultiRangeFetch{
+			URL:    xorbURL,
+			Ranges: descriptors,
+		}
+
+		response.Xorbs[xorbHashStr] = []XorbMultiRangeFetch{multiRangeFetch}
 	}
 
 	return response, nil

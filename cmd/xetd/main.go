@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/wzshiming/xet/pkg/server"
-	"github.com/wzshiming/xet/pkg/storage"
+	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/storage"
 )
 
 func main() {

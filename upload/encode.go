@@ -3,8 +3,8 @@ package upload
 import (
 	"io"
 
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // EncodeXorb serializes a xorb for upload (full format with footer).

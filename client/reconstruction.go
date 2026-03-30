@@ -7,7 +7,7 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/download"
+	"github.com/wzshiming/xet/download"
 )
 
 // GetReconstructionV1 retrieves reconstruction information for a file

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/wzshiming/xet/pkg/upload"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/upload"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // UploadXorb serializes and uploads a xorb to the server

@@ -8,7 +8,7 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // ReaderV2 implements io.Reader for V2 reconstruction

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/client"
+	"github.com/wzshiming/xet/client"
 )
 
 var ctx = context.Background()

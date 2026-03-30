@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 func TestEncodeDecodeXorb(t *testing.T) {

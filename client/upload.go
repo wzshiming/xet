@@ -5,9 +5,9 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/upload"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/upload"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // uploadClientAdapter adapts the Client to the upload.ClientAdapter interface.

@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/upload"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/upload"
+	"github.com/wzshiming/xet/xorb"
 )
 
 func TestUploadXorb(t *testing.T) {

@@ -11,9 +11,9 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/download"
-	"github.com/wzshiming/xet/pkg/storage"
-	"github.com/wzshiming/xet/pkg/upload"
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/upload"
 )
 
 // Handler represents an XET CAS server

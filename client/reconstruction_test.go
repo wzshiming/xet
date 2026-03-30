@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/download"
+	"github.com/wzshiming/xet/download"
 )
 
 func TestGetReconstruction(t *testing.T) {

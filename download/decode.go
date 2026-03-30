@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // ClientAdapter provides access to client operations needed for reconstruction decoding

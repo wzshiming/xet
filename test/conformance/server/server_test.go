@@ -13,9 +13,9 @@ import (
 
 	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
-	"github.com/wzshiming/xet/pkg/client"
-	"github.com/wzshiming/xet/pkg/server"
-	"github.com/wzshiming/xet/pkg/storage"
+	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/storage"
 )
 
 // TestServerUploadDownloadConformance tests that files uploaded through the native

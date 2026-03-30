@@ -7,8 +7,8 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/download"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // clientAdapter adapts the Client to the download.ClientAdapter interface

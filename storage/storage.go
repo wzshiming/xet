@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/xorb"
+	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // Storage defines the interface for storing and retrieving XET data

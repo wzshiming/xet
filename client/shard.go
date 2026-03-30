@@ -7,8 +7,8 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/pkg/shard"
-	"github.com/wzshiming/xet/pkg/upload"
+	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/upload"
 )
 
 // UploadShard uploads a serialized shard to the server
