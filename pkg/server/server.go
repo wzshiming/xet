@@ -124,7 +124,7 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Build reconstruction response
-	response, err := s.buildReconstructionResponse(shard, fileHash, r.Header.Get("Range"))
+	response, err := s.buildReconstructionResponse(r.Context(), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -142,7 +142,7 @@ func (s *Server) handleGetReconstruction(w http.ResponseWriter, r *http.Request)
 // convention used by xet-core: ByteRangeStart is an offset into the
 // header-stripped stream, and range requests to the xorb download endpoint
 // are served from the same stripped stream (see handleDownloadXorb).
-func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponse, error) {
+func (s *Server) buildReconstructionResponse(ctx context.Context, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponse, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -228,9 +228,9 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 		// URL ranges are byte offsets within the compressed-data stream of the
 		// stored xorb (headers stripped).  Load the stored xorb and compute
 		// the accurate ranges from the actual compressed chunk sizes.
-		startByte, endByte := s.compressedDataRange(entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte := s.compressedDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
-		xorbURL := s.storage.GetXorbURL("default", entry.CASHash)
+		xorbURL := s.storage.GetXorbURL(namespace, entry.CASHash)
 
 		fetchEntry := client.FetchInfoEntry{
 			Range: client.ChunkRange{
@@ -258,8 +258,8 @@ func (s *Server) buildReconstructionResponse(sh *shard.Shard, fileHash xet.Hash,
 // The returned range includes the 8-byte chunk header for each chunk, so that
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
-func (s *Server) compressedDataRange(xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
-	xorbObj, err := s.storage.GetXorb(context.Background(), "default", xorbHash)
+func (s *Server) compressedDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
+	xorbObj, err := s.storage.GetXorb(ctx, namespace, xorbHash)
 	if err != nil {
 		return 0, 0
 	}
@@ -331,7 +331,7 @@ func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Build V2 reconstruction response
-	response, err := s.buildReconstructionResponseV2(shard, fileHash, r.Header.Get("Range"))
+	response, err := s.buildReconstructionResponseV2(r.Context(), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -344,7 +344,7 @@ func (s *Server) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reques
 // buildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
 // The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
 // into multi-range fetch entries for more efficient downloading.
-func (s *Server) buildReconstructionResponseV2(sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponseV2, error) {
+func (s *Server) buildReconstructionResponseV2(ctx context.Context, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*client.ReconstructionResponseV2, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -434,7 +434,7 @@ func (s *Server) buildReconstructionResponseV2(sh *shard.Shard, fileHash xet.Has
 		response.Terms = append(response.Terms, term)
 
 		// Calculate byte ranges for this term
-		startByte, endByte := s.compressedDataRange(entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte := s.compressedDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 
 		// Collect fetch info grouped by xorb
 		xorbHashStr := entry.CASHash.String()
@@ -453,7 +453,7 @@ func (s *Server) buildReconstructionResponseV2(sh *shard.Shard, fileHash xet.Has
 	// A more sophisticated implementation could group consecutive/nearby ranges
 	for xorbHashStr, ranges := range xorbFetchRanges {
 		xorbHash, _ := xet.ParseHash(xorbHashStr)
-		xorbURL := s.storage.GetXorbURL("default", xorbHash)
+		xorbURL := s.storage.GetXorbURL(namespace, xorbHash)
 
 		var descriptors []client.XorbRangeDescriptor
 		for _, r := range ranges {
