@@ -364,37 +364,41 @@ func (fs *FileStorage) GetXorbDataRange(ctx context.Context, namespace string, x
 	}
 	defer f.Close()
 
-	// Read xorb data to compute chunk offsets in the stored format.
-	// We need the actual byte layout to calculate ranges for HTTP range requests.
-	xorbData, err := io.ReadAll(f)
-	if err != nil {
-		return 0, 0
-	}
-
-	// Parse chunks to find byte offsets in the stored xorb.
+	// Parse chunks to find byte offsets in the stored xorb using streaming.
 	// The stored format for xet-core uploads is [header0(8)][data0][header1(8)][data1]...
 	// where header = version(1) + compressedSize(3 LE) + comprType(1) + uncompressedSize(3 LE).
+	// We stream through the file without buffering it entirely in memory.
 	type chunkSpan struct{ start, end int64 }
 	var spans []chunkSpan
 	offset := int64(0)
-	data := xorbData
 
-	for int(offset) < len(data) {
-		if int(offset)+8 > len(data) {
+	for {
+		// Try to read the next 8-byte header
+		headerBuf := make([]byte, 8)
+		n, err := io.ReadFull(f, headerBuf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// End of stream - no more chunks
 			break
 		}
+		if err != nil {
+			// Unexpected error
+			return 0, 0
+		}
+
 		// Stop at XETBLOB footer (Go-client full format)
-		if int(offset)+7 <= len(data) && string(data[offset:offset+7]) == xorb.XorbIdentifier {
+		if n >= 7 && string(headerBuf[:7]) == xorb.XorbIdentifier {
 			break
 		}
 
 		headerStart := offset
 
 		// Read compressed size (3-byte LE, bytes 1-3 of the 8-byte header)
-		compressedSize := int64(data[offset+1]) | int64(data[offset+2])<<8 | int64(data[offset+3])<<16
+		compressedSize := int64(headerBuf[1]) | int64(headerBuf[2])<<8 | int64(headerBuf[3])<<16
 		offset += 8 // skip header
 
-		if int(offset)+int(compressedSize) > len(data) {
+		// Skip the compressed data without buffering it
+		if _, err := io.CopyN(io.Discard, f, compressedSize); err != nil {
+			// Can't read expected amount of data
 			break
 		}
 
