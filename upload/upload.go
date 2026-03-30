@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -143,32 +144,35 @@ func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.H
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size.
+// A new group is started before adding a chunk that would cause the total to
+// reach or exceed targetXorbSize, matching the xet-go reference implementation.
 func groupChunksIntoXorbs(chunks []chunkInfo, targetXorbSize uint64) []*xorbGroup {
 	var groups []*xorbGroup
 	var currentGroup *xorbGroup
 	var currentSize uint64
-	startIndex := 0
 
 	for i, chunk := range chunks {
+		chunkSize := uint64(len(chunk.Data))
+
+		// Finalize the current group before adding a chunk that would reach or
+		// exceed the target size.
+		if currentGroup != nil && len(currentGroup.Chunks) > 0 && currentSize+chunkSize >= targetXorbSize {
+			groups = append(groups, currentGroup)
+			currentGroup = nil
+			currentSize = 0
+		}
+
 		if currentGroup == nil {
 			currentGroup = &xorbGroup{
 				Chunks:      make([][]byte, 0),
 				ChunkHashes: make([]xet.Hash, 0),
-				StartIndex:  startIndex,
+				StartIndex:  i,
 			}
 		}
 
 		currentGroup.Chunks = append(currentGroup.Chunks, chunk.Data)
 		currentGroup.ChunkHashes = append(currentGroup.ChunkHashes, chunk.Hash)
-		currentSize += uint64(len(chunk.Data))
-
-		// Check if we should start a new group
-		if currentSize >= targetXorbSize {
-			groups = append(groups, currentGroup)
-			currentGroup = nil
-			currentSize = 0
-			startIndex = i + 1
-		}
+		currentSize += chunkSize
 	}
 
 	// Add remaining group
@@ -372,6 +376,12 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 		}
 		sh.CASInfos = append(sh.CASInfos, *casBlock)
 	}
+
+	// Sort CAS blocks by hash for a deterministic shard layout that matches
+	// the reference implementation (xet-go).
+	sort.Slice(sh.CASInfos, func(i, j int) bool {
+		return sh.CASInfos[i].CASHash.String() < sh.CASInfos[j].CASHash.String()
+	})
 
 	_, err := client.UploadShard(ctx, sh)
 	if err != nil {
