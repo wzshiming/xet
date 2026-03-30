@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,14 +26,14 @@ type Server struct {
 // It returns true if the token is valid
 type AuthFunc func(token string) bool
 
-// ServerOptions configures the server
-type ServerOptions struct {
+// HandlerOptions configures the server
+type HandlerOptions struct {
 	Storage Storage
 	AuthFn  AuthFunc // Optional authentication function
 }
 
-// NewServer creates a new XET CAS server
-func NewServer(opts ServerOptions) *Server {
+// NewHandler creates a new XET CAS server
+func NewHandler(opts HandlerOptions) *Server {
 	s := &Server{
 		storage: opts.Storage,
 		router:  mux.NewRouter(),
@@ -292,23 +291,4 @@ func (s *Server) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 		// Error writing response, but headers already sent
 		fmt.Fprintf(os.Stderr, "Error writing shard response: %v\n", err)
 	}
-}
-
-// ListenAndServe starts the server
-func (s *Server) ListenAndServe(addr string) error {
-	fmt.Printf("Starting XET CAS server on %s\n", addr)
-	return http.ListenAndServe(addr, s)
-}
-
-// ListenAndServeTLS starts the server with TLS
-func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
-	fmt.Printf("Starting XET CAS server on %s (TLS)\n", addr)
-	return http.ListenAndServeTLS(addr, certFile, keyFile, s)
-}
-
-// Shutdown gracefully shuts down the server
-func (s *Server) Shutdown(ctx context.Context) error {
-	// Note: This would need to be implemented with http.Server
-	// For now, this is a placeholder
-	return nil
 }

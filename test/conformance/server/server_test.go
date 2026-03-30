@@ -87,7 +87,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewServer(server.ServerOptions{
+			srv = server.NewHandler(server.HandlerOptions{
 				Storage: storage,
 			})
 
@@ -238,7 +238,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Fatalf("Failed to create storage: %v", err)
 			}
 
-			srv = server.NewServer(server.ServerOptions{
+			srv = server.NewHandler(server.HandlerOptions{
 				Storage: storage,
 			})
 

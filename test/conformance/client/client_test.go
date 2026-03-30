@@ -176,7 +176,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create xet-go storage: %v", err)
 				}
 
-				xetgoSrv = server.NewServer(server.ServerOptions{
+				xetgoSrv = server.NewHandler(server.HandlerOptions{
 					Storage: xetgoStorage,
 				})
 				xetgoProxy = NewRecordingProxy(xetgoSrv)
@@ -228,7 +228,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create native storage: %v", err)
 				}
 
-				nativeSrv = server.NewServer(server.ServerOptions{
+				nativeSrv = server.NewHandler(server.HandlerOptions{
 					Storage: nativeStorage,
 				})
 				nativeProxy = NewRecordingProxy(nativeSrv)
@@ -292,7 +292,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to create storage: %v", err)
 				}
 
-				srv = server.NewServer(server.ServerOptions{
+				srv = server.NewHandler(server.HandlerOptions{
 					Storage: storage,
 				})
 				proxy = NewRecordingProxy(srv)

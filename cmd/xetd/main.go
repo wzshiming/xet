@@ -3,9 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/wzshiming/xet/pkg/server"
 )
@@ -16,8 +15,6 @@ func main() {
 	storageDir := flag.String("storage", "./xet-data", "Storage directory for xorbs and shards")
 	baseURL := flag.String("base-url", "", "Base URL for serving xorb data (optional)")
 	authToken := flag.String("token", "", "Authentication token (optional, if set, clients must provide this token)")
-	tlsCert := flag.String("tls-cert", "", "TLS certificate file (optional)")
-	tlsKey := flag.String("tls-key", "", "TLS key file (optional)")
 	flag.Parse()
 
 	// Create storage
@@ -42,33 +39,14 @@ func main() {
 	}
 
 	// Create server
-	srv := server.NewServer(server.ServerOptions{
+	srv := server.NewHandler(server.HandlerOptions{
 		Storage: storage,
 		AuthFn:  authFn,
 	})
 
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Start server in a goroutine
-	errChan := make(chan error, 1)
-	go func() {
-		if *tlsCert != "" && *tlsKey != "" {
-			errChan <- srv.ListenAndServeTLS(*addr, *tlsCert, *tlsKey)
-		} else {
-			errChan <- srv.ListenAndServe(*addr)
-		}
-	}()
-
-	// Wait for shutdown signal or error
-	select {
-	case err := <-errChan:
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-			os.Exit(1)
-		}
-	case sig := <-sigChan:
-		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+	err = http.ListenAndServe(*addr, srv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		os.Exit(1)
 	}
 }
