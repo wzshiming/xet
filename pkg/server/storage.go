@@ -164,6 +164,11 @@ func (fs *FileStorage) GetXorb(ctx context.Context, namespace string, xorbHash x
 
 // StoreShard stores a shard
 func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	// Generate a unique filename (use first file hash)
+	if len(s.Files) == 0 {
+		return false, fmt.Errorf("shard has no file blocks")
+	}
+
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -207,20 +212,26 @@ func (fs *FileStorage) StoreShard(ctx context.Context, s *shard.Shard) (bool, er
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}
 
-	// Read all data from the reader
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return false, fmt.Errorf("read serialized shard: %w", err)
-	}
-
-	// Generate a unique filename (use first file hash)
-	if len(s.Files) == 0 {
-		return false, fmt.Errorf("shard has no file blocks")
-	}
-
 	shardPath := filepath.Join(fs.basePath, "shards", s.Files[0].FileHash.String())
-	if err := os.WriteFile(shardPath, data, 0644); err != nil {
-		return false, fmt.Errorf("write shard: %w", err)
+	if _, err := os.Stat(shardPath); err == nil {
+		return false, nil
+	}
+
+	f, err := os.OpenFile(shardPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return false, fmt.Errorf("create shard file: %w", err)
+	}
+
+	_, err = io.Copy(f, r)
+	if err != nil {
+		f.Close()
+		return false, fmt.Errorf("write shard to disk: %w", err)
+	}
+	f.Close()
+
+	err = os.Rename(shardPath+".tmp", shardPath)
+	if err != nil {
+		return false, fmt.Errorf("finalize shard file: %w", err)
 	}
 
 	// Update in-memory indexes
