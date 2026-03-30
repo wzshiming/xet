@@ -23,6 +23,8 @@ type ReaderV1 struct {
 	chunkOffset int
 	currentTerm *Term
 	currentXorb *xorb.Xorb
+	localStart  uint32 // Local chunk index start (relative to downloaded xorb)
+	localEnd    uint32 // Local chunk index end (relative to downloaded xorb)
 	err         error
 }
 
@@ -59,7 +61,7 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 		}
 
 		// Check if we're done with current term's chunks
-		if r.chunkIdx >= r.currentTerm.Range.End {
+		if r.chunkIdx >= r.localEnd {
 			r.currentTerm = nil
 			r.currentXorb = nil
 			r.termIdx++
@@ -71,7 +73,7 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 
 		// Apply skip for first chunk of first term
 		data := chunk.UncompressedData
-		if r.termIdx == 0 && r.chunkIdx == r.currentTerm.Range.Start && r.skipBytes > 0 {
+		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
 			if r.skipBytes >= int64(len(data)) {
 				r.skipBytes -= int64(len(data))
 				r.chunkIdx++
@@ -129,13 +131,21 @@ func (r *ReaderV1) loadTerm() error {
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
+	// Convert absolute chunk indices to local indices within the downloaded xorb
+	// The fetchInfo.Range describes the absolute chunk range that was downloaded
+	// The downloaded xorb starts at chunk 0, so we need to subtract the offset
+	localStart := term.Range.Start - fetchInfo.Range.Start
+	localEnd := term.Range.End - fetchInfo.Range.Start
+
 	// Validate chunk range
-	if term.Range.End > uint32(len(xorbObj.Chunks)) {
-		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", term.Range.Start, term.Range.End, len(xorbObj.Chunks))
+	if localEnd > uint32(len(xorbObj.Chunks)) {
+		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
 	}
 
 	r.currentXorb = xorbObj
-	r.chunkIdx = term.Range.Start
+	r.localStart = localStart
+	r.localEnd = localEnd
+	r.chunkIdx = localStart
 	r.chunkOffset = 0
 
 	return nil
