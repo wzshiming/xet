@@ -42,7 +42,6 @@ func printUsage() {
 	fmt.Println("Usage: xetc <command> [options]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  info <file>              Display chunking and hashing information for a file")
 	fmt.Println("  upload <file>            Upload a file to XET CAS server")
 	fmt.Println("  download <hash> <output> Download a file from XET CAS server")
 	fmt.Println("  help                     Display this help message")
@@ -59,7 +58,6 @@ func printUsage() {
 	fmt.Println("  --cache                  Enable chunk caching")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  xetc info myfile.txt")
 	fmt.Println("  xetc upload myfile.txt --url https://xet.example.com --token abc123")
 	fmt.Println("  xetc download a1b2c3d4... output.txt --url https://xet.example.com")
 }
