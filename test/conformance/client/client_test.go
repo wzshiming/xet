@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -143,6 +144,14 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 		{
 			name: "100MB repeating",
 			data: utils.MakeRepeatData(100 * 1024 * 1024),
+		},
+		{
+			name: "200MB",
+			data: utils.MakeRandData(200 * 1024 * 1024),
+		},
+		{
+			name: "200MB repeating",
+			data: utils.MakeRepeatData(200 * 1024 * 1024),
 		},
 	}
 
@@ -380,19 +389,11 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 	xetgoByType := groupRequestsByType(xetgoReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// Get request types
-	xetgoTypes := getSortedKeys(xetgoByType)
-	nativeTypes := getSortedKeys(nativeByType)
-
-	// Filter core requests (exclude dedup queries which are optional)
-	coreXetgoTypes := filterCoreRequests(xetgoTypes)
-	coreNativeTypes := filterCoreRequests(nativeTypes)
-
-	// STRICT: Both clients must make core uploads (xorb + shard)
-	if !equalStringSlices(coreXetgoTypes, coreNativeTypes) {
-		t.Errorf("Core request type mismatch:\n  xet-go:  %v\n  native:  %v",
-			coreXetgoTypes, coreNativeTypes)
-	}
+	// STRICT: All non-dedup request type counts must match after canonicalizing
+	// v1/v2 variants. Dedup probes are validated semantically below.
+	assertCanonicalTypeCountEquality(t, xetgoByType, nativeByType, map[string]bool{
+		"GET:/v{version}/chunks/default/{hash}": true,
+	})
 
 	// STRICT: Both must upload at least one xorb
 	xetgoXorbCount := len(xetgoByType["POST:/v1/xorbs/default/{hash}"])
@@ -416,14 +417,8 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 		t.Errorf("native client uploaded %d shards, expected exactly 1", nativeShardCount)
 	}
 
-	// Symmetric validation: check for native-only request types
-	for reqType := range nativeByType {
-		if !strings.HasPrefix(reqType, "GET:/v1/chunks/") {
-			if _, ok := xetgoByType[reqType]; !ok {
-				t.Errorf("Request type %s present in native but not in xet-go", reqType)
-			}
-		}
-	}
+	// STRICT: Dedup chunk queries must target the same chunk hash set.
+	compareChunkDedupQueries(t, xetgoReqs, nativeReqs)
 
 	// Compare xorb uploads - validate chunk content
 	xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
@@ -444,10 +439,6 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 	xetgoByType := groupRequestsByType(xetgoReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// Get request types
-	xetgoTypes := getSortedKeys(xetgoByType)
-	nativeTypes := getSortedKeys(nativeByType)
-
 	// STRICT: Both must query reconstruction (v1 or v2)
 	xetgoReconCount := len(xetgoByType["GET:/v1/reconstructions/{hash}"]) + len(xetgoByType["GET:/v2/reconstructions/{hash}"])
 	nativeReconCount := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
@@ -461,24 +452,11 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 	// STRICT: Both must download xorb data
 	xetgoXorbDownloadCount := len(xetgoByType["GET:/v1/xorbs/default/{hash}/data"])
 	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}/data"])
-	if xetgoXorbDownloadCount != nativeXorbDownloadCount {
-		if xetgoXorbDownloadCount == 0 {
-			t.Errorf("xet-go did not download any xorb data")
-		}
-		if nativeXorbDownloadCount == 0 {
-			t.Errorf("native client did not download any xorb data")
-		}
+	if xetgoXorbDownloadCount == 0 && nativeXorbDownloadCount > 0 {
+		t.Errorf("xet-go did not download any xorb data")
 	}
-
-	// xet-go may issue a separate range request for each shard term referencing
-	// a given xorb, so its total count can exceed native's. We only require that
-	// the set of unique xorbs downloaded by both clients is identical.
-	xetgoUniqueXorbs := countUniqueXorbPaths(xetgoByType["GET:/v1/xorbs/default/{hash}/data"])
-	nativeUniqueXorbs := countUniqueXorbPaths(nativeByType["GET:/v1/xorbs/default/{hash}/data"])
-	if xetgoUniqueXorbs != nativeUniqueXorbs {
-		// STRICT: both clients must download the exact same unique set of xorbs.
-		t.Errorf("Unique xorb download count mismatch: xet-go=%d native=%d",
-			xetgoUniqueXorbs, nativeUniqueXorbs)
+	if nativeXorbDownloadCount == 0 && xetgoXorbDownloadCount > 0 {
+		t.Errorf("native client did not download any xorb data")
 	}
 
 	// STRICT: Compare reconstruction query paths (must use same file hash)
@@ -489,48 +467,132 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}/data"]
 	compareXorbDownloadRanges(t, xetgoXorbReqs, nativeXorbReqs)
 
-	// Symmetric validation - allowing for v1/v2 API version differences
-	for reqType := range nativeByType {
-		// Check if this request type exists in xetgo, allowing v1/v2 API version differences
-		if !hasEquivalentRequest(reqType, xetgoByType) {
-			t.Errorf("Request type %s present in native but no equivalent in xet-go", reqType)
-		}
-	}
-	for reqType := range xetgoByType {
-		// Check if this request type exists in native, allowing v1/v2 API version differences
-		if !hasEquivalentRequest(reqType, nativeByType) {
-			t.Errorf("Request type %s present in xet-go but no equivalent in native", reqType)
-		}
-	}
+	// STRICT: Except for xorb data (validated by precise range coverage), all
+	// request types must match exactly after canonicalizing v1/v2 variants.
+	assertCanonicalTypeCountEquality(t, xetgoByType, nativeByType, map[string]bool{
+		"GET:/v{version}/reconstructions/{hash}": true,
+		"GET:/v1/xorbs/default/{hash}/data":      true,
+	})
+
+	// Get request types for logging after strict checks.
+	xetgoTypes := getSortedKeys(xetgoByType)
+	nativeTypes := getSortedKeys(nativeByType)
 
 	t.Logf("✓ Download conformance check passed for file %s", fileHash)
 	t.Logf("  xet-go request types: %v", xetgoTypes)
 	t.Logf("  native request types: %v", nativeTypes)
 }
 
-// hasEquivalentRequest checks if a request type or its v1/v2 equivalent exists in the map
-func hasEquivalentRequest(reqType string, requests map[string][]RequestRecord) bool {
-	if _, ok := requests[reqType]; ok {
-		return true
+// canonicalizeRequestType normalizes versioned API prefixes so v1/v2 endpoints
+// compare as the same behavior for conformance purposes.
+func canonicalizeRequestType(reqType string) string {
+	parts := strings.SplitN(reqType, ":", 2)
+	if len(parts) != 2 {
+		return reqType
 	}
-	return false
+	method := parts[0]
+	path := parts[1]
+	path = strings.Replace(path, "/v1/", "/v{version}/", 1)
+	path = strings.Replace(path, "/v2/", "/v{version}/", 1)
+	return method + ":" + path
 }
 
-// countUniqueXorbPaths returns the number of unique xorb paths across a slice of requests.
-func countUniqueXorbPaths(reqs []RequestRecord) int {
-	seen := make(map[string]bool)
+// assertCanonicalTypeCountEquality enforces exact equality of request-type counts
+// after canonicalizing API versions.
+func assertCanonicalTypeCountEquality(t *testing.T, xetgoByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
+	t.Helper()
+
+	xetgoCounts := make(map[string]int)
+	nativeCounts := make(map[string]int)
+
+	for reqType, reqs := range xetgoByType {
+		canonical := canonicalizeRequestType(reqType)
+		if skipTypes != nil && (skipTypes[reqType] || skipTypes[canonical]) {
+			continue
+		}
+		xetgoCounts[canonical] += len(reqs)
+	}
+
+	for reqType, reqs := range nativeByType {
+		canonical := canonicalizeRequestType(reqType)
+		if skipTypes != nil && (skipTypes[reqType] || skipTypes[canonical]) {
+			continue
+		}
+		nativeCounts[canonical] += len(reqs)
+	}
+
+	for key, xCount := range xetgoCounts {
+		nCount := nativeCounts[key]
+		if xCount != nCount {
+			t.Errorf("Request type count mismatch for %s: xet-go=%d native=%d", key, xCount, nCount)
+		}
+	}
+	for key, nCount := range nativeCounts {
+		xCount := xetgoCounts[key]
+		if xCount != nCount {
+			t.Errorf("Request type count mismatch for %s: xet-go=%d native=%d", key, xCount, nCount)
+		}
+	}
+}
+
+// compareChunkDedupQueries validates dedup probes semantically. Clients may choose
+// different probing strategies, but every probed chunk hash must belong to that
+// client's uploaded chunk set.
+func compareChunkDedupQueries(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+	t.Helper()
+
+	xetgoChunks := make(map[string]bool)
+	nativeChunks := make(map[string]bool)
+	xetgoUploaded := extractUploadedChunkHashes(t, xetgoReqs)
+	nativeUploaded := extractUploadedChunkHashes(t, nativeReqs)
+
+	for _, req := range xetgoReqs {
+		if req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/v1/chunks/") {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(req.Path, "/v1/chunks/"), "/")
+		if len(parts) > 0 && len(parts[0]) == 64 && isHexString(parts[0]) {
+			xetgoChunks[parts[0]] = true
+		}
+	}
+
+	for _, req := range nativeReqs {
+		if req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/v1/chunks/") {
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(req.Path, "/v1/chunks/"), "/")
+		if len(parts) > 0 && len(parts[0]) == 64 && isHexString(parts[0]) {
+			nativeChunks[parts[0]] = true
+		}
+	}
+
+	for h := range xetgoChunks {
+		if !xetgoUploaded[h] {
+			t.Errorf("xet-go queried dedup chunk %s that is not in xet-go uploaded chunks", h)
+		}
+	}
+	for h := range nativeChunks {
+		if !nativeUploaded[h] {
+			t.Errorf("native queried dedup chunk %s that is not in native uploaded chunks", h)
+		}
+	}
+}
+
+func extractUploadedChunkHashes(t *testing.T, reqs []RequestRecord) map[string]bool {
+	t.Helper()
+
+	result := make(map[string]bool)
 	for _, req := range reqs {
-		seen[req.Path] = true
-	}
-	return len(seen)
-}
-
-// filterCoreRequests filters out deduplication queries to focus on core upload operations
-func filterCoreRequests(types []string) []string {
-	var result []string
-	for _, t := range types {
-		if !strings.HasPrefix(t, "GET:/v1/chunks/") {
-			result = append(result, t)
+		if req.Method != http.MethodPost || normalizePath(req.Path) != "/v1/xorbs/default/{hash}" {
+			continue
+		}
+		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
+		if err != nil {
+			t.Errorf("failed to decode xorb while extracting uploaded chunks: %v", err)
+			continue
+		}
+		for _, chunkHash := range xorbObj.ChunkHashes {
+			result[chunkHash.String()] = true
 		}
 	}
 	return result
@@ -578,19 +640,6 @@ func getSortedKeys(m map[string][]RequestRecord) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-// equalStringSlices checks if two string slices are equal
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // compareXorbRequests compares xorb upload requests by deserializing and comparing chunk content
@@ -847,8 +896,8 @@ func compareReconstructionPaths(t *testing.T, xetgoReqs, nativeReqs []RequestRec
 
 	for _, req := range xetgoReqs {
 		if strings.Contains(req.Path, "/reconstructions/") {
-			parts := strings.Split(req.Path, "/")
-			for _, part := range parts {
+			parts := strings.SplitSeq(req.Path, "/")
+			for part := range parts {
 				if len(part) == 64 && isHexString(part) {
 					if part != expectedFileHash {
 						t.Errorf("xet-go reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
@@ -860,8 +909,8 @@ func compareReconstructionPaths(t *testing.T, xetgoReqs, nativeReqs []RequestRec
 
 	for _, req := range nativeReqs {
 		if strings.Contains(req.Path, "/reconstructions/") {
-			parts := strings.Split(req.Path, "/")
-			for _, part := range parts {
+			parts := strings.SplitSeq(req.Path, "/")
+			for part := range parts {
 				if len(part) == 64 && isHexString(part) {
 					if part != expectedFileHash {
 						t.Errorf("native reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
@@ -890,9 +939,8 @@ func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestReco
 		nativeRangesByPath[req.Path] = append(nativeRangesByPath[req.Path], rangeHeader)
 	}
 
-	// For each xorb path, compare the Range headers.
-	// xet-go may issue more requests than native for the same xorb (e.g. one
-	// per shard term), so we only error when xet-go downloads FEWER times.
+	// For each xorb path, compare semantic range coverage. Clients may split
+	// ranges differently, but the downloaded byte intervals must be identical.
 	for path, xetgoRanges := range xetgoRangesByPath {
 		nativeRanges, ok := nativeRangesByPath[path]
 		if !ok {
@@ -900,24 +948,19 @@ func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestReco
 			continue
 		}
 
-		if len(xetgoRanges) < len(nativeRanges) {
-			t.Errorf("Xorb %s: xet-go made fewer requests than native: xet-go=%d native=%d",
-				path, len(xetgoRanges), len(nativeRanges))
+		xMerged, xErr := mergeRanges(xetgoRanges)
+		nMerged, nErr := mergeRanges(nativeRanges)
+		if xErr != nil {
+			t.Errorf("xet-go has invalid Range header for xorb %s: %v", path, xErr)
+			continue
+		}
+		if nErr != nil {
+			t.Errorf("native has invalid Range header for xorb %s: %v", path, nErr)
 			continue
 		}
 
-		// When the counts match, compare Range headers exactly.
-		if len(xetgoRanges) == len(nativeRanges) {
-			// Sort ranges for stable comparison
-			sort.Strings(xetgoRanges)
-			sort.Strings(nativeRanges)
-
-			for i := range xetgoRanges {
-				if xetgoRanges[i] != nativeRanges[i] {
-					t.Errorf("Xorb %s download %d Range header mismatch: xet-go=%q native=%q",
-						path, i, xetgoRanges[i], nativeRanges[i])
-				}
-			}
+		if !equalByteRanges(xMerged, nMerged) {
+			t.Errorf("Xorb %s merged byte-range mismatch: xet-go=%v native=%v", path, xMerged, nMerged)
 		}
 	}
 
@@ -927,4 +970,81 @@ func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestReco
 			t.Errorf("native downloaded xorb %s but xet-go did not", path)
 		}
 	}
+}
+
+type byteRange struct {
+	start int64
+	end   int64
+}
+
+func parseRangeHeader(value string) (byteRange, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return byteRange{}, fmt.Errorf("empty Range header")
+	}
+	if !strings.HasPrefix(value, "bytes=") {
+		return byteRange{}, fmt.Errorf("unsupported Range header format %q", value)
+	}
+	parts := strings.SplitN(strings.TrimPrefix(value, "bytes="), "-", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return byteRange{}, fmt.Errorf("unsupported Range header format %q", value)
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return byteRange{}, fmt.Errorf("invalid Range start %q", parts[0])
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return byteRange{}, fmt.Errorf("invalid Range end %q", parts[1])
+	}
+	if start < 0 || end < start {
+		return byteRange{}, fmt.Errorf("invalid Range bounds %q", value)
+	}
+	return byteRange{start: start, end: end}, nil
+}
+
+func mergeRanges(values []string) ([]byteRange, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	ranges := make([]byteRange, 0, len(values))
+	for _, value := range values {
+		r, err := parseRangeHeader(value)
+		if err != nil {
+			return nil, err
+		}
+		ranges = append(ranges, r)
+	}
+
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].start == ranges[j].start {
+			return ranges[i].end < ranges[j].end
+		}
+		return ranges[i].start < ranges[j].start
+	})
+
+	merged := []byteRange{ranges[0]}
+	for _, current := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		if current.start <= last.end+1 {
+			if current.end > last.end {
+				last.end = current.end
+			}
+			continue
+		}
+		merged = append(merged, current)
+	}
+	return merged, nil
+}
+
+func equalByteRanges(a, b []byteRange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].start != b[i].start || a[i].end != b[i].end {
+			return false
+		}
+	}
+	return true
 }
