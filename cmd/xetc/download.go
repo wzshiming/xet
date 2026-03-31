@@ -120,7 +120,7 @@ func newDownloadResolveCmd(out io.Writer) *cobra.Command {
 		Short: "Resolve a Hugging Face URL and download through CAS",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			hfInfo, err := hf.ResolveDownload(cmd.Context(), args[0])
+			hfInfo, err := hf.ResolveDownload(cmd.Context(), nil, args[0])
 			if err != nil {
 				return fmt.Errorf("resolve download target: %w", err)
 			}

@@ -35,54 +35,62 @@ type XETToken struct {
 	Revision string
 }
 
-func ResolveDownload(ctx context.Context, resolveURL string) (DownloadResolved, error) {
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+// ResolveDownload resolves a download URL to its corresponding file hash and CAS endpoint
+func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (*DownloadResolved, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, resolveURL, nil)
 	if err != nil {
-		return DownloadResolved{}, fmt.Errorf("create resolve request: %w", err)
+		return nil, fmt.Errorf("create resolve request: %w", err)
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return DownloadResolved{}, fmt.Errorf("resolve request: %w", err)
+		return nil, fmt.Errorf("resolve request: %w", err)
 	}
 	defer resp.Body.Close()
 
+	return ResolveResponse(ctx, httpClient, resp)
+}
+
+// ResolveXETReadToken resolves a Hugging Face repo reference to an XET read token for downloading
+func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (*DownloadResolved, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return DownloadResolved{}, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
 
 	linkMap := parseLinkHeaders(resp.Header.Values("Link"))
 	reconURLStr := linkMap["xet-reconstruction-info"]
 	if reconURLStr == "" {
-		return DownloadResolved{}, fmt.Errorf("missing xet-reconstruction-info link")
+		return nil, fmt.Errorf("missing xet-reconstruction-info link")
 	}
 
 	reconURL, err := url.Parse(reconURLStr)
 	if err != nil {
-		return DownloadResolved{}, fmt.Errorf("parse reconstruction link: %w", err)
+		return nil, fmt.Errorf("parse reconstruction link: %w", err)
 	}
 	if reconURL.Scheme == "" || reconURL.Host == "" {
-		return DownloadResolved{}, fmt.Errorf("invalid reconstruction link: %s", reconURLStr)
+		return nil, fmt.Errorf("invalid reconstruction link: %s", reconURLStr)
 	}
 
 	hashStr := path.Base(reconURL.Path)
 	if hashStr == "" {
 		hashStr := resp.Header.Get("X-Xet-Hash")
 		if hashStr == "" {
-			return DownloadResolved{}, fmt.Errorf("missing X-Xet-Hash header in resolve response")
+			return nil, fmt.Errorf("missing X-Xet-Hash header in resolve response")
 		}
 	}
 
 	fileHash, err := xet.ParseHash(hashStr)
 	if err != nil {
-		return DownloadResolved{}, fmt.Errorf("parse X-Xet-Hash: %w", err)
+		return nil, fmt.Errorf("parse X-Xet-Hash: %w", err)
 	}
 
 	result := DownloadResolved{
@@ -91,15 +99,23 @@ func ResolveDownload(ctx context.Context, resolveURL string) (DownloadResolved, 
 	}
 
 	if authURL := linkMap["xet-auth"]; authURL != "" {
+		if httpClient == nil {
+			httpClient = &http.Client{
+				Timeout: 30 * time.Second,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+		}
 		tokenResp, err := fetchXETAuthToken(ctx, httpClient, authURL)
 		if err != nil {
-			return DownloadResolved{}, fmt.Errorf("fetch xet auth token: %w", err)
+			return nil, fmt.Errorf("fetch xet auth token: %w", err)
 		}
 		result.Token = tokenResp.Token
 		result.BaseURL = tokenResp.CASURL
 	}
 
-	return result, nil
+	return &result, nil
 }
 
 func ResolveXETWriteToken(ctx context.Context, repoOrURL, hubToken string, opts UploadOptions) (XETToken, error) {

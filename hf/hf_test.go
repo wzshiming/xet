@@ -30,7 +30,7 @@ func TestResolveHuggingFace(t *testing.T) {
 	}))
 	defer resolveSrv.Close()
 
-	info, err := ResolveDownload(context.Background(), resolveSrv.URL)
+	info, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
 	if err != nil {
 		t.Fatalf("Resolve returned error: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestResolveHuggingFaceMissingHeaders(t *testing.T) {
 	}))
 	defer resolveSrv.Close()
 
-	_, err := ResolveDownload(context.Background(), resolveSrv.URL)
+	_, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
 	if err == nil {
 		t.Fatalf("expected error due to missing headers")
 	}
