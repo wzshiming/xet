@@ -16,7 +16,7 @@ const (
 	defaultHFEndpoint = "https://huggingface.co"
 )
 
-func executeUpload(ctx context.Context, filename, baseURL, token, namespace string, noDedup bool, out io.Writer) (err error) {
+func executeUpload(ctx context.Context, filename, baseURL, token, namespace string, out io.Writer) (err error) {
 	if baseURL == "" {
 		return fmt.Errorf("--url is required")
 	}
@@ -38,7 +38,7 @@ func executeUpload(ctx context.Context, filename, baseURL, token, namespace stri
 		client.WithNamespace(namespace),
 	)
 
-	session := cli.UploadSession(client.WithUploadGlobalDedup(!noDedup))
+	session := cli.UploadSession()
 
 	if _, err := fmt.Fprintf(out, "%s Uploading file\n", filename); err != nil {
 		return err

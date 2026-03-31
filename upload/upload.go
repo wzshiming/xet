@@ -37,7 +37,7 @@ type xorbGroup struct {
 
 // UploadFiles chunks, deduplicates, and uploads multiple files using the
 // provided client adapter. It returns the computed file hashes.
-func UploadFiles(ctx context.Context, client ClientAdapter, enableGlobalDedup bool, readers ...io.Reader) ([]xet.Hash, error) {
+func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader) ([]xet.Hash, error) {
 	localChunkCache := make(map[xet.Hash]*DeduplicationResult)
 
 	// Step 1: Chunk all files and deduplicate
@@ -59,7 +59,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, enableGlobalDedup bo
 			chunkSizes = append(chunkSizes, chunk.Size())
 
 			// Deduplicate
-			dedupResult := deduplicateChunk(ctx, client, localChunkCache, enableGlobalDedup, chunkHash)
+			dedupResult := deduplicateChunk(ctx, client, localChunkCache, chunkHash)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, chunkInfo{
@@ -109,29 +109,28 @@ func UploadFiles(ctx context.Context, client ClientAdapter, enableGlobalDedup bo
 }
 
 // deduplicateChunk checks if a chunk already exists.
-func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, enableGlobalDedup bool, chunkHash xet.Hash) *DeduplicationResult {
+func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHash xet.Hash) *DeduplicationResult {
 	// Check local session cache first
 	if result, ok := cache[chunkHash]; ok {
 		return result
 	}
 
 	// Check global deduplication if enabled
-	if enableGlobalDedup && client != nil {
-		shardData, err := client.QueryChunkDeduplication(ctx, chunkHash)
-		if err == nil && shardData != nil {
-			// Found in global dedup - extract xorb hash and chunk index
-			if len(shardData.CASInfos) > 0 {
-				casBlock := shardData.CASInfos[0]
-				if len(casBlock.Chunks) > 0 {
-					result := &DeduplicationResult{
-						ChunkHash:  chunkHash,
-						IsNew:      false,
-						XorbHash:   casBlock.CASHash,
-						ChunkIndex: 0, // First chunk in the returned info
-					}
-					cache[chunkHash] = result
-					return result
+
+	shardData, err := client.QueryChunkDeduplication(ctx, chunkHash)
+	if err == nil && shardData != nil {
+		// Found in global dedup - extract xorb hash and chunk index
+		if len(shardData.CASInfos) > 0 {
+			casBlock := shardData.CASInfos[0]
+			if len(casBlock.Chunks) > 0 {
+				result := &DeduplicationResult{
+					ChunkHash:  chunkHash,
+					IsNew:      false,
+					XorbHash:   casBlock.CASHash,
+					ChunkIndex: 0, // First chunk in the returned info
 				}
+				cache[chunkHash] = result
+				return result
 			}
 		}
 	}

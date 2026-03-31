@@ -29,35 +29,18 @@ func (a *uploadClientAdapter) QueryChunkDeduplication(ctx context.Context, chunk
 
 // UploadSession represents an upload session
 type UploadSession struct {
-	client            *Client
-	enableGlobalDedup bool
-}
-
-type uploadSessionOptions struct {
-	EnableGlobalDedup bool
-}
-
-// WithUploadGlobalDedup configures whether to check global deduplication before uploading chunks
-func WithUploadGlobalDedup(enabled bool) func(*uploadSessionOptions) {
-	return func(opts *uploadSessionOptions) {
-		opts.EnableGlobalDedup = enabled
-	}
+	client *Client
 }
 
 // UploadSession creates a new upload session with optional global deduplication
-func (c *Client) UploadSession(opts ...func(*uploadSessionOptions)) *UploadSession {
-	options := &uploadSessionOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
+func (c *Client) UploadSession() *UploadSession {
 	return &UploadSession{
-		client:            c,
-		enableGlobalDedup: options.EnableGlobalDedup,
+		client: c,
 	}
 }
 
 // UploadFiles uploads multiple files and returns their hashes
 func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
 	adapter := &uploadClientAdapter{client: s.client}
-	return upload.UploadFiles(ctx, adapter, s.enableGlobalDedup, readers...)
+	return upload.UploadFiles(ctx, adapter, readers...)
 }

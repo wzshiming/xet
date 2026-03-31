@@ -26,7 +26,6 @@ func newUploadCASCmd(out io.Writer) *cobra.Command {
 		baseURL   string
 		token     string
 		namespace string
-		noDedup   bool
 	)
 
 	cmd := &cobra.Command{
@@ -34,14 +33,13 @@ func newUploadCASCmd(out io.Writer) *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return executeUpload(cmd.Context(), args[0], baseURL, token, namespace, noDedup, out)
+			return executeUpload(cmd.Context(), args[0], baseURL, token, namespace, out)
 		},
 	}
 
 	cmd.Flags().StringVar(&baseURL, "url", defaultHFCASURL, "CAS server URL")
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
-	cmd.Flags().BoolVar(&noDedup, "no-dedup", false, "Disable global deduplication")
 	return cmd
 }
 
@@ -53,7 +51,6 @@ func newUploadHFCmd(out io.Writer) *cobra.Command {
 		hfRepoType string
 		hfRevision string
 		namespace  string
-		noDedup    bool
 	)
 
 	cmd := &cobra.Command{
@@ -80,7 +77,7 @@ func newUploadHFCmd(out io.Writer) *cobra.Command {
 				return err
 			}
 
-			return executeUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, noDedup, out)
+			return executeUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, out)
 		},
 	}
 
@@ -90,6 +87,5 @@ func newUploadHFCmd(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
-	cmd.Flags().BoolVar(&noDedup, "no-dedup", false, "Disable global deduplication")
 	return cmd
 }
