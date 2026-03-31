@@ -29,6 +29,7 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 		token       string
 		namespace   string
 		concurrency int
+		resume      bool
 	)
 
 	cmd := &cobra.Command{
@@ -40,7 +41,7 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
-			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, concurrency, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, concurrency, resume, out)
 		},
 	}
 
@@ -48,6 +49,7 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
+	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }
 
@@ -60,6 +62,7 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 		hfRevision  string
 		namespace   string
 		concurrency int
+		resume      bool
 	)
 
 	cmd := &cobra.Command{
@@ -91,7 +94,7 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 				return err
 			}
 
-			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, resume, out)
 		},
 	}
 
@@ -102,11 +105,15 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
+	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }
 
 func newDownloadResolveCmd(out io.Writer) *cobra.Command {
-	var concurrency int
+	var (
+		concurrency int
+		resume      bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "resolve <resolve-url> <file>",
@@ -120,9 +127,10 @@ func newDownloadResolveCmd(out io.Writer) *cobra.Command {
 			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", args[1], hfInfo.Hash.String()); err != nil {
 				return err
 			}
-			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", concurrency, out)
+			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", concurrency, resume, out)
 		},
 	}
 	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
+	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }

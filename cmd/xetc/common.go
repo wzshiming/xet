@@ -139,9 +139,17 @@ func executeUpload(ctx context.Context, filename, baseURL, token, namespace stri
 	return nil
 }
 
-func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL, token, namespace string, concurrency int, out io.Writer) (err error) {
+func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL, token, namespace string, concurrency int, resume bool, out io.Writer) (err error) {
 	if baseURL == "" {
 		return fmt.Errorf("--url is required")
+	}
+
+	// Detect partial download for resume
+	var resumeOffset int64
+	if resume {
+		if stat, statErr := os.Stat(outputFile); statErr == nil && stat.Mode().IsRegular() {
+			resumeOffset = stat.Size()
+		}
 	}
 
 	cli := client.NewClient(
@@ -157,6 +165,9 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 	if out != nil {
 		session.WithProgress(func(progress client.Progress) {
 			progressMu.Lock()
+			// Adjust byte counts so progress reflects the full file, not just the remaining portion
+			progress.BytesRead += resumeOffset
+			progress.TotalBytes += resumeOffset
 			latestProgress = progress
 			rate := speed.Update(progress.TransferredBytes, time.Now())
 			_, _ = fmt.Fprintf(out, "\r%s", formatDownloadProgress(progress, rate))
@@ -164,14 +175,48 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 		})
 	}
 
-	reader, expectedLength, err := session.DownloadFile(ctx, fileHash)
-	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+	var downloadOpts []client.ReqOpt
+	if resumeOffset > 0 {
+		downloadOpts = append(downloadOpts, client.WithRangeStart(resumeOffset))
 	}
 
-	file, err := os.Create(outputFile)
+	reader, expectedLength, err := session.DownloadFile(ctx, fileHash, downloadOpts...)
 	if err != nil {
-		return fmt.Errorf("create output file: %w", err)
+		if resumeOffset > 0 {
+			// Range request failed (server may not support it); fall back to full download
+			resumeOffset = 0
+			reader, expectedLength, err = session.DownloadFile(ctx, fileHash)
+		}
+		if err != nil {
+			return fmt.Errorf("download failed: %w", err)
+		}
+	}
+
+	// File is already fully downloaded
+	if expectedLength == 0 && resumeOffset > 0 {
+		if out != nil {
+			if _, writeErr := fmt.Fprintf(out, "✓ File already complete! (%d bytes)\n", resumeOffset); writeErr != nil {
+				return writeErr
+			}
+			if _, writeErr := fmt.Fprintf(out, "Saved to: %s\n", outputFile); writeErr != nil {
+				return writeErr
+			}
+		}
+		return nil
+	}
+
+	// Open output file: append if resuming, create otherwise
+	var file *os.File
+	if resumeOffset > 0 {
+		file, err = os.OpenFile(outputFile, os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("open output file for append: %w", err)
+		}
+	} else {
+		file, err = os.Create(outputFile)
+		if err != nil {
+			return fmt.Errorf("create output file: %w", err)
+		}
 	}
 	defer func() {
 		closeErr := file.Close()
@@ -186,8 +231,8 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 		if _, writeErr := fmt.Fprint(out, "\r"); err == nil && writeErr != nil {
 			err = writeErr
 		}
-		latestProgress.BytesRead = n
-		latestProgress.TotalBytes = expectedLength
+		latestProgress.BytesRead = resumeOffset + n
+		latestProgress.TotalBytes = resumeOffset + expectedLength
 		rate := speed.Update(latestProgress.TransferredBytes, time.Now())
 		if _, writeErr := fmt.Fprintf(out, "%s\n", formatDownloadProgress(latestProgress, rate)); err == nil && writeErr != nil {
 			err = writeErr
@@ -198,7 +243,8 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 		return fmt.Errorf("write output file: %w", err)
 	}
 
-	if _, err := fmt.Fprintf(out, "✓ Download complete! (%d bytes)\n", n); err != nil {
+	total := resumeOffset + n
+	if _, err := fmt.Fprintf(out, "✓ Download complete! (%d bytes)\n", total); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(out, "Saved to: %s\n", outputFile); err != nil {
