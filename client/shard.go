@@ -16,11 +16,16 @@ import (
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, err := upload.EncodeShard(shardObj)
-	if err != nil {
-		return nil, err
+	r, encodeErr := upload.EncodeShard(shardObj)
+	if encodeErr != nil {
+		return nil, encodeErr
 	}
-	body := io.Reader(r)
+	cacheFile, contentLength, err := c.spoolReaderToCache(r, "upload-shard")
+	if err != nil {
+		return nil, fmt.Errorf("cache serialized shard: %w", err)
+	}
+
+	var body io.Reader = cacheFile
 	if onUpload := getUploadProgress(ctx); onUpload != nil {
 		body = wrapReaderWithReadProgress(body, onUpload)
 	}
@@ -31,6 +36,8 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = contentLength
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -39,7 +46,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeAndIgnoreError(resp.Body)
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -56,6 +63,18 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 // QueryChunkDeduplication checks if a chunk exists in the global deduplication index
 func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*shard.Shard, error) {
 	url := fmt.Sprintf("%s/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
+	cacheKey := stableCacheKey(c.namespace, chunkHash.String())
+	cacheFile, _, hit, err := c.openPersistentCache("query-chunk", cacheKey, ".bin")
+	if err != nil {
+		return nil, fmt.Errorf("open chunk query cache: %w", err)
+	}
+	if hit {
+		defer closeAndIgnoreError(cacheFile)
+		shardObj, decodeErr := upload.DecodeChunkQueryResponse(cacheFile)
+		if decodeErr == nil {
+			return shardObj, nil
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -70,7 +89,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeAndIgnoreError(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
 		// Chunk not found - this is expected for new chunks
@@ -81,8 +100,14 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, err
 	}
 
-	// Deserialize shard directly from response body
-	shardObj, err := upload.DecodeChunkQueryResponse(resp.Body)
+	cacheFile, _, err = c.writePersistentCache("query-chunk", cacheKey, ".bin", resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cache chunk query response: %w", err)
+	}
+	defer closeAndIgnoreError(cacheFile)
+
+	// Deserialize shard from cached response
+	shardObj, err := upload.DecodeChunkQueryResponse(cacheFile)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}

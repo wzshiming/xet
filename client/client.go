@@ -9,10 +9,11 @@ import (
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	token      string
-	namespace  string
+	baseURL      string
+	httpClient   *http.Client
+	token        string
+	namespace    string
+	cacheDirPath string
 }
 
 type Options func(*Client)
@@ -38,6 +39,12 @@ func WithToken(token string) Options {
 func WithNamespace(namespace string) Options {
 	return func(c *Client) {
 		c.namespace = namespace
+	}
+}
+
+func WithCacheDir(dir string) Options {
+	return func(c *Client) {
+		c.cacheDirPath = dir
 	}
 }
 

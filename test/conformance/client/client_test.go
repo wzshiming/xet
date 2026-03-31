@@ -240,7 +240,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeProxy = NewRecordingProxy(nativeSrv)
 
 				// Upload with native client
-				nativeClient := client.NewClient(client.WithBaseURL(nativeHttpSrv.URL))
+				nativeClient := client.NewClient(client.WithBaseURL(nativeHttpSrv.URL), client.WithCacheDir(t.TempDir()))
 
 				nativeFile := filepath.Join(tempDir, "native-upload.bin")
 				if err := os.WriteFile(nativeFile, tt.data, 0644); err != nil {
@@ -299,7 +299,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				proxy = NewRecordingProxy(srv)
 
 				// First upload file using native client
-				nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+				nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL), client.WithCacheDir(t.TempDir()))
 
 				tempDir := t.TempDir()
 				uploadFile := filepath.Join(tempDir, "upload.bin")

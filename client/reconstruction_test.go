@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wzshiming/xet"
@@ -47,7 +48,9 @@ func TestGetReconstruction(t *testing.T) {
 				},
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -72,7 +75,9 @@ func TestGetReconstruction(t *testing.T) {
 func TestGetReconstructionError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("file not found"))
+		if _, err := w.Write([]byte("file not found")); err != nil {
+			t.Fatalf("write error body: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -98,7 +103,9 @@ func TestGetReconstructionRange(t *testing.T) {
 			Terms:                []download.Term{},
 			FetchInfo:            map[string][]download.FetchInfoEntry{},
 		}
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -153,7 +160,9 @@ func TestGetReconstructionV2(t *testing.T) {
 				},
 			},
 		}
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -181,7 +190,9 @@ func TestGetReconstructionV2(t *testing.T) {
 func TestGetReconstructionV2Error(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("file not found"))
+		if _, err := w.Write([]byte("file not found")); err != nil {
+			t.Fatalf("write error body: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -207,7 +218,9 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 			Terms:                []download.Term{},
 			Xorbs:                map[string][]download.XorbMultiRangeFetch{},
 		}
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -221,5 +234,34 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 
 	if reconstruction.OffsetIntoFirstRange != 1000 {
 		t.Errorf("Expected OffsetIntoFirstRange 1000, got %d", reconstruction.OffsetIntoFirstRange)
+	}
+}
+
+func TestGetReconstructionV1UsesPersistentCache(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		resp := download.ReconstructionResponse{
+			OffsetIntoFirstRange: 0,
+			Terms:                []download.Term{},
+			FetchInfo:            map[string][]download.FetchInfoEntry{},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	c := NewClient(WithBaseURL(server.URL))
+	c.cacheDirPath = t.TempDir()
+
+	hash := xet.Hash{9, 8, 7}
+	if _, err := c.GetReconstructionV1(context.Background(), hash); err != nil {
+		t.Fatalf("first reconstruction call failed: %v", err)
+	}
+	if _, err := c.GetReconstructionV1(context.Background(), hash); err != nil {
+		t.Fatalf("second reconstruction call failed: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("expected one network hit due to cache reuse, got %d", got)
 	}
 }
