@@ -74,6 +74,7 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
 	s.root.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	s.root.HandleFunc("/api/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 	s.root.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Used by xet-core but not defined in spec
@@ -81,6 +82,7 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
 	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 
 	// /v1/shards is defined in the spec as the upload endpoint for shards,
 	// but xet-core actually uploads shards to /shards, so we support both.
@@ -92,6 +94,21 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 
 	s.root.NotFoundHandler = s.next
+}
+
+type batchChunkDedupQueryRequest struct {
+	ChunkHashes []string `json:"chunk_hashes"`
+}
+
+type batchChunkDedupQueryResponse struct {
+	Results []batchChunkDedupResult `json:"results"`
+}
+
+type batchChunkDedupResult struct {
+	ChunkHash  string `json:"chunk_hash"`
+	Found      bool   `json:"found"`
+	XorbHash   string `json:"xorb_hash,omitempty"`
+	ChunkIndex uint32 `json:"chunk_index,omitempty"`
 }
 
 // ServeHTTP implements http.Handler
@@ -317,4 +334,42 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 		// Error writing response, but headers already sent
 		fmt.Fprintf(os.Stderr, "Error writing shard response: %v\n", err)
 	}
+}
+
+// handleQueryChunksBatch handles POST /v1/chunks/{namespace}:query.
+func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+
+	var reqBody batchChunkDedupQueryRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	results := make([]batchChunkDedupResult, 0, len(reqBody.ChunkHashes))
+	for _, chunkHashStr := range reqBody.ChunkHashes {
+		res := batchChunkDedupResult{ChunkHash: chunkHashStr, Found: false}
+
+		chunkHash, err := xet.ParseHash(chunkHashStr)
+		if err != nil {
+			results = append(results, res)
+			continue
+		}
+
+		shardObj, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
+		if err != nil || shardObj == nil || len(shardObj.CASInfos) == 0 || len(shardObj.CASInfos[0].Chunks) == 0 {
+			results = append(results, res)
+			continue
+		}
+
+		casBlock := shardObj.CASInfos[0]
+		res.Found = true
+		res.XorbHash = casBlock.CASHash.String()
+		res.ChunkIndex = 0
+		results = append(results, res)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(batchChunkDedupQueryResponse{Results: results})
 }

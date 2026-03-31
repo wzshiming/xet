@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"io"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wzshiming/xet"
@@ -28,6 +29,40 @@ func (s *stubUploadClientAdapter) UploadShard(_ context.Context, shardObj *shard
 
 func (s *stubUploadClientAdapter) QueryChunkDeduplication(_ context.Context, _ xet.Hash) (*shard.Shard, error) {
 	return nil, nil
+}
+
+type batchStubUploadClientAdapter struct {
+	stubUploadClientAdapter
+	batchCalls  atomic.Int32
+	singleCalls atomic.Int32
+}
+
+type inspectBatchStubUploadClientAdapter struct {
+	stubUploadClientAdapter
+	lastBatch []xet.Hash
+}
+
+func (s *batchStubUploadClientAdapter) QueryChunkDeduplication(_ context.Context, _ xet.Hash) (*shard.Shard, error) {
+	s.singleCalls.Add(1)
+	return nil, nil
+}
+
+func (s *batchStubUploadClientAdapter) QueryChunksDeduplication(_ context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*DeduplicationResult, error) {
+	s.batchCalls.Add(1)
+	results := make(map[xet.Hash]*DeduplicationResult, len(chunkHashes))
+	for _, chunkHash := range chunkHashes {
+		results[chunkHash] = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+	}
+	return results, nil
+}
+
+func (s *inspectBatchStubUploadClientAdapter) QueryChunksDeduplication(_ context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*DeduplicationResult, error) {
+	s.lastBatch = append([]xet.Hash(nil), chunkHashes...)
+	results := make(map[xet.Hash]*DeduplicationResult, len(chunkHashes))
+	for _, chunkHash := range chunkHashes {
+		results[chunkHash] = &DeduplicationResult{ChunkHash: chunkHash, IsNew: false, XorbHash: xet.Hash{9}, ChunkIndex: 0}
+	}
+	return results, nil
 }
 
 func TestEncodeDecodeXorb(t *testing.T) {
@@ -204,5 +239,54 @@ func TestUploadFilesSetsFileMetadataExtSHA256(t *testing.T) {
 	}
 	if !bytes.Equal(file.MetadataExt.SHA256Hash[:], expectedSHA256[:]) {
 		t.Fatalf("sha256 mismatch: got %x want %x", file.MetadataExt.SHA256Hash, expectedSHA256)
+	}
+}
+
+func TestUploadFilesPrefersBatchChunkDeduplication(t *testing.T) {
+	adapter := &batchStubUploadClientAdapter{}
+	data := bytes.Repeat([]byte("batch-dedup-test-"), 2048)
+
+	if _, err := UploadFiles(context.Background(), adapter, []io.Reader{bytes.NewReader(data)}); err != nil {
+		t.Fatalf("UploadFiles failed: %v", err)
+	}
+
+	if adapter.batchCalls.Load() == 0 {
+		t.Fatal("expected batch dedup query to be used")
+	}
+	if adapter.singleCalls.Load() != 0 {
+		t.Fatalf("expected single dedup query not to be used, got %d calls", adapter.singleCalls.Load())
+	}
+}
+
+func TestDeduplicateChunksUsesSparseGlobalProbes(t *testing.T) {
+	adapter := &inspectBatchStubUploadClientAdapter{}
+
+	chunkHashes := make([]xet.Hash, 600)
+	for i := range chunkHashes {
+		chunkHashes[i][0] = byte(i)
+		chunkHashes[i][1] = byte(i >> 8)
+		chunkHashes[i][2] = byte(i >> 16)
+		chunkHashes[i][3] = byte(i >> 24)
+	}
+
+	cache := make(map[xet.Hash]*DeduplicationResult)
+	deduplicateChunks(context.Background(), adapter, cache, chunkHashes, 4)
+
+	if len(adapter.lastBatch) != 3 {
+		t.Fatalf("expected 3 sparse probes (0,256,512), got %d", len(adapter.lastBatch))
+	}
+	if adapter.lastBatch[0] != chunkHashes[0] || adapter.lastBatch[1] != chunkHashes[256] || adapter.lastBatch[2] != chunkHashes[512] {
+		t.Fatal("unexpected sparse probe positions")
+	}
+
+	if len(cache) != len(chunkHashes) {
+		t.Fatalf("cache size mismatch: got %d want %d", len(cache), len(chunkHashes))
+	}
+
+	if cache[chunkHashes[0]].IsNew {
+		t.Fatal("expected probed chunk to be deduplicated")
+	}
+	if !cache[chunkHashes[1]].IsNew {
+		t.Fatal("expected non-probed chunk to stay new")
 	}
 }

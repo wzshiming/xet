@@ -186,6 +186,103 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, cache map[xet.
 	if len(chunkHashes) == 0 {
 		return
 	}
+
+	for _, chunkHash := range chunkHashes {
+		cache[chunkHash] = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+	}
+
+	probeChunkHashes := selectChunkHashesForGlobalDedup(chunkHashes)
+	if len(probeChunkHashes) == 0 {
+		return
+	}
+
+	if batchClient, ok := client.(BatchDeduplicationClientAdapter); ok {
+		if deduplicateChunksBatch(ctx, batchClient, cache, probeChunkHashes, concurrency) {
+			return
+		}
+	}
+
+	deduplicateChunksSingle(ctx, client, cache, probeChunkHashes, concurrency)
+}
+
+func selectChunkHashesForGlobalDedup(chunkHashes []xet.Hash) []xet.Hash {
+	if len(chunkHashes) == 0 {
+		return nil
+	}
+
+	const minSpacingBetweenGlobalDedupQueries = 256
+	probes := make([]xet.Hash, 0, len(chunkHashes)/minSpacingBetweenGlobalDedupQueries+1)
+	for i, chunkHash := range chunkHashes {
+		if i == 0 || i%minSpacingBetweenGlobalDedupQueries == 0 {
+			probes = append(probes, chunkHash)
+		}
+	}
+	return probes
+}
+
+func deduplicateChunksBatch(ctx context.Context, client BatchDeduplicationClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) bool {
+	if len(chunkHashes) == 0 {
+		return true
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	const batchSize = 256
+	batchCount := (len(chunkHashes) + batchSize - 1) / batchSize
+	if concurrency > batchCount {
+		concurrency = batchCount
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+
+	queue := make(chan []xet.Hash, batchCount)
+	for start := 0; start < len(chunkHashes); start += batchSize {
+		end := min(start+batchSize, len(chunkHashes))
+		batch := make([]xet.Hash, end-start)
+		copy(batch, chunkHashes[start:end])
+		queue <- batch
+	}
+	close(queue)
+
+	var mu sync.Mutex
+	var hadError bool
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for batch := range queue {
+				results, err := client.QueryChunksDeduplication(ctx, batch)
+				if err != nil {
+					mu.Lock()
+					hadError = true
+					mu.Unlock()
+					return
+				}
+
+				mu.Lock()
+				for _, chunkHash := range batch {
+					result, ok := results[chunkHash]
+					if !ok || result == nil {
+						result = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+					}
+					cache[chunkHash] = result
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	return !hadError
+}
+
+func deduplicateChunksSingle(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) {
+	if len(chunkHashes) == 0 {
+		return
+	}
 	if concurrency <= 0 {
 		concurrency = 1
 	}

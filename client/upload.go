@@ -33,6 +33,10 @@ func (a *uploadClientAdapter) QueryChunkDeduplication(ctx context.Context, chunk
 	return a.client.QueryChunkDeduplication(ctx, chunkHash)
 }
 
+func (a *uploadClientAdapter) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
+	return a.client.QueryChunksDeduplication(ctx, chunkHashes)
+}
+
 // UploadSession represents an upload session
 type UploadSession struct {
 	client       *Client

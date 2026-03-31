@@ -14,3 +14,9 @@ type ClientAdapter interface {
 	UploadShard(ctx context.Context, shardObj *shard.Shard) (*ShardUploadResponse, error)
 	QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*shard.Shard, error)
 }
+
+// BatchDeduplicationClientAdapter is an optional extension interface for
+// querying multiple chunk deduplication entries in one call.
+type BatchDeduplicationClientAdapter interface {
+	QueryChunksDeduplication(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*DeduplicationResult, error)
+}
