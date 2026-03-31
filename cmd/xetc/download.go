@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/hf"
 )
 
@@ -24,9 +25,10 @@ func newDownloadCmd(out io.Writer) *cobra.Command {
 
 func newDownloadCASCmd(out io.Writer) *cobra.Command {
 	var (
-		baseURL   string
-		token     string
-		namespace string
+		baseURL     string
+		token       string
+		namespace   string
+		concurrency int
 	)
 
 	cmd := &cobra.Command{
@@ -38,24 +40,26 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
-			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, concurrency, out)
 		},
 	}
 
 	cmd.Flags().StringVar(&baseURL, "url", defaultHFCASURL, "CAS server URL")
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
 	return cmd
 }
 
 func newDownloadHFCmd(out io.Writer) *cobra.Command {
 	var (
-		hfRepo     string
-		hfToken    string
-		hfEndpoint string
-		hfRepoType string
-		hfRevision string
-		namespace  string
+		hfRepo      string
+		hfToken     string
+		hfEndpoint  string
+		hfRepoType  string
+		hfRevision  string
+		namespace   string
+		concurrency int
 	)
 
 	cmd := &cobra.Command{
@@ -87,7 +91,7 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 				return err
 			}
 
-			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, out)
 		},
 	}
 
@@ -97,10 +101,13 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
 	return cmd
 }
 
 func newDownloadResolveCmd(out io.Writer) *cobra.Command {
+	var concurrency int
+
 	cmd := &cobra.Command{
 		Use:   "resolve <resolve-url> <file>",
 		Short: "Resolve a Hugging Face URL and download through CAS",
@@ -113,8 +120,9 @@ func newDownloadResolveCmd(out io.Writer) *cobra.Command {
 			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", args[1], hfInfo.Hash.String()); err != nil {
 				return err
 			}
-			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", out)
+			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", concurrency, out)
 		},
 	}
+	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")
 	return cmd
 }

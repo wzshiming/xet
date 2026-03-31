@@ -1,9 +1,5 @@
 package download
 
-import (
-	"github.com/wzshiming/xet"
-)
-
 // ReconstructionResponse represents the response from the file reconstruction API
 type ReconstructionResponse struct {
 	OffsetIntoFirstRange int64                       `json:"offset_into_first_range"`
@@ -55,10 +51,4 @@ type XorbMultiRangeFetch struct {
 type XorbRangeDescriptor struct {
 	Chunks ChunkRange `json:"chunks"`
 	Bytes  ByteRange  `json:"bytes"`
-}
-
-// Storage interface provides access to storage operations needed for reconstruction
-type Storage interface {
-	GetXorbURL(namespace string, xorbHash xet.Hash) string
-	GetXorbReadSeekCloser(ctx interface{}, namespace string, xorbHash xet.Hash) (interface{}, error)
 }

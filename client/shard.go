@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/wzshiming/xet"
@@ -19,8 +20,12 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	if err != nil {
 		return nil, err
 	}
+	body := io.Reader(r)
+	if onUpload := getUploadProgress(ctx); onUpload != nil {
+		body = wrapReaderWithReadProgress(body, onUpload)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, r)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

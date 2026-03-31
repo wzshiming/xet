@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/hf"
 )
 
@@ -23,9 +24,10 @@ func newUploadCmd(out io.Writer) *cobra.Command {
 
 func newUploadCASCmd(out io.Writer) *cobra.Command {
 	var (
-		baseURL   string
-		token     string
-		namespace string
+		baseURL     string
+		token       string
+		namespace   string
+		concurrency int
 	)
 
 	cmd := &cobra.Command{
@@ -33,24 +35,26 @@ func newUploadCASCmd(out io.Writer) *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return executeUpload(cmd.Context(), args[0], baseURL, token, namespace, out)
+			return executeUpload(cmd.Context(), args[0], baseURL, token, namespace, concurrency, out)
 		},
 	}
 
 	cmd.Flags().StringVar(&baseURL, "url", defaultHFCASURL, "CAS server URL")
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultUploadConcurrency, "Number of upload tasks to run concurrently")
 	return cmd
 }
 
 func newUploadHFCmd(out io.Writer) *cobra.Command {
 	var (
-		hfRepo     string
-		hfToken    string
-		hfEndpoint string
-		hfRepoType string
-		hfRevision string
-		namespace  string
+		hfRepo      string
+		hfToken     string
+		hfEndpoint  string
+		hfRepoType  string
+		hfRevision  string
+		namespace   string
+		concurrency int
 	)
 
 	cmd := &cobra.Command{
@@ -77,7 +81,7 @@ func newUploadHFCmd(out io.Writer) *cobra.Command {
 				return err
 			}
 
-			return executeUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, out)
+			return executeUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, out)
 		},
 	}
 
@@ -87,5 +91,6 @@ func newUploadHFCmd(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultUploadConcurrency, "Number of upload tasks to run concurrently")
 	return cmd
 }

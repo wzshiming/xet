@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,6 +55,28 @@ func NewClient(opts ...Options) *Client {
 }
 
 type ReqOpt func(req *http.Request)
+
+type downloadProgressContextKey struct{}
+type uploadProgressContextKey struct{}
+
+func WithDownloadProgress(progress func(int64)) ReqOpt {
+	return func(req *http.Request) {
+		ctx := context.WithValue(req.Context(), downloadProgressContextKey{}, progress)
+		*req = *req.WithContext(ctx)
+	}
+}
+
+func withUploadProgressContext(ctx context.Context, progress func(int64)) context.Context {
+	if progress == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, uploadProgressContextKey{}, progress)
+}
+
+func getUploadProgress(ctx context.Context) func(int64) {
+	progress, _ := ctx.Value(uploadProgressContextKey{}).(func(int64))
+	return progress
+}
 
 func WithRange(start, end int64) ReqOpt {
 	return func(req *http.Request) {

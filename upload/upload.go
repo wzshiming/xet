@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -35,12 +36,38 @@ type xorbGroup struct {
 	StartIndex  int
 }
 
+type options struct {
+	concurrency int
+}
+
+func WithConcurrency(concurrency int) func(*options) {
+	return func(o *options) {
+		o.concurrency = concurrency
+	}
+}
+
+// UploadFile chunks, deduplicates, and uploads a single file using the provided client adapter.
+func UploadFile(ctx context.Context, client ClientAdapter, reader io.Reader, opts ...func(*options)) (xet.Hash, error) {
+	hashes, err := UploadFiles(ctx, client, []io.Reader{reader}, opts...)
+	if err != nil {
+		return xet.Hash{}, err
+	}
+	return hashes[0], nil
+}
+
 // UploadFiles chunks, deduplicates, and uploads multiple files using the
 // provided client adapter. It returns the computed file hashes.
-func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader) ([]xet.Hash, error) {
+func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader, opts ...func(*options)) ([]xet.Hash, error) {
+	options := &options{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	concurrency := min(1, options.concurrency)
+
 	localChunkCache := make(map[xet.Hash]*DeduplicationResult)
 
-	// Step 1: Chunk all files and deduplicate
+	// Step 1: Chunk all files
 	var allChunks []chunkInfo
 	var fileHashes []xet.Hash
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
@@ -58,16 +85,12 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader
 			chunkHashes = append(chunkHashes, chunkHash)
 			chunkSizes = append(chunkSizes, chunk.Size())
 
-			// Deduplicate
-			dedupResult := deduplicateChunk(ctx, client, localChunkCache, chunkHash)
-
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, chunkInfo{
 				FileIndex: index,
 				Data:      chunk.Bytes(),
 				Hash:      chunkHash,
 				Offset:    uint64(offset),
-				Dedup:     dedupResult,
 			})
 
 			fileChunkRanges[index] = append(fileChunkRanges[index], chunkIdx)
@@ -83,7 +106,14 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader
 		fileHashes = append(fileHashes, fileHash)
 	}
 
-	// Step 2: Group new chunks into xorbs
+	// Step 2: Deduplicate unique chunks
+	uniqueChunkHashes := uniqueChunkHashes(allChunks)
+	deduplicateChunks(ctx, client, localChunkCache, uniqueChunkHashes, concurrency)
+	for i := range allChunks {
+		allChunks[i].Dedup = localChunkCache[allChunks[i].Hash]
+	}
+
+	// Step 3: Group new chunks into xorbs
 	var newChunks []chunkInfo
 	seenNewChunk := make(map[xet.Hash]bool)
 	for _, chunk := range allChunks {
@@ -95,12 +125,12 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader
 
 	xorbs := groupChunksIntoXorbs(newChunks, xet.MaxXorbSerializedSize)
 
-	// Step 3: Upload xorbs
-	if err := uploadXorbs(ctx, client, localChunkCache, xorbs); err != nil {
+	// Step 4: Upload xorbs
+	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency); err != nil {
 		return nil, fmt.Errorf("upload xorbs: %w", err)
 	}
 
-	// Step 4: Build and upload shard
+	// Step 5: Build and upload shard
 	if err := buildAndUploadShard(ctx, client, fileHashes, allChunks, fileChunkRanges); err != nil {
 		return nil, fmt.Errorf("build and upload shard: %w", err)
 	}
@@ -108,15 +138,42 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers ...io.Reader
 	return fileHashes, nil
 }
 
-// deduplicateChunk checks if a chunk already exists.
-func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHash xet.Hash) *DeduplicationResult {
-	// Check local session cache first
-	if result, ok := cache[chunkHash]; ok {
-		return result
+func deduplicateChunks(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) {
+	if len(chunkHashes) == 0 {
+		return
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(chunkHashes) {
+		concurrency = len(chunkHashes)
 	}
 
-	// Check global deduplication if enabled
+	queue := make(chan xet.Hash, len(chunkHashes))
+	for _, chunkHash := range chunkHashes {
+		queue <- chunkHash
+	}
+	close(queue)
 
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for chunkHash := range queue {
+				result := queryDeduplicationChunk(ctx, client, chunkHash)
+				mu.Lock()
+				cache[chunkHash] = result
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// queryDeduplicationChunk checks if a chunk already exists globally.
+func queryDeduplicationChunk(ctx context.Context, client ClientAdapter, chunkHash xet.Hash) *DeduplicationResult {
 	shardData, err := client.QueryChunkDeduplication(ctx, chunkHash)
 	if err == nil && shardData != nil {
 		// Found in global dedup - extract xorb hash and chunk index
@@ -129,7 +186,6 @@ func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.H
 					XorbHash:   casBlock.CASHash,
 					ChunkIndex: 0, // First chunk in the returned info
 				}
-				cache[chunkHash] = result
 				return result
 			}
 		}
@@ -140,8 +196,20 @@ func deduplicateChunk(ctx context.Context, client ClientAdapter, cache map[xet.H
 		ChunkHash: chunkHash,
 		IsNew:     true,
 	}
-	cache[chunkHash] = result
 	return result
+}
+
+func uniqueChunkHashes(chunks []chunkInfo) []xet.Hash {
+	seen := make(map[xet.Hash]bool, len(chunks))
+	unique := make([]xet.Hash, 0, len(chunks))
+	for _, chunk := range chunks {
+		if seen[chunk.Hash] {
+			continue
+		}
+		seen[chunk.Hash] = true
+		unique = append(unique, chunk.Hash)
+	}
+	return unique
 }
 
 // groupChunksIntoXorbs groups chunks into xorbs targeting the specified size.
@@ -185,33 +253,73 @@ func groupChunksIntoXorbs(chunks []chunkInfo, targetXorbSize uint64) []*xorbGrou
 }
 
 // uploadXorbs serializes and uploads all xorbs.
-func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup) error {
-	for _, group := range groups {
-		// Create xorb
-		xorbObj := xorb.NewXorb()
-		for _, chunkData := range group.Chunks {
-			if err := xorbObj.AddChunk(chunkData); err != nil {
-				return fmt.Errorf("add chunk to xorb: %w", err)
-			}
-		}
-
-		// Upload
-		_, err := client.UploadXorb(ctx, xorbObj)
-		if err != nil {
-			return fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
-		}
-
-		// Update local cache with xorb information
-		for i, chunkHash := range group.ChunkHashes {
-			if result, ok := cache[chunkHash]; ok && result.IsNew {
-				result.IsNew = false
-				result.XorbHash = xorbObj.Hash
-				result.ChunkIndex = uint32(i)
-			}
-		}
+func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(groups) {
+		concurrency = len(groups)
 	}
 
-	return nil
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	queue := make(chan *xorbGroup, len(groups))
+	for _, group := range groups {
+		queue <- group
+	}
+	close(queue)
+
+	var firstErr error
+	var errOnce sync.Once
+	var cacheMu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for group := range queue {
+				if ctx.Err() != nil {
+					return
+				}
+
+				xorbObj := xorb.NewXorb()
+				for _, chunkData := range group.Chunks {
+					if err := xorbObj.AddChunk(chunkData); err != nil {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("add chunk to xorb: %w", err)
+							cancel()
+						})
+						return
+					}
+				}
+
+				if _, err := client.UploadXorb(ctx, xorbObj); err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
+						cancel()
+					})
+					return
+				}
+
+				cacheMu.Lock()
+				for i, chunkHash := range group.ChunkHashes {
+					if result, ok := cache[chunkHash]; ok && result.IsNew {
+						result.IsNew = false
+						result.XorbHash = xorbObj.Hash
+						result.ChunkIndex = uint32(i)
+					}
+				}
+				cacheMu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
 }
 
 // buildAndUploadShard constructs and uploads the shard.

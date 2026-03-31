@@ -269,7 +269,7 @@ func (r *shardReader) buildCASBlock(cb CASBlock) []byte {
 func (r *shardReader) buildBookend() []byte {
 	buf := make([]byte, 48)
 	// Bytes 0-31: All 0xFF
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		buf[i] = 0xFF
 	}
 	// Bytes 32-47: All 0x00 (already zeroed)

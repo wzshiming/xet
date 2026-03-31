@@ -31,7 +31,12 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 		return nil, fmt.Errorf("read serialized xorb: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(data))
+	body := io.Reader(bytes.NewReader(data))
+	if onUpload := getUploadProgress(ctx); onUpload != nil {
+		body = wrapReaderWithReadProgress(body, onUpload)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -86,11 +91,32 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	// Check if a Range header was set on the actual request
 	chunkOnly := req.Header.Get("Range") != ""
 
+	var body io.Reader = resp.Body
+	if progress, _ := req.Context().Value(downloadProgressContextKey{}).(func(int64)); progress != nil {
+		body = &progressReadCloser{
+			ReadCloser: resp.Body,
+			onRead:     progress,
+		}
+	}
+
 	// Deserialize the xorb
-	xorbObj, err := xorb.Decode(resp.Body, chunkOnly)
+	xorbObj, err := xorb.Decode(body, chunkOnly)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize xorb: %w", err)
 	}
 
 	return xorbObj, nil
+}
+
+type progressReadCloser struct {
+	io.ReadCloser
+	onRead func(int64)
+}
+
+func (r *progressReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(int64(n))
+	}
+	return n, err
 }

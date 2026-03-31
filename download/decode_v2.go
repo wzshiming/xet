@@ -16,7 +16,9 @@ type ReaderV2 struct {
 	ctx            context.Context
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
-	xorbCache      map[string]cachedXorbV2
+	termFetches    []selectedFetchV2
+	prefetcher     *xorbPrefetcher
+	initErr        error
 
 	// State for reading
 	termIdx     int
@@ -29,24 +31,36 @@ type ReaderV2 struct {
 	err         error
 }
 
-type cachedXorbV2 struct {
-	xorb       *xorb.Xorb
+type selectedFetchV2 struct {
+	key        string
 	chunkStart uint32
 	chunkEnd   uint32
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2) io.Reader {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...func(*options)) io.Reader {
+	options := &options{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	termFetches, tasks, err := planReaderV2(reconstruction)
 	return &ReaderV2{
 		client:         client,
 		ctx:            ctx,
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
-		xorbCache:      map[string]cachedXorbV2{},
+		termFetches:    termFetches,
+		prefetcher:     newXorbPrefetcher(ctx, client, tasks, options.concurrencyValue()),
+		initErr:        err,
 	}
 }
 
 func (r *ReaderV2) Read(p []byte) (n int, err error) {
+	if r.initErr != nil {
+		return 0, r.initErr
+	}
+
 	if r.err != nil {
 		return 0, r.err
 	}
@@ -117,27 +131,60 @@ func (r *ReaderV2) loadTerm() error {
 	term := &r.reconstruction.Terms[r.termIdx]
 	r.currentTerm = term
 
-	if cached, ok := r.xorbCache[term.Hash]; ok {
-		if cached.chunkStart <= term.Range.Start && cached.chunkEnd >= term.Range.End {
-			localStart := term.Range.Start - cached.chunkStart
-			localEnd := term.Range.End - cached.chunkStart
-			if localEnd > uint32(len(cached.xorb.Chunks)) {
-				return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(cached.xorb.Chunks))
-			}
-
-			r.currentXorb = cached.xorb
-			r.localStart = localStart
-			r.localEnd = localEnd
-			r.chunkIdx = localStart
-			r.chunkOffset = 0
-			return nil
-		}
+	selected := r.termFetches[r.termIdx]
+	xorbObj, err := r.prefetcher.Wait(selected.key)
+	if err != nil {
+		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	// Get fetch info for this xorb
-	fetchList, ok := r.reconstruction.Xorbs[term.Hash]
+	localStart := term.Range.Start - selected.chunkStart
+	localEnd := term.Range.End - selected.chunkStart
+
+	// Validate chunk range
+	if localEnd > uint32(len(xorbObj.Chunks)) {
+		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
+	}
+
+	r.currentXorb = xorbObj
+	r.localStart = localStart
+	r.localEnd = localEnd
+	r.chunkIdx = localStart
+	r.chunkOffset = 0
+
+	return nil
+}
+
+func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetchV2, []xorbFetchTask, error) {
+	selected := make([]selectedFetchV2, len(reconstruction.Terms))
+	tasks := make([]xorbFetchTask, 0, len(reconstruction.Terms))
+	for i := range reconstruction.Terms {
+		term := &reconstruction.Terms[i]
+		fetch, rg, err := selectFetchInfoV2(reconstruction, term)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		key := fmt.Sprintf("%s|%s|%d|%d|%d|%d", term.Hash, fetch.URL, rg.Chunks.Start, rg.Chunks.End, rg.Bytes.Start, rg.Bytes.End)
+		selected[i] = selectedFetchV2{
+			key:        key,
+			chunkStart: rg.Chunks.Start,
+			chunkEnd:   rg.Chunks.End,
+		}
+		tasks = append(tasks, xorbFetchTask{
+			key: key,
+			url: fetch.URL,
+			header: http.Header{
+				"Range": []string{fmt.Sprintf("bytes=%d-%d", rg.Bytes.Start, rg.Bytes.End)},
+			},
+		})
+	}
+	return selected, tasks, nil
+}
+
+func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*XorbMultiRangeFetch, *XorbRangeDescriptor, error) {
+	fetchList, ok := reconstruction.Xorbs[term.Hash]
 	if !ok || len(fetchList) == 0 {
-		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
+		return nil, nil, fmt.Errorf("no fetch info for xorb %s", term.Hash)
 	}
 
 	var selectedFetch *XorbMultiRangeFetch
@@ -155,44 +202,10 @@ func (r *ReaderV2) loadTerm() error {
 	}
 
 	if selectedFetch == nil || selectedRange == nil {
-		return fmt.Errorf("no matching range descriptor for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
+		return nil, nil, fmt.Errorf("no matching range descriptor for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
 	}
 
-	chunkStart := selectedRange.Chunks.Start
-	chunkEnd := selectedRange.Chunks.End
-	byteStart := selectedRange.Bytes.Start
-	byteEnd := selectedRange.Bytes.End
-
-	header := http.Header{
-		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteStart, byteEnd)},
-	}
-
-	xorbObj, err := r.client.DownloadXorb(r.ctx, selectedFetch.URL, header)
-	if err != nil {
-		return fmt.Errorf("download xorb: %w", err)
-	}
-
-	localStart := term.Range.Start - chunkStart
-	localEnd := term.Range.End - chunkStart
-
-	// Validate chunk range
-	if localEnd > uint32(len(xorbObj.Chunks)) {
-		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
-	}
-
-	r.xorbCache[term.Hash] = cachedXorbV2{
-		xorb:       xorbObj,
-		chunkStart: chunkStart,
-		chunkEnd:   chunkEnd,
-	}
-
-	r.currentXorb = xorbObj
-	r.localStart = localStart
-	r.localEnd = localEnd
-	r.chunkIdx = localStart
-	r.chunkOffset = 0
-
-	return nil
+	return selectedFetch, selectedRange, nil
 }
 
 // ExpectedLengthV2 calculates the expected file length from V2 reconstruction

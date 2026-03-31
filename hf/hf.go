@@ -301,8 +301,8 @@ func isRepoActionSegment(part string) bool {
 func parseLinkHeaders(values []string) map[string]string {
 	result := make(map[string]string)
 	for _, value := range values {
-		parts := strings.Split(value, ",")
-		for _, part := range parts {
+		parts := strings.SplitSeq(value, ",")
+		for part := range parts {
 			part = strings.TrimSpace(part)
 			if !strings.HasPrefix(part, "<") {
 				continue
