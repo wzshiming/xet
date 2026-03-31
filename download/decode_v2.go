@@ -208,6 +208,29 @@ func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*X
 	return selectedFetch, selectedRange, nil
 }
 
+// ExpectedTransferBytesV2 computes the total compressed bytes that will be transferred
+// over the network when reconstructing a V2 file. Deduplicated ranges are counted once.
+func ExpectedTransferBytesV2(reconstruction *ReconstructionResponseV2) int64 {
+	_, tasks, err := planReaderV2(reconstruction)
+	if err != nil {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(tasks))
+	var total int64
+	for _, task := range tasks {
+		if _, ok := seen[task.key]; ok {
+			continue
+		}
+		seen[task.key] = struct{}{}
+		rng := task.header.Get("Range")
+		var start, end int64
+		if n, _ := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); n == 2 && end >= start {
+			total += end - start + 1
+		}
+	}
+	return total
+}
+
 // ExpectedLengthV2 calculates the expected file length from V2 reconstruction
 func ExpectedLengthV2(reconstruction *ReconstructionResponseV2) int64 {
 	var total uint64

@@ -37,12 +37,21 @@ type xorbGroup struct {
 }
 
 type options struct {
-	concurrency int
+	concurrency  int
+	onTotalBytes func(int64)
 }
 
 func WithConcurrency(concurrency int) func(*options) {
 	return func(o *options) {
 		o.concurrency = concurrency
+	}
+}
+
+// WithOnTotalBytes registers a callback that is invoked once the total number
+// of raw bytes to be uploaded is known (after deduplication and xorb grouping).
+func WithOnTotalBytes(cb func(int64)) func(*options) {
+	return func(o *options) {
+		o.onTotalBytes = cb
 	}
 }
 
@@ -63,7 +72,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 		opt(options)
 	}
 
-	concurrency := min(1, options.concurrency)
+	concurrency := max(1, options.concurrency)
 
 	localChunkCache := make(map[xet.Hash]*DeduplicationResult)
 
@@ -124,6 +133,16 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 	}
 
 	xorbs := groupChunksIntoXorbs(newChunks, xet.MaxXorbSerializedSize)
+
+	if options.onTotalBytes != nil {
+		var total int64
+		for _, g := range xorbs {
+			for _, data := range g.Chunks {
+				total += int64(len(data))
+			}
+		}
+		options.onTotalBytes(total)
+	}
 
 	// Step 4: Upload xorbs
 	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency); err != nil {

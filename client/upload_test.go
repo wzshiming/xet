@@ -24,7 +24,7 @@ func TestUploadSessionWithConcurrency(t *testing.T) {
 func TestUploadSessionWithProgress(t *testing.T) {
 	session := NewClient().UploadSession()
 	called := false
-	progress := func(progress Progress) {
+	progress := func(current, total int64) {
 		called = true
 	}
 
@@ -35,26 +35,27 @@ func TestUploadSessionWithProgress(t *testing.T) {
 		t.Fatal("expected progress callback to be configured")
 	}
 
-	session.progress(Progress{})
+	session.progress(0, 0)
 	if !called {
 		t.Fatal("expected configured progress callback to be invoked")
 	}
 }
 
-func TestUploadProgressTrackerAggregatesReadAndUploadedBytes(t *testing.T) {
-	var updates []Progress
-	tracker := newByteProgressTracker(func(readBytes, transferBytes int64) {
-		updates = append(updates, newProgress(readBytes, 0, transferBytes))
-	})
+func TestUploadProgressTrackerTransferBytes(t *testing.T) {
+	type update struct{ current, total int64 }
+	var updates []update
+	tracker := newSessionProgressTracker(func(current, total int64) {
+		updates = append(updates, update{current, total})
+	}, func() int64 { return 50 })
 
-	tracker.AddReadBytes(11)
+	tracker.AddTransferBytes(11)
 	tracker.AddTransferBytes(7)
 
 	if len(updates) < 2 {
 		t.Fatalf("expected at least 2 progress updates, got %d", len(updates))
 	}
 	last := updates[len(updates)-1]
-	if last.BytesRead != 11 || last.TransferredBytes != 7 {
+	if last.current != 18 || last.total != 50 {
 		t.Fatalf("unexpected tracker progress: %+v", last)
 	}
 }

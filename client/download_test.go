@@ -27,7 +27,7 @@ func TestDownloadSessionWithConcurrency(t *testing.T) {
 func TestDownloadSessionWithProgress(t *testing.T) {
 	session := NewClient().DownloadSession()
 	called := false
-	progress := func(progress Progress) {
+	progress := func(current, total int64) {
 		called = true
 	}
 
@@ -38,85 +38,40 @@ func TestDownloadSessionWithProgress(t *testing.T) {
 		t.Fatal("expected progress callback to be configured")
 	}
 
-	session.progress(Progress{})
+	session.progress(0, 0)
 	if !called {
 		t.Fatal("expected configured progress callback to be invoked")
 	}
 }
 
-func TestWrapReaderWithProgress(t *testing.T) {
-	var updates []Progress
-	tracker := newByteProgressTracker(func(readBytes, transferBytes int64) {
-		updates = append(updates, newProgress(readBytes, 5, transferBytes))
-	})
-	tracker.Report()
-	reader := wrapReaderWithReadProgress(newChunkedStringReader("hello", 2), tracker.AddReadBytes)
-
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read all: %v", err)
-	}
-	if string(data) != "hello" {
-		t.Fatalf("unexpected content: %q", string(data))
-	}
-	if len(updates) < 2 {
-		t.Fatalf("expected at least 2 progress updates, got %d", len(updates))
-	}
-	if updates[0].BytesRead != 0 || updates[0].TotalBytes != 5 {
-		t.Fatalf("unexpected initial progress: %+v", updates[0])
-	}
-	last := updates[len(updates)-1]
-	if last.BytesRead != 5 || last.TotalBytes != 5 {
-		t.Fatalf("unexpected final progress: %+v", last)
-	}
-	if last.TransferredBytes != 0 {
-		t.Fatalf("unexpected downloaded bytes in reader-only test: %+v", last)
-	}
-}
-
-func TestProgressTrackerAggregatesDownloadedAndReadBytes(t *testing.T) {
-	var updates []Progress
-	tracker := newByteProgressTracker(func(readBytes, transferBytes int64) {
-		updates = append(updates, newProgress(readBytes, 100, transferBytes))
-	})
+func TestProgressTrackerTransferBytes(t *testing.T) {
+	type update struct{ current, total int64 }
+	var updates []update
+	total := int64(100)
+	tracker := newSessionProgressTracker(func(current, tot int64) {
+		updates = append(updates, update{current, tot})
+	}, func() int64 { return total })
 
 	tracker.Report()
 	tracker.AddTransferBytes(7)
-	tracker.AddReadBytes(3)
+	tracker.AddTransferBytes(3)
 
 	if len(updates) < 3 {
 		t.Fatalf("expected at least 3 progress updates, got %d", len(updates))
 	}
+	if updates[0].current != 0 || updates[0].total != 100 {
+		t.Fatalf("unexpected initial progress: %+v", updates[0])
+	}
 	last := updates[len(updates)-1]
-	if last.TotalBytes != 100 || last.TransferredBytes != 7 || last.BytesRead != 3 {
-		t.Fatalf("unexpected aggregated progress: %+v", last)
+	if last.current != 10 || last.total != 100 {
+		t.Fatalf("unexpected final progress: %+v", last)
 	}
 }
 
-func TestNewSessionProgressTracker(t *testing.T) {
-	var updates []Progress
-	tracker := newSessionProgressTracker(func(progress Progress) {
-		updates = append(updates, progress)
-	}, func(readBytes, transferBytes int64) Progress {
-		return newProgress(readBytes, 100, transferBytes)
-	})
-
-	tracker.AddTransferBytes(7)
-	tracker.AddReadBytes(3)
-
-	if len(updates) < 2 {
-		t.Fatalf("expected at least 2 updates, got %d", len(updates))
-	}
-	last := updates[len(updates)-1]
-	if last.TotalBytes != 100 || last.TransferredBytes != 7 || last.BytesRead != 3 {
-		t.Fatalf("unexpected aggregated progress: %+v", last)
-	}
-}
-
-func TestNilProgressTrackerWrapReader(t *testing.T) {
-	reader := newChunkedStringReader("hello", 2)
-	if wrapped := (*byteProgressTracker)(nil).WrapReader(reader); wrapped != reader {
-		t.Fatal("expected nil tracker to leave reader unchanged")
+func TestNewSessionProgressTrackerNilProgress(t *testing.T) {
+	tracker := newSessionProgressTracker(nil, func() int64 { return 0 })
+	if tracker != nil {
+		t.Fatal("expected nil tracker when progress is nil")
 	}
 }
 

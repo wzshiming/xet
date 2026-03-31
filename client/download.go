@@ -84,11 +84,10 @@ func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash,
 	}
 
 	expectedLength := download.ExpectedLengthV1(reconstructionResp)
+	totalTransfer := download.ExpectedTransferBytesV1(reconstructionResp)
 
 	adapter := &clientAdapter{client: s.client}
-	tracker := newSessionProgressTracker(s.progress, func(readBytes, transferBytes int64) Progress {
-		return newProgress(readBytes, expectedLength, transferBytes)
-	})
+	tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer })
 	if tracker != nil {
 		adapter.onDownloadedBytes = tracker.AddTransferBytes
 	}
@@ -97,7 +96,6 @@ func (s *DownloadSession) DownloadFileV1(ctx context.Context, fileHash xet.Hash,
 	reader := download.NewReaderV1(ctx, adapter, reconstructionResp, download.WithConcurrency(s.concurrency))
 	if tracker != nil {
 		tracker.Report()
-		reader = tracker.WrapReader(reader)
 	}
 
 	return reader, expectedLength, nil
@@ -111,11 +109,10 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 	}
 
 	expectedLength := download.ExpectedLengthV2(reconstructionResp)
+	totalTransfer := download.ExpectedTransferBytesV2(reconstructionResp)
 
 	adapter := &clientAdapter{client: s.client}
-	tracker := newSessionProgressTracker(s.progress, func(readBytes, transferBytes int64) Progress {
-		return newProgress(readBytes, expectedLength, transferBytes)
-	})
+	tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer })
 	if tracker != nil {
 		adapter.onDownloadedBytes = tracker.AddTransferBytes
 	}
@@ -124,7 +121,6 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 	reader := download.NewReaderV2(ctx, adapter, reconstructionResp, download.WithConcurrency(s.concurrency))
 	if tracker != nil {
 		tracker.Report()
-		reader = tracker.WrapReader(reader)
 	}
 
 	return reader, expectedLength, nil

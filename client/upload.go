@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"io"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -65,11 +66,15 @@ func (s *UploadSession) WithProgress(progress ProgressFunc) *UploadSession {
 // UploadFiles uploads multiple files and returns their hashes
 func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
 	adapter := &uploadClientAdapter{client: s.client}
-	tracker := newSessionProgressTracker(s.progress, func(readBytes, transferBytes int64) Progress {
-		return newProgress(readBytes, 0, transferBytes)
-	})
+	var totalTransfer atomic.Int64
+	tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer.Load() })
 	if tracker != nil {
 		adapter.onUploadedBytes = tracker.AddTransferBytes
 	}
-	return upload.UploadFiles(ctx, adapter, tracker.WrapReaders(readers), upload.WithConcurrency(s.concurrency))
+	return upload.UploadFiles(ctx, adapter, readers,
+		upload.WithConcurrency(s.concurrency),
+		upload.WithOnTotalBytes(func(total int64) {
+			totalTransfer.Store(total)
+		}),
+	)
 }

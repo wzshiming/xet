@@ -89,20 +89,15 @@ func executeUpload(ctx context.Context, filename, baseURL, token, namespace stri
 
 	session := cli.UploadSession().WithConcurrency(concurrency)
 	speed := newSpeedTracker(instantRateWindow)
-	var totalBytes int64
-	if info, statErr := f.Stat(); statErr == nil {
-		totalBytes = info.Size()
-	}
 
 	var progressMu sync.Mutex
-	var latestProgress client.Progress
+	var latestCurrent, latestTotal int64
 	if out != nil {
-		session.WithProgress(func(progress client.Progress) {
+		session.WithProgress(func(current, total int64) {
 			progressMu.Lock()
-			progress.TotalBytes = totalBytes
-			latestProgress = progress
-			rate := speed.Update(progress.TransferredBytes, time.Now())
-			_, _ = fmt.Fprintf(out, "\r%s", formatUploadProgress(progress, rate))
+			latestCurrent, latestTotal = current, total
+			rate := speed.Update(current, time.Now())
+			_, _ = fmt.Fprintf(out, "\r%s", formatUploadProgress(current, total, rate))
 			progressMu.Unlock()
 		})
 	}
@@ -116,9 +111,8 @@ func executeUpload(ctx context.Context, filename, baseURL, token, namespace stri
 		if _, writeErr := fmt.Fprint(out, "\r"); err == nil && writeErr != nil {
 			err = writeErr
 		}
-		latestProgress.TotalBytes = totalBytes
-		rate := speed.Update(latestProgress.TransferredBytes, time.Now())
-		if _, writeErr := fmt.Fprintf(out, "%s\n", formatUploadProgress(latestProgress, rate)); err == nil && writeErr != nil {
+		rate := speed.Update(latestCurrent, time.Now())
+		if _, writeErr := fmt.Fprintf(out, "%s\n", formatUploadProgress(latestCurrent, latestTotal, rate)); err == nil && writeErr != nil {
 			err = writeErr
 		}
 		progressMu.Unlock()
@@ -161,16 +155,13 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 	speed := newSpeedTracker(instantRateWindow)
 
 	var progressMu sync.Mutex
-	var latestProgress client.Progress
+	var latestCurrent, latestTotal int64
 	if out != nil {
-		session.WithProgress(func(progress client.Progress) {
+		session.WithProgress(func(current, total int64) {
 			progressMu.Lock()
-			// Adjust byte counts so progress reflects the full file, not just the remaining portion
-			progress.BytesRead += resumeOffset
-			progress.TotalBytes += resumeOffset
-			latestProgress = progress
-			rate := speed.Update(progress.TransferredBytes, time.Now())
-			_, _ = fmt.Fprintf(out, "\r%s", formatDownloadProgress(progress, rate))
+			latestCurrent, latestTotal = current, total
+			rate := speed.Update(current, time.Now())
+			_, _ = fmt.Fprintf(out, "\r%s", formatDownloadProgress(current, total, rate))
 			progressMu.Unlock()
 		})
 	}
@@ -231,10 +222,8 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 		if _, writeErr := fmt.Fprint(out, "\r"); err == nil && writeErr != nil {
 			err = writeErr
 		}
-		latestProgress.BytesRead = resumeOffset + n
-		latestProgress.TotalBytes = resumeOffset + expectedLength
-		rate := speed.Update(latestProgress.TransferredBytes, time.Now())
-		if _, writeErr := fmt.Fprintf(out, "%s\n", formatDownloadProgress(latestProgress, rate)); err == nil && writeErr != nil {
+		rate := speed.Update(latestCurrent, time.Now())
+		if _, writeErr := fmt.Fprintf(out, "%s\n", formatDownloadProgress(latestCurrent, latestTotal, rate)); err == nil && writeErr != nil {
 			err = writeErr
 		}
 		progressMu.Unlock()
@@ -253,37 +242,28 @@ func executeDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL
 	return nil
 }
 
-func formatDownloadProgress(progress client.Progress, bytesPerSecond int64) string {
-	current := progress.BytesRead
-	total := progress.TotalBytes
-	fetched := progress.TransferredBytes
+func formatDownloadProgress(current, total int64, bytesPerSecond int64) string {
 	rate := formatTransferRate(bytesPerSecond)
-	ratio := formatCompressionRatio(current, fetched)
 	if total > 0 {
 		percent := float64(current) * 100 / float64(total)
 		if percent > 100 {
 			percent = 100
 		}
-		return fmt.Sprintf("Downloading... %.1f%% (%s/%s, fetched %s, %s, ratio %s)", percent, formatByteSize(current), formatByteSize(total), formatByteSize(fetched), rate, ratio)
+		return fmt.Sprintf("Downloading... %.1f%% (%s / %s, %s)", percent, formatByteSize(current), formatByteSize(total), rate)
 	}
-
-	return fmt.Sprintf("Downloading... %s (fetched %s, %s, ratio %s)", formatByteSize(current), formatByteSize(fetched), rate, ratio)
+	return fmt.Sprintf("Downloading... %s (%s)", formatByteSize(current), rate)
 }
 
-func formatUploadProgress(progress client.Progress, bytesPerSecond int64) string {
-	current := progress.BytesRead
-	total := progress.TotalBytes
-	fetched := progress.TransferredBytes
+func formatUploadProgress(current, total int64, bytesPerSecond int64) string {
 	rate := formatTransferRate(bytesPerSecond)
-	ratio := formatCompressionRatio(current, fetched)
-	if progress.TotalBytes > 0 {
+	if total > 0 {
 		percent := float64(current) * 100 / float64(total)
 		if percent > 100 {
 			percent = 100
 		}
-		return fmt.Sprintf("Uploading... %.1f%% (%s/%s, sent %s, %s, ratio %s)", percent, formatByteSize(current), formatByteSize(total), formatByteSize(fetched), rate, ratio)
+		return fmt.Sprintf("Uploading... %.1f%% (%s / %s, %s)", percent, formatByteSize(current), formatByteSize(total), rate)
 	}
-	return fmt.Sprintf("Uploading... read %s, sent %s, %s, ratio %s", formatByteSize(current), formatByteSize(fetched), rate, ratio)
+	return fmt.Sprintf("Uploading... %s (%s)", formatByteSize(current), rate)
 }
 
 func formatTransferRate(bytesPerSecond int64) string {
@@ -293,12 +273,6 @@ func formatTransferRate(bytesPerSecond int64) string {
 	return formatByteSize(bytesPerSecond) + "/s"
 }
 
-func formatCompressionRatio(logicalBytes, transferBytes int64) string {
-	if logicalBytes <= 0 || transferBytes <= 0 {
-		return "n/a"
-	}
-	return fmt.Sprintf("%.2fx", float64(logicalBytes)/float64(transferBytes))
-}
 
 func formatByteSize(size int64) string {
 	const unit = 1024
