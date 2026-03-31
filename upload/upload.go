@@ -2,7 +2,9 @@ package upload
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 	"sync"
@@ -39,8 +41,10 @@ type xorbGroup struct {
 type options struct {
 	concurrency  int
 	onTotalBytes func(int64)
+	enableSHA256 bool
 }
 
+// WithConcurrency configures how many upload tasks run concurrently.
 func WithConcurrency(concurrency int) func(*options) {
 	return func(o *options) {
 		o.concurrency = concurrency
@@ -52,6 +56,13 @@ func WithConcurrency(concurrency int) func(*options) {
 func WithOnTotalBytes(cb func(int64)) func(*options) {
 	return func(o *options) {
 		o.onTotalBytes = cb
+	}
+}
+
+// WithEnableSHA256 configures whether to compute and include SHA-256 hashes in the shard metadata.
+func WithEnableSHA256(enabled bool) func(*options) {
+	return func(o *options) {
+		o.enableSHA256 = enabled
 	}
 }
 
@@ -79,9 +90,16 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 	// Step 1: Chunk all files
 	var allChunks []chunkInfo
 	var fileHashes []xet.Hash
+	var fileSHA256s [][32]byte
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
 	for index, reader := range readers {
+		var sha256Hasher hash.Hash
+		if options.enableSHA256 {
+			sha256Hasher = sha256.New()
+			reader = io.TeeReader(reader, sha256Hasher)
+		}
+
 		// Compute chunk hashes
 		chunkHashes := []xet.Hash{}
 
@@ -113,6 +131,13 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 		fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 
 		fileHashes = append(fileHashes, fileHash)
+
+		if options.enableSHA256 {
+			var fileSHA256 [32]byte
+			copy(fileSHA256[:], sha256Hasher.Sum(nil))
+			fileSHA256s = append(fileSHA256s, fileSHA256)
+		}
+
 	}
 
 	// Step 2: Deduplicate unique chunks
@@ -150,7 +175,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 	}
 
 	// Step 5: Build and upload shard
-	if err := buildAndUploadShard(ctx, client, fileHashes, allChunks, fileChunkRanges); err != nil {
+	if err := buildAndUploadShard(ctx, client, fileHashes, fileSHA256s, allChunks, fileChunkRanges); err != nil {
 		return nil, fmt.Errorf("build and upload shard: %w", err)
 	}
 
@@ -342,7 +367,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 }
 
 // buildAndUploadShard constructs and uploads the shard.
-func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes []xet.Hash, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
+func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes []xet.Hash, fileSHA256s [][32]byte, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
 	// Create shard with default header
 	sh := shard.NewShard()
 
@@ -365,7 +390,12 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 			Entries:      make([]shard.FileDataSequenceEntry, 0),
 			Verification: make([]xet.Hash, 0),
 		}
-
+		if len(fileSHA256s) == len(fileHashes) {
+			fileBlock.MetadataExt = &shard.FileMetadataExt{
+				SHA256Hash: fileSHA256s[fileIdx],
+			}
+			fileBlock.Flags |= shard.FileWithMetadataExt
+		}
 		// Group consecutive chunks by xorb to create terms
 		type termInfo struct {
 			xorbHash   xet.Hash

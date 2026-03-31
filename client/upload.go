@@ -35,9 +35,10 @@ func (a *uploadClientAdapter) QueryChunkDeduplication(ctx context.Context, chunk
 
 // UploadSession represents an upload session
 type UploadSession struct {
-	client      *Client
-	concurrency int
-	progress    ProgressFunc
+	client       *Client
+	concurrency  int
+	progress     ProgressFunc
+	enableSHA256 bool
 }
 
 // UploadSession creates a new upload session with optional global deduplication
@@ -63,6 +64,12 @@ func (s *UploadSession) WithProgress(progress ProgressFunc) *UploadSession {
 	return s
 }
 
+// WithEnableSHA256 configures whether to compute SHA256 hashes for files.
+func (s *UploadSession) WithEnableSHA256(enable bool) *UploadSession {
+	s.enableSHA256 = enable
+	return s
+}
+
 // UploadFiles uploads multiple files and returns their hashes
 func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
 	adapter := &uploadClientAdapter{client: s.client}
@@ -73,6 +80,7 @@ func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) (
 	}
 	return upload.UploadFiles(ctx, adapter, readers,
 		upload.WithConcurrency(s.concurrency),
+		upload.WithEnableSHA256(s.enableSHA256),
 		upload.WithOnTotalBytes(func(total int64) {
 			totalTransfer.Store(total)
 		}),
