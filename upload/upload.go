@@ -85,9 +85,11 @@ func UploadFiles(ctx context.Context, client ClientAdapter, enableGlobalDedup bo
 
 	// Step 2: Group new chunks into xorbs
 	var newChunks []chunkInfo
+	seenNewChunk := make(map[xet.Hash]bool)
 	for _, chunk := range allChunks {
-		if chunk.Dedup.IsNew {
+		if chunk.Dedup.IsNew && !seenNewChunk[chunk.Hash] {
 			newChunks = append(newChunks, chunk)
+			seenNewChunk[chunk.Hash] = true
 		}
 	}
 
