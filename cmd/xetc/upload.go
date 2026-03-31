@@ -1,57 +1,95 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"os"
+	"io"
 
-	"github.com/wzshiming/xet/client"
+	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/hf"
 )
 
-func uploadCommand() {
-	fs := flag.NewFlagSet("upload", flag.ExitOnError)
-	url := fs.String("url", "https://cas-server.xethub.hf.co", "CAS server URL")
-	token := fs.String("token", "", "Authentication token")
-	namespace := fs.String("namespace", "default", "Storage namespace")
-	noDedup := fs.Bool("no-dedup", false, "Disable global deduplication")
-	fs.Parse(os.Args[2:])
-
-	if *url == "" {
-		fmt.Fprintln(os.Stderr, "Error: --url is required")
-		os.Exit(1)
+func newUploadCmd(out io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "upload",
+		Short: "Upload files through CAS or Hugging Face XET tokens",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
 	}
 
-	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: xet upload <file> --url <url> [options]")
-		os.Exit(1)
+	cmd.AddCommand(newUploadCASCmd(out), newUploadHFCmd(out))
+	return cmd
+}
+
+func newUploadCASCmd(out io.Writer) *cobra.Command {
+	var (
+		baseURL   string
+		token     string
+		namespace string
+		noDedup   bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "cas <file>",
+		Short: "Upload a file using the native CAS API",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return executeUpload(cmd.Context(), args[0], baseURL, token, namespace, noDedup, out)
+		},
 	}
 
-	filename := fs.Arg(0)
+	cmd.Flags().StringVar(&baseURL, "url", defaultHFCASURL, "CAS server URL")
+	cmd.Flags().StringVar(&token, "token", "", "CAS token")
+	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().BoolVar(&noDedup, "no-dedup", false, "Disable global deduplication")
+	return cmd
+}
 
-	// Read file
-	f, err := os.Open(filename)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-		os.Exit(1)
+func newUploadHFCmd(out io.Writer) *cobra.Command {
+	var (
+		hfRepo     string
+		hfToken    string
+		hfEndpoint string
+		hfRepoType string
+		hfRevision string
+		namespace  string
+		noDedup    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "hf <file>",
+		Short: "Upload a file using Hugging Face xet-write-token API",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if hfRepo == "" {
+				return fmt.Errorf("--repo is required")
+			}
+			if hfToken == "" {
+				return fmt.Errorf("--token is required")
+			}
+
+			hfInfo, err := hf.ResolveXETWriteToken(cmd.Context(), hfRepo, hfToken, hf.UploadOptions{
+				Endpoint: hfEndpoint,
+				RepoType: hfRepoType,
+				Revision: hfRevision,
+			})
+			if err != nil {
+				return fmt.Errorf("resolve Hugging Face upload target: %w", err)
+			}
+			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face upload target: %s/%s@%s\n", args[0], hfInfo.RepoType, hfInfo.RepoID, hfInfo.Revision); err != nil {
+				return err
+			}
+
+			return executeUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, noDedup, out)
+		},
 	}
-	defer f.Close()
 
-	// Create API client
-	cli := client.NewClient(client.WithBaseURL(*url), client.WithToken(*token), client.WithNamespace(*namespace))
-
-	// Create upload session
-	session := cli.UploadSession(client.WithUploadGlobalDedup(!*noDedup))
-
-	// Upload the file
-	fmt.Printf("%s Uploading file\n", filename)
-	filehashs, err := session.UploadFiles(ctx, f)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Upload failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("✓ Upload complete!")
-	for _, h := range filehashs {
-		fmt.Printf("File hash: %s\n", h.String())
-	}
+	cmd.Flags().StringVar(&hfRepo, "repo", "", "Hugging Face repo ID or repo URL")
+	cmd.Flags().StringVar(&hfToken, "token", "", "Hugging Face access token")
+	cmd.Flags().StringVar(&hfEndpoint, "endpoint", defaultHFEndpoint, "Hugging Face Hub endpoint override")
+	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
+	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
+	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	cmd.Flags().BoolVar(&noDedup, "no-dedup", false, "Disable global deduplication")
+	return cmd
 }

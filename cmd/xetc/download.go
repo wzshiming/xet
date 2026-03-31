@@ -1,96 +1,120 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
-	"net/url"
-	"os"
 
+	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/download/hf"
+	"github.com/wzshiming/xet/hf"
 )
 
-func downloadCommand() {
-	fs := flag.NewFlagSet("download", flag.ExitOnError)
-	url := fs.String("url", "https://cas-server.xethub.hf.co", "CAS server URL")
-	token := fs.String("token", "", "Authentication token")
-	fs.Parse(os.Args[2:])
-
-	if fs.NArg() < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: xet download <hash|hf-resolve-url> <file> [--url <url>] [options]")
-		os.Exit(1)
+func newDownloadCmd(out io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "download",
+		Short: "Download files through CAS, Hugging Face tokens, or resolve URLs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
 	}
 
-	hashStr := fs.Arg(0)
-	outputFile := fs.Arg(1)
-
-	var fileHash xet.Hash
-	var err error
-	baseURL := *url
-	tokenVal := *token
-
-	// Hugging Face resolve URL support
-	if isURL(hashStr) {
-		hfInfo, err := hf.Resolve(ctx, hashStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Resolve URL failed: %v\n", err)
-			os.Exit(1)
-		}
-		fileHash = hfInfo.Hash
-		baseURL = hfInfo.BaseURL
-		tokenVal = hfInfo.Token
-		fmt.Printf("%s Resolved Hugging Face file hash: %s\n", outputFile, fileHash.String())
-	} else {
-		// Parse file hash
-		fileHash, err = xet.ParseHash(hashStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid file hash: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if baseURL == "" {
-		fmt.Fprintln(os.Stderr, "Error: --url is required (or provide a Hugging Face resolve URL as the hash argument)")
-		os.Exit(1)
-	}
-
-	// Create API client
-	cli := client.NewClient(client.WithBaseURL(baseURL), client.WithToken(tokenVal))
-
-	// Create download session
-	session := cli.DownloadSession()
-
-	// Download the file
-	reader, _, err := session.DownloadFile(ctx, fileHash)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	file, err := os.Create(outputFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-
-	// Write downloaded content to output file
-	n, err := io.Copy(file, reader)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing to output file: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("✓ Download complete! (%d bytes)\n", n)
-	fmt.Printf("Saved to: %s\n", outputFile)
+	cmd.AddCommand(newDownloadCASCmd(out), newDownloadHFCmd(out), newDownloadResolveCmd(out))
+	return cmd
 }
 
-func isURL(str string) bool {
-	u, err := url.Parse(str)
-	if err != nil {
-		return false
+func newDownloadCASCmd(out io.Writer) *cobra.Command {
+	var (
+		baseURL   string
+		token     string
+		namespace string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "cas <hash> <file>",
+		Short: "Download a file using the native CAS API",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fileHash, err := xet.ParseHash(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid file hash: %w", err)
+			}
+			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, out)
+		},
 	}
-	return u.Scheme != "" && u.Host != ""
+
+	cmd.Flags().StringVar(&baseURL, "url", defaultHFCASURL, "CAS server URL")
+	cmd.Flags().StringVar(&token, "token", "", "CAS token")
+	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	return cmd
+}
+
+func newDownloadHFCmd(out io.Writer) *cobra.Command {
+	var (
+		hfRepo     string
+		hfToken    string
+		hfEndpoint string
+		hfRepoType string
+		hfRevision string
+		namespace  string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "hf <hash> <file>",
+		Short: "Download a file using Hugging Face xet-read-token API",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if hfRepo == "" {
+				return fmt.Errorf("--repo is required")
+			}
+			if hfToken == "" {
+				return fmt.Errorf("--token is required")
+			}
+
+			fileHash, err := xet.ParseHash(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid file hash: %w", err)
+			}
+
+			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), hfRepo, hfToken, hf.UploadOptions{
+				Endpoint: hfEndpoint,
+				RepoType: hfRepoType,
+				Revision: hfRevision,
+			})
+			if err != nil {
+				return fmt.Errorf("resolve Hugging Face download target: %w", err)
+			}
+			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face download target: %s/%s@%s\n", args[1], hfInfo.RepoType, hfInfo.RepoID, hfInfo.Revision); err != nil {
+				return err
+			}
+
+			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, out)
+		},
+	}
+
+	cmd.Flags().StringVar(&hfRepo, "repo", "", "Hugging Face repo ID or repo URL")
+	cmd.Flags().StringVar(&hfToken, "token", "", "Hugging Face access token")
+	cmd.Flags().StringVar(&hfEndpoint, "endpoint", defaultHFEndpoint, "Hugging Face Hub endpoint override")
+	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
+	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
+	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
+	return cmd
+}
+
+func newDownloadResolveCmd(out io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "resolve <resolve-url> <file>",
+		Short: "Resolve a Hugging Face URL and download through CAS",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hfInfo, err := hf.ResolveDownload(cmd.Context(), args[0])
+			if err != nil {
+				return fmt.Errorf("resolve download target: %w", err)
+			}
+			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", args[1], hfInfo.Hash.String()); err != nil {
+				return err
+			}
+			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", out)
+		},
+	}
+	return cmd
 }

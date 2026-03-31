@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/wzshiming/xet/upload"
@@ -21,11 +23,20 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
+	// TODO: For large xorb uploads, we may want to stream the upload instead of buffering the entire serialized xorb in memory.
+	// This would require implementing an io.Reader that can serialize the xorb on-the-fly as it's being read.
+	// For now, we buffer it in memory for simplicity.
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read serialized xorb: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(data))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)

@@ -3,54 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+
+	"github.com/spf13/cobra"
 )
 
 var ctx = context.Background()
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
-	}
-
-	command := os.Args[1]
-
-	switch command {
-	case "upload":
-		uploadCommand()
-	case "download":
-		downloadCommand()
-	case "help", "--help", "-h":
-		printUsage()
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
-		printUsage()
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func printUsage() {
-	fmt.Println("XET - Content-Addressable Storage Tool")
-	fmt.Println()
-	fmt.Println("Usage: xetc <command> [options]")
-	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  upload <file>                      Upload a file to XET CAS server")
-	fmt.Println("  download <hash|hf-resolve> <file>  Download from XET CAS or a Hugging Face resolve URL")
-	fmt.Println("  help                     Display this help message")
-	fmt.Println()
-	fmt.Println("Upload Options:")
-	fmt.Println("  --url <url>              CAS server URL (required)")
-	fmt.Println("  --token <token>          Authentication token")
-	fmt.Println("  --namespace <ns>         Storage namespace (default: default)")
-	fmt.Println("  --no-dedup               Disable global deduplication")
-	fmt.Println()
-	fmt.Println("Download Options:")
-	fmt.Println("  --url <url>              CAS server URL (required)")
-	fmt.Println("  --token <token>          Authentication token")
-	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  xetc upload myfile.txt --url https://xet.example.com --token abc123")
-	fmt.Println("  xetc download a1b2c3d4... output.txt --url https://xet.example.com")
+func run(args []string, out, errOut io.Writer) error {
+	cmd := newRootCmd(out, errOut)
+	cmd.SetArgs(normalizeArgs(args))
+	return cmd.ExecuteContext(ctx)
+}
+
+func newRootCmd(out, errOut io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:           "xetc",
+		Short:         "XET content-addressable storage tool",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+
+	cmd.SetOut(out)
+	cmd.SetErr(errOut)
+	cmd.CompletionOptions.DisableDefaultCmd = true
+	cmd.AddCommand(newUploadCmd(out), newDownloadCmd(out))
+	return cmd
 }
