@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/test/conformance/utils"
 )
 
 // TestServerUploadDownloadConformance tests that files uploaded through the native
@@ -28,32 +28,28 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 		data []byte
 	}{
 		{
+			name: "Empty file",
+			data: []byte{},
+		},
+		{
 			name: "Hello World",
 			data: []byte("Hello World!"),
 		},
 		{
-			name: "1KB",
-			data: makeBinaryData(1024),
-		},
-		{
-			name: "10KB",
-			data: makeBinaryData(10 * 1024),
-		},
-		{
-			name: "100KB",
-			data: makeBinaryData(100 * 1024),
-		},
-		{
-			name: "1MB",
-			data: makeBinaryData(1024 * 1024),
-		},
-		{
 			name: "10MB",
-			data: makeBinaryData(10 * 1024 * 1024),
+			data: utils.MakeRandData(10 * 1024 * 1024),
+		},
+		{
+			name: "10MB repeating",
+			data: utils.MakeRepeatData(10 * 1024 * 1024),
 		},
 		{
 			name: "100MB",
-			data: makeBinaryData(100 * 1024 * 1024),
+			data: utils.MakeRandData(100 * 1024 * 1024),
+		},
+		{
+			name: "100MB repeating",
+			data: utils.MakeRepeatData(100 * 1024 * 1024),
 		},
 	}
 
@@ -349,15 +345,4 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			})
 		})
 	}
-}
-
-var seed = rand.NewSource(0)
-
-// makeBinaryData creates a deterministic byte sequence of the given size.
-func makeBinaryData(size int) []byte {
-	result := make([]byte, size)
-	for i := range result {
-		result[i] = byte(seed.Int63() % 256)
-	}
-	return result
 }

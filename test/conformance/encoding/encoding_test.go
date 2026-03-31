@@ -7,6 +7,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
+	"github.com/wzshiming/xet/test/conformance/utils"
 )
 
 // chunkEntry holds the hash and size for a single chunk.
@@ -29,28 +30,20 @@ func TestConformance(t *testing.T) {
 			data: []byte("Hello World!"),
 		},
 		{
-			name: "1KB",
-			data: makeBinaryData(1024),
-		},
-		{
-			name: "10KB",
-			data: makeBinaryData(10 * 1024),
-		},
-		{
-			name: "100KB",
-			data: makeBinaryData(100 * 1024),
-		},
-		{
-			name: "1MB",
-			data: makeBinaryData(1024 * 1024),
-		},
-		{
 			name: "10MB",
-			data: makeBinaryData(10 * 1024 * 1024),
+			data: utils.MakeRandData(10 * 1024 * 1024),
+		},
+		{
+			name: "10MB repeating",
+			data: utils.MakeRepeatData(10 * 1024 * 1024),
 		},
 		{
 			name: "100MB",
-			data: makeBinaryData(100 * 1024 * 1024),
+			data: utils.MakeRandData(100 * 1024 * 1024),
+		},
+		{
+			name: "100MB repeating",
+			data: utils.MakeRepeatData(100 * 1024 * 1024),
 		},
 	}
 
@@ -165,13 +158,4 @@ func getReferenceFileHash(t *testing.T, data []byte) string {
 		t.Fatal("reference HashFiles returned no results")
 	}
 	return results[0].Hash
-}
-
-// makeBinaryData creates a deterministic byte sequence of the given size.
-func makeBinaryData(size int) []byte {
-	result := make([]byte, size)
-	for i := range result {
-		result[i] = byte(i % 256)
-	}
-	return result
 }
