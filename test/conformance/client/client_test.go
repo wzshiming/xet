@@ -397,11 +397,13 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 	// STRICT: Both must upload at least one xorb
 	xetgoXorbCount := len(xetgoByType["POST:/v1/xorbs/default/{hash}"])
 	nativeXorbCount := len(nativeByType["POST:/v1/xorbs/default/{hash}"])
-	if xetgoXorbCount == 0 {
-		t.Errorf("xet-go did not upload any xorbs")
-	}
-	if nativeXorbCount == 0 {
-		t.Errorf("native client did not upload any xorbs")
+	if xetgoXorbCount != nativeXorbCount {
+		if xetgoXorbCount == 0 {
+			t.Errorf("xet-go did not upload any xorbs")
+		}
+		if nativeXorbCount == 0 {
+			t.Errorf("native client did not upload any xorbs")
+		}
 	}
 
 	// STRICT: Both must upload exactly one shard
@@ -459,11 +461,13 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 	// STRICT: Both must download xorb data
 	xetgoXorbDownloadCount := len(xetgoByType["GET:/v1/xorbs/default/{hash}/data"])
 	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}/data"])
-	if xetgoXorbDownloadCount == 0 {
-		t.Errorf("xet-go did not download any xorb data")
-	}
-	if nativeXorbDownloadCount == 0 {
-		t.Errorf("native client did not download any xorb data")
+	if xetgoXorbDownloadCount != nativeXorbDownloadCount {
+		if xetgoXorbDownloadCount == 0 {
+			t.Errorf("xet-go did not download any xorb data")
+		}
+		if nativeXorbDownloadCount == 0 {
+			t.Errorf("native client did not download any xorb data")
+		}
 	}
 
 	// xet-go may issue a separate range request for each shard term referencing
