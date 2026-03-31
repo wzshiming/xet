@@ -16,6 +16,7 @@ type ReaderV1 struct {
 	ctx            context.Context
 	reconstruction *ReconstructionResponse
 	skipBytes      int64
+	xorbCache      map[string]cachedXorbV1
 
 	// State for reading
 	termIdx     int
@@ -28,6 +29,12 @@ type ReaderV1 struct {
 	err         error
 }
 
+type cachedXorbV1 struct {
+	xorb       *xorb.Xorb
+	chunkStart uint32
+	chunkEnd   uint32
+}
+
 // NewReaderV1 creates a new V1 reconstruction reader
 func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponse) io.Reader {
 	return &ReaderV1{
@@ -35,6 +42,7 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		ctx:            ctx,
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
+		xorbCache:      map[string]cachedXorbV1{},
 	}
 }
 
@@ -109,18 +117,36 @@ func (r *ReaderV1) loadTerm() error {
 	term := &r.reconstruction.Terms[r.termIdx]
 	r.currentTerm = term
 
+	if cached, ok := r.xorbCache[term.Hash]; ok {
+		if cached.chunkStart <= term.Range.Start && cached.chunkEnd >= term.Range.End {
+			localStart := term.Range.Start - cached.chunkStart
+			localEnd := term.Range.End - cached.chunkStart
+			if localEnd > uint32(len(cached.xorb.Chunks)) {
+				return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(cached.xorb.Chunks))
+			}
+
+			r.currentXorb = cached.xorb
+			r.localStart = localStart
+			r.localEnd = localEnd
+			r.chunkIdx = localStart
+			r.chunkOffset = 0
+			return nil
+		}
+	}
+
 	// Get fetch info for this xorb
 	fetchInfoList, ok := r.reconstruction.FetchInfo[term.Hash]
 	if !ok || len(fetchInfoList) == 0 {
 		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
 	}
 
-	// Find the fetch info entry that covers this term's chunk range
+	// Find a fetch info entry that covers this term's chunk range.
 	var fetchInfo *FetchInfoEntry
 	for i := range fetchInfoList {
-		if fetchInfoList[i].Range.Start == term.Range.Start && fetchInfoList[i].Range.End == term.Range.End {
-			fetchInfo = &fetchInfoList[i]
-			break
+		if fetchInfoList[i].Range.Start <= term.Range.Start && fetchInfoList[i].Range.End >= term.Range.End {
+			if fetchInfo == nil || (fetchInfoList[i].URLRange.End-fetchInfoList[i].URLRange.Start) < (fetchInfo.URLRange.End-fetchInfo.URLRange.Start) {
+				fetchInfo = &fetchInfoList[i]
+			}
 		}
 	}
 
@@ -128,13 +154,10 @@ func (r *ReaderV1) loadTerm() error {
 		return fmt.Errorf("no matching fetch info for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
 	}
 
-	// Determine if we should use URLRange for efficient partial download
-	byteRange := &fetchInfo.URLRange
-
 	// We need to pass the request opts to the client, but the interface expects interface{}
 	// This will be handled by the actual client implementation
 	header := http.Header{
-		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End)},
+		"Range": []string{fmt.Sprintf("bytes=%d-%d", fetchInfo.URLRange.Start, fetchInfo.URLRange.End)},
 	}
 
 	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchInfo.URL, header)
@@ -142,15 +165,18 @@ func (r *ReaderV1) loadTerm() error {
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	// Convert absolute chunk indices to local indices within the downloaded xorb
-	// The fetchInfo.Range describes the absolute chunk range that was downloaded
-	// The downloaded xorb starts at chunk 0, so we need to subtract the offset
 	localStart := term.Range.Start - fetchInfo.Range.Start
 	localEnd := term.Range.End - fetchInfo.Range.Start
 
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {
 		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
+	}
+
+	r.xorbCache[term.Hash] = cachedXorbV1{
+		xorb:       xorbObj,
+		chunkStart: fetchInfo.Range.Start,
+		chunkEnd:   fetchInfo.Range.End,
 	}
 
 	r.currentXorb = xorbObj

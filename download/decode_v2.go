@@ -16,6 +16,7 @@ type ReaderV2 struct {
 	ctx            context.Context
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
+	xorbCache      map[string]cachedXorbV2
 
 	// State for reading
 	termIdx     int
@@ -28,6 +29,12 @@ type ReaderV2 struct {
 	err         error
 }
 
+type cachedXorbV2 struct {
+	xorb       *xorb.Xorb
+	chunkStart uint32
+	chunkEnd   uint32
+}
+
 // NewReaderV2 creates a new V2 reconstruction reader
 func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2) io.Reader {
 	return &ReaderV2{
@@ -35,6 +42,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		ctx:            ctx,
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
+		xorbCache:      map[string]cachedXorbV2{},
 	}
 }
 
@@ -109,52 +117,73 @@ func (r *ReaderV2) loadTerm() error {
 	term := &r.reconstruction.Terms[r.termIdx]
 	r.currentTerm = term
 
+	if cached, ok := r.xorbCache[term.Hash]; ok {
+		if cached.chunkStart <= term.Range.Start && cached.chunkEnd >= term.Range.End {
+			localStart := term.Range.Start - cached.chunkStart
+			localEnd := term.Range.End - cached.chunkStart
+			if localEnd > uint32(len(cached.xorb.Chunks)) {
+				return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(cached.xorb.Chunks))
+			}
+
+			r.currentXorb = cached.xorb
+			r.localStart = localStart
+			r.localEnd = localEnd
+			r.chunkIdx = localStart
+			r.chunkOffset = 0
+			return nil
+		}
+	}
+
 	// Get fetch info for this xorb
 	fetchList, ok := r.reconstruction.Xorbs[term.Hash]
 	if !ok || len(fetchList) == 0 {
 		return fmt.Errorf("no fetch info for xorb %s", term.Hash)
 	}
 
-	// Find the range descriptor that covers this term's chunk range
-	var matchedRange *XorbRangeDescriptor
-	var fetchURL string
-loop:
-	for _, fetchEntry := range fetchList {
-		for _, ranges := range fetchEntry.Ranges {
-			if ranges.Chunks.Start == term.Range.Start &&
-				ranges.Chunks.End == term.Range.End {
-				matchedRange = &ranges
-				fetchURL = fetchEntry.URL
-				break loop
+	var selectedFetch *XorbMultiRangeFetch
+	var selectedRange *XorbRangeDescriptor
+	for i := range fetchList {
+		for j := range fetchList[i].Ranges {
+			rg := &fetchList[i].Ranges[j]
+			if rg.Chunks.Start <= term.Range.Start && rg.Chunks.End >= term.Range.End {
+				if selectedRange == nil || (rg.Bytes.End-rg.Bytes.Start) < (selectedRange.Bytes.End-selectedRange.Bytes.Start) {
+					selectedFetch = &fetchList[i]
+					selectedRange = rg
+				}
 			}
 		}
 	}
 
-	if matchedRange == nil {
+	if selectedFetch == nil || selectedRange == nil {
 		return fmt.Errorf("no matching range descriptor for term chunk range [%d, %d)", term.Range.Start, term.Range.End)
 	}
 
-	// Determine whether to issue a ranged download
-	byteRange := &matchedRange.Bytes
+	chunkStart := selectedRange.Chunks.Start
+	chunkEnd := selectedRange.Chunks.End
+	byteStart := selectedRange.Bytes.Start
+	byteEnd := selectedRange.Bytes.End
 
 	header := http.Header{
-		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteRange.Start, byteRange.End)},
+		"Range": []string{fmt.Sprintf("bytes=%d-%d", byteStart, byteEnd)},
 	}
 
-	xorbObj, err := r.client.DownloadXorb(r.ctx, fetchURL, header)
+	xorbObj, err := r.client.DownloadXorb(r.ctx, selectedFetch.URL, header)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
 	}
 
-	// Convert absolute chunk indices to local indices within the downloaded xorb
-	// The matchedRange.Chunks describes the absolute chunk range that was downloaded
-	// The downloaded xorb starts at chunk 0, so we need to subtract the offset
-	localStart := term.Range.Start - matchedRange.Chunks.Start
-	localEnd := term.Range.End - matchedRange.Chunks.Start
+	localStart := term.Range.Start - chunkStart
+	localEnd := term.Range.End - chunkStart
 
 	// Validate chunk range
 	if localEnd > uint32(len(xorbObj.Chunks)) {
 		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
+	}
+
+	r.xorbCache[term.Hash] = cachedXorbV2{
+		xorb:       xorbObj,
+		chunkStart: chunkStart,
+		chunkEnd:   chunkEnd,
 	}
 
 	r.currentXorb = xorbObj
