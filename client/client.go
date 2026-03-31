@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
 // Client represents an HTTP client for the XET protocol
@@ -44,15 +43,11 @@ func WithNamespace(namespace string) Options {
 // NewClient creates a new API client
 func NewClient(opts ...Options) *Client {
 	c := &Client{
-		namespace: "default",
+		httpClient: &http.Client{},
+		namespace:  "default",
 	}
 	for _, opt := range opts {
 		opt(c)
-	}
-	if c.httpClient == nil {
-		c.httpClient = &http.Client{
-			Timeout: 30 * time.Second,
-		}
 	}
 
 	return c
