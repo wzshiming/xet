@@ -1,6 +1,6 @@
 module github.com/wzshiming/xet/test/conformance
 
-go 1.24.13
+go 1.25
 
 require (
 	github.com/wzshiming/xet v0.0.0

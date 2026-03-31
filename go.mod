@@ -1,6 +1,6 @@
 module github.com/wzshiming/xet
 
-go 1.24.13
+go 1.25
 
 require (
 	github.com/gorilla/mux v1.8.1
