@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -273,7 +272,6 @@ func formatTransferRate(bytesPerSecond int64) string {
 	return formatByteSize(bytesPerSecond) + "/s"
 }
 
-
 func formatByteSize(size int64) string {
 	const unit = 1024
 	if size < unit {
@@ -290,53 +288,4 @@ func formatByteSize(size int64) string {
 	}
 
 	return fmt.Sprintf("%.1f PiB", value/unit)
-}
-
-func isURL(str string) bool {
-	u, err := url.Parse(str)
-	if err != nil {
-		return false
-	}
-	return u.Scheme != "" && u.Host != ""
-}
-
-func normalizeArgs(args []string) []string {
-	if len(args) < 2 {
-		return args
-	}
-
-	switch args[0] {
-	case "upload":
-		if !isUploadMode(args[1]) {
-			return append([]string{"upload", "cas"}, args[1:]...)
-		}
-	case "download":
-		if !isDownloadMode(args[1]) {
-			mode := "cas"
-			if isURL(args[1]) {
-				mode = "resolve"
-			}
-			return append([]string{"download", mode}, args[1:]...)
-		}
-	}
-
-	return args
-}
-
-func isUploadMode(arg string) bool {
-	switch arg {
-	case "cas", "hf", "help", "--help", "-h":
-		return true
-	default:
-		return false
-	}
-}
-
-func isDownloadMode(arg string) bool {
-	switch arg {
-	case "cas", "hf", "resolve", "help", "--help", "-h":
-		return true
-	default:
-		return false
-	}
 }

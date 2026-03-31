@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
@@ -10,7 +10,7 @@ import (
 	"github.com/wzshiming/xet/hf"
 )
 
-func newDownloadCmd(out io.Writer) *cobra.Command {
+func newDownloadCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "download",
 		Short: "Download files through CAS, Hugging Face tokens, or resolve URLs",
@@ -19,11 +19,11 @@ func newDownloadCmd(out io.Writer) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(newDownloadCASCmd(out), newDownloadHFCmd(out), newDownloadResolveCmd(out))
+	cmd.AddCommand(newDownloadCASCmd(), newDownloadHFCmd(), newDownloadResolveCmd())
 	return cmd
 }
 
-func newDownloadCASCmd(out io.Writer) *cobra.Command {
+func newDownloadCASCmd() *cobra.Command {
 	var (
 		baseURL     string
 		token       string
@@ -41,7 +41,7 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
-			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, concurrency, resume, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], baseURL, token, namespace, concurrency, resume, os.Stderr)
 		},
 	}
 
@@ -53,7 +53,7 @@ func newDownloadCASCmd(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-func newDownloadHFCmd(out io.Writer) *cobra.Command {
+func newDownloadHFCmd() *cobra.Command {
 	var (
 		hfRepo      string
 		hfToken     string
@@ -90,11 +90,11 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolve Hugging Face download target: %w", err)
 			}
-			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face download target: %s/%s@%s\n", args[1], hfInfo.RepoType, hfInfo.RepoID, hfInfo.Revision); err != nil {
+			if _, err := fmt.Fprintf(os.Stderr, "%s Resolved Hugging Face download target: %s/%s@%s\n", args[1], hfInfo.RepoType, hfInfo.RepoID, hfInfo.Revision); err != nil {
 				return err
 			}
 
-			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, resume, out)
+			return executeDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, resume, os.Stderr)
 		},
 	}
 
@@ -109,7 +109,7 @@ func newDownloadHFCmd(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-func newDownloadResolveCmd(out io.Writer) *cobra.Command {
+func newDownloadResolveCmd() *cobra.Command {
 	var (
 		concurrency int
 		resume      bool
@@ -124,10 +124,10 @@ func newDownloadResolveCmd(out io.Writer) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolve download target: %w", err)
 			}
-			if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", args[1], hfInfo.Hash.String()); err != nil {
+			if _, err := fmt.Fprintf(os.Stderr, "%s Resolved Hugging Face file hash: %s\n", args[1], hfInfo.Hash.String()); err != nil {
 				return err
 			}
-			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", concurrency, resume, out)
+			return executeDownload(cmd.Context(), hfInfo.Hash, args[1], hfInfo.BaseURL, hfInfo.Token, "default", concurrency, resume, os.Stderr)
 		},
 	}
 	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultDownloadConcurrency, "Number of xorb ranges to prefetch concurrently")

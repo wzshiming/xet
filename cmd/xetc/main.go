@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -12,19 +11,14 @@ import (
 var ctx = context.Background()
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	cmd := newRootCmd()
+	if err := cmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, out, errOut io.Writer) error {
-	cmd := newRootCmd(out, errOut)
-	cmd.SetArgs(normalizeArgs(args))
-	return cmd.ExecuteContext(ctx)
-}
-
-func newRootCmd(out, errOut io.Writer) *cobra.Command {
+func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "xetc",
 		Short:         "XET content-addressable storage tool",
@@ -35,9 +29,6 @@ func newRootCmd(out, errOut io.Writer) *cobra.Command {
 		},
 	}
 
-	cmd.SetOut(out)
-	cmd.SetErr(errOut)
-	cmd.CompletionOptions.DisableDefaultCmd = true
-	cmd.AddCommand(newUploadCmd(out), newDownloadCmd(out))
+	cmd.AddCommand(newUploadCmd(), newDownloadCmd())
 	return cmd
 }
