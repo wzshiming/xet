@@ -186,13 +186,13 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 
 		result := &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
 		if item.Found {
-			result.IsNew = false
 			if item.XorbHash != "" {
 				if xorbHash, err := xet.ParseHash(item.XorbHash); err == nil {
+					result.IsNew = false
 					result.XorbHash = xorbHash
+					result.ChunkIndex = item.ChunkIndex
 				}
 			}
-			result.ChunkIndex = item.ChunkIndex
 		}
 		results[chunkHash] = result
 	}
@@ -215,16 +215,28 @@ func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHash
 		}
 
 		result := &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
-		if shardData != nil && len(shardData.CASInfos) > 0 {
-			casBlock := shardData.CASInfos[0]
-			if len(casBlock.Chunks) > 0 {
+		if shardData != nil {
+			xorbHash, chunkIndex, ok := findChunkLocationInDedupShard(shardData, chunkHash)
+			if ok {
 				result.IsNew = false
-				result.XorbHash = casBlock.CASHash
-				result.ChunkIndex = 0
+				result.XorbHash = xorbHash
+				result.ChunkIndex = chunkIndex
 			}
 		}
 
 		results[chunkHash] = result
 	}
 	return results, nil
+}
+
+func findChunkLocationInDedupShard(shardData *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
+	for _, casBlock := range shardData.CASInfos {
+		for i, casChunk := range casBlock.Chunks {
+			if casChunk.ChunkHash == chunkHash {
+				return casBlock.CASHash, uint32(i), true
+			}
+		}
+	}
+
+	return xet.Hash{}, 0, false
 }

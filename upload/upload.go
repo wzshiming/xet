@@ -3,6 +3,7 @@ package upload
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"hash"
 	"io"
@@ -212,12 +213,30 @@ func selectChunkHashesForGlobalDedup(chunkHashes []xet.Hash) []xet.Hash {
 
 	const minSpacingBetweenGlobalDedupQueries = 256
 	probes := make([]xet.Hash, 0, len(chunkHashes)/minSpacingBetweenGlobalDedupQueries+1)
+	lastProbeIndex := -minSpacingBetweenGlobalDedupQueries
 	for i, chunkHash := range chunkHashes {
-		if i == 0 || i%minSpacingBetweenGlobalDedupQueries == 0 {
+		if i == 0 {
 			probes = append(probes, chunkHash)
+			lastProbeIndex = i
+			continue
+		}
+
+		if i-lastProbeIndex < minSpacingBetweenGlobalDedupQueries {
+			continue
+		}
+
+		if isChunkHashGlobalDedupEligible(chunkHash) {
+			probes = append(probes, chunkHash)
+			lastProbeIndex = i
 		}
 	}
 	return probes
+}
+
+func isChunkHashGlobalDedupEligible(chunkHash xet.Hash) bool {
+	const dedupModulus uint64 = 1024
+	value := binary.LittleEndian.Uint64(chunkHash[24:32])
+	return value%dedupModulus == 0
 }
 
 func deduplicateChunksBatch(ctx context.Context, client BatchDeduplicationClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) bool {
@@ -267,6 +286,9 @@ func deduplicateChunksBatch(ctx context.Context, client BatchDeduplicationClient
 					result, ok := results[chunkHash]
 					if !ok || result == nil {
 						result = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+					} else if !result.IsNew && result.XorbHash == (xet.Hash{}) {
+						// A dedup hit without a CAS target is unusable; treat as new.
+						result = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
 					}
 					cache[chunkHash] = result
 				}
@@ -304,6 +326,10 @@ func deduplicateChunksSingle(ctx context.Context, client ClientAdapter, cache ma
 			defer wg.Done()
 			for chunkHash := range queue {
 				result := queryDeduplicationChunk(ctx, client, chunkHash)
+				if !result.IsNew && result.XorbHash == (xet.Hash{}) {
+					// Defensive fallback for malformed dedup responses.
+					result = &DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+				}
 				mu.Lock()
 				cache[chunkHash] = result
 				mu.Unlock()
@@ -317,18 +343,15 @@ func deduplicateChunksSingle(ctx context.Context, client ClientAdapter, cache ma
 func queryDeduplicationChunk(ctx context.Context, client ClientAdapter, chunkHash xet.Hash) *DeduplicationResult {
 	shardData, err := client.QueryChunkDeduplication(ctx, chunkHash)
 	if err == nil && shardData != nil {
-		// Found in global dedup - extract xorb hash and chunk index
-		if len(shardData.CASInfos) > 0 {
-			casBlock := shardData.CASInfos[0]
-			if len(casBlock.Chunks) > 0 {
-				result := &DeduplicationResult{
-					ChunkHash:  chunkHash,
-					IsNew:      false,
-					XorbHash:   casBlock.CASHash,
-					ChunkIndex: 0, // First chunk in the returned info
-				}
-				return result
+		xorbHash, chunkIndex, ok := findChunkLocationInShard(shardData, chunkHash)
+		if ok {
+			result := &DeduplicationResult{
+				ChunkHash:  chunkHash,
+				IsNew:      false,
+				XorbHash:   xorbHash,
+				ChunkIndex: chunkIndex,
 			}
+			return result
 		}
 	}
 
@@ -338,6 +361,18 @@ func queryDeduplicationChunk(ctx context.Context, client ClientAdapter, chunkHas
 		IsNew:     true,
 	}
 	return result
+}
+
+func findChunkLocationInShard(shardData *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
+	for _, casBlock := range shardData.CASInfos {
+		for i, casChunk := range casBlock.Chunks {
+			if casChunk.ChunkHash == chunkHash {
+				return casBlock.CASHash, uint32(i), true
+			}
+		}
+	}
+
+	return xet.Hash{}, 0, false
 }
 
 func uniqueChunkHashes(chunks []chunkInfo) []xet.Hash {
@@ -449,7 +484,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				cacheMu.Lock()
 				for i, chunkHash := range group.ChunkHashes {
 					if result, ok := cache[chunkHash]; ok && result.IsNew {
-						result.IsNew = false
 						result.XorbHash = xorbObj.Hash
 						result.ChunkIndex = uint32(i)
 					}
@@ -557,10 +591,12 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 			}
 
 			// Track this xorb
-			if _, exists := xorbMap[xorbHash]; !exists {
-				xorbMap[xorbHash] = &shard.CASBlock{
-					CASHash: xorbHash,
-					Chunks:  make([]shard.CASChunkSequenceEntry, 0),
+			if chunk.Dedup.IsNew {
+				if _, exists := xorbMap[xorbHash]; !exists {
+					xorbMap[xorbHash] = &shard.CASBlock{
+						CASHash: xorbHash,
+						Chunks:  make([]shard.CASChunkSequenceEntry, 0),
+					}
 				}
 			}
 		}
@@ -602,6 +638,10 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 	xorbSeenChunks := make(map[xet.Hash]map[xet.Hash]bool) // track added chunks per xorb
 
 	for _, chunk := range allChunks {
+		if !chunk.Dedup.IsNew {
+			continue
+		}
+
 		xorbHash := chunk.Dedup.XorbHash
 		chunkSize := uint32(len(chunk.Data))
 

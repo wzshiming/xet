@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -138,9 +139,51 @@ func TestQueryChunksDeduplicationBatchEndpoint(t *testing.T) {
 	}
 }
 
+func TestQueryChunksDeduplicationBatchIgnoresIncompleteHits(t *testing.T) {
+	chunk := xet.Hash{7, 7, 7}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chunks/default:query" {
+			http.NotFound(w, r)
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{
+					"chunk_hash": chunk.String(),
+					"found":      true,
+					// Missing xorb_hash should not be treated as dedup hit.
+					"chunk_index": uint32(42),
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(WithBaseURL(server.URL), WithCacheDir(t.TempDir()))
+	results, err := client.QueryChunksDeduplication(context.Background(), []xet.Hash{chunk})
+	if err != nil {
+		t.Fatalf("QueryChunksDeduplication failed: %v", err)
+	}
+
+	result, ok := results[chunk]
+	if !ok || result == nil {
+		t.Fatal("missing dedup result")
+	}
+	if !result.IsNew {
+		t.Fatal("expected incomplete hit to be treated as new")
+	}
+	if result.XorbHash != (xet.Hash{}) {
+		t.Fatalf("expected empty xorb hash, got %s", result.XorbHash.String())
+	}
+}
+
 func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 	var postCalls atomic.Int32
 	var getCalls atomic.Int32
+	chunk := xet.Hash{1}
+	xorbHash := xet.Hash{9}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/chunks/default:query" {
@@ -151,6 +194,26 @@ func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 
 		if r.Method == http.MethodGet {
 			getCalls.Add(1)
+			if r.URL.Path == "/v1/chunks/default/"+chunk.String() {
+				sh := shard.NewShard()
+				sh.CASInfos = append(sh.CASInfos, shard.CASBlock{
+					CASHash: xorbHash,
+					Chunks: []shard.CASChunkSequenceEntry{
+						{ChunkHash: xet.Hash{88}, ByteRangeStart: 0, UnpackedSegBytes: 1},
+						{ChunkHash: chunk, ByteRangeStart: 1, UnpackedSegBytes: 1},
+					},
+				})
+
+				reader, err := shard.Encode(sh, false)
+				if err != nil {
+					t.Fatalf("encode shard response: %v", err)
+				}
+				if _, err := io.Copy(w, reader); err != nil {
+					t.Fatalf("write shard response: %v", err)
+				}
+				return
+			}
+
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -160,7 +223,7 @@ func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(WithBaseURL(server.URL), WithCacheDir(t.TempDir()))
-	chunks := []xet.Hash{{1}, {2}, {3}}
+	chunks := []xet.Hash{chunk, {2}, {3}}
 
 	results, err := client.QueryChunksDeduplication(context.Background(), chunks)
 	if err != nil {
@@ -179,8 +242,52 @@ func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 		if !ok || result == nil {
 			t.Fatalf("missing result for chunk %s", chunk.String())
 		}
-		if !result.IsNew {
+		if chunk != chunks[0] && !result.IsNew {
 			t.Fatalf("expected chunk %s to be marked as new", chunk.String())
 		}
+	}
+
+	if results[chunk].IsNew {
+		t.Fatalf("expected chunk %s to be marked as deduplicated", chunk.String())
+	}
+	if results[chunk].XorbHash != xorbHash {
+		t.Fatalf("unexpected xorb hash: got %s want %s", results[chunk].XorbHash, xorbHash)
+	}
+	if results[chunk].ChunkIndex != 1 {
+		t.Fatalf("unexpected chunk index: got %d want 1", results[chunk].ChunkIndex)
+	}
+}
+
+func TestFindChunkLocationInDedupShard(t *testing.T) {
+	chunk := xet.Hash{7}
+	xorbHash := xet.Hash{8}
+
+	sh := shard.NewShard()
+	sh.CASInfos = append(sh.CASInfos, shard.CASBlock{
+		CASHash: xorbHash,
+		Chunks: []shard.CASChunkSequenceEntry{
+			{ChunkHash: xet.Hash{1}},
+			{ChunkHash: chunk},
+		},
+	})
+
+	reader, err := shard.Encode(sh, false)
+	if err != nil {
+		t.Fatalf("encode shard: %v", err)
+	}
+	decoded, err := shard.Decode(bytes.NewReader(func() []byte {
+		b, _ := io.ReadAll(reader)
+		return b
+	}()))
+	if err != nil {
+		t.Fatalf("decode shard: %v", err)
+	}
+
+	h, idx, ok := findChunkLocationInDedupShard(decoded, chunk)
+	if !ok {
+		t.Fatal("expected chunk match")
+	}
+	if h != xorbHash || idx != 1 {
+		t.Fatalf("unexpected match result: hash=%s idx=%d", h, idx)
 	}
 }

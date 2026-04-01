@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"sync/atomic"
@@ -263,19 +264,20 @@ func TestDeduplicateChunksUsesSparseGlobalProbes(t *testing.T) {
 
 	chunkHashes := make([]xet.Hash, 600)
 	for i := range chunkHashes {
-		chunkHashes[i][0] = byte(i)
-		chunkHashes[i][1] = byte(i >> 8)
-		chunkHashes[i][2] = byte(i >> 16)
-		chunkHashes[i][3] = byte(i >> 24)
+		binary.LittleEndian.PutUint64(chunkHashes[i][24:32], uint64(i*13+1))
 	}
+
+	// Make only these positions eligible by setting value % 1024 == 0.
+	binary.LittleEndian.PutUint64(chunkHashes[300][24:32], 1024)
+	binary.LittleEndian.PutUint64(chunkHashes[560][24:32], 2048)
 
 	cache := make(map[xet.Hash]*DeduplicationResult)
 	deduplicateChunks(context.Background(), adapter, cache, chunkHashes, 4)
 
 	if len(adapter.lastBatch) != 3 {
-		t.Fatalf("expected 3 sparse probes (0,256,512), got %d", len(adapter.lastBatch))
+		t.Fatalf("expected 3 sparse probes (first, eligible@300, eligible@560), got %d", len(adapter.lastBatch))
 	}
-	if adapter.lastBatch[0] != chunkHashes[0] || adapter.lastBatch[1] != chunkHashes[256] || adapter.lastBatch[2] != chunkHashes[512] {
+	if adapter.lastBatch[0] != chunkHashes[0] || adapter.lastBatch[1] != chunkHashes[300] || adapter.lastBatch[2] != chunkHashes[560] {
 		t.Fatal("unexpected sparse probe positions")
 	}
 
@@ -288,5 +290,53 @@ func TestDeduplicateChunksUsesSparseGlobalProbes(t *testing.T) {
 	}
 	if !cache[chunkHashes[1]].IsNew {
 		t.Fatal("expected non-probed chunk to stay new")
+	}
+}
+
+func TestBuildAndUploadShardExcludesDedupedCASBlocks(t *testing.T) {
+	adapter := &stubUploadClientAdapter{}
+	fileHash := xet.Hash{1}
+	oldXorbHash := xet.Hash{2}
+	newXorbHash := xet.Hash{3}
+
+	allChunks := []chunkInfo{
+		{
+			Data: []byte("existing-deduped"),
+			Hash: xet.Hash{10},
+			Dedup: &DeduplicationResult{
+				ChunkHash:  xet.Hash{10},
+				IsNew:      false,
+				XorbHash:   oldXorbHash,
+				ChunkIndex: 7,
+			},
+		},
+		{
+			Data: []byte("new-upload"),
+			Hash: xet.Hash{11},
+			Dedup: &DeduplicationResult{
+				ChunkHash:  xet.Hash{11},
+				IsNew:      true,
+				XorbHash:   newXorbHash,
+				ChunkIndex: 0,
+			},
+		},
+	}
+
+	fileChunkRanges := map[int][]int{0: {0, 1}}
+	err := buildAndUploadShard(context.Background(), adapter, []xet.Hash{fileHash}, nil, allChunks, fileChunkRanges)
+	if err != nil {
+		t.Fatalf("buildAndUploadShard failed: %v", err)
+	}
+
+	if adapter.uploadedShard == nil {
+		t.Fatal("expected shard upload to be called")
+	}
+
+	if len(adapter.uploadedShard.CASInfos) != 1 {
+		t.Fatalf("expected exactly one CAS block for newly uploaded xorb, got %d", len(adapter.uploadedShard.CASInfos))
+	}
+
+	if adapter.uploadedShard.CASInfos[0].CASHash != newXorbHash {
+		t.Fatalf("unexpected CAS hash: got %s want %s", adapter.uploadedShard.CASInfos[0].CASHash, newXorbHash)
 	}
 }
