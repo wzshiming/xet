@@ -375,6 +375,132 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 	}
 }
 
+func TestClientUploadConformanceWithExistingData(t *testing.T) {
+	seedData := utils.MakeRepeatData(8 * 1024 * 1024)
+	targetData := append([]byte{}, seedData[:4*1024*1024]...)
+	targetData = append(targetData, utils.MakeRandData(4*1024*1024)...)
+
+	tempDir := t.TempDir()
+	xetgoSeedFile := filepath.Join(tempDir, "xetgo-seed.bin")
+	xetgoTargetFile := filepath.Join(tempDir, "xetgo-target.bin")
+	nativeSeedFile := filepath.Join(tempDir, "native-seed.bin")
+	nativeTargetFile := filepath.Join(tempDir, "native-target.bin")
+
+	if err := os.WriteFile(xetgoSeedFile, seedData, 0644); err != nil {
+		t.Fatalf("write xet-go seed file: %v", err)
+	}
+	if err := os.WriteFile(xetgoTargetFile, targetData, 0644); err != nil {
+		t.Fatalf("write xet-go target file: %v", err)
+	}
+	if err := os.WriteFile(nativeSeedFile, seedData, 0644); err != nil {
+		t.Fatalf("write native seed file: %v", err)
+	}
+	if err := os.WriteFile(nativeTargetFile, targetData, 0644); err != nil {
+		t.Fatalf("write native target file: %v", err)
+	}
+
+	// xet-go backend
+	xetgoStorageDir := t.TempDir()
+	var xetgoStor storage.Storage
+	var xetgoSrv *server.Handler
+	var xetgoProxy *RecordingProxy
+	var xetgoHTTP *httptest.Server
+
+	xetgoHTTP = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if xetgoProxy != nil {
+			xetgoProxy.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "server not initialized", http.StatusInternalServerError)
+	}))
+	defer xetgoHTTP.Close()
+
+	var err error
+	xetgoStor, err = storage.NewFileStorage(
+		storage.WithBasePath(xetgoStorageDir),
+		storage.WithBaseURL(xetgoHTTP.URL),
+	)
+	if err != nil {
+		t.Fatalf("create xet-go storage: %v", err)
+	}
+	xetgoSrv = server.NewHandler(server.WithStorage(xetgoStor))
+	xetgoProxy = NewRecordingProxy(xetgoSrv)
+
+	if _, err := xetgo.UploadFiles([]string{xetgoSeedFile}, xetgoHTTP.URL, nil, nil, false); err != nil {
+		t.Fatalf("seed upload with xet-go failed: %v", err)
+	}
+	xetgoProxy.ClearRequests()
+
+	xetgoResults, err := xetgo.UploadFiles([]string{xetgoTargetFile}, xetgoHTTP.URL, nil, nil, false)
+	if err != nil {
+		t.Fatalf("target upload with xet-go failed: %v", err)
+	}
+	if len(xetgoResults) != 1 {
+		t.Fatalf("expected one xet-go result, got %d", len(xetgoResults))
+	}
+	xetgoRequests := xetgoProxy.GetRequests()
+
+	// native backend
+	nativeStorageDir := t.TempDir()
+	var nativeStor storage.Storage
+	var nativeSrv *server.Handler
+	var nativeProxy *RecordingProxy
+	var nativeHTTP *httptest.Server
+
+	nativeHTTP = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if nativeProxy != nil {
+			nativeProxy.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "server not initialized", http.StatusInternalServerError)
+	}))
+	defer nativeHTTP.Close()
+
+	nativeStor, err = storage.NewFileStorage(
+		storage.WithBasePath(nativeStorageDir),
+		storage.WithBaseURL(nativeHTTP.URL),
+	)
+	if err != nil {
+		t.Fatalf("create native storage: %v", err)
+	}
+	nativeSrv = server.NewHandler(server.WithStorage(nativeStor))
+	nativeProxy = NewRecordingProxy(nativeSrv)
+
+	nativeClient := client.NewClient(client.WithBaseURL(nativeHTTP.URL), client.WithCacheDir(t.TempDir()))
+
+	seedReader, err := os.Open(nativeSeedFile)
+	if err != nil {
+		t.Fatalf("open native seed file: %v", err)
+	}
+	if _, err := nativeClient.UploadSession().UploadFiles(context.Background(), seedReader); err != nil {
+		_ = seedReader.Close()
+		t.Fatalf("seed upload with native client failed: %v", err)
+	}
+	if err := seedReader.Close(); err != nil {
+		t.Fatalf("close native seed file: %v", err)
+	}
+	nativeProxy.ClearRequests()
+
+	targetReader, err := os.Open(nativeTargetFile)
+	if err != nil {
+		t.Fatalf("open native target file: %v", err)
+	}
+	nativeHashes, err := nativeClient.UploadSession().UploadFiles(context.Background(), targetReader)
+	if err != nil {
+		_ = targetReader.Close()
+		t.Fatalf("target upload with native client failed: %v", err)
+	}
+	if err := targetReader.Close(); err != nil {
+		t.Fatalf("close native target file: %v", err)
+	}
+	if len(nativeHashes) != 1 {
+		t.Fatalf("expected one native result, got %d", len(nativeHashes))
+	}
+	nativeRequests := nativeProxy.GetRequests()
+
+	compareUploadRequests(t, xetgoRequests, nativeRequests, xetgoResults[0].Hash, nativeHashes[0].String())
+}
+
 // compareUploadRequests compares HTTP requests from xet-go and native clients for uploads
 func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, xetgoHash, nativeHash string) {
 	t.Helper()
@@ -393,6 +519,7 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 	// v1/v2 variants. Dedup probes are validated semantically below.
 	assertCanonicalTypeCountEquality(t, xetgoByType, nativeByType, map[string]bool{
 		"GET:/v{version}/chunks/default/{hash}": true,
+		"POST:/v{version}/chunks/default:query": true,
 	})
 
 	// STRICT: Both must upload at least one xorb

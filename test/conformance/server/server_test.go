@@ -3,6 +3,7 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -344,5 +345,122 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Logf("Successfully downloaded and verified file with hash %s", expectedHash)
 			})
 		})
+	}
+}
+
+func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
+	storageDir := t.TempDir()
+
+	var stor storage.Storage
+	var srv *server.Handler
+	var httpSrv *httptest.Server
+
+	httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if srv != nil {
+			srv.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "server not initialized", http.StatusInternalServerError)
+	}))
+	defer httpSrv.Close()
+
+	var err error
+	stor, err = storage.NewFileStorage(
+		storage.WithBasePath(storageDir),
+		storage.WithBaseURL(httpSrv.URL),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+
+	srv = server.NewHandler(server.WithStorage(stor))
+	nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL), client.WithCacheDir(t.TempDir()))
+
+	data := utils.MakeRandData(2 * 1024 * 1024)
+	uploadFile := filepath.Join(t.TempDir(), "batch-dedup.bin")
+	if err := os.WriteFile(uploadFile, data, 0644); err != nil {
+		t.Fatalf("write upload file: %v", err)
+	}
+
+	f, err := os.Open(uploadFile)
+	if err != nil {
+		t.Fatalf("open upload file: %v", err)
+	}
+	fileHashes, err := nativeClient.UploadSession().UploadFiles(context.Background(), f)
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("upload failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close upload file: %v", err)
+	}
+
+	if len(fileHashes) != 1 {
+		t.Fatalf("expected one file hash, got %d", len(fileHashes))
+	}
+
+	shardObj, err := stor.GetShardByFileHash(context.Background(), fileHashes[0])
+	if err != nil {
+		t.Fatalf("get shard by file hash: %v", err)
+	}
+
+	var targetChunk xet.Hash
+	var expectedXorb xet.Hash
+	var expectedIndex uint32
+	found := false
+	for _, cas := range shardObj.CASInfos {
+		if len(cas.Chunks) < 2 {
+			continue
+		}
+		targetChunk = cas.Chunks[1].ChunkHash
+		expectedXorb = cas.CASHash
+		expectedIndex = 1
+		found = true
+		break
+	}
+	if !found {
+		t.Skip("uploaded shard did not contain a CAS block with at least two chunks")
+	}
+
+	body, err := json.Marshal(map[string]any{"chunk_hashes": []string{targetChunk.String()}})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	resp, err := http.Post(httpSrv.URL+"/v1/chunks/default:query", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("batch dedup query failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch dedup status=%d body=%s", resp.StatusCode, string(b))
+	}
+
+	var batchResp struct {
+		Results []struct {
+			ChunkHash  string `json:"chunk_hash"`
+			Found      bool   `json:"found"`
+			XorbHash   string `json:"xorb_hash"`
+			ChunkIndex uint32 `json:"chunk_index"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+
+	if len(batchResp.Results) != 1 {
+		t.Fatalf("expected one batch result, got %d", len(batchResp.Results))
+	}
+	result := batchResp.Results[0]
+	if !result.Found {
+		t.Fatalf("expected found=true for chunk %s", targetChunk.String())
+	}
+	if result.XorbHash != expectedXorb.String() {
+		t.Fatalf("unexpected xorb hash: got %s want %s", result.XorbHash, expectedXorb.String())
+	}
+	if result.ChunkIndex != expectedIndex {
+		t.Fatalf("unexpected chunk index: got %d want %d", result.ChunkIndex, expectedIndex)
 	}
 }

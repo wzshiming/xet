@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
 )
@@ -358,18 +359,35 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 		}
 
 		shardObj, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
-		if err != nil || shardObj == nil || len(shardObj.CASInfos) == 0 || len(shardObj.CASInfos[0].Chunks) == 0 {
+		if err != nil || shardObj == nil {
 			results = append(results, res)
 			continue
 		}
 
-		casBlock := shardObj.CASInfos[0]
+		xorbHash, chunkIndex, ok := findChunkLocationInShard(shardObj, chunkHash)
+		if !ok {
+			results = append(results, res)
+			continue
+		}
+
 		res.Found = true
-		res.XorbHash = casBlock.CASHash.String()
-		res.ChunkIndex = 0
+		res.XorbHash = xorbHash.String()
+		res.ChunkIndex = chunkIndex
 		results = append(results, res)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchChunkDedupQueryResponse{Results: results})
+}
+
+func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
+	for _, casBlock := range shardObj.CASInfos {
+		for i, casChunk := range casBlock.Chunks {
+			if casChunk.ChunkHash == chunkHash {
+				return casBlock.CASHash, uint32(i), true
+			}
+		}
+	}
+
+	return xet.Hash{}, 0, false
 }
