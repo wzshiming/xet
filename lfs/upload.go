@@ -8,14 +8,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // BatchUploadResult holds upload credentials from a successful batch negotiation.
 type BatchUploadResult struct {
-	NeedsUpload bool
-	Upload      Action
-	Verify      Action
+	Upload *Action
+	Verify *Action
 }
 
 // ResolveOIDUpload negotiates an upload and extracts Xet action headers.
@@ -39,11 +37,9 @@ func ResolveOIDUpload(ctx context.Context, hubToken string, target Target, obj B
 
 	output := make([]BatchUploadResult, len(resp.Objects))
 	for i, objResp := range resp.Objects {
-
 		uploadAction, hasUpload := objResp.Actions["upload"]
 		if hasUpload {
-			output[i].NeedsUpload = true
-			output[i].Upload = Action{
+			output[i].Upload = &Action{
 				Href:   uploadAction.Href,
 				Header: uploadAction.Header,
 			}
@@ -51,7 +47,7 @@ func ResolveOIDUpload(ctx context.Context, hubToken string, target Target, obj B
 
 		verifyAction, hasVerify := objResp.Actions["verify"]
 		if hasVerify {
-			output[i].Verify = Action{
+			output[i].Verify = &Action{
 				Href:   verifyAction.Href,
 				Header: verifyAction.Header,
 			}
@@ -62,66 +58,36 @@ func ResolveOIDUpload(ctx context.Context, hubToken string, target Target, obj B
 }
 
 // VerifyObject calls the LFS verify endpoint after a successful upload.
-func VerifyObject(ctx context.Context, action Action, obj BatchObject) error {
-	if action.Href == "" {
-		return nil
-	}
-
+func VerifyObject(ctx context.Context, action *Action, obj BatchObject) error {
 	body, err := json.Marshal(obj)
 	if err != nil {
 		return fmt.Errorf("encode LFS verify request: %w", err)
 	}
 
-	const maxAttempts = 5
-	backoff := 200 * time.Millisecond
-	var lastErr error
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, action.Href, bytes.NewReader(body))
-		if err != nil {
-			return fmt.Errorf("create LFS verify request: %w", err)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, action.Href, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create LFS verify request: %w", err)
+	}
+	for k, v := range action.Header {
+		if k == "" || v == "" {
+			continue
 		}
-		for k, v := range action.Header {
-			if k == "" || v == "" {
-				continue
-			}
-			req.Header.Set(k, v)
-		}
-		req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("LFS verify request: %w", err)
-		} else {
-			respBody, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			trimmedBody := strings.TrimSpace(string(respBody))
-
-			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-				return nil
-			}
-
-			lastErr = fmt.Errorf("LFS verify request failed with status %d: %s", resp.StatusCode, trimmedBody)
-
-			if resp.StatusCode != http.StatusNotFound || !isTransientVerifyNotFound(trimmedBody) || attempt == maxAttempts {
-				return lastErr
-			}
-		}
-
-		if attempt < maxAttempts {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("LFS verify request canceled: %w", ctx.Err())
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-		}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do LFS verify request: %w", err)
 	}
 
-	return lastErr
-}
+	respBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	trimmedBody := strings.TrimSpace(string(respBody))
 
-func isTransientVerifyNotFound(respBody string) bool {
-	body := strings.ToLower(respBody)
-	return strings.Contains(body, "no file uploaded for oid")
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+
+	return fmt.Errorf("LFS verify failed (status %d): %s", resp.StatusCode, trimmedBody)
 }

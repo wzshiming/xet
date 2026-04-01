@@ -61,7 +61,7 @@ func NewCommand() *cobra.Command {
 			}
 			batchResult := batchResults[0]
 
-			if !batchResult.NeedsUpload {
+			if batchResult.Upload == nil {
 				if _, err := fmt.Fprintf(os.Stderr, "%s File already exists on server, skipping upload\n", args[0]); err != nil {
 					return err
 				}
@@ -77,7 +77,7 @@ func NewCommand() *cobra.Command {
 				return err
 			}
 
-			if batchResult.Verify.Href != "" {
+			if batchResult.Verify != nil {
 				if _, err := fmt.Fprintf(os.Stderr, "%s Verifying upload with Hub...\n", args[0]); err != nil {
 					return err
 				}
