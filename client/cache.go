@@ -23,13 +23,6 @@ func (f *removeOnCloseFile) Close() error {
 	return err
 }
 
-func closeAndIgnoreError(closer io.Closer) {
-	if closer == nil {
-		return
-	}
-	_ = closer.Close()
-}
-
 func (c *Client) cacheDir() string {
 	if c.cacheDirPath != "" {
 		return c.cacheDirPath
@@ -127,12 +120,12 @@ func (c *Client) openPersistentCache(bucket, key, ext string) (*os.File, int64, 
 
 	info, err := f.Stat()
 	if err != nil {
-		closeAndIgnoreError(f)
+		f.Close()
 		return nil, 0, false, fmt.Errorf("stat persistent cache: %w", err)
 	}
 
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		closeAndIgnoreError(f)
+		f.Close()
 		return nil, 0, false, fmt.Errorf("rewind persistent cache: %w", err)
 	}
 
@@ -165,7 +158,7 @@ func (c *Client) writePersistentCache(bucket, key, ext string, reader io.Reader)
 
 	size, copyErr := io.Copy(tmp, reader)
 	if copyErr != nil {
-		closeAndIgnoreError(tmp)
+		tmp.Close()
 		_ = os.Remove(tmpPath)
 		return nil, 0, fmt.Errorf("write persistent cache: %w", copyErr)
 	}

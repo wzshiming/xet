@@ -43,7 +43,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 			return nil, fmt.Errorf("cache serialized xorb: %w", err)
 		}
 	}
-	defer closeAndIgnoreError(cacheFile)
+	defer cacheFile.Close()
 
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
 
@@ -68,7 +68,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 		return nil, fmt.Errorf("open xorb download cache: %w", err)
 	}
 	if hit {
-		defer closeAndIgnoreError(cacheFile)
+		defer cacheFile.Close()
 		chunkOnly := req.Header.Get("Range") != ""
 		xorbObj, decodeErr := xorb.Decode(cacheFile, chunkOnly)
 		if decodeErr != nil {
@@ -113,7 +113,7 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -135,7 +135,7 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	if err != nil {
 		return nil, fmt.Errorf("cache xorb response: %w", err)
 	}
-	defer closeAndIgnoreError(cacheFile)
+	defer cacheFile.Close()
 
 	// Deserialize the xorb
 	xorbObj, err := xorb.Decode(cacheFile, chunkOnly)

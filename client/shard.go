@@ -62,7 +62,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, fmt.Errorf("open chunk query cache: %w", err)
 	}
 	if hit {
-		defer closeAndIgnoreError(cacheFile)
+		defer cacheFile.Close()
 		shardObj, decodeErr := upload.DecodeShard(cacheFile)
 		if decodeErr == nil {
 			return shardObj, nil
@@ -105,7 +105,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
 		// Chunk not found - this is expected for new chunks
@@ -120,7 +120,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	if err != nil {
 		return nil, fmt.Errorf("cache chunk query response: %w", err)
 	}
-	defer closeAndIgnoreError(cacheFile)
+	defer cacheFile.Close()
 
 	// Deserialize shard from cached response
 	shardObj, err := upload.DecodeShard(cacheFile)
@@ -163,7 +163,7 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 	if err != nil {
 		return nil, fmt.Errorf("do batch request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 		return c.queryChunksDeduplicationFallback(ctx, chunkHashes)

@@ -34,7 +34,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 		return nil, fmt.Errorf("open reconstruction cache: %w", err)
 	}
 	if hit {
-		defer closeAndIgnoreError(cacheFile)
+		defer cacheFile.Close()
 		var reconstructionResp download.ReconstructionResponse
 		if decodeErr := json.NewDecoder(cacheFile).Decode(&reconstructionResp); decodeErr == nil {
 			return &reconstructionResp, nil
@@ -45,7 +45,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 	if err != nil {
 		return nil, fmt.Errorf("cache reconstruction response: %w", err)
 	}
-	defer closeAndIgnoreError(cacheFile)
+	defer cacheFile.Close()
 
 	var reconstructionResp download.ReconstructionResponse
 	if err := json.NewDecoder(cacheFile).Decode(&reconstructionResp); err != nil {
@@ -88,7 +88,7 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 		return nil, fmt.Errorf("open reconstruction cache: %w", err)
 	}
 	if hit {
-		defer closeAndIgnoreError(cacheFile)
+		defer cacheFile.Close()
 		var reconstructionResp download.ReconstructionResponseV2
 		if decodeErr := json.NewDecoder(cacheFile).Decode(&reconstructionResp); decodeErr == nil {
 			return &reconstructionResp, nil
@@ -99,7 +99,7 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
-	defer closeAndIgnoreError(resp.Body)
+	defer resp.Body.Close()
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -109,7 +109,7 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 	if err != nil {
 		return nil, fmt.Errorf("cache reconstruction response: %w", err)
 	}
-	defer closeAndIgnoreError(cacheFile)
+	defer cacheFile.Close()
 
 	var reconstructionResp download.ReconstructionResponseV2
 	if err := json.NewDecoder(cacheFile).Decode(&reconstructionResp); err != nil {
