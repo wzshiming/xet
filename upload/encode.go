@@ -18,10 +18,3 @@ func EncodeXorb(xorbObj *xorb.Xorb) (io.Reader, error) {
 func EncodeShard(shardObj *shard.Shard) (io.Reader, error) {
 	return shard.Encode(shardObj, false)
 }
-
-// EncodeChunkQueryResponse serializes a shard for a chunk deduplication
-// query response (without footer). Used by the server when responding
-// to chunk dedup queries.
-func EncodeChunkQueryResponse(shardObj *shard.Shard) (io.Reader, error) {
-	return shard.Encode(shardObj, false)
-}

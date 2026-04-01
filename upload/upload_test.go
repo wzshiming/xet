@@ -149,15 +149,15 @@ func TestEncodeDecodeChunkQueryResponse(t *testing.T) {
 	shardObj := shard.NewShard()
 
 	// Encode as chunk query response
-	reader, err := EncodeChunkQueryResponse(shardObj)
+	reader, err := EncodeShard(shardObj)
 	if err != nil {
-		t.Fatalf("EncodeChunkQueryResponse failed: %v", err)
+		t.Fatalf("EncodeShard failed: %v", err)
 	}
 
 	// Decode as chunk query response
-	decoded, err := DecodeChunkQueryResponse(reader)
+	decoded, err := DecodeShard(reader)
 	if err != nil {
-		t.Fatalf("DecodeChunkQueryResponse failed: %v", err)
+		t.Fatalf("DecodeShard failed: %v", err)
 	}
 
 	if decoded == nil {

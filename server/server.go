@@ -322,7 +322,7 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serialize shard without footer (for API responses) and stream directly
-	reader, err := upload.EncodeChunkQueryResponse(shardObj)
+	reader, err := upload.EncodeShard(shardObj)
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return

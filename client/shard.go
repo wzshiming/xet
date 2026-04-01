@@ -86,7 +86,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	}
 	if hit {
 		defer closeAndIgnoreError(cacheFile)
-		shardObj, decodeErr := upload.DecodeChunkQueryResponse(cacheFile)
+		shardObj, decodeErr := upload.DecodeShard(cacheFile)
 		if decodeErr == nil {
 			return shardObj, nil
 		}
@@ -123,7 +123,7 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	defer closeAndIgnoreError(cacheFile)
 
 	// Deserialize shard from cached response
-	shardObj, err := upload.DecodeChunkQueryResponse(cacheFile)
+	shardObj, err := upload.DecodeShard(cacheFile)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
