@@ -91,10 +91,16 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 		}
 
 		// Read from current chunk
-		chunk := r.currentXorb.Chunks[r.chunkIdx]
+		chunk, err := r.currentXorb.Chunk(int(r.chunkIdx))
+		if err != nil {
+			return 0, err
+		}
 
 		// Apply skip for first chunk of first term
-		data := chunk.UncompressedData
+		data, err := chunk.UncompressedData()
+		if err != nil {
+			return 0, err
+		}
 		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
 			if r.skipBytes >= int64(len(data)) {
 				r.skipBytes -= int64(len(data))
@@ -141,8 +147,8 @@ func (r *ReaderV1) loadTerm() error {
 	localEnd := term.Range.End - selected.chunkStart
 
 	// Validate chunk range
-	if localEnd > uint32(len(xorbObj.Chunks)) {
-		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, len(xorbObj.Chunks))
+	if localEnd > uint32(xorbObj.ChunkSize()) {
+		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, xorbObj.ChunkSize())
 	}
 
 	r.currentXorb = xorbObj

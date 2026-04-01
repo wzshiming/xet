@@ -17,10 +17,7 @@ import (
 // Storage defines the interface for storing and retrieving XET data
 type Storage interface {
 	// PutXorb stores an xorb by its hash
-	PutXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error)
-
-	// GetXorb retrieves an xorb by its hash
-	GetXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (*xorb.Xorb, error)
+	PutXorb(ctx context.Context, namespace string, xorbHash xet.Hash, r io.Reader) (bool, error)
 
 	// GetXorbURL generates a URL for accessing xorb data
 	GetXorbURL(namespace string, xorbHash xet.Hash) string
@@ -32,7 +29,7 @@ type Storage interface {
 	HasXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (bool, error)
 
 	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
-	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
+	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 
 	// PutShard stores a shard by its hash
 	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
@@ -147,37 +144,29 @@ func (fs *FileStorage) loadShards() error {
 }
 
 // PutXorb stores an xorb
-func (fs *FileStorage) PutXorb(ctx context.Context, namespace string, xorbObj *xorb.Xorb) (bool, error) {
+func (fs *FileStorage) PutXorb(ctx context.Context, namespace string, xorbHash xet.Hash, r io.Reader) (bool, error) {
 	xorbDir := filepath.Join(fs.basePath, "xorbs", namespace)
 	if err := os.MkdirAll(xorbDir, 0755); err != nil {
 		return false, fmt.Errorf("create xorb directory: %w", err)
 	}
 
-	xorbPath := filepath.Join(xorbDir, xorbObj.Hash.String())
+	xorbPath := filepath.Join(xorbDir, xorbHash.String())
 
 	// Check if xorb already exists
 	if _, err := os.Stat(xorbPath); err == nil {
 		return false, nil // Already exists
 	}
-
-	// Serialize xorb to full format with footer for storage.
-	// This ensures all clients can download the same format consistently.
-	r, err := xorb.Encode(xorbObj, false)
-	if err != nil {
-		return false, fmt.Errorf("serialize xorb: %w", err)
-	}
-
 	// Write xorb to disk using streaming
 	f, err := os.OpenFile(xorbPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return false, fmt.Errorf("create xorb file: %w", err)
 	}
 
-	_, err = io.Copy(f, r)
+	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
 	if err != nil {
 		f.Close()
 		os.Remove(xorbPath + ".tmp")
-		return false, fmt.Errorf("write xorb: %w", err)
+		return false, fmt.Errorf("validate xorb: %w", err)
 	}
 	f.Close()
 
@@ -188,31 +177,6 @@ func (fs *FileStorage) PutXorb(ctx context.Context, namespace string, xorbObj *x
 	}
 
 	return true, nil
-}
-
-// GetXorb retrieves an xorb
-func (fs *FileStorage) GetXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (*xorb.Xorb, error) {
-	xorbPath := filepath.Join(fs.basePath, "xorbs", namespace, xorbHash.String())
-
-	// Open file for streaming deserialization
-	f, err := os.Open(xorbPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("xorb not found")
-		}
-		return nil, fmt.Errorf("open xorb file: %w", err)
-	}
-	defer f.Close()
-
-	// Deserialize xorb from file using streaming.
-	// The stored format always has the full XETBLOB footer (chunkOnly=false)
-	// because PutXorb normalizes all uploads to this format.
-	xorbObj, err := xorb.Decode(f, false)
-	if err != nil {
-		return nil, fmt.Errorf("deserialize xorb: %w", err)
-	}
-
-	return xorbObj, nil
 }
 
 // GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
@@ -382,61 +346,17 @@ func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.Hash) string {
 // The returned range includes the 8-byte chunk header for each chunk, so that
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
-func (fs *FileStorage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64) {
+func (fs *FileStorage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
 	xorbPath := filepath.Join(fs.basePath, "xorbs", namespace, xorbHash.String())
 	f, err := os.Open(xorbPath)
 	if err != nil {
-		return 0, 0
+		return 0, 0, fmt.Errorf("failed to open xorb file: %w", err)
 	}
 	defer f.Close()
 
-	// Parse chunks to find byte offsets in the stored xorb using streaming.
-	// The stored format for xet-core uploads is [header0(8)][data0][header1(8)][data1]...
-	// where header = version(1) + compressedSize(3 LE) + comprType(1) + uncompressedSize(3 LE).
-	// We stream through the file without buffering it entirely in memory.
-	type chunkSpan struct{ start, end int64 }
-	var spans []chunkSpan
-	offset := int64(0)
-
-	for {
-		// Try to read the next 8-byte header
-		headerBuf := make([]byte, 8)
-		n, err := io.ReadFull(f, headerBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			// End of stream - no more chunks
-			break
-		}
-		if err != nil {
-			// Unexpected error
-			return 0, 0
-		}
-
-		// Stop at XETBLOB footer (Go-client full format)
-		if n >= 7 && string(headerBuf[:7]) == xorb.XorbIdentifier {
-			break
-		}
-
-		headerStart := offset
-
-		// Read compressed size (3-byte LE, bytes 1-3 of the 8-byte header)
-		compressedSize := int64(headerBuf[1]) | int64(headerBuf[2])<<8 | int64(headerBuf[3])<<16
-		offset += 8 // skip header
-
-		// Skip the compressed data without buffering it
-		if _, err := io.CopyN(io.Discard, f, compressedSize); err != nil {
-			// Can't read expected amount of data
-			break
-		}
-
-		offset += compressedSize
-
-		// The chunk span includes the header and the compressed payload.
-		spans = append(spans, chunkSpan{start: headerStart, end: offset - 1})
+	startByte, endByte, err = xorb.ChunkDataRange(f, chunkStart, chunkEnd)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
-
-	if int(chunkStart) >= len(spans) || int(chunkEnd) > len(spans) || chunkStart >= chunkEnd {
-		return 0, 0
-	}
-
-	return spans[chunkStart].start, spans[chunkEnd-1].end
+	return startByte, endByte, nil
 }

@@ -456,16 +456,18 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 
 				if _, err := client.UploadXorb(ctx, xorbObj); err != nil {
 					errOnce.Do(func() {
-						firstErr = fmt.Errorf("upload xorb %s: %w", xorbObj.Hash.String(), err)
+						h, _ := xorbObj.Hash()
+						firstErr = fmt.Errorf("upload xorb %s: %w", h.String(), err)
 						cancel()
 					})
 					return
 				}
 
 				cacheMu.Lock()
+				xorbHash, _ := xorbObj.Hash()
 				for i, chunkHash := range group.ChunkHashes {
 					if result, ok := cache[chunkHash]; ok && result.IsNew {
-						result.XorbHash = xorbObj.Hash
+						result.XorbHash = xorbHash
 						result.ChunkIndex = uint32(i)
 					}
 				}

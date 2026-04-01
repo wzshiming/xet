@@ -266,14 +266,8 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deserializedXorb, err := upload.DecodeXorb(r.Body, xorbHash)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	// Store xorb directly. PutXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, deserializedXorb)
+	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, xorbHash, r.Body)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return

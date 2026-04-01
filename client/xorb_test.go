@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/upload"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -27,7 +27,13 @@ func TestUploadXorb(t *testing.T) {
 		}
 
 		// Try to deserialize it to verify it's valid
-		_, err := xorb.Decode(r.Body, false)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("Failed to read request body: %v", err)
+			return
+		}
+		xorbObj := xorb.NewXorb()
+		err = xorbObj.Decode(bytes.NewReader(body), true)
 		if err != nil {
 			t.Errorf("Failed to deserialize uploaded xorb: %v", err)
 		}
@@ -44,8 +50,7 @@ func TestUploadXorb(t *testing.T) {
 	// Create a test xorb
 	xorbObj := xorb.NewXorb()
 	testData := []byte("test chunk data")
-	chunkData := xet.ChunkBytes(testData)
-	err := xorbObj.AddChunk(chunkData)
+	err := xorbObj.AddChunk(testData)
 	if err != nil {
 		t.Fatalf("Failed to add chunk: %v", err)
 	}
@@ -62,10 +67,11 @@ func TestUploadXorb(t *testing.T) {
 
 func TestDownloadXorbUsesPersistentCache(t *testing.T) {
 	xorbObj := xorb.NewXorb()
-	if err := xorbObj.AddChunk(xet.ChunkBytes([]byte("cache-me"))); err != nil {
+	if err := xorbObj.AddChunk([]byte("cache-me")); err != nil {
 		t.Fatalf("add chunk: %v", err)
 	}
-	encoded, err := xorb.Encode(xorbObj, false)
+
+	encoded, err := xorbObj.Encode(true)
 	if err != nil {
 		t.Fatalf("encode xorb: %v", err)
 	}
@@ -94,8 +100,16 @@ func TestDownloadXorbUsesPersistentCache(t *testing.T) {
 		t.Fatalf("second download: %v", err)
 	}
 
-	if first.Hash != second.Hash {
-		t.Fatalf("cached xorb mismatch: %s vs %s", first.Hash.String(), second.Hash.String())
+	firstHash, err := first.Hash()
+	if err != nil {
+		t.Fatalf("first.Hash(): %v", err)
+	}
+	secondHash, err := second.Hash()
+	if err != nil {
+		t.Fatalf("second.Hash(): %v", err)
+	}
+	if firstHash != secondHash {
+		t.Fatalf("cached xorb mismatch: %s vs %s", firstHash.String(), secondHash.String())
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("expected one network hit due to cache reuse, got %d", got)

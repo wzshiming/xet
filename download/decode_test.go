@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -88,7 +87,7 @@ func makeTestXorb(t *testing.T, chunks ...string) *xorb.Xorb {
 	t.Helper()
 	xorbObj := xorb.NewXorb()
 	for _, chunk := range chunks {
-		if err := xorbObj.AddChunk(xet.ChunkBytes([]byte(chunk))); err != nil {
+		if err := xorbObj.AddChunk([]byte(chunk)); err != nil {
 			t.Fatalf("add chunk: %v", err)
 		}
 	}

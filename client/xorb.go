@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"path"
 	"strings"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/upload"
 	"github.com/wzshiming/xet/xorb"
@@ -18,24 +18,18 @@ import (
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
 func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.XorbUploadResponse, error) {
-	// Ensure the xorb hash is computed before it is used as a cache key or URL path.
-	// The hash is normally set as a side-effect of Encode, so an all-zero hash here
-	// means the xorb was freshly built and has not yet been serialized.
-	if xorbObj.Hash == (xet.Hash{}) {
-		chunkSizes := make([]uint64, len(xorbObj.Chunks))
-		for i, chunk := range xorbObj.Chunks {
-			chunkSizes[i] = uint64(len(chunk.UncompressedData))
-		}
-		xorbObj.Hash = xet.ComputeXorbHash(xorbObj.ChunkHashes, chunkSizes)
+	xorbHash, err := xorbObj.Hash()
+	if err != nil {
+		return nil, fmt.Errorf("compute xorb hash: %w", err)
 	}
-	cacheKey := stableCacheKey(c.namespace, xorbObj.Hash.String())
+	cacheKey := stableCacheKey(c.namespace, xorbHash.String())
 	cacheFile, contentLength, hit, err := c.openPersistentCache("upload-xorb", cacheKey, ".bin")
 	if err != nil {
 		return nil, fmt.Errorf("open xorb upload cache: %w", err)
 	}
 	if !hit {
 		// Serialize only on cache miss, then persist for future uploads with the same xorb hash.
-		reader, encodeErr := upload.EncodeXorb(xorbObj)
+		reader, encodeErr := xorbObj.Encode(true)
 		if encodeErr != nil {
 			return nil, fmt.Errorf("serialize xorb: %w", encodeErr)
 		}
@@ -46,7 +40,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 	}
 	defer cacheFile.Close()
 
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
 
 	var body io.Reader = cacheFile
 	if c.progressFunc != nil {
@@ -95,51 +89,47 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Heade
 		req.Header[k] = v
 	}
 
+	withFooter := req.Header.Get("Range") == ""
 	cacheKey := stableCacheKey(path.Base(req.URL.Path), strings.TrimPrefix(req.Header.Get("Range"), "bytes="))
 	cacheFile, _, hit, err := c.openPersistentCache("download-xorb", cacheKey, ".bin")
 	if err != nil {
 		return nil, fmt.Errorf("open xorb download cache: %w", err)
 	}
-	if hit {
-		defer cacheFile.Close()
-		chunkOnly := req.Header.Get("Range") != ""
-		xorbObj, decodeErr := xorb.Decode(cacheFile, chunkOnly)
-		if decodeErr != nil {
-			return nil, fmt.Errorf("deserialize xorb from cache: %w", decodeErr)
+	if !hit {
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("do request: %w", err)
 		}
-		return xorbObj, nil
+		defer resp.Body.Close()
+
+		if err := reqError(req, resp); err != nil {
+			return nil, err
+		}
+
+		var body io.Reader = resp.Body
+		if c.progressFunc != nil {
+			body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
+		}
+
+		cacheFile, _, err = c.writePersistentCache("download-xorb", cacheKey, ".bin", body)
+		if err != nil {
+			return nil, fmt.Errorf("cache xorb response: %w", err)
+		}
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// Read the file content into memory before closing it.
+	// Chunk lazy-loading stores byte offsets into the reader; using a bytes.Reader
+	// keeps the data alive for the lifetime of the Xorb without holding the file open.
+	data, err := io.ReadAll(cacheFile)
+	cacheFile.Close()
 	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := reqError(req, resp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read cached xorb: %w", err)
 	}
 
-	// Determine if this is a range request (chunks-only format)
-	// Check if a Range header was set on the actual request
-	chunkOnly := req.Header.Get("Range") != ""
-
-	var body io.Reader = resp.Body
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
-	}
-
-	cacheFile, _, err = c.writePersistentCache("download-xorb", cacheKey, ".bin", body)
-	if err != nil {
-		return nil, fmt.Errorf("cache xorb response: %w", err)
-	}
-	defer cacheFile.Close()
-
-	// Deserialize the xorb
-	xorbObj, err := xorb.Decode(cacheFile, chunkOnly)
+	xorbObj := xorb.NewXorb()
+	err = xorbObj.Decode(bytes.NewReader(data), withFooter)
 	if err != nil {
 		return nil, fmt.Errorf("deserialize xorb: %w", err)
 	}
-
 	return xorbObj, nil
 }

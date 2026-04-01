@@ -1,146 +1,49 @@
 package xorb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
-
-	"github.com/wzshiming/xet"
 )
 
 // Encode returns a streaming reader for the xorb serialization.
-// If chunkOnly is true, only the chunk data region is written (without footer).
-// If chunkOnly is false, the full XETBLOB format with footer is written.
-//
-// The returned io.Reader streams the data directly without buffering everything in memory.
-func Encode(x *Xorb, chunkOnly bool) (io.Reader, error) {
-	if chunkOnly {
-		return &xorbChunksOnlyReader{
-			xorb: x,
-		}, nil
+func (x *Xorb) Encode(withFooter bool) (io.Reader, error) {
+	r := &xorbReader{
+		xorb:       x,
+		withFooter: withFooter,
 	}
-
-	// Build footer for full serialization
-	footer, chunkOffsets, unpackedOffsets, err := x.buildFooterData()
-	if err != nil {
-		return nil, err
+	if withFooter {
+		// Pre-allocate offset slices with known capacity to avoid incremental growth.
+		n := len(x.chunks)
+		r.chunkOffsets = make([]uint64, 0, n)
+		r.unpackedOffsets = make([]uint64, 0, n)
 	}
-
-	return &xorbReader{
-		xorb:            x,
-		footer:          footer,
-		chunkOffsets:    chunkOffsets,
-		unpackedOffsets: unpackedOffsets,
-	}, nil
+	return r, nil
 }
 
-// xorbChunksOnlyReader implements io.Reader for chunk-only serialization
-type xorbChunksOnlyReader struct {
-	xorb      *Xorb
-	chunkIdx  int
-	buffer    []byte
-	bufOffset int
-}
-
-func (r *xorbChunksOnlyReader) Read(p []byte) (n int, err error) {
-	for n < len(p) {
-		// Check if we're done with all chunks
-		if r.chunkIdx >= len(r.xorb.Chunks) {
-			if n > 0 {
-				return n, nil
-			}
-			return 0, io.EOF
-		}
-
-		// If buffer is empty or consumed, prepare next chunk
-		if len(r.buffer) == 0 || r.bufOffset >= len(r.buffer) {
-			chunk := r.xorb.Chunks[r.chunkIdx]
-
-			// Build chunk header (8 bytes)
-			header := ChunkHeader{
-				Version:          0,
-				CompressedSize:   uint32(len(chunk.CompressedData)),
-				CompressionType:  chunk.CompressionType,
-				UncompressedSize: uint32(len(chunk.UncompressedData)),
-			}
-
-			headerBuf := make([]byte, 8)
-			headerBuf[0] = header.Version
-			headerBuf[1] = byte(header.CompressedSize & 0xFF)
-			headerBuf[2] = byte((header.CompressedSize >> 8) & 0xFF)
-			headerBuf[3] = byte((header.CompressedSize >> 16) & 0xFF)
-			headerBuf[4] = byte(header.CompressionType)
-			headerBuf[5] = byte(header.UncompressedSize & 0xFF)
-			headerBuf[6] = byte((header.UncompressedSize >> 8) & 0xFF)
-			headerBuf[7] = byte((header.UncompressedSize >> 16) & 0xFF)
-
-			// Combine header and compressed data into a new buffer
-			r.buffer = make([]byte, 0, 8+len(chunk.CompressedData))
-			r.buffer = append(r.buffer, headerBuf...)
-			r.buffer = append(r.buffer, chunk.CompressedData...)
-			r.bufOffset = 0
-		}
-
-		// Copy from buffer to output
-		copied := copy(p[n:], r.buffer[r.bufOffset:])
-		n += copied
-		r.bufOffset += copied
-
-		// If we've consumed the entire buffer, move to next chunk
-		if r.bufOffset >= len(r.buffer) {
-			r.chunkIdx++
-			r.buffer = nil
-			r.bufOffset = 0
-		}
-	}
-
-	return n, nil
-}
-
-// xorbReader implements io.Reader for full xorb serialization (with footer)
+// xorbReader implements io.Reader for xorb serialization.
+// If withFooter is true, the full XETBLOB format with footer is written;
+// otherwise only the chunk data region is written.
 type xorbReader struct {
 	xorb            *Xorb
-	footer          []byte
-	chunkOffsets    []uint64
-	unpackedOffsets []uint64
+	withFooter      bool
 	chunkIdx        int
 	buffer          []byte
 	bufOffset       int
 	footerWritten   bool
+	chunkOffsets    []uint64
+	unpackedOffsets []uint64
 }
 
 func (r *xorbReader) Read(p []byte) (n int, err error) {
 	for n < len(p) {
 		// Write chunks first
-		if r.chunkIdx < len(r.xorb.Chunks) {
+		if r.chunkIdx < len(r.xorb.chunks) {
 			// If buffer is empty or consumed, prepare next chunk
-			if len(r.buffer) == 0 || r.bufOffset >= len(r.buffer) {
-				chunk := r.xorb.Chunks[r.chunkIdx]
-
-				// Build chunk header (8 bytes)
-				header := ChunkHeader{
-					Version:          0,
-					CompressedSize:   uint32(len(chunk.CompressedData)),
-					CompressionType:  chunk.CompressionType,
-					UncompressedSize: uint32(len(chunk.UncompressedData)),
+			if r.bufOffset >= len(r.buffer) {
+				if err := r.loadChunk(); err != nil {
+					return 0, err
 				}
-
-				headerBuf := make([]byte, 8)
-				headerBuf[0] = header.Version
-				headerBuf[1] = byte(header.CompressedSize & 0xFF)
-				headerBuf[2] = byte((header.CompressedSize >> 8) & 0xFF)
-				headerBuf[3] = byte((header.CompressedSize >> 16) & 0xFF)
-				headerBuf[4] = byte(header.CompressionType)
-				headerBuf[5] = byte(header.UncompressedSize & 0xFF)
-				headerBuf[6] = byte((header.UncompressedSize >> 8) & 0xFF)
-				headerBuf[7] = byte((header.UncompressedSize >> 16) & 0xFF)
-
-				// Combine header and compressed data into a new buffer
-				r.buffer = make([]byte, 0, 8+len(chunk.CompressedData))
-				r.buffer = append(r.buffer, headerBuf...)
-				r.buffer = append(r.buffer, chunk.CompressedData...)
-				r.bufOffset = 0
 			}
 
 			// Copy from buffer to output
@@ -148,41 +51,35 @@ func (r *xorbReader) Read(p []byte) (n int, err error) {
 			n += copied
 			r.bufOffset += copied
 
-			// If we've consumed the entire buffer, move to next chunk
+			// If we've consumed the entire buffer, move to next chunk.
 			if r.bufOffset >= len(r.buffer) {
 				r.chunkIdx++
-				r.buffer = nil
+				r.buffer = r.buffer[:0] // retain capacity for next chunk
 				r.bufOffset = 0
 			}
 			continue
 		}
 
-		// Write footer
-		if !r.footerWritten || (r.footerWritten && r.bufOffset < len(r.buffer)) {
+		// Write footer if present
+		if r.withFooter {
 			if !r.footerWritten {
-				// Prepare footer buffer
-				footerLenBuf := make([]byte, 4)
-				binary.LittleEndian.PutUint32(footerLenBuf, uint32(len(r.footer)))
-
-				r.buffer = make([]byte, 0, len(r.footer)+4)
-				r.buffer = append(r.buffer, r.footer...)
-				r.buffer = append(r.buffer, footerLenBuf...)
+				if err := r.buildFooter(); err != nil {
+					return 0, fmt.Errorf("failed to build footer: %w", err)
+				}
 				r.bufOffset = 0
 				r.footerWritten = true
 			}
-
-			// Copy from buffer to output
-			copied := copy(p[n:], r.buffer[r.bufOffset:])
-			n += copied
-			r.bufOffset += copied
-
-			// If we haven't finished the footer buffer, keep going
 			if r.bufOffset < len(r.buffer) {
-				continue
+				copied := copy(p[n:], r.buffer[r.bufOffset:])
+				n += copied
+				r.bufOffset += copied
+				if r.bufOffset < len(r.buffer) {
+					continue
+				}
 			}
 		}
 
-		// All done - we've written all chunks and footer
+		// All done
 		if n > 0 {
 			return n, nil
 		}
@@ -192,96 +89,122 @@ func (r *xorbReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// buildFooterData builds the footer bytes and returns them along with offset arrays
-func (x *Xorb) buildFooterData() ([]byte, []uint64, []uint64, error) {
-	// Track chunk offsets for boundary section
-	chunkOffsets := make([]uint64, len(x.Chunks))
-	unpackedOffsets := make([]uint64, len(x.Chunks))
-	currentOffset := uint64(0)
-	currentUnpacked := uint64(0)
+// loadChunk compresses the current chunk and writes its header + data into r.buffer.
+func (r *xorbReader) loadChunk() error {
+	// Use a pointer into the slice so that lazy materialization is cached.
+	chunk := &r.xorb.chunks[r.chunkIdx]
 
-	// Calculate offsets
-	for i, chunk := range x.Chunks {
-		currentOffset += 8 + uint64(len(chunk.CompressedData))
-		currentUnpacked += uint64(len(chunk.UncompressedData))
-
-		// Store END offsets per spec section 7.5.3
-		chunkOffsets[i] = currentOffset
-		unpackedOffsets[i] = currentUnpacked
-	}
-
-	// Build CasObjectInfo footer
-	footer, err := x.buildFooter(chunkOffsets, unpackedOffsets)
+	compressedData, compressionType, err := chunk.compressedData()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to build footer: %w", err)
+		return fmt.Errorf("failed to compress chunk: %w", err)
 	}
 
-	return footer, chunkOffsets, unpackedOffsets, nil
+	// Record end offsets for footer construction (only needed when writing footer).
+	if r.withFooter {
+		var prevPacked, prevUnpacked uint64
+		if len(r.chunkOffsets) > 0 {
+			prevPacked = r.chunkOffsets[len(r.chunkOffsets)-1]
+			prevUnpacked = r.unpackedOffsets[len(r.unpackedOffsets)-1]
+		}
+		r.chunkOffsets = append(r.chunkOffsets, prevPacked+8+uint64(len(compressedData)))
+		r.unpackedOffsets = append(r.unpackedOffsets, prevUnpacked+uint64(chunk.size()))
+	}
+
+	compressedSize := uint32(len(compressedData))
+	uncompressedSize := chunk.size()
+
+	// Reuse buffer capacity; grow only if needed to avoid repeated allocations.
+	need := 8 + len(compressedData)
+	if cap(r.buffer) < need {
+		r.buffer = make([]byte, 0, need)
+	} else {
+		r.buffer = r.buffer[:0]
+	}
+
+	// Build chunk header (8 bytes):
+	//   [0]    version (0)
+	//   [1-3]  compressed size (little-endian, 3 bytes)
+	//   [4]    compression type
+	//   [5-7]  uncompressed size (little-endian, 3 bytes)
+	r.buffer = append(r.buffer,
+		0,
+		byte(compressedSize),
+		byte(compressedSize>>8),
+		byte(compressedSize>>16),
+		byte(compressionType),
+		byte(uncompressedSize),
+		byte(uncompressedSize>>8),
+		byte(uncompressedSize>>16),
+	)
+	r.buffer = append(r.buffer, compressedData...)
+	r.bufOffset = 0
+	return nil
 }
 
-// buildFooter builds the CasObjectInfo footer
-func (x *Xorb) buildFooter(chunkOffsets, unpackedOffsets []uint64) ([]byte, error) {
-	var buf bytes.Buffer
+// buildFooter writes the full CasObjectInfo footer (including trailing length) directly into r.buffer.
+func (r *xorbReader) buildFooter() error {
+	x := r.xorb
+	numChunks := uint32(len(x.chunks))
 
-	// Compute xorb hash from chunk hashes
-	chunkSizes := make([]uint64, len(x.Chunks))
-	for i, chunk := range x.Chunks {
-		chunkSizes[i] = uint64(len(chunk.UncompressedData))
+	// Pre-allocate the exact footer size to avoid any reallocations.
+	// Layout: main header (40) + hash section (12 + numChunks*32) + boundary section (12 + numChunks*8) + trailer (28) + length (4)
+	footerSize := 40 + 12 + int(numChunks)*32 + 12 + int(numChunks)*8 + 28 + 4
+	if cap(r.buffer) < footerSize {
+		r.buffer = make([]byte, 0, footerSize)
+	} else {
+		r.buffer = r.buffer[:0]
 	}
 
-	// Compute xorb hash using inline Merkle tree implementation
-	x.Hash = xet.ComputeXorbHash(x.ChunkHashes, chunkSizes)
-
 	// Main Header: XETBLOB ident (7 bytes), version (1), xorb hash (32 bytes)
-	buf.Write([]byte(XorbIdentifier))
-	buf.WriteByte(1) // version - MUST be 1 per spec
-	buf.Write(x.Hash[:])
+	hash, err := x.Hash()
+	if err != nil {
+		return fmt.Errorf("failed to compute xorb hash: %w", err)
+	}
+	r.buffer = append(r.buffer, xorbIdentifier[:]...)
+	r.buffer = append(r.buffer, 1) // version - MUST be 1 per spec
+	r.buffer = append(r.buffer, hash[:]...)
 
 	// Hash Section: XBLBHSH ident (7 bytes), version (1), num_chunks (4 bytes), chunk hashes
-	buf.Write([]byte(HashSectionIdent))
-	buf.WriteByte(0) // version
-
-	numChunks := uint32(len(x.Chunks))
-	binary.Write(&buf, binary.LittleEndian, numChunks)
-
-	for _, hash := range x.ChunkHashes {
-		buf.Write(hash[:])
+	r.buffer = append(r.buffer, hashSectionIdent[:]...)
+	r.buffer = append(r.buffer, 0) // version
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, numChunks)
+	for i := range x.chunks {
+		h, err := x.chunks[i].Hash()
+		if err != nil {
+			return fmt.Errorf("failed to compute chunk hash: %w", err)
+		}
+		r.buffer = append(r.buffer, h[:]...)
 	}
 
 	// Boundary Section: XBLBBND ident (7 bytes), version (1), num_chunks (4 bytes), chunk offsets
-	buf.Write([]byte(BoundarySectionIdent))
-	buf.WriteByte(1) // version - MUST be 1 per spec
-	binary.Write(&buf, binary.LittleEndian, numChunks)
-
-	// Write boundary offsets (packed offsets in xorb)
-	for _, offset := range chunkOffsets {
-		binary.Write(&buf, binary.LittleEndian, uint32(offset))
+	r.buffer = append(r.buffer, boundarySectionIdent[:]...)
+	r.buffer = append(r.buffer, 1) // version - MUST be 1 per spec
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, numChunks)
+	for _, offset := range r.chunkOffsets {
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(offset))
 	}
-
-	// Write unpacked offsets (offsets in reconstructed file)
-	for _, offset := range unpackedOffsets {
-		binary.Write(&buf, binary.LittleEndian, uint32(offset))
+	for _, offset := range r.unpackedOffsets {
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(offset))
 	}
 
 	// Trailer: num_chunks (4), hash_offset_from_end (4), boundary_offset_from_end (4), reserved (16)
-	// Calculate offsets from the end of the footer (not including the 4-byte length trailer)
-	footerEndPos := buf.Len() + 4 + 4 + 4 + 16 // current pos + trailer fields
+	footerEndPos := len(r.buffer) + 4 + 4 + 4 + 16 // current pos + trailer fields
 
 	// Hash section starts at position 40 (after main header)
-	hashSectionStart := 40
-	hashOffsetFromEnd := uint32(footerEndPos - hashSectionStart)
+	hashOffsetFromEnd := uint32(footerEndPos - 40)
 
 	// Boundary section starts after hash section
 	boundarySectionStart := 40 + 8 + 4 + int(numChunks)*32 // main header + hash header + num_chunks + hashes
 	boundaryOffsetFromEnd := uint32(footerEndPos - boundarySectionStart)
 
-	binary.Write(&buf, binary.LittleEndian, numChunks)
-	binary.Write(&buf, binary.LittleEndian, hashOffsetFromEnd)
-	binary.Write(&buf, binary.LittleEndian, boundaryOffsetFromEnd)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, numChunks)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, hashOffsetFromEnd)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, boundaryOffsetFromEnd)
+	var reserved [16]byte
+	r.buffer = append(r.buffer, reserved[:]...) // reserved
 
-	// Reserved: 16 bytes, zero
-	reserved := make([]byte, 16)
-	buf.Write(reserved)
+	// Trailing footer length (4 bytes)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(len(r.buffer)))
 
-	return buf.Bytes(), nil
+	return nil
 }

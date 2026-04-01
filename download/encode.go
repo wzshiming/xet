@@ -9,5 +9,5 @@ import (
 // StorageAdapter provides access to storage operations needed for reconstruction encoding
 type StorageAdapter interface {
 	GetXorbURL(namespace string, xorbHash xet.Hash) string
-	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
+	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 }

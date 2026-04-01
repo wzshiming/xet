@@ -4,27 +4,28 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/pierrec/lz4/v4"
 )
 
-// CompressionType represents the type of compression used
-type CompressionType uint8
+// compressionType represents the type of compression used
+type compressionType uint8
 
 const (
-	CompressionNone          CompressionType = 0 // No compression
-	CompressionLZ4           CompressionType = 1 // LZ4 Frame format
-	CompressionByteGrouping4 CompressionType = 2 // ByteGrouping4 + LZ4
+	compressionNone          compressionType = 0 // No compression
+	compressionLZ4           compressionType = 1 // LZ4 Frame format
+	compressionByteGrouping4 compressionType = 2 // ByteGrouping4 + LZ4
 )
 
 // decompressChunk decompresses a chunk using the specified compression type
-func decompressChunk(data []byte, compressionType CompressionType, uncompressedSize int) ([]byte, error) {
+func decompressChunk(data []byte, compressionType compressionType, uncompressedSize int) ([]byte, error) {
 	switch compressionType {
-	case CompressionNone:
+	case compressionNone:
 		return data, nil
-	case CompressionLZ4:
+	case compressionLZ4:
 		return decompressLZ4(data, uncompressedSize)
-	case CompressionByteGrouping4:
+	case compressionByteGrouping4:
 		return decompressByteGrouping4LZ4(data, uncompressedSize)
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %d", compressionType)
@@ -49,14 +50,25 @@ func compressLZ4(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// lz4ReaderPool pools lz4.Reader objects to avoid per-call allocation.
+var lz4ReaderPool sync.Pool
+
 // decompressLZ4 decompresses LZ4 Frame format data
 func decompressLZ4(data []byte, uncompressedSize int) ([]byte, error) {
-	r := lz4.NewReader(bytes.NewReader(data))
-	result := make([]byte, uncompressedSize)
+	br := bytes.NewReader(data)
 
-	// Use io.ReadFull to ensure we read all expected bytes
-	// A single Read() call may return fewer bytes without error
+	var r *lz4.Reader
+	if v := lz4ReaderPool.Get(); v != nil {
+		r = v.(*lz4.Reader)
+		r.Reset(br)
+	} else {
+		r = lz4.NewReader(br)
+	}
+
+	result := make([]byte, uncompressedSize)
 	n, err := io.ReadFull(r, result)
+	lz4ReaderPool.Put(r)
+
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return nil, fmt.Errorf("failed to decompress LZ4: %w", err)
 	}
@@ -142,18 +154,18 @@ func reverseByteGrouping4(data []byte) []byte {
 }
 
 // selectBestCompression tries different compression methods and returns the best one
-func selectBestCompression(data []byte) ([]byte, CompressionType, error) {
+func selectBestCompression(data []byte) ([]byte, compressionType, error) {
 	// Try no compression
 	noneSize := len(data)
 	best := data
-	bestType := CompressionNone
+	bestType := compressionNone
 	bestSize := noneSize
 
 	// Try LZ4
 	lz4Data, err := compressLZ4(data)
 	if err == nil && len(lz4Data) < bestSize {
 		best = lz4Data
-		bestType = CompressionLZ4
+		bestType = compressionLZ4
 		bestSize = len(lz4Data)
 	}
 
@@ -161,7 +173,7 @@ func selectBestCompression(data []byte) ([]byte, CompressionType, error) {
 	bg4Data, err := compressByteGrouping4LZ4(data)
 	if err == nil && len(bg4Data) < bestSize {
 		best = bg4Data
-		bestType = CompressionByteGrouping4
+		bestType = compressionByteGrouping4
 		bestSize = len(bg4Data)
 	}
 

@@ -6,24 +6,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
-	"github.com/wzshiming/xet/xorb"
 )
-
-// DecodeXorb deserializes a xorb from an upload request body and verifies
-// that the computed hash matches the expected hash. Used by the server when
-// receiving xorb uploads.
-func DecodeXorb(body io.Reader, expectedHash xet.Hash) (*xorb.Xorb, error) {
-	xorbObj, err := xorb.Decode(body, true)
-	if err != nil {
-		return nil, fmt.Errorf("invalid xorb format: %w", err)
-	}
-
-	if xorbObj.Hash != expectedHash {
-		return nil, fmt.Errorf("hash mismatch: xorb has %s, expected %s", xorbObj.Hash.String(), expectedHash.String())
-	}
-
-	return xorbObj, nil
-}
 
 // DecodeShard deserializes and validates a shard from an upload request body.
 // Used by the server when receiving shard uploads.

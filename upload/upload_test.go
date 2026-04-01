@@ -65,57 +65,6 @@ func (s *inspectBatchStubUploadClientAdapter) QueryChunksDeduplication(_ context
 	return results, nil
 }
 
-func TestEncodeDecodeXorb(t *testing.T) {
-	// Create a test xorb
-	xorbObj := xorb.NewXorb()
-	testData := xet.ChunkBytes([]byte("test chunk data"))
-	if err := xorbObj.AddChunk(testData); err != nil {
-		t.Fatalf("AddChunk failed: %v", err)
-	}
-
-	// Encode
-	reader, err := EncodeXorb(xorbObj)
-	if err != nil {
-		t.Fatalf("EncodeXorb failed: %v", err)
-	}
-
-	// Decode with correct hash
-	decoded, err := DecodeXorb(reader, xorbObj.Hash)
-	if err != nil {
-		t.Fatalf("DecodeXorb failed: %v", err)
-	}
-
-	if decoded.Hash != xorbObj.Hash {
-		t.Errorf("Hash mismatch: got %s, want %s", decoded.Hash.String(), xorbObj.Hash.String())
-	}
-
-	if len(decoded.Chunks) != len(xorbObj.Chunks) {
-		t.Errorf("Chunk count mismatch: got %d, want %d", len(decoded.Chunks), len(xorbObj.Chunks))
-	}
-}
-
-func TestDecodeXorbHashMismatch(t *testing.T) {
-	// Create a test xorb
-	xorbObj := xorb.NewXorb()
-	testData := xet.ChunkBytes([]byte("test chunk data"))
-	if err := xorbObj.AddChunk(testData); err != nil {
-		t.Fatalf("AddChunk failed: %v", err)
-	}
-
-	// Encode
-	reader, err := EncodeXorb(xorbObj)
-	if err != nil {
-		t.Fatalf("EncodeXorb failed: %v", err)
-	}
-
-	// Decode with wrong hash
-	wrongHash := xet.Hash{}
-	_, err = DecodeXorb(reader, wrongHash)
-	if err == nil {
-		t.Fatal("Expected error for hash mismatch, got nil")
-	}
-}
-
 func TestEncodeDecodeShard(t *testing.T) {
 	// Create a test shard
 	shardObj := shard.NewShard()
@@ -161,14 +110,6 @@ func TestEncodeDecodeChunkQueryResponse(t *testing.T) {
 
 	if decoded == nil {
 		t.Fatal("Decoded shard is nil")
-	}
-}
-
-func TestDecodeXorbInvalidData(t *testing.T) {
-	invalidData := bytes.NewReader([]byte("not a valid xorb"))
-	_, err := DecodeXorb(invalidData, xet.Hash{})
-	if err == nil {
-		t.Fatal("Expected error for invalid xorb data, got nil")
 	}
 }
 

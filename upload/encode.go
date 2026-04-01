@@ -4,14 +4,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet/shard"
-	"github.com/wzshiming/xet/xorb"
 )
-
-// EncodeXorb serializes a xorb for upload (full format with footer).
-// Used by the client when uploading xorbs to the server.
-func EncodeXorb(xorbObj *xorb.Xorb) (io.Reader, error) {
-	return xorb.Encode(xorbObj, false)
-}
 
 // EncodeShard serializes a shard for upload (without footer).
 // Used by the client when uploading shards to the server.

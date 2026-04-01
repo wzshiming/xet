@@ -705,13 +705,21 @@ func extractUploadedChunkHashes(t *testing.T, reqs []RequestRecord) map[string]b
 		if req.Method != http.MethodPost || normalizePath(req.Path) != "/v1/xorbs/default/{hash}" {
 			continue
 		}
-		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
+
+		xorbObj := xorb.NewXorb()
+		err := xorbObj.Decode(bytes.NewReader(req.Body), false)
 		if err != nil {
 			t.Errorf("failed to decode xorb while extracting uploaded chunks: %v", err)
 			continue
 		}
-		for _, chunkHash := range xorbObj.ChunkHashes {
-			result[chunkHash.String()] = true
+		chunks := xorbObj.Chunks()
+		for i := range chunks {
+			h, err := chunks[i].Hash()
+			if err != nil {
+				t.Errorf("failed to hash chunk: %v", err)
+				continue
+			}
+			result[h.String()] = true
 		}
 	}
 	return result
@@ -785,7 +793,8 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range xetgoReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
+		xorbObj := xorb.NewXorb()
+		err := xorbObj.Decode(bytes.NewReader(req.Body), false)
 		if err != nil {
 			t.Errorf("Failed to deserialize xet-go xorb: %v", err)
 			continue
@@ -793,11 +802,22 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 		}
 
 		info := xorbInfo{hash: req.Path}
-		for i, chunkHash := range xorbObj.ChunkHashes {
-			xetgoChunkHashes[chunkHash] = true
-			info.chunkHashes = append(info.chunkHashes, chunkHash)
-			if i < len(xorbObj.Chunks) {
-				info.chunkSizes = append(info.chunkSizes, len(xorbObj.Chunks[i].UncompressedData))
+		chunks := xorbObj.Chunks()
+		for i := range chunks {
+			h, err := chunks[i].Hash()
+			if err != nil {
+				t.Errorf("Failed to hash chunk: %v", err)
+				continue
+			}
+			xetgoChunkHashes[h] = true
+			info.chunkHashes = append(info.chunkHashes, h)
+			if i < xorbObj.ChunkSize() {
+				data, err := chunks[i].UncompressedData()
+				if err != nil {
+					t.Errorf("Failed to get chunk data: %v", err)
+					continue
+				}
+				info.chunkSizes = append(info.chunkSizes, len(data))
 			}
 		}
 		xetgoXorbs = append(xetgoXorbs, info)
@@ -805,18 +825,30 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	for _, req := range nativeReqs {
 		// Try to deserialize the xorb
-		xorbObj, err := xorb.Decode(bytes.NewBuffer(req.Body), true)
+		xorbObj := xorb.NewXorb()
+		err := xorbObj.Decode(bytes.NewReader(req.Body), false)
 		if err != nil {
 			t.Errorf("Failed to deserialize native xorb: %v", err)
 			continue
 		}
 
 		info := xorbInfo{hash: req.Path}
-		for i, chunkHash := range xorbObj.ChunkHashes {
-			nativeChunkHashes[chunkHash] = true
-			info.chunkHashes = append(info.chunkHashes, chunkHash)
-			if i < len(xorbObj.Chunks) {
-				info.chunkSizes = append(info.chunkSizes, len(xorbObj.Chunks[i].UncompressedData))
+		chunks := xorbObj.Chunks()
+		for i := range chunks {
+			h, err := chunks[i].Hash()
+			if err != nil {
+				t.Errorf("Failed to hash chunk: %v", err)
+				continue
+			}
+			nativeChunkHashes[h] = true
+			info.chunkHashes = append(info.chunkHashes, h)
+			if i < xorbObj.ChunkSize() {
+				data, err := chunks[i].UncompressedData()
+				if err != nil {
+					t.Errorf("Failed to get chunk data: %v", err)
+					continue
+				}
+				info.chunkSizes = append(info.chunkSizes, len(data))
 			}
 		}
 		nativeXorbs = append(nativeXorbs, info)

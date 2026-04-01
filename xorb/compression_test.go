@@ -156,11 +156,11 @@ func TestSelectBestCompression(t *testing.T) {
 			// Decompress based on type
 			var decompressed []byte
 			switch compressionType {
-			case CompressionNone:
+			case compressionNone:
 				decompressed = compressed
-			case CompressionLZ4:
+			case compressionLZ4:
 				decompressed, err = decompressLZ4(compressed, len(tc.data))
-			case CompressionByteGrouping4:
+			case compressionByteGrouping4:
 				decompressed, err = decompressByteGrouping4LZ4(compressed, len(tc.data))
 			default:
 				t.Fatalf("Unknown compression type: %d", compressionType)
