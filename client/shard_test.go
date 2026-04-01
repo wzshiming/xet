@@ -197,7 +197,8 @@ func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 			if r.URL.Path == "/v1/chunks/default/"+chunk.String() {
 				sh := shard.NewShard()
 				sh.CASInfos = append(sh.CASInfos, shard.CASBlock{
-					CASHash: xorbHash,
+					CASHash:       xorbHash,
+					NumBytesInCAS: 2,
 					Chunks: []shard.CASChunkSequenceEntry{
 						{ChunkHash: xet.Hash{88}, ByteRangeStart: 0, UnpackedSegBytes: 1},
 						{ChunkHash: chunk, ByteRangeStart: 1, UnpackedSegBytes: 1},

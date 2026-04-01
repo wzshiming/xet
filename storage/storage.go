@@ -28,6 +28,9 @@ type Storage interface {
 	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
 	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadSeekCloser, error)
 
+	// HasXorb checks whether an xorb exists.
+	HasXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (bool, error)
+
 	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
 	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.Hash, chunkStart, chunkEnd uint32) (startByte, endByte int64)
 
@@ -225,6 +228,21 @@ func (fs *FileStorage) GetXorbReadSeekCloser(ctx context.Context, namespace stri
 	}
 
 	return f, nil
+}
+
+// HasXorb checks whether an xorb exists.
+func (fs *FileStorage) HasXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (bool, error) {
+	xorbPath := filepath.Join(fs.basePath, "xorbs", namespace, xorbHash.String())
+
+	_, err := os.Stat(xorbPath)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("check xorb file: %w", err)
 }
 
 // PutShard stores a shard

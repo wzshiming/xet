@@ -280,6 +280,14 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for _, casBlock := range shard.CASInfos {
+		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
+		if err != nil || !exists {
+			http.Error(w, "Invalid shard: referenced xorb not uploaded", http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Store shard
 	wasInserted, err := s.storage.PutShard(r.Context(), shard)
 	if err != nil {

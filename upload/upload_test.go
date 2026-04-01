@@ -181,6 +181,81 @@ func TestDecodeShardInvalidData(t *testing.T) {
 	}
 }
 
+func TestDecodeShardRejectsFooterInUploadPayload(t *testing.T) {
+	sh := shard.NewShard()
+	sh.Footer = &shard.Footer{Version: 1}
+
+	r, err := shard.Encode(sh, true)
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+
+	_, err = DecodeShard(r)
+	if err == nil {
+		t.Fatal("expected error for shard footer in upload payload")
+	}
+}
+
+func TestDecodeShardRejectsNonZeroCASFlags(t *testing.T) {
+	sh := shard.NewShard()
+	sh.Files = []shard.FileBlock{{
+		FileHash: xet.Hash{1},
+		Entries: []shard.FileDataSequenceEntry{{
+			CASHash:          xet.Hash{2},
+			CASFlags:         1,
+			UnpackedSegBytes: 1,
+			ChunkIndexStart:  0,
+			ChunkIndexEnd:    1,
+		}},
+	}}
+	sh.CASInfos = []shard.CASBlock{{
+		CASHash:        xet.Hash{2},
+		NumBytesInCAS:  1,
+		NumBytesOnDisk: 1,
+		Chunks: []shard.CASChunkSequenceEntry{{
+			ChunkHash:        xet.Hash{3},
+			ByteRangeStart:   0,
+			UnpackedSegBytes: 1,
+		}},
+	}}
+
+	r, err := EncodeShard(sh)
+	if err != nil {
+		t.Fatalf("EncodeShard failed: %v", err)
+	}
+
+	_, err = DecodeShard(r)
+	if err == nil {
+		t.Fatal("expected error for non-zero CAS flags")
+	}
+}
+
+func TestDecodeShardRejectsNonContiguousByteRangeStart(t *testing.T) {
+	sh := shard.NewShard()
+	sh.Files = []shard.FileBlock{{
+		FileHash: xet.Hash{1},
+	}}
+	sh.CASInfos = []shard.CASBlock{{
+		CASHash:        xet.Hash{2},
+		NumBytesInCAS:  2,
+		NumBytesOnDisk: 2,
+		Chunks: []shard.CASChunkSequenceEntry{
+			{ChunkHash: xet.Hash{3}, ByteRangeStart: 0, UnpackedSegBytes: 1},
+			{ChunkHash: xet.Hash{4}, ByteRangeStart: 2, UnpackedSegBytes: 1},
+		},
+	}}
+
+	r, err := EncodeShard(sh)
+	if err != nil {
+		t.Fatalf("EncodeShard failed: %v", err)
+	}
+
+	_, err = DecodeShard(r)
+	if err == nil {
+		t.Fatal("expected error for non-contiguous byte range starts")
+	}
+}
+
 func TestXorbUploadResponseJSON(t *testing.T) {
 	resp := XorbUploadResponse{WasInserted: true}
 	data, err := json.Marshal(resp)
