@@ -69,20 +69,6 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 			}
 		}
 
-		// Find the CAS block
-		var casBlock *shard.CASBlock
-		for i := range sh.CASInfos {
-			if sh.CASInfos[i].CASHash == entry.CASHash {
-				casBlock = &sh.CASInfos[i]
-				break
-			}
-		}
-
-		if casBlock == nil {
-			currentByteOffset = termEnd
-			continue
-		}
-
 		// Calculate offset into first term if this is the first included term
 		if len(response.Terms) == 0 && hasRange && termStart < requestedStart {
 			response.OffsetIntoFirstRange = requestedStart - termStart

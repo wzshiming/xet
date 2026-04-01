@@ -94,6 +94,9 @@ func (s *Handler) registerRoutes() {
 	// Not defined in the spec, but we can support it without much effort since it's just serving raw stored xorb bytes.
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
 
+	// Batch reconstruction endpoint used by xet-core: GET /reconstructions?file_id=<hex>&file_id=<hex>&...
+	s.root.HandleFunc("/reconstructions", s.handleBatchGetReconstruction).Methods(http.MethodGet)
+
 	s.root.NotFoundHandler = s.next
 }
 
@@ -165,6 +168,60 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleBatchGetReconstruction handles GET /reconstructions?file_id=<hex>&file_id=<hex>&...
+func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	fileIDStrs := r.URL.Query()["file_id"]
+	if len(fileIDStrs) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&download.BatchReconstructionResponse{
+			Files:     make(map[string][]download.Term),
+			FetchInfo: make(map[string][]download.FetchInfoEntry),
+		})
+		return
+	}
+
+	fileHashes := make([]xet.Hash, 0, len(fileIDStrs))
+	for _, idStr := range fileIDStrs {
+		h, err := xet.ParseHash(idStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid file_id %q: %v", idStr, err), http.StatusBadRequest)
+			return
+		}
+		fileHashes = append(fileHashes, h)
+	}
+
+	batch := &download.BatchReconstructionResponse{
+		Files:     make(map[string][]download.Term, len(fileHashes)),
+		FetchInfo: make(map[string][]download.FetchInfoEntry),
+	}
+
+	for _, fileHash := range fileHashes {
+		sh, err := s.storage.GetShardByFileHash(r.Context(), fileHash)
+		if err != nil {
+			// Skip files not found; caller can check which hashes are absent.
+			continue
+		}
+		single, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", sh, fileHash, "")
+		if err != nil {
+			continue
+		}
+		batch.Files[fileHash.String()] = single.Terms
+		for xorbHash, entries := range single.FetchInfo {
+			if _, exists := batch.FetchInfo[xorbHash]; !exists {
+				batch.FetchInfo[xorbHash] = entries
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(batch)
 }
 
 // handleGetReconstructionV2 handles GET /v2/reconstructions/{file_hash}

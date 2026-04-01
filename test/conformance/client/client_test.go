@@ -1170,3 +1170,418 @@ func equalByteRanges(a, b []byteRange) bool {
 	}
 	return true
 }
+
+// compareBatchDownloadRequests compares HTTP request patterns between xet-go and the
+// native client for a multi-file batch download.
+// It asserts that the native client uses the batch /reconstructions endpoint and that
+// both clients cover the same byte ranges when downloading xorb data.
+func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHashes []xet.Hash) {
+	t.Helper()
+
+	xetgoByType := groupRequestsByType(xetgoReqs)
+	nativeByType := groupRequestsByType(nativeReqs)
+
+	// Log which reconstruction strategy each client used — xet-go may call individual
+	// endpoints while native should use the batch endpoint.
+	xetgoBatchRecon := len(xetgoByType["GET:/reconstructions"])
+	nativeBatchRecon := len(nativeByType["GET:/reconstructions"])
+	xetgoSingleRecon := len(xetgoByType["GET:/v1/reconstructions/{hash}"]) + len(xetgoByType["GET:/v2/reconstructions/{hash}"])
+	nativeSingleRecon := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
+
+	t.Logf("Reconstruction: xet-go — %d batch, %d single-file; native — %d batch, %d single-file",
+		xetgoBatchRecon, xetgoSingleRecon, nativeBatchRecon, nativeSingleRecon)
+
+	// STRICT: native client must use the batch endpoint for multiple files.
+	if nativeBatchRecon == 0 {
+		t.Errorf("native client did not use the batch /reconstructions endpoint for %d files", len(fileHashes))
+	}
+	// STRICT: native client must not fall back to individual reconstruction endpoints.
+	if nativeSingleRecon > 0 {
+		t.Errorf("native client issued %d individual /v{n}/reconstructions/{hash} requests, expected 0", nativeSingleRecon)
+	}
+
+	// Both clients must download xorb data to reconstruct the files.
+	xetgoXorbReqs := xetgoByType["GET:/v1/xorbs/default/{hash}/data"]
+	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}/data"]
+	if len(xetgoXorbReqs) == 0 && len(nativeXorbReqs) > 0 {
+		t.Errorf("xet-go did not download any xorb data while native did")
+	}
+	if len(nativeXorbReqs) == 0 && len(xetgoXorbReqs) > 0 {
+		t.Errorf("native client did not download any xorb data while xet-go did")
+	}
+
+	// STRICT: both clients must cover identical byte ranges per xorb.
+	compareXorbDownloadRanges(t, xetgoXorbReqs, nativeXorbReqs)
+
+	t.Logf("✓ Batch download xorb-range conformance passed for %d files", len(fileHashes))
+}
+
+// TestClientBatchDownloadConformance tests the DownloadFiles batch method of the native
+// client, verifying that multiple files can be downloaded in a single batch request,
+// that reconstructed content matches the originals, and that batch results are identical
+// to sequential DownloadFile calls.
+func TestClientBatchDownloadConformance(t *testing.T) {
+	storageDir := t.TempDir()
+	var stor storage.Storage
+	var srv *server.Handler
+	var httpSrv *httptest.Server
+
+	httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if srv != nil {
+			srv.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "server not initialized", http.StatusInternalServerError)
+	}))
+	defer httpSrv.Close()
+
+	var err error
+	stor, err = storage.NewFileStorage(
+		storage.WithBasePath(storageDir),
+		storage.WithBaseURL(httpSrv.URL),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create storage: %v", err)
+	}
+	srv = server.NewHandler(server.WithStorage(stor))
+	nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL), client.WithCacheDir(t.TempDir()))
+
+	datasets := []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "Empty file",
+			data: []byte{},
+		},
+		{
+			name: "Hello World",
+			data: []byte("Hello World!"),
+		},
+		{
+			name: "10MB",
+			data: utils.MakeRandData(10 * 1024 * 1024),
+		},
+		{
+			name: "10MB repeating",
+			data: utils.MakeRepeatData(10 * 1024 * 1024),
+		},
+		{
+			name: "100MB",
+			data: utils.MakeRandData(100 * 1024 * 1024),
+		},
+		{
+			name: "100MB repeating",
+			data: utils.MakeRepeatData(100 * 1024 * 1024),
+		},
+		{
+			name: "200MB",
+			data: utils.MakeRandData(200 * 1024 * 1024),
+		},
+		{
+			name: "200MB repeating",
+			data: utils.MakeRepeatData(200 * 1024 * 1024),
+		},
+	}
+
+	// Upload all files once; sub-tests below reuse the same server state.
+	hashes := make([]xet.Hash, len(datasets))
+	for i, tc := range datasets {
+		hash, err := nativeClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(tc.data))
+		if err != nil {
+			t.Fatalf("upload %s: %v", tc.name, err)
+		}
+		hashes[i] = hash
+	}
+
+	t.Run("downloads_all_files", func(t *testing.T) {
+		session := nativeClient.DownloadSession()
+		readers, sizes, err := session.DownloadFiles(context.Background(), hashes)
+		if err != nil {
+			t.Fatalf("DownloadFiles failed: %v", err)
+		}
+		if len(readers) != len(datasets) {
+			t.Fatalf("expected %d readers, got %d", len(datasets), len(readers))
+		}
+		if len(sizes) != len(datasets) {
+			t.Fatalf("expected %d sizes, got %d", len(datasets), len(sizes))
+		}
+
+		for i, tc := range datasets {
+			if readers[i] == nil {
+				t.Errorf("reader %d (%s) is nil", i, tc.name)
+				continue
+			}
+			if sizes[i] != int64(len(tc.data)) {
+				t.Errorf("file %d (%s) size: got %d want %d", i, tc.name, sizes[i], int64(len(tc.data)))
+			}
+			got, err := io.ReadAll(readers[i])
+			if err != nil {
+				t.Errorf("read file %d (%s): %v", i, tc.name, err)
+				continue
+			}
+			if !bytes.Equal(got, tc.data) {
+				t.Errorf("file %d (%s) content mismatch: got %d bytes want %d bytes",
+					i, tc.name, len(got), len(tc.data))
+			}
+		}
+		t.Logf("✓ DownloadFiles returned correct data for %d files", len(datasets))
+	})
+
+	t.Run("empty_batch", func(t *testing.T) {
+		session := nativeClient.DownloadSession()
+		readers, sizes, err := session.DownloadFiles(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("empty DownloadFiles failed: %v", err)
+		}
+		if len(readers) != 0 {
+			t.Errorf("expected 0 readers, got %d", len(readers))
+		}
+		if len(sizes) != 0 {
+			t.Errorf("expected 0 sizes, got %d", len(sizes))
+		}
+	})
+
+	t.Run("single_file_batch", func(t *testing.T) {
+		session := nativeClient.DownloadSession()
+		readers, sizes, err := session.DownloadFiles(context.Background(), hashes[:1])
+		if err != nil {
+			t.Fatalf("single-file DownloadFiles failed: %v", err)
+		}
+		if len(readers) != 1 || readers[0] == nil {
+			t.Fatalf("expected one non-nil reader, got %d readers", len(readers))
+		}
+		if sizes[0] != int64(len(datasets[0].data)) {
+			t.Errorf("size mismatch: got %d want %d", sizes[0], len(datasets[0].data))
+		}
+		got, err := io.ReadAll(readers[0])
+		if err != nil {
+			t.Fatalf("read single-file batch: %v", err)
+		}
+		if !bytes.Equal(got, datasets[0].data) {
+			t.Error("single-file batch content mismatch")
+		}
+	})
+
+	t.Run("results_match_sequential_download", func(t *testing.T) {
+		session := nativeClient.DownloadSession()
+		batchReaders, batchSizes, err := session.DownloadFiles(context.Background(), hashes)
+		if err != nil {
+			t.Fatalf("batch DownloadFiles failed: %v", err)
+		}
+
+		for i, tc := range datasets {
+			seqSession := nativeClient.DownloadSession()
+			seqReader, seqSize, err := seqSession.DownloadFile(context.Background(), hashes[i])
+			if err != nil {
+				t.Fatalf("sequential DownloadFile %d (%s) failed: %v", i, tc.name, err)
+			}
+			if batchSizes[i] != seqSize {
+				t.Errorf("file %d (%s) size: batch=%d sequential=%d",
+					i, tc.name, batchSizes[i], seqSize)
+			}
+			batchData, err := io.ReadAll(batchReaders[i])
+			if err != nil {
+				t.Errorf("read batch file %d (%s): %v", i, tc.name, err)
+				continue
+			}
+			seqData, err := io.ReadAll(seqReader)
+			if err != nil {
+				t.Errorf("read sequential file %d (%s): %v", i, tc.name, err)
+				continue
+			}
+			if !bytes.Equal(batchData, seqData) {
+				t.Errorf("file %d (%s): batch and sequential data differ", i, tc.name)
+			}
+		}
+		t.Logf("✓ Batch and sequential downloads produce identical results for %d files", len(datasets))
+	})
+
+	t.Run("batch_request_uses_correct_endpoint", func(t *testing.T) {
+		// Verify that DownloadFiles issues a GET /reconstructions request (not individual
+		// /v1/reconstructions/{hash} or /v2/reconstructions/{hash} requests).
+		var proxy *RecordingProxy
+		var proxiedSrv *httptest.Server
+
+		var innerStor storage.Storage
+		var innerSrv *server.Handler
+		innerStorDir := t.TempDir()
+
+		proxiedSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if proxy != nil {
+				proxy.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "not initialized", http.StatusInternalServerError)
+		}))
+		defer proxiedSrv.Close()
+
+		var innerErr error
+		innerStor, innerErr = storage.NewFileStorage(
+			storage.WithBasePath(innerStorDir),
+			storage.WithBaseURL(proxiedSrv.URL),
+		)
+		if innerErr != nil {
+			t.Fatalf("create inner storage: %v", innerErr)
+		}
+		innerSrv = server.NewHandler(server.WithStorage(innerStor))
+		proxy = NewRecordingProxy(innerSrv)
+
+		// Upload two small files.
+		innerClient := client.NewClient(client.WithBaseURL(proxiedSrv.URL), client.WithCacheDir(t.TempDir()))
+		data1 := []byte("batch endpoint check – file one")
+		data2 := []byte("batch endpoint check – file two")
+
+		h1, err := innerClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data1))
+		if err != nil {
+			t.Fatalf("upload file1: %v", err)
+		}
+		h2, err := innerClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data2))
+		if err != nil {
+			t.Fatalf("upload file2: %v", err)
+		}
+
+		proxy.ClearRequests()
+
+		// Batch-download both files and capture the resulting requests.
+		session := innerClient.DownloadSession()
+		readers, _, err := session.DownloadFiles(context.Background(), []xet.Hash{h1, h2})
+		if err != nil {
+			t.Fatalf("DownloadFiles failed: %v", err)
+		}
+		for i, r := range readers {
+			if r == nil {
+				t.Fatalf("reader %d is nil", i)
+			}
+			if _, err := io.ReadAll(r); err != nil {
+				t.Fatalf("read reader %d: %v", i, err)
+			}
+		}
+
+		reqs := proxy.GetRequests()
+		batchReconCount := 0
+		singleReconCount := 0
+		for _, req := range reqs {
+			if req.Method == http.MethodGet && req.Path == "/reconstructions" {
+				batchReconCount++
+			}
+			if req.Method == http.MethodGet && strings.HasPrefix(req.Path, "/v1/reconstructions/") {
+				singleReconCount++
+			}
+			if req.Method == http.MethodGet && strings.HasPrefix(req.Path, "/v2/reconstructions/") {
+				singleReconCount++
+			}
+		}
+
+		if batchReconCount == 0 {
+			t.Error("expected at least one GET /reconstructions batch request")
+		}
+		if singleReconCount > 0 {
+			t.Errorf("expected no individual /v{n}/reconstructions/{hash} requests, got %d", singleReconCount)
+		}
+		t.Logf("✓ DownloadFiles issued %d batch reconstruction request(s) and %d single-file request(s)",
+			batchReconCount, singleReconCount)
+	})
+
+	t.Run("xetgo_batch_download_comparison", func(t *testing.T) {
+		// Setup a dedicated proxy-recorded server so we can observe every HTTP
+		// request made by both xet-go and the native client.
+		cmpStorDir := t.TempDir()
+		var cmpStor storage.Storage
+		var cmpSrv *server.Handler
+		var cmpProxy *RecordingProxy
+		var cmpHTTP *httptest.Server
+
+		cmpHTTP = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if cmpProxy != nil {
+				cmpProxy.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "not initialized", http.StatusInternalServerError)
+		}))
+		defer cmpHTTP.Close()
+
+		var cmpErr error
+		cmpStor, cmpErr = storage.NewFileStorage(
+			storage.WithBasePath(cmpStorDir),
+			storage.WithBaseURL(cmpHTTP.URL),
+		)
+		if cmpErr != nil {
+			t.Fatalf("create comparison storage: %v", cmpErr)
+		}
+		cmpSrv = server.NewHandler(server.WithStorage(cmpStor))
+		cmpProxy = NewRecordingProxy(cmpSrv)
+
+		cmpClient := client.NewClient(client.WithBaseURL(cmpHTTP.URL), client.WithCacheDir(t.TempDir()))
+
+		// Upload three files — one tiny, two larger — to exercise multiple xorbs.
+		cmpDatasets := [][]byte{
+			[]byte("xetgo-vs-native batch comparison – small"),
+			utils.MakeRandData(1024 * 1024),
+			utils.MakeRepeatData(1024 * 1024),
+		}
+		cmpHashes := make([]xet.Hash, len(cmpDatasets))
+		for i, data := range cmpDatasets {
+			hash, err := cmpClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("upload comparison dataset %d: %v", i, err)
+			}
+			cmpHashes[i] = hash
+		}
+
+		// ── xet-go batch download ────────────────────────────────────────────────
+		cmpProxy.ClearRequests()
+		tempDir := t.TempDir()
+		xetgoDownloadReqs := make([]xetgo.DownloadRequest, len(cmpDatasets))
+		for i, h := range cmpHashes {
+			xetgoDownloadReqs[i] = xetgo.DownloadRequest{
+				DestinationPath: filepath.Join(tempDir, fmt.Sprintf("xetgo-%d.bin", i)),
+				Hash:            h.String(),
+				FileSize:        int64(len(cmpDatasets[i])),
+			}
+		}
+		if _, err := xetgo.DownloadFiles(xetgoDownloadReqs, cmpHTTP.URL, nil); err != nil {
+			t.Fatalf("xet-go DownloadFiles failed: %v", err)
+		}
+		xetgoHTTPReqs := cmpProxy.GetRequests()
+
+		// Verify xet-go reconstructed the correct content.
+		for i, data := range cmpDatasets {
+			got, err := os.ReadFile(xetgoDownloadReqs[i].DestinationPath)
+			if err != nil {
+				t.Errorf("read xet-go file %d: %v", i, err)
+				continue
+			}
+			if !bytes.Equal(got, data) {
+				t.Errorf("xet-go file %d content mismatch: got %d bytes, want %d bytes", i, len(got), len(data))
+			}
+		}
+
+		// ── native batch download ────────────────────────────────────────────────
+		// Use a fresh client (empty cache) so reconstruction is not served from disk.
+		cmpProxy.ClearRequests()
+		freshClient := client.NewClient(client.WithBaseURL(cmpHTTP.URL), client.WithCacheDir(t.TempDir()))
+		readers, _, err := freshClient.DownloadSession().DownloadFiles(context.Background(), cmpHashes)
+		if err != nil {
+			t.Fatalf("native DownloadFiles failed: %v", err)
+		}
+		for i, r := range readers {
+			if r == nil {
+				t.Errorf("native reader %d is nil", i)
+				continue
+			}
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Errorf("read native file %d: %v", i, err)
+				continue
+			}
+			if !bytes.Equal(got, cmpDatasets[i]) {
+				t.Errorf("native file %d content mismatch: got %d bytes, want %d bytes", i, len(got), len(cmpDatasets[i]))
+			}
+		}
+		nativeHTTPReqs := cmpProxy.GetRequests()
+
+		// ── compare HTTP request patterns ────────────────────────────────────────
+		compareBatchDownloadRequests(t, xetgoHTTPReqs, nativeHTTPReqs, cmpHashes)
+	})
+}

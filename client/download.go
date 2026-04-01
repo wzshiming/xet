@@ -121,3 +121,42 @@ func (s *DownloadSession) DownloadFileV2(ctx context.Context, fileHash xet.Hash,
 
 	return reader, expectedLength, nil
 }
+
+// DownloadFiles downloads multiple files using a single batch reconstruction request.
+// All files share one fetch_info map, so each xorb is fetched only once across the batch.
+// It returns a reader and size per file in the same order as fileHashes.
+// Individual errors are embedded per-entry; a nil reader means that file was not found.
+func (s *DownloadSession) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io.Reader, []int64, error) {
+	if len(fileHashes) == 0 {
+		return nil, nil, nil
+	}
+
+	batchResp, err := s.client.BatchGetReconstruction(ctx, fileHashes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("batch get reconstruction: %w", err)
+	}
+
+	adapter := &clientAdapter{client: s.client}
+
+	readers := make([]io.Reader, len(fileHashes))
+	sizes := make([]int64, len(fileHashes))
+	for i, fileHash := range fileHashes {
+		terms, ok := batchResp.Files[fileHash.String()]
+		if !ok {
+			// File not in response — return nil reader for this slot.
+			continue
+		}
+
+		// Build a per-file ReconstructionResponse reusing the shared fetch_info.
+		singleResp := &download.ReconstructionResponse{
+			OffsetIntoFirstRange: 0,
+			Terms:                terms,
+			FetchInfo:            batchResp.FetchInfo,
+		}
+
+		sizes[i] = download.ExpectedLengthV1(singleResp)
+		readers[i] = download.NewReaderV1(ctx, adapter, singleResp, download.WithConcurrency(s.concurrency))
+	}
+
+	return readers, sizes, nil
+}

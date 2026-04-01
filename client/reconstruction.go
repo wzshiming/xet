@@ -118,3 +118,47 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 
 	return &reconstructionResp, nil
 }
+
+// BatchGetReconstruction retrieves reconstruction information for multiple files in a single request.
+// It calls GET /reconstructions?file_id=<hex>&file_id=<hex>&... and returns the aggregated response.
+func (c *Client) BatchGetReconstruction(ctx context.Context, fileHashes []xet.Hash) (*download.BatchReconstructionResponse, error) {
+	if len(fileHashes) == 0 {
+		return &download.BatchReconstructionResponse{
+			Files:     make(map[string][]download.Term),
+			FetchInfo: make(map[string][]download.FetchInfoEntry),
+		}, nil
+	}
+
+	urlStr := c.baseURL + "/reconstructions?"
+	for i, h := range fileHashes {
+		if i > 0 {
+			urlStr += "&"
+		}
+		urlStr += "file_id=" + h.String()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create batch reconstruction request: %w", err)
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do batch reconstruction request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := reqError(req, resp); err != nil {
+		return nil, err
+	}
+
+	var batchResp download.BatchReconstructionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		return nil, fmt.Errorf("decode batch reconstruction response: %w", err)
+	}
+
+	return &batchResp, nil
+}

@@ -52,3 +52,13 @@ type XorbRangeDescriptor struct {
 	Chunks ChunkRange `json:"chunks"`
 	Bytes  ByteRange  `json:"bytes"`
 }
+
+// BatchReconstructionResponse is the response from GET /reconstructions?file_id=...
+// It aggregates reconstruction info for multiple files. The fetch_info map is shared
+// across all files so each xorb is only downloaded once.
+type BatchReconstructionResponse struct {
+	// Files maps hex-encoded file hash to its ordered list of reconstruction terms.
+	Files map[string][]Term `json:"files"`
+	// FetchInfo maps hex-encoded xorb hash to the fetch entries needed to download it.
+	FetchInfo map[string][]FetchInfoEntry `json:"fetch_info"`
+}
