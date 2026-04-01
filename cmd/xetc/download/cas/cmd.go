@@ -6,7 +6,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -36,7 +35,7 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&baseURL, "url", common.DefaultHFCASURL, "CAS server URL")
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
-	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultUploadConcurrency, "Number of download tasks to run concurrently")
+	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of download tasks to run concurrently")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }

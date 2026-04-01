@@ -1,10 +1,11 @@
 package client
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
+
+	"github.com/wzshiming/xet/progress"
 )
 
 // Client represents an HTTP client for the XET protocol
@@ -14,93 +15,73 @@ type Client struct {
 	token        string
 	namespace    string
 	cacheDirPath string
+	concurrency  int
+	progressFunc progress.ProgressFunc
 }
 
 type Options func(*Client)
 
+// WithBaseURL sets the base URL for the API endpoints, allowing the client to connect to different servers or environments.
 func WithBaseURL(url string) Options {
 	return func(c *Client) {
 		c.baseURL = url
 	}
 }
 
+// WithHTTPClient allows users to provide a custom HTTP client, which can be used to configure timeouts, TLS settings, or other HTTP behaviors.
 func WithHTTPClient(httpClient *http.Client) Options {
 	return func(c *Client) {
 		c.httpClient = httpClient
 	}
 }
 
+// WithToken sets the authentication token for the client, which will be included in the Authorization header of API requests.
 func WithToken(token string) Options {
 	return func(c *Client) {
 		c.token = token
 	}
 }
 
+// WithNamespace sets the namespace for the client, which is used to scope resources on the server.
 func WithNamespace(namespace string) Options {
 	return func(c *Client) {
 		c.namespace = namespace
 	}
 }
 
+// WithCacheDir sets the directory path for caching API responses and serialized data. If not set, caching is disabled.
 func WithCacheDir(dir string) Options {
 	return func(c *Client) {
 		c.cacheDirPath = dir
 	}
 }
 
+// WithProgressFunc sets a callback function to receive progress updates for uploads and downloads.
+func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
+	return func(c *Client) {
+		c.progressFunc = progressFunc
+	}
+}
+
+// WithConcurrency sets the concurrency level for uploads and downloads, allowing multiple parts of a file to be processed in parallel for improved performance.
+func WithConcurrency(concurrency int) Options {
+	return func(c *Client) {
+		c.concurrency = concurrency
+	}
+}
+
 // NewClient creates a new API client
 func NewClient(opts ...Options) *Client {
 	c := &Client{
-		httpClient: &http.Client{},
-		namespace:  "default",
+		httpClient:  &http.Client{},
+		namespace:   "default",
+		concurrency: 4,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 
 	return c
-}
-
-type ReqOpt func(req *http.Request)
-
-type downloadProgressContextKey struct{}
-type uploadProgressContextKey struct{}
-
-func WithDownloadProgress(progress func(int64)) ReqOpt {
-	return func(req *http.Request) {
-		ctx := context.WithValue(req.Context(), downloadProgressContextKey{}, progress)
-		*req = *req.WithContext(ctx)
-	}
-}
-
-func withUploadProgressContext(ctx context.Context, progress func(int64)) context.Context {
-	if progress == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, uploadProgressContextKey{}, progress)
-}
-
-func getUploadProgress(ctx context.Context) func(int64) {
-	progress, _ := ctx.Value(uploadProgressContextKey{}).(func(int64))
-	return progress
-}
-
-func WithRange(start, end int64) ReqOpt {
-	return func(req *http.Request) {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-	}
-}
-
-func WithRangeStart(start int64) ReqOpt {
-	return func(req *http.Request) {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
-	}
-}
-
-func WithRangeEnd(end int64) ReqOpt {
-	return func(req *http.Request) {
-		req.Header.Set("Range", fmt.Sprintf("bytes=-%d", end))
-	}
 }
 
 var errNotFound = fmt.Errorf("404 not found")

@@ -257,8 +257,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					}
 				}()
 
-				uploadSession := nativeClient.UploadSession()
-				fileHash, err := uploadSession.UploadFile(context.Background(), f)
+				fileHash, err := nativeClient.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file with native client: %v", err)
 				}
@@ -312,8 +311,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := nativeClient.UploadSession()
-				fileHash, err := uploadSession.UploadFile(context.Background(), f)
+				fileHash, err := nativeClient.UploadFile(context.Background(), f)
 				f.Close()
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
@@ -339,8 +337,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Download with native client
 				proxy.ClearRequests()
-				downloadSession := nativeClient.DownloadSession()
-				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}
@@ -470,7 +467,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native seed file: %v", err)
 	}
-	if _, err := nativeClient.UploadSession().UploadFile(context.Background(), seedReader); err != nil {
+	if _, err := nativeClient.UploadFile(context.Background(), seedReader); err != nil {
 		_ = seedReader.Close()
 		t.Fatalf("seed upload with native client failed: %v", err)
 	}
@@ -483,7 +480,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native target file: %v", err)
 	}
-	nativeHash, err := nativeClient.UploadSession().UploadFile(context.Background(), targetReader)
+	nativeHash, err := nativeClient.UploadFile(context.Background(), targetReader)
 	if err != nil {
 		_ = targetReader.Close()
 		t.Fatalf("target upload with native client failed: %v", err)
@@ -1287,7 +1284,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	// Upload all files once; sub-tests below reuse the same server state.
 	hashes := make([]xet.Hash, len(datasets))
 	for i, tc := range datasets {
-		hash, err := nativeClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(tc.data))
+		hash, err := nativeClient.UploadFile(context.Background(), bytes.NewReader(tc.data))
 		if err != nil {
 			t.Fatalf("upload %s: %v", tc.name, err)
 		}
@@ -1295,8 +1292,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	}
 
 	t.Run("downloads_all_files", func(t *testing.T) {
-		session := nativeClient.DownloadSession()
-		readers, sizes, err := session.DownloadFiles(context.Background(), hashes)
+		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), hashes)
 		if err != nil {
 			t.Fatalf("DownloadFiles failed: %v", err)
 		}
@@ -1329,8 +1325,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	})
 
 	t.Run("empty_batch", func(t *testing.T) {
-		session := nativeClient.DownloadSession()
-		readers, sizes, err := session.DownloadFiles(context.Background(), nil)
+		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), nil)
 		if err != nil {
 			t.Fatalf("empty DownloadFiles failed: %v", err)
 		}
@@ -1343,8 +1338,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	})
 
 	t.Run("single_file_batch", func(t *testing.T) {
-		session := nativeClient.DownloadSession()
-		readers, sizes, err := session.DownloadFiles(context.Background(), hashes[:1])
+		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), hashes[:1])
 		if err != nil {
 			t.Fatalf("single-file DownloadFiles failed: %v", err)
 		}
@@ -1364,15 +1358,13 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	})
 
 	t.Run("results_match_sequential_download", func(t *testing.T) {
-		session := nativeClient.DownloadSession()
-		batchReaders, batchSizes, err := session.DownloadFiles(context.Background(), hashes)
+		batchReaders, batchSizes, err := nativeClient.DownloadFiles(context.Background(), hashes)
 		if err != nil {
 			t.Fatalf("batch DownloadFiles failed: %v", err)
 		}
 
 		for i, tc := range datasets {
-			seqSession := nativeClient.DownloadSession()
-			seqReader, seqSize, err := seqSession.DownloadFile(context.Background(), hashes[i])
+			seqReader, seqSize, err := nativeClient.DownloadFile(context.Background(), hashes[i], nil)
 			if err != nil {
 				t.Fatalf("sequential DownloadFile %d (%s) failed: %v", i, tc.name, err)
 			}
@@ -1432,11 +1424,11 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		data1 := []byte("batch endpoint check – file one")
 		data2 := []byte("batch endpoint check – file two")
 
-		h1, err := innerClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data1))
+		h1, err := innerClient.UploadFile(context.Background(), bytes.NewReader(data1))
 		if err != nil {
 			t.Fatalf("upload file1: %v", err)
 		}
-		h2, err := innerClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data2))
+		h2, err := innerClient.UploadFile(context.Background(), bytes.NewReader(data2))
 		if err != nil {
 			t.Fatalf("upload file2: %v", err)
 		}
@@ -1444,8 +1436,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		proxy.ClearRequests()
 
 		// Batch-download both files and capture the resulting requests.
-		session := innerClient.DownloadSession()
-		readers, _, err := session.DownloadFiles(context.Background(), []xet.Hash{h1, h2})
+		readers, _, err := innerClient.DownloadFiles(context.Background(), []xet.Hash{h1, h2})
 		if err != nil {
 			t.Fatalf("DownloadFiles failed: %v", err)
 		}
@@ -1522,7 +1513,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		}
 		cmpHashes := make([]xet.Hash, len(cmpDatasets))
 		for i, data := range cmpDatasets {
-			hash, err := cmpClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data))
+			hash, err := cmpClient.UploadFile(context.Background(), bytes.NewReader(data))
 			if err != nil {
 				t.Fatalf("upload comparison dataset %d: %v", i, err)
 			}
@@ -1561,7 +1552,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		// Use a fresh client (empty cache) so reconstruction is not served from disk.
 		cmpProxy.ClearRequests()
 		freshClient := client.NewClient(client.WithBaseURL(cmpHTTP.URL), client.WithCacheDir(t.TempDir()))
-		readers, _, err := freshClient.DownloadSession().DownloadFiles(context.Background(), cmpHashes)
+		readers, _, err := freshClient.DownloadFiles(context.Background(), cmpHashes)
 		if err != nil {
 			t.Fatalf("native DownloadFiles failed: %v", err)
 		}

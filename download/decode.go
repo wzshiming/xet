@@ -17,6 +17,7 @@ type options struct {
 	concurrency int
 }
 
+// WithConcurrency configures how many xorb ranges are prefetched concurrently.
 func WithConcurrency(concurrency int) func(*options) {
 	return func(o *options) {
 		o.concurrency = concurrency

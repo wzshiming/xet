@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/upload"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -48,8 +49,8 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbObj.Hash.String())
 
 	var body io.Reader = cacheFile
-	if onUpload := getUploadProgress(ctx); onUpload != nil {
-		body = wrapReaderWithReadProgress(body, onUpload)
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
@@ -84,14 +85,14 @@ func (c *Client) UploadXorb(ctx context.Context, xorbObj *xorb.Xorb) (*upload.Xo
 
 // DownloadXorb downloads and deserializes a xorb from a URL
 // This is a high-level method that handles downloading and deserialization of a Xorb object from a given URL.
-func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (*xorb.Xorb, error) {
+func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Header) (*xorb.Xorb, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	for _, opt := range opts {
-		opt(req)
+	for k, v := range header {
+		req.Header[k] = v
 	}
 
 	cacheKey := stableCacheKey(path.Base(req.URL.Path), strings.TrimPrefix(req.Header.Get("Range"), "bytes="))
@@ -123,12 +124,9 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	// Check if a Range header was set on the actual request
 	chunkOnly := req.Header.Get("Range") != ""
 
-	body := resp.Body
-	if progress, _ := req.Context().Value(downloadProgressContextKey{}).(func(int64)); progress != nil {
-		body = &progressReadCloser{
-			ReadCloser: resp.Body,
-			onRead:     progress,
-		}
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
 	}
 
 	cacheFile, _, err = c.writePersistentCache("download-xorb", cacheKey, ".bin", body)
@@ -144,17 +142,4 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, opts ...ReqOpt) (
 	}
 
 	return xorbObj, nil
-}
-
-type progressReadCloser struct {
-	io.ReadCloser
-	onRead func(int64)
-}
-
-func (r *progressReadCloser) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
-	if n > 0 && r.onRead != nil {
-		r.onRead(int64(n))
-	}
-	return n, err
 }

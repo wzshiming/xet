@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/progress"
 )
 
 // GetReconstructionV1 retrieves reconstruction information for a file
-func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*download.ReconstructionResponse, error) {
+func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponse, error) {
 	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -20,12 +22,12 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	for k, v := range header {
+		req.Header[k] = v
 	}
 
-	for _, opt := range opts {
-		opt(req)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	cacheKey := stableCacheKey(fileHash.String(), strings.TrimPrefix(req.Header.Get("Range"), "bytes="))
@@ -51,7 +53,12 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 		return nil, err
 	}
 
-	cacheFile, _, err = c.writePersistentCache("reconstruction-v1", cacheKey, ".json", resp.Body)
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
+	}
+
+	cacheFile, _, err = c.writePersistentCache("reconstruction-v1", cacheKey, ".json", body)
 	if err != nil {
 		return nil, fmt.Errorf("cache reconstruction response: %w", err)
 	}
@@ -66,7 +73,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, opt
 }
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
-func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opts ...ReqOpt) (*download.ReconstructionResponseV2, error) {
+func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV2, error) {
 	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -74,12 +81,12 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	for k, v := range header {
+		req.Header[k] = v
 	}
 
-	for _, opt := range opts {
-		opt(req)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
 	cacheKey := stableCacheKey(fileHash.String(), strings.TrimPrefix(req.Header.Get("Range"), "bytes="))
@@ -105,7 +112,12 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, opt
 		return nil, err
 	}
 
-	cacheFile, _, err = c.writePersistentCache("reconstruction-v2", cacheKey, ".json", resp.Body)
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
+	}
+
+	cacheFile, _, err = c.writePersistentCache("reconstruction-v2", cacheKey, ".json", body)
 	if err != nil {
 		return nil, fmt.Errorf("cache reconstruction response: %w", err)
 	}
@@ -155,8 +167,13 @@ func (c *Client) BatchGetReconstruction(ctx context.Context, fileHashes []xet.Ha
 		return nil, err
 	}
 
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, urlStr, resp.ContentLength, c.progressFunc)
+	}
+
 	var batchResp download.BatchReconstructionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+	if err := json.NewDecoder(body).Decode(&batchResp); err != nil {
 		return nil, fmt.Errorf("decode batch reconstruction response: %w", err)
 	}
 

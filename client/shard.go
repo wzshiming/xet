@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/upload"
 )
@@ -42,8 +43,8 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	}
 
 	var body io.Reader = cacheFile
-	if onUpload := getUploadProgress(ctx); onUpload != nil {
-		body = wrapReaderWithReadProgress(body, onUpload)
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
@@ -116,7 +117,12 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, err
 	}
 
-	cacheFile, _, err = c.writePersistentCache("query-chunk", cacheKey, ".bin", resp.Body)
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
+	}
+
+	cacheFile, _, err = c.writePersistentCache("query-chunk", cacheKey, ".bin", body)
 	if err != nil {
 		return nil, fmt.Errorf("cache chunk query response: %w", err)
 	}
@@ -173,8 +179,13 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 		return nil, err
 	}
 
+	var body io.Reader = resp.Body
+	if c.progressFunc != nil {
+		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
+	}
+
 	var batchResp batchChunkDedupQueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+	if err := json.NewDecoder(body).Decode(&batchResp); err != nil {
 		return nil, fmt.Errorf("decode batch chunk query response: %w", err)
 	}
 

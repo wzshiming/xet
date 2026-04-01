@@ -125,8 +125,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Download using native client to verify
-				downloadSession := nativeClient.DownloadSession()
-				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}
@@ -159,8 +158,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := nativeClient.UploadSession()
-				fileHash, err := uploadSession.UploadFile(context.Background(), f)
+				fileHash, err := nativeClient.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
@@ -250,8 +248,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Upload using native client
-				uploadSession := nativeClient.UploadSession()
-				fileHash, err := uploadSession.UploadFile(context.Background(), f)
+				fileHash, err := nativeClient.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
@@ -292,15 +289,13 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to open upload file: %v", err)
 				}
 
-				uploadSession := nativeClient.UploadSession()
-				fileHash, err := uploadSession.UploadFile(context.Background(), f)
+				fileHash, err := nativeClient.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
 				// Download using native client
-				downloadSession := nativeClient.DownloadSession()
-				reader, _, err := downloadSession.DownloadFile(context.Background(), fileHash)
+				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
 				if err != nil {
 					t.Fatalf("Failed to download file: %v", err)
 				}
@@ -383,7 +378,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open upload file: %v", err)
 	}
-	fileHash, err := nativeClient.UploadSession().UploadFile(context.Background(), f)
+	fileHash, err := nativeClient.UploadFile(context.Background(), f)
 	if err != nil {
 		_ = f.Close()
 		t.Fatalf("upload failed: %v", err)
@@ -502,7 +497,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 	}
 	hashes := make([]xet.Hash, len(datasets))
 	for i, data := range datasets {
-		hash, err := nativeClient.UploadSession().UploadFile(context.Background(), bytes.NewReader(data))
+		hash, err := nativeClient.UploadFile(context.Background(), bytes.NewReader(data))
 		if err != nil {
 			t.Fatalf("upload dataset %d: %v", i, err)
 		}
@@ -679,8 +674,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 
 	// Verify that the native client's DownloadFiles also reconstructs content correctly.
 	t.Run("native_client_download_files", func(t *testing.T) {
-		session := nativeClient.DownloadSession()
-		readers, sizes, err := session.DownloadFiles(context.Background(), hashes)
+		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), hashes)
 		if err != nil {
 			t.Fatalf("DownloadFiles failed: %v", err)
 		}
@@ -800,7 +794,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 
 		// Native client downloads all files via DownloadFiles (batch endpoint).
 		nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL), client.WithCacheDir(t.TempDir()))
-		readers, sizes, err := nativeClient.DownloadSession().DownloadFiles(context.Background(), hashes)
+		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), hashes)
 		if err != nil {
 			t.Fatalf("native DownloadFiles failed: %v", err)
 		}

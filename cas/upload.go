@@ -7,10 +7,11 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/progress"
 )
 
 // Upload uploads a file to the CAS server and returns the resulting file hash.
-func Upload(ctx context.Context, filename, baseURL, token, namespace string, concurrency int, progressFunc client.ProgressFunc) (fileHash xet.Hash, err error) {
+func Upload(ctx context.Context, filename, baseURL, token, namespace string, concurrency int, progressFunc progress.ProgressFunc) (fileHash xet.Hash, err error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return xet.Hash{}, fmt.Errorf("open input file: %w", err)
@@ -21,16 +22,11 @@ func Upload(ctx context.Context, filename, baseURL, token, namespace string, con
 		client.WithBaseURL(baseURL),
 		client.WithToken(token),
 		client.WithNamespace(namespace),
+		client.WithProgressFunc(progressFunc),
+		client.WithConcurrency(concurrency),
 	}
 
 	cli := client.NewClient(opts...)
-	session := cli.UploadSession().
-		WithConcurrency(concurrency).
-		WithEnableSHA256(true)
 
-	if progressFunc != nil {
-		session = session.WithProgress(progressFunc)
-	}
-
-	return session.UploadFile(ctx, f)
+	return cli.UploadFile(ctx, f)
 }

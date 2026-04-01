@@ -8,7 +8,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 	"github.com/wzshiming/xet/lfs"
 )
@@ -99,7 +98,7 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
-	cmd.Flags().IntVar(&concurrency, "concurrency", client.DefaultUploadConcurrency, "Number of upload tasks to run concurrently")
+	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of upload tasks to run concurrently")
 	return cmd
 }
 

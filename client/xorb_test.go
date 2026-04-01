@@ -85,11 +85,11 @@ func TestDownloadXorbUsesPersistentCache(t *testing.T) {
 	client := NewClient(WithBaseURL(server.URL))
 	client.cacheDirPath = t.TempDir()
 
-	first, err := client.DownloadXorb(context.Background(), server.URL+"/xorb")
+	first, err := client.DownloadXorb(context.Background(), server.URL+"/xorb", nil)
 	if err != nil {
 		t.Fatalf("first download: %v", err)
 	}
-	second, err := client.DownloadXorb(context.Background(), server.URL+"/xorb")
+	second, err := client.DownloadXorb(context.Background(), server.URL+"/xorb", nil)
 	if err != nil {
 		t.Fatalf("second download: %v", err)
 	}

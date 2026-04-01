@@ -56,7 +56,7 @@ func TestGetReconstruction(t *testing.T) {
 
 	client := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
 
-	reconstruction, err := client.GetReconstructionV1(context.Background(), testHash)
+	reconstruction, err := client.GetReconstructionV1(context.Background(), testHash, nil)
 	if err != nil {
 		t.Fatalf("GetReconstruction failed: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestGetReconstructionError(t *testing.T) {
 	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
-	_, err := client.GetReconstructionV1(context.Background(), hash)
+	_, err := client.GetReconstructionV1(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
 	}
@@ -112,7 +112,7 @@ func TestGetReconstructionRange(t *testing.T) {
 	client := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
-	reconstruction, err := client.GetReconstructionV1(context.Background(), hash, WithRange(1000, 2000))
+	reconstruction, err := client.GetReconstructionV1(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
 	if err != nil {
 		t.Fatalf("GetReconstructionRange failed: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestGetReconstructionV2(t *testing.T) {
 
 	c := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
 
-	reconstruction, err := c.GetReconstructionV2(context.Background(), testHash)
+	reconstruction, err := c.GetReconstructionV2(context.Background(), testHash, nil)
 	if err != nil {
 		t.Fatalf("GetReconstructionV2 failed: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestGetReconstructionV2Error(t *testing.T) {
 	c := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
-	_, err := c.GetReconstructionV2(context.Background(), hash)
+	_, err := c.GetReconstructionV2(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
 	}
@@ -227,7 +227,7 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	c := NewClient(WithBaseURL(server.URL))
 
 	hash := xet.Hash{}
-	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, WithRange(1000, 2000))
+	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
 	if err != nil {
 		t.Fatalf("GetReconstructionRangeV2 failed: %v", err)
 	}
@@ -254,10 +254,10 @@ func TestGetReconstructionV1UsesPersistentCache(t *testing.T) {
 	c.cacheDirPath = t.TempDir()
 
 	hash := xet.Hash{9, 8, 7}
-	if _, err := c.GetReconstructionV1(context.Background(), hash); err != nil {
+	if _, err := c.GetReconstructionV1(context.Background(), hash, nil); err != nil {
 		t.Fatalf("first reconstruction call failed: %v", err)
 	}
-	if _, err := c.GetReconstructionV1(context.Background(), hash); err != nil {
+	if _, err := c.GetReconstructionV1(context.Background(), hash, nil); err != nil {
 		t.Fatalf("second reconstruction call failed: %v", err)
 	}
 
