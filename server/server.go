@@ -71,31 +71,23 @@ func NewHandler(opts ...Option) *Handler {
 
 // registerRoutes sets up all HTTP routes.
 func (s *Handler) registerRoutes() {
-	// Defined in specification
-	s.root.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-	s.root.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.root.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
-	s.root.HandleFunc("/api/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
-	s.root.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
+	// Defined in specification but not used by xet-core, so we can leave these commented out for now.
+	// s.root.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	// s.root.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	// s.root.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	// s.root.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
-	// Used by xet-core but not defined in spec
+	// Used by xet-core but not defined in specification.
 	s.root.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
+	s.root.HandleFunc("/reconstructions", s.handleBatchGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
 	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
-
-	// /v1/shards is defined in the spec as the upload endpoint for shards,
-	// but xet-core actually uploads shards to /shards, so we support both.
-	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Download endpoint for xorb data, used by xet-core and the Go client.
-	// Not defined in the spec, but we can support it without much effort since it's just serving raw stored xorb bytes.
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
-
-	// Batch reconstruction endpoint used by xet-core: GET /reconstructions?file_id=<hex>&file_id=<hex>&...
-	s.root.HandleFunc("/reconstructions", s.handleBatchGetReconstruction).Methods(http.MethodGet)
 
 	s.root.NotFoundHandler = s.next
 }
