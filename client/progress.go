@@ -15,9 +15,6 @@ type byteProgressTracker struct {
 }
 
 func newSessionProgressTracker(progress ProgressFunc, getTotal func() int64) *byteProgressTracker {
-	if progress == nil {
-		return nil
-	}
 	return &byteProgressTracker{report: func(transferBytes int64) {
 		progress(transferBytes, getTotal())
 	}}

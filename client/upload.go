@@ -87,10 +87,12 @@ func (s *UploadSession) UploadFile(ctx context.Context, reader io.Reader) (xet.H
 func (s *UploadSession) UploadFiles(ctx context.Context, readers []io.Reader) ([]xet.Hash, error) {
 	adapter := &uploadClientAdapter{client: s.client}
 	var totalTransfer atomic.Int64
-	tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer.Load() })
-	if tracker != nil {
+
+	if s.progress != nil {
+		tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer.Load() })
 		adapter.onUploadedBytes = tracker.AddTransferBytes
 	}
+
 	return upload.UploadFiles(ctx, adapter, readers,
 		upload.WithConcurrency(s.concurrency),
 		upload.WithEnableSHA256(s.enableSHA256),
