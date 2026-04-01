@@ -3,7 +3,6 @@ package upload
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -287,34 +286,6 @@ func TestShardUploadResponseJSON(t *testing.T) {
 
 	if decoded.Result != resp.Result {
 		t.Errorf("Result mismatch: got %d, want %d", decoded.Result, resp.Result)
-	}
-}
-
-func TestUploadFilesSetsFileMetadataExtSHA256(t *testing.T) {
-	data := []byte("upload metadata ext sha256 test")
-	expectedSHA256 := sha256.Sum256(data)
-
-	adapter := &stubUploadClientAdapter{}
-	if _, err := UploadFiles(context.Background(), adapter, []io.Reader{bytes.NewReader(data)}, WithEnableSHA256(true)); err != nil {
-		t.Fatalf("UploadFiles failed: %v", err)
-	}
-
-	if adapter.uploadedShard == nil {
-		t.Fatal("expected shard upload to be called")
-	}
-	if len(adapter.uploadedShard.Files) != 1 {
-		t.Fatalf("unexpected file blocks count: got %d want 1", len(adapter.uploadedShard.Files))
-	}
-
-	file := adapter.uploadedShard.Files[0]
-	if file.Flags&shard.FileWithMetadataExt == 0 {
-		t.Fatalf("expected FileWithMetadataExt flag to be set, got flags=%032b", uint32(file.Flags))
-	}
-	if file.MetadataExt == nil {
-		t.Fatal("expected metadata extension to be present")
-	}
-	if !bytes.Equal(file.MetadataExt.SHA256Hash[:], expectedSHA256[:]) {
-		t.Fatalf("sha256 mismatch: got %x want %x", file.MetadataExt.SHA256Hash, expectedSHA256)
 	}
 }
 

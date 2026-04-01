@@ -74,8 +74,17 @@ func (s *UploadSession) WithEnableSHA256(enable bool) *UploadSession {
 	return s
 }
 
+// UploadFile uploads a single file and returns its hash
+func (s *UploadSession) UploadFile(ctx context.Context, reader io.Reader) (xet.Hash, error) {
+	hashes, err := s.UploadFiles(ctx, []io.Reader{reader})
+	if err != nil {
+		return xet.Hash{}, err
+	}
+	return hashes[0], nil
+}
+
 // UploadFiles uploads multiple files and returns their hashes
-func (s *UploadSession) UploadFiles(ctx context.Context, readers ...io.Reader) ([]xet.Hash, error) {
+func (s *UploadSession) UploadFiles(ctx context.Context, readers []io.Reader) ([]xet.Hash, error) {
 	adapter := &uploadClientAdapter{client: s.client}
 	var totalTransfer atomic.Int64
 	tracker := newSessionProgressTracker(s.progress, func() int64 { return totalTransfer.Load() })

@@ -6,19 +6,21 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/cmd/xetc/download"
+	"github.com/wzshiming/xet/cmd/xetc/upload"
 )
 
 var ctx = context.Background()
 
 func main() {
-	cmd := newRootCmd()
+	cmd := newRootCommand()
 	if err := cmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func newRootCmd() *cobra.Command {
+func newRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "xetc",
 		Short:         "XET content-addressable storage tool",
@@ -29,6 +31,9 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(newUploadCmd(), newDownloadCmd())
+	cmd.AddCommand(
+		upload.NewCommand(),
+		download.NewCommand(),
+	)
 	return cmd
 }

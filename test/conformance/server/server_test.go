@@ -159,12 +159,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				uploadSession := nativeClient.UploadSession()
-				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				fileHash, err := uploadSession.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
-
-				fileHash := fileHashes[0]
 
 				// Download using xet-go client
 				downloadFile := filepath.Join(tempDir, "download-xetgo.bin")
@@ -252,7 +250,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 				// Upload using native client
 				uploadSession := nativeClient.UploadSession()
-				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				fileHash, err := uploadSession.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
@@ -268,7 +266,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Compare hashes
-				nativeHash := fileHashes[0].String()
+				nativeHash := fileHash.String()
 				refHash := refResults[0].Hash
 
 				if nativeHash != refHash {
@@ -294,12 +292,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				uploadSession := nativeClient.UploadSession()
-				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				fileHash, err := uploadSession.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
-
-				fileHash := fileHashes[0]
 
 				// Download using native client
 				downloadSession := nativeClient.DownloadSession()
@@ -386,7 +382,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open upload file: %v", err)
 	}
-	fileHashes, err := nativeClient.UploadSession().UploadFiles(context.Background(), f)
+	fileHash, err := nativeClient.UploadSession().UploadFile(context.Background(), f)
 	if err != nil {
 		_ = f.Close()
 		t.Fatalf("upload failed: %v", err)
@@ -395,11 +391,11 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("close upload file: %v", err)
 	}
 
-	if len(fileHashes) != 1 {
-		t.Fatalf("expected one file hash, got %d", len(fileHashes))
+	if fileHash == (xet.Hash{}) {
+		t.Fatalf("expected a valid file hash, got empty hash")
 	}
 
-	shardObj, err := stor.GetShardByFileHash(context.Background(), fileHashes[0])
+	shardObj, err := stor.GetShardByFileHash(context.Background(), fileHash)
 	if err != nil {
 		t.Fatalf("get shard by file hash: %v", err)
 	}

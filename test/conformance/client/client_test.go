@@ -258,7 +258,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				}()
 
 				uploadSession := nativeClient.UploadSession()
-				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				fileHash, err := uploadSession.UploadFile(context.Background(), f)
 				if err != nil {
 					t.Fatalf("Failed to upload file with native client: %v", err)
 				}
@@ -266,7 +266,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeRequests := nativeProxy.GetRequests()
 
 				// Compare requests
-				compareUploadRequests(t, xetgoRequests, nativeRequests, uploadResults[0].Hash, fileHashes[0].String())
+				compareUploadRequests(t, xetgoRequests, nativeRequests, uploadResults[0].Hash, fileHash.String())
 			})
 
 			t.Run("download_conformance", func(t *testing.T) {
@@ -313,13 +313,11 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				}
 
 				uploadSession := nativeClient.UploadSession()
-				fileHashes, err := uploadSession.UploadFiles(context.Background(), f)
+				fileHash, err := uploadSession.UploadFile(context.Background(), f)
 				f.Close()
 				if err != nil {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
-
-				fileHash := fileHashes[0]
 
 				// Download with xet-go
 				proxy.ClearRequests()
@@ -472,7 +470,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native seed file: %v", err)
 	}
-	if _, err := nativeClient.UploadSession().UploadFiles(context.Background(), seedReader); err != nil {
+	if _, err := nativeClient.UploadSession().UploadFile(context.Background(), seedReader); err != nil {
 		_ = seedReader.Close()
 		t.Fatalf("seed upload with native client failed: %v", err)
 	}
@@ -485,7 +483,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native target file: %v", err)
 	}
-	nativeHashes, err := nativeClient.UploadSession().UploadFiles(context.Background(), targetReader)
+	nativeHash, err := nativeClient.UploadSession().UploadFile(context.Background(), targetReader)
 	if err != nil {
 		_ = targetReader.Close()
 		t.Fatalf("target upload with native client failed: %v", err)
@@ -493,12 +491,9 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err := targetReader.Close(); err != nil {
 		t.Fatalf("close native target file: %v", err)
 	}
-	if len(nativeHashes) != 1 {
-		t.Fatalf("expected one native result, got %d", len(nativeHashes))
-	}
 	nativeRequests := nativeProxy.GetRequests()
 
-	compareUploadRequests(t, xetgoRequests, nativeRequests, xetgoResults[0].Hash, nativeHashes[0].String())
+	compareUploadRequests(t, xetgoRequests, nativeRequests, xetgoResults[0].Hash, nativeHash.String())
 }
 
 // compareUploadRequests compares HTTP requests from xet-go and native clients for uploads

@@ -30,6 +30,7 @@ type XETToken struct {
 	BaseURL  string
 	Token    string
 	Exp      int64
+	HubURL   string
 	RepoType string
 	RepoID   string
 	Revision string
@@ -55,7 +56,9 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 	if err != nil {
 		return nil, fmt.Errorf("resolve request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	return ResolveResponse(ctx, httpClient, resp)
 }
@@ -155,7 +158,9 @@ func resolveRepoToken(ctx context.Context, repoOrURL, hubToken string, opts Uplo
 	if err != nil {
 		return XETToken{}, fmt.Errorf("%s auth request: %w", mode, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -171,6 +176,7 @@ func resolveRepoToken(ctx context.Context, repoOrURL, hubToken string, opts Uplo
 		BaseURL:  tokenInfo.CASURL,
 		Token:    tokenInfo.Token,
 		Exp:      tokenInfo.Exp,
+		HubURL:   target.Endpoint,
 		RepoType: target.RepoType,
 		RepoID:   target.RepoID,
 		Revision: target.Revision,
@@ -363,7 +369,9 @@ func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL st
 	if err != nil {
 		return nil, fmt.Errorf("auth request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
