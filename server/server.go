@@ -316,14 +316,17 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Deserialize shard
-	shard, err := upload.DecodeShard(r.Body)
-	if err != nil {
-		http.Error(w, "Invalid shard format", http.StatusBadRequest)
+	// Deserialize and validate shard.
+	shardObj := shard.NewShard()
+	if err := shardObj.Decode(r.Body, false); err != nil {
+		http.Error(w, "Invalid shard format: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	for _, casBlock := range shard.CASInfos {
+	if err := shardObj.Validate(); err != nil {
+		http.Error(w, "Invalid shard: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	for _, casBlock := range shardObj.CASInfos {
 		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
 		if err != nil || !exists {
 			http.Error(w, "Invalid shard: referenced xorb not uploaded", http.StatusBadRequest)
@@ -332,7 +335,7 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Store shard
-	wasInserted, err := s.storage.PutShard(r.Context(), shard)
+	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
 	if err != nil {
 		http.Error(w, "Failed to store shard", http.StatusInternalServerError)
 		return
@@ -374,7 +377,7 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serialize shard without footer (for API responses) and stream directly
-	reader, err := upload.EncodeShard(shardObj)
+	reader, err := shardObj.Encode(false)
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return

@@ -11,29 +11,34 @@ import (
 
 // Decode deserializes a shard from an io.Reader.
 // The reader is consumed incrementally without buffering the entire stream.
-func Decode(r io.Reader) (*Shard, error) {
-	s := &Shard{}
+// If withFooter is true, the shard must contain a footer; if false, it must not.
+func (s *Shard) Decode(r io.Reader, withFooter bool) error {
 	var buf [48]byte
 
 	// Read 48-byte header
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
-		return nil, fmt.Errorf("failed to read header: %w", err)
+		return fmt.Errorf("failed to read header: %w", err)
 	}
-	copy(s.Header.Tag[:], buf[:32])
-	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
-		return nil, fmt.Errorf("invalid shard magic sequence")
+	if !bytes.Equal(buf[15:32], shardMagicSequence[:]) {
+		return fmt.Errorf("invalid shard magic sequence")
 	}
-	s.Header.Version = binary.LittleEndian.Uint64(buf[32:40])
-	if s.Header.Version != 2 {
-		return nil, fmt.Errorf("unsupported shard version: %d", s.Header.Version)
+	version := binary.LittleEndian.Uint64(buf[32:40])
+	if version != 2 {
+		return fmt.Errorf("unsupported shard version: %d", version)
 	}
-	s.Header.FooterSize = binary.LittleEndian.Uint64(buf[40:48])
+	s.FooterSize = binary.LittleEndian.Uint64(buf[40:48])
+	if withFooter && s.FooterSize == 0 {
+		return fmt.Errorf("footer expected but not present")
+	}
+	if !withFooter && s.FooterSize != 0 {
+		return fmt.Errorf("footer unexpected: FooterSize=%d", s.FooterSize)
+	}
 
 	// Read file blocks until bookend
 	s.Files = make([]FileBlock, 0)
 	for {
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return nil, fmt.Errorf("failed to read file section: %w", err)
+			return fmt.Errorf("failed to read file section: %w", err)
 		}
 		if isBookend(&buf) {
 			break
@@ -48,7 +53,7 @@ func Decode(r io.Reader) (*Shard, error) {
 		fb.Entries = make([]FileDataSequenceEntry, numEntries)
 		for i := range numEntries {
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return nil, fmt.Errorf("failed to read file entry %d: %w", i, err)
+				return fmt.Errorf("failed to read file entry %d: %w", i, err)
 			}
 			entry := &fb.Entries[i]
 			copy(entry.CASHash[:], buf[:32])
@@ -62,7 +67,7 @@ func Decode(r io.Reader) (*Shard, error) {
 			fb.Verification = make([]xet.Hash, numEntries)
 			for i := range numEntries {
 				if _, err := io.ReadFull(r, buf[:]); err != nil {
-					return nil, fmt.Errorf("failed to read verification entry %d: %w", i, err)
+					return fmt.Errorf("failed to read verification entry %d: %w", i, err)
 				}
 				copy(fb.Verification[i][:], buf[:32])
 				// buf[32:48] reserved
@@ -71,7 +76,7 @@ func Decode(r io.Reader) (*Shard, error) {
 
 		if fb.Flags&FileWithMetadataExt != 0 {
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return nil, fmt.Errorf("failed to read metadata ext: %w", err)
+				return fmt.Errorf("failed to read metadata ext: %w", err)
 			}
 			fb.MetadataExt = &FileMetadataExt{}
 			copy(fb.MetadataExt.SHA256Hash[:], buf[:32])
@@ -85,7 +90,7 @@ func Decode(r io.Reader) (*Shard, error) {
 	s.CASInfos = make([]CASBlock, 0)
 	for {
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return nil, fmt.Errorf("failed to read CAS section: %w", err)
+			return fmt.Errorf("failed to read CAS section: %w", err)
 		}
 		if isBookend(&buf) {
 			break
@@ -101,7 +106,7 @@ func Decode(r io.Reader) (*Shard, error) {
 		cb.Chunks = make([]CASChunkSequenceEntry, numEntries)
 		for i := range numEntries {
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
-				return nil, fmt.Errorf("failed to read chunk entry %d: %w", i, err)
+				return fmt.Errorf("failed to read chunk entry %d: %w", i, err)
 			}
 			chunk := &cb.Chunks[i]
 			copy(chunk.ChunkHash[:], buf[:32])
@@ -115,83 +120,108 @@ func Decode(r io.Reader) (*Shard, error) {
 	}
 
 	// Read footer if present
-	if s.Header.FooterSize > 0 {
-		footerBuf := make([]byte, s.Header.FooterSize)
-		if _, err := io.ReadFull(r, footerBuf); err != nil {
-			return nil, fmt.Errorf("failed to read footer: %w", err)
+	if s.FooterSize > 0 {
+		if s.FooterSize < 200 {
+			return fmt.Errorf("footer too small: %d", s.FooterSize)
 		}
-		if err := s.readFooter(footerBuf, 0); err != nil {
-			return nil, fmt.Errorf("failed to parse footer: %w", err)
+
+		s.Footer = &Footer{}
+		f := s.Footer
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer version: %w", err)
+		}
+		f.Version = binary.LittleEndian.Uint64(buf[:8])
+		if f.Version != 1 {
+			return fmt.Errorf("unsupported footer version: %d", f.Version)
+		}
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer file info offset: %w", err)
+		}
+		f.FileInfoOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer cas info offset: %w", err)
+		}
+		f.CASInfoOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer file lookup offset: %w", err)
+		}
+		f.FileLookupOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer file lookup num entries: %w", err)
+		}
+		f.FileLookupNumEntries = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer cas lookup offset: %w", err)
+		}
+		f.CASLookupOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer cas lookup num entries: %w", err)
+		}
+		f.CASLookupNumEntries = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer chunk lookup offset: %w", err)
+		}
+		f.ChunkLookupOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer chunk lookup num entries: %w", err)
+		}
+		f.ChunkLookupNumEntries = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:32]); err != nil {
+			return fmt.Errorf("failed to read footer chunk hash key: %w", err)
+		}
+		copy(f.ChunkHashKey[:], buf[:32])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer shard creation timestamp: %w", err)
+		}
+		f.ShardCreationTimestamp = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer shard key expiry: %w", err)
+		}
+		f.ShardKeyExpiry = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:]); err != nil {
+			return fmt.Errorf("failed to read footer reserved: %w", err)
+		}
+		copy(f.Reserved[:], buf[:])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer stored bytes on disk: %w", err)
+		}
+		f.StoredBytesOnDisk = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer materialized bytes: %w", err)
+		}
+		f.MaterializedBytes = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer stored bytes: %w", err)
+		}
+		f.StoredBytes = binary.LittleEndian.Uint64(buf[:8])
+
+		if _, err := io.ReadFull(r, buf[:8]); err != nil {
+			return fmt.Errorf("failed to read footer offset: %w", err)
+		}
+		f.FooterOffset = binary.LittleEndian.Uint64(buf[:8])
+
+		if s.FooterSize > 200 {
+			if _, err := io.CopyN(io.Discard, r, int64(s.FooterSize)-200); err != nil {
+				return fmt.Errorf("failed to drain footer: %w", err)
+			}
 		}
 	}
-
-	return s, nil
-}
-
-// readFooter reads the 200-byte footer
-func (s *Shard) readFooter(data []byte, offset int) error {
-	if offset+200 > len(data) {
-		return fmt.Errorf("data too short for footer")
-	}
-
-	s.Footer = &Footer{}
-	f := s.Footer
-
-	// Read all footer fields in order
-	f.Version = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	if f.Version != 1 {
-		return fmt.Errorf("unsupported footer version: %d", f.Version)
-	}
-
-	f.FileInfoOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.CASInfoOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.FileLookupOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.FileLookupNumEntries = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.CASLookupOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.CASLookupNumEntries = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.ChunkLookupOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.ChunkLookupNumEntries = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	copy(f.ChunkHashKey[:], data[offset:offset+32])
-	offset += 32
-
-	f.ShardCreationTimestamp = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.ShardKeyExpiry = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	copy(f.Reserved[:], data[offset:offset+48])
-	offset += 48
-
-	f.StoredBytesOnDisk = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.MaterializedBytes = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.StoredBytes = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
-
-	f.FooterOffset = binary.LittleEndian.Uint64(data[offset : offset+8])
-	offset += 8
 
 	return nil
 }

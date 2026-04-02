@@ -37,7 +37,7 @@ func TestQueryChunkDeduplicationFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return a minimal valid shard
 		shardObj := shard.NewShard()
-		reader, _ := shard.Encode(shardObj, false)
+		reader, _ := shardObj.Encode(false)
 		if _, err := io.Copy(w, reader); err != nil {
 			t.Fatalf("copy shard response: %v", err)
 		}
@@ -62,7 +62,7 @@ func TestQueryChunkDeduplicationUsesPersistentCache(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		shardObj := shard.NewShard()
-		reader, _ := shard.Encode(shardObj, false)
+		reader, _ := shardObj.Encode(false)
 		if _, err := io.Copy(w, reader); err != nil {
 			t.Fatalf("copy shard response: %v", err)
 		}
@@ -205,7 +205,7 @@ func TestQueryChunksDeduplicationFallsBackToSingleQuery(t *testing.T) {
 					},
 				})
 
-				reader, err := shard.Encode(sh, false)
+				reader, err := sh.Encode(false)
 				if err != nil {
 					t.Fatalf("encode shard response: %v", err)
 				}
@@ -272,15 +272,15 @@ func TestFindChunkLocationInDedupShard(t *testing.T) {
 		},
 	})
 
-	reader, err := shard.Encode(sh, false)
+	reader, err := sh.Encode(false)
 	if err != nil {
 		t.Fatalf("encode shard: %v", err)
 	}
-	decoded, err := shard.Decode(bytes.NewReader(func() []byte {
+	decoded := shard.NewShard()
+	if err := decoded.Decode(bytes.NewReader(func() []byte {
 		b, _ := io.ReadAll(reader)
 		return b
-	}()))
-	if err != nil {
+	}()), false); err != nil {
 		t.Fatalf("decode shard: %v", err)
 	}
 

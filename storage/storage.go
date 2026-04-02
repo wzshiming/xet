@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -118,7 +117,8 @@ func (fs *FileStorage) loadShards() error {
 			continue // Skip files we can't read
 		}
 
-		s, err := shard.Decode(f)
+		s := shard.NewShard()
+		err = s.Decode(f, true)
 		f.Close()
 		if err != nil {
 			continue // Skip invalid shards
@@ -232,29 +232,8 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		return false, nil // Already exists
 	}
 
-	// Ensure shard has a footer for storage
-	if s.Footer == nil {
-		s.Footer = &shard.Footer{
-			Version:                1,
-			FileInfoOffset:         0, // Will be set during serialization
-			CASInfoOffset:          0, // Will be set during serialization
-			FileLookupOffset:       0, // Will be set during serialization
-			FileLookupNumEntries:   0,
-			CASLookupOffset:        0, // Will be set during serialization
-			CASLookupNumEntries:    0,
-			ChunkLookupOffset:      0, // Will be set during serialization
-			ChunkLookupNumEntries:  0,
-			ShardCreationTimestamp: uint64(time.Now().Unix()),
-			ShardKeyExpiry:         0,
-			StoredBytesOnDisk:      0,
-			MaterializedBytes:      0,
-			StoredBytes:            0,
-			FooterOffset:           0, // Will be set during serialization
-		}
-	}
-
 	// Serialize shard with footer for storage
-	r, err := shard.Encode(s, true)
+	r, err := s.Encode(true)
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}

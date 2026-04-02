@@ -1,22 +1,17 @@
 package shard
 
 import (
+	"time"
+
 	"github.com/wzshiming/xet"
 )
 
 // Shard represents a binary metadata structure that describes file reconstructions and xorb contents
 type Shard struct {
-	Header   Header
-	Files    []FileBlock
-	CASInfos []CASBlock
-	Footer   *Footer // Optional, omitted for upload API
-}
-
-// Header represents the 48-byte shard header
-type Header struct {
-	Tag        [32]byte // Magic identifier (application ID + magic sequence)
-	Version    uint64   // Must be 2
-	FooterSize uint64   // 0 if footer omitted
+	FooterSize uint64 // 0 if footer omitted
+	Files      []FileBlock
+	CASInfos   []CASBlock
+	Footer     *Footer // Optional, omitted for upload API
 }
 
 // FileFlags represents flags in the file data sequence header
@@ -45,22 +40,25 @@ type FileDataSequenceEntry struct {
 	ChunkIndexEnd    uint32 // Exclusive
 }
 
-// FileMetadataExt contains optional metadata (SHA-256 hash)
-type FileMetadataExt struct {
-	SHA256Hash [32]byte
-}
+// SHA256Hash is the xet-core wire format for a SHA-256 digest.
+// Each 8-byte segment of the raw digest is stored in reversed byte order.
+type SHA256Hash [32]byte
 
-// EncodeSHA256ForMetadata converts a raw SHA-256 digest to the xet-core metadata format.
-// xet-core stores non-empty file SHA-256 values with each 8-byte segment reversed.
-func EncodeSHA256ForMetadata(sum [32]byte) [32]byte {
-	var encoded [32]byte
-	for segment := range len(sum) / 8 {
+// NewSHA256Hash converts a raw SHA-256 digest to the xet-core wire format.
+func NewSHA256Hash(raw [32]byte) SHA256Hash {
+	var h SHA256Hash
+	for segment := range len(raw) / 8 {
 		start := segment * 8
 		for offset := range 8 {
-			encoded[start+offset] = sum[start+7-offset]
+			h[start+offset] = raw[start+7-offset]
 		}
 	}
-	return encoded
+	return h
+}
+
+// FileMetadataExt contains optional metadata (SHA-256 hash)
+type FileMetadataExt struct {
+	SHA256Hash SHA256Hash
 }
 
 // CASBlock represents a xorb and its chunks
@@ -120,20 +118,9 @@ var hfApplicationID = [14]byte{
 	0x74, 0x61, 0x44, 0x61, 0x74, 0x61,
 }
 
-// NewShard creates a new empty shard with default header
+// NewShard creates a new empty shard.
 func NewShard() *Shard {
-	// Build default tag with HF application ID
-	var tag [32]byte
-	copy(tag[:14], hfApplicationID[:])
-	tag[14] = 0x00 // Null byte
-	copy(tag[15:], shardMagicSequence[:])
-
 	return &Shard{
-		Header: Header{
-			Tag:        tag,
-			Version:    2,
-			FooterSize: 0,
-		},
 		Files:    make([]FileBlock, 0),
 		CASInfos: make([]CASBlock, 0),
 	}
@@ -147,4 +134,28 @@ func (s *Shard) AddFile(fb FileBlock) {
 // AddCASBlock adds a CAS block to the shard
 func (s *Shard) AddCASBlock(cb CASBlock) {
 	s.CASInfos = append(s.CASInfos, cb)
+}
+
+// SetFooter creates a Footer for this shard, computing StoredBytesOnDisk,
+// StoredBytes, and MaterializedBytes from the current CAS and file data.
+// Offset fields (FileInfoOffset, CASInfoOffset, FooterOffset) are set
+// automatically during Encode and do not need to be supplied here.
+func (s *Shard) SetFooter() {
+	var storedBytesOnDisk, storedBytes, materializedBytes uint64
+	for _, cas := range s.CASInfos {
+		storedBytesOnDisk += uint64(cas.NumBytesOnDisk)
+		storedBytes += uint64(cas.NumBytesInCAS)
+	}
+	for _, file := range s.Files {
+		for _, entry := range file.Entries {
+			materializedBytes += uint64(entry.UnpackedSegBytes)
+		}
+	}
+	s.Footer = &Footer{
+		Version:                1,
+		StoredBytesOnDisk:      storedBytesOnDisk,
+		StoredBytes:            storedBytes,
+		MaterializedBytes:      materializedBytes,
+		ShardCreationTimestamp: uint64(time.Now().Unix()),
+	}
 }

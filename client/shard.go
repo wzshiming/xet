@@ -33,7 +33,7 @@ type batchChunkDedupResult struct {
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, encodeErr := upload.EncodeShard(shardObj)
+	r, encodeErr := shardObj.Encode(false)
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
@@ -87,7 +87,8 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	}
 	if hit {
 		defer cacheFile.Close()
-		shardObj, decodeErr := upload.DecodeShard(cacheFile)
+		shardObj := shard.NewShard()
+		decodeErr := shardObj.Decode(cacheFile, false)
 		if decodeErr == nil {
 			return shardObj, nil
 		}
@@ -129,8 +130,8 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	defer cacheFile.Close()
 
 	// Deserialize shard from cached response
-	shardObj, err := upload.DecodeShard(cacheFile)
-	if err != nil {
+	shardObj := shard.NewShard()
+	if err := shardObj.Decode(cacheFile, false); err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 

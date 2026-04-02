@@ -6,313 +6,233 @@ import (
 	"io"
 )
 
-// Encode serializes the shard to binary format (without footer for upload API).
-// Returns an io.Reader that streams the data directly without buffering everything in memory.
-func Encode(s *Shard, includeFooter bool) (io.Reader, error) {
-	if includeFooter && s.Footer == nil {
-		return nil, fmt.Errorf("footer is required but not set")
+// Encode returns a streaming reader for the shard serialization.
+func (s *Shard) Encode(withFooter bool) (io.Reader, error) {
+	if withFooter {
+		if s.Footer == nil {
+			s.SetFooter()
+		}
 	}
 	return &shardReader{
-		shard:         s,
-		state:         stateHeader,
-		includeFooter: includeFooter,
+		shard:      s,
+		withFooter: withFooter,
 	}, nil
 }
 
-// shardReader implements io.Reader for shard serialization
+// shardReader implements io.Reader for shard serialization.
+// Sections: header (0), file blocks (1..numFiles), file bookend (numFiles+1),
+// CAS blocks (numFiles+2..numFiles+1+numCAS), CAS bookend (numFiles+2+numCAS).
+// Footer follows all sections if withFooter is true.
 type shardReader struct {
 	shard         *Shard
-	state         readerState
-	includeFooter bool
-	fileIdx       int
-	casIdx        int
+	withFooter    bool
+	sectionIdx    int
 	buffer        []byte
 	bufOffset     int
+	footerWritten bool
 	bytesWritten  int64
-	// Footer tracking
+	// Offsets recorded for footer construction.
 	fileInfoOffset uint64
 	casInfoOffset  uint64
 	footerOffset   uint64
 }
 
-// readerState represents the current state of the reader
-type readerState int
-
-const (
-	stateHeader readerState = iota
-	stateFileBlocks
-	stateFileBookend
-	stateCASBlocks
-	stateCASBookend
-	stateFooter
-	stateDone
-)
-
 func (r *shardReader) Read(p []byte) (n int, err error) {
+	numFiles := len(r.shard.Files)
+	numCAS := len(r.shard.CASInfos)
+	totalSections := numFiles + numCAS + 3
+
 	for n < len(p) {
-		// Check if we're done
-		if r.state == stateDone {
-			if n > 0 {
-				return n, nil
-			}
-			return 0, io.EOF
-		}
-
-		// If buffer is empty or consumed, prepare next data based on state
-		if len(r.buffer) == 0 || r.bufOffset >= len(r.buffer) {
-			if err := r.prepareNextBuffer(); err != nil {
-				if err == io.EOF {
-					r.state = stateDone
-					if n > 0 {
-						return n, nil
-					}
-					return 0, io.EOF
+		// Write all sections (header, file blocks, file bookend, CAS blocks, CAS bookend).
+		if r.sectionIdx < totalSections {
+			if r.bufOffset >= len(r.buffer) {
+				if err := r.loadSection(r.sectionIdx, numFiles, numCAS); err != nil {
+					return n, err
 				}
-				return n, err
+			}
+
+			copied := copy(p[n:], r.buffer[r.bufOffset:])
+			n += copied
+			r.bufOffset += copied
+			r.bytesWritten += int64(copied)
+
+			if r.bufOffset >= len(r.buffer) {
+				// Record byte offsets needed by the footer.
+				switch r.sectionIdx {
+				case 0: // header complete
+					r.fileInfoOffset = uint64(r.bytesWritten)
+				case numFiles + 1: // file bookend complete
+					r.casInfoOffset = uint64(r.bytesWritten)
+				case numFiles + numCAS + 2: // CAS bookend complete
+					r.footerOffset = uint64(r.bytesWritten)
+				}
+				r.sectionIdx++
+				r.buffer = r.buffer[:0]
+				r.bufOffset = 0
+			}
+			continue
+		}
+
+		// Write footer if requested.
+		if r.withFooter {
+			if !r.footerWritten {
+				r.buildFooterBuffer()
+				r.bufOffset = 0
+				r.footerWritten = true
+			}
+			if r.bufOffset < len(r.buffer) {
+				copied := copy(p[n:], r.buffer[r.bufOffset:])
+				n += copied
+				r.bufOffset += copied
+				r.bytesWritten += int64(copied)
+				if r.bufOffset < len(r.buffer) {
+					continue
+				}
 			}
 		}
 
-		// Copy from buffer to output
-		copied := copy(p[n:], r.buffer[r.bufOffset:])
-		n += copied
-		r.bufOffset += copied
-		r.bytesWritten += int64(copied)
+		if n > 0 {
+			return n, nil
+		}
+		return 0, io.EOF
 	}
 
 	return n, nil
 }
 
-func (r *shardReader) prepareNextBuffer() error {
-	switch r.state {
-	case stateHeader:
-		// Set footer size based on includeFooter
-		if r.includeFooter {
-			r.shard.Header.FooterSize = 200
+func (r *shardReader) loadSection(idx, numFiles, numCAS int) error {
+	casBookendIdx := numFiles + numCAS + 2
+	switch {
+	case idx == 0:
+		// Header (48 bytes).
+		if r.withFooter {
+			r.shard.FooterSize = 200
 		} else {
-			r.shard.Header.FooterSize = 0
+			r.shard.FooterSize = 0
 		}
+		r.buildHeader()
 
-		r.buffer = make([]byte, 48)
-		r.buildHeader(r.buffer)
-		r.bufOffset = 0
-		r.fileInfoOffset = uint64(r.bytesWritten) + 48
-		r.state = stateFileBlocks
-		return nil
+	case idx >= 1 && idx <= numFiles:
+		// File block.
+		r.buildFileBlock(r.shard.Files[idx-1])
 
-	case stateFileBlocks:
-		if r.fileIdx < len(r.shard.Files) {
-			fb := r.shard.Files[r.fileIdx]
-			r.buffer = r.buildFileBlock(fb)
-			r.bufOffset = 0
-			r.fileIdx++
-			return nil
-		}
-		r.state = stateFileBookend
-		return r.prepareNextBuffer()
+	case idx == numFiles+1:
+		// File bookend (48 bytes).
+		r.buildBookend()
 
-	case stateFileBookend:
-		r.buffer = r.buildBookend()
-		r.bufOffset = 0
-		r.casInfoOffset = uint64(r.bytesWritten) + 48
-		r.state = stateCASBlocks
-		return nil
+	case idx >= numFiles+2 && idx < casBookendIdx:
+		// CAS block.
+		r.buildCASBlock(r.shard.CASInfos[idx-numFiles-2])
 
-	case stateCASBlocks:
-		if r.casIdx < len(r.shard.CASInfos) {
-			cb := r.shard.CASInfos[r.casIdx]
-			r.buffer = r.buildCASBlock(cb)
-			r.bufOffset = 0
-			r.casIdx++
-			return nil
-		}
-		r.state = stateCASBookend
-		return r.prepareNextBuffer()
-
-	case stateCASBookend:
-		r.buffer = r.buildBookend()
-		r.bufOffset = 0
-		if r.includeFooter {
-			r.footerOffset = uint64(r.bytesWritten) + 48
-			r.state = stateFooter
-		} else {
-			r.state = stateDone
-		}
-		return nil
-
-	case stateFooter:
-		// Update footer with offsets
-		r.shard.Footer.FileInfoOffset = r.fileInfoOffset
-		r.shard.Footer.CASInfoOffset = r.casInfoOffset
-		r.shard.Footer.FooterOffset = r.footerOffset
-
-		r.buffer = make([]byte, 200)
-		r.buildFooter(r.buffer)
-		r.bufOffset = 0
-		r.state = stateDone
-		return nil
-
-	case stateDone:
-		return io.EOF
+	case idx == casBookendIdx:
+		// CAS bookend (48 bytes).
+		r.buildBookend()
 
 	default:
-		return fmt.Errorf("invalid reader state: %d", r.state)
+		return fmt.Errorf("invalid section index: %d", idx)
 	}
+	r.bufOffset = 0
+	return nil
 }
 
-func (r *shardReader) buildHeader(buf []byte) {
-	// Tag (32 bytes)
-	copy(buf[0:32], r.shard.Header.Tag[:])
-
-	// Version (8 bytes)
-	binary.LittleEndian.PutUint64(buf[32:40], r.shard.Header.Version)
-
-	// FooterSize (8 bytes)
-	binary.LittleEndian.PutUint64(buf[40:48], r.shard.Header.FooterSize)
+func (r *shardReader) buildFooterBuffer() {
+	f := r.shard.Footer
+	f.FileInfoOffset = r.fileInfoOffset
+	f.CASInfoOffset = r.casInfoOffset
+	f.FooterOffset = r.footerOffset
+	r.buffer = r.buffer[:0]
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.Version)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.FileInfoOffset)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.CASInfoOffset)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.FileLookupOffset)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.FileLookupNumEntries)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.CASLookupOffset)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.CASLookupNumEntries)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.ChunkLookupOffset)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.ChunkLookupNumEntries)
+	r.buffer = append(r.buffer, f.ChunkHashKey[:]...)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.ShardCreationTimestamp)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.ShardKeyExpiry)
+	r.buffer = append(r.buffer, f.Reserved[:]...)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.StoredBytesOnDisk)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.MaterializedBytes)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.StoredBytes)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.FooterOffset)
 }
 
-func (r *shardReader) buildFileBlock(fb FileBlock) []byte {
-	// Calculate size: header (48) + entries (48 each) + verification (48 each if flag set) + metadata ext (48 if flag set)
-	size := 48 + len(fb.Entries)*48
-	if fb.Flags&FileWithVerification != 0 {
-		size += len(fb.Verification) * 48
-	}
-	if fb.Flags&FileWithMetadataExt != 0 {
-		size += 48
-	}
+func (r *shardReader) buildHeader() {
+	const version uint64 = 2
 
-	buf := make([]byte, size)
-	offset := 0
+	r.buffer = r.buffer[:0]
+	r.buffer = append(r.buffer, hfApplicationID[:]...)
+	r.buffer = append(r.buffer, 0)
+	r.buffer = append(r.buffer, shardMagicSequence[:]...)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, version)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, r.shard.FooterSize)
+}
+
+func (r *shardReader) buildFileBlock(fb FileBlock) {
+	r.buffer = r.buffer[:0]
 
 	// FileDataSequenceHeader (48 bytes)
-	copy(buf[offset:offset+32], fb.FileHash[:])
-	offset += 32
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(fb.Flags))
-	offset += 4
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(len(fb.Entries)))
-	offset += 4
-	// 8 bytes reserved (already zeroed)
-	offset += 8
+	r.buffer = append(r.buffer, fb.FileHash[:]...)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(fb.Flags))
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(len(fb.Entries)))
+	r.buffer = append(r.buffer, 0, 0, 0, 0, 0, 0, 0, 0) // 8 bytes reserved
 
 	// FileDataSequenceEntry entries (48 bytes each)
 	for _, entry := range fb.Entries {
-		copy(buf[offset:offset+32], entry.CASHash[:])
-		offset += 32
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], entry.CASFlags)
-		offset += 4
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], entry.UnpackedSegBytes)
-		offset += 4
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], entry.ChunkIndexStart)
-		offset += 4
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], entry.ChunkIndexEnd)
-		offset += 4
+		r.buffer = append(r.buffer, entry.CASHash[:]...)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, entry.CASFlags)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, entry.UnpackedSegBytes)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, entry.ChunkIndexStart)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, entry.ChunkIndexEnd)
 	}
 
 	// FileVerificationEntry entries (48 bytes each) if flag set
 	if fb.Flags&FileWithVerification != 0 {
 		for _, verif := range fb.Verification {
-			copy(buf[offset:offset+32], verif[:])
-			offset += 32
-			// 16 bytes reserved (already zeroed)
-			offset += 16
+			r.buffer = append(r.buffer, verif[:]...)
+			r.buffer = append(r.buffer, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 16 bytes reserved
 		}
 	}
 
 	// FileMetadataExt (48 bytes) if flag set
 	if fb.Flags&FileWithMetadataExt != 0 {
 		if fb.MetadataExt != nil {
-			copy(buf[offset:offset+32], fb.MetadataExt.SHA256Hash[:])
-			offset += 32
-			// 16 bytes reserved (already zeroed)
-			offset += 16
+			r.buffer = append(r.buffer, fb.MetadataExt.SHA256Hash[:]...)
+			r.buffer = append(r.buffer, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 16 bytes reserved
 		}
 	}
-
-	return buf
 }
 
-func (r *shardReader) buildCASBlock(cb CASBlock) []byte {
-	// Calculate size: header (48) + entries (48 each)
-	size := 48 + len(cb.Chunks)*48
-
-	buf := make([]byte, size)
-	offset := 0
+func (r *shardReader) buildCASBlock(cb CASBlock) {
+	r.buffer = r.buffer[:0]
 
 	// CASChunkSequenceHeader (48 bytes)
-	copy(buf[offset:offset+32], cb.CASHash[:])
-	offset += 32
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], cb.CASFlags)
-	offset += 4
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(len(cb.Chunks)))
-	offset += 4
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], cb.NumBytesInCAS)
-	offset += 4
-	binary.LittleEndian.PutUint32(buf[offset:offset+4], cb.NumBytesOnDisk)
-	offset += 4
+	r.buffer = append(r.buffer, cb.CASHash[:]...)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, cb.CASFlags)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(len(cb.Chunks)))
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, cb.NumBytesInCAS)
+	r.buffer = binary.LittleEndian.AppendUint32(r.buffer, cb.NumBytesOnDisk)
 
 	// CASChunkSequenceEntry entries (48 bytes each)
 	for _, chunk := range cb.Chunks {
-		copy(buf[offset:offset+32], chunk.ChunkHash[:])
-		offset += 32
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], chunk.ByteRangeStart)
-		offset += 4
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], chunk.UnpackedSegBytes)
-		offset += 4
-		binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32(chunk.Flags))
-		offset += 4
-		// 4 bytes reserved (already zeroed)
-		offset += 4
+		r.buffer = append(r.buffer, chunk.ChunkHash[:]...)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, chunk.ByteRangeStart)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, chunk.UnpackedSegBytes)
+		r.buffer = binary.LittleEndian.AppendUint32(r.buffer, uint32(chunk.Flags))
+		r.buffer = append(r.buffer, 0, 0, 0, 0) // 4 bytes reserved
 	}
-
-	return buf
 }
 
-func (r *shardReader) buildBookend() []byte {
-	buf := make([]byte, 48)
-	// Bytes 0-31: All 0xFF
-	for i := range 32 {
-		buf[i] = 0xFF
-	}
-	// Bytes 32-47: All 0x00 (already zeroed)
-	return buf
-}
-
-func (r *shardReader) buildFooter(buf []byte) {
-	f := r.shard.Footer
-	offset := 0
-
-	// Write all footer fields in order (200 bytes total)
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.Version)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.FileInfoOffset)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.CASInfoOffset)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.FileLookupOffset)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.FileLookupNumEntries)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.CASLookupOffset)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.CASLookupNumEntries)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.ChunkLookupOffset)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.ChunkLookupNumEntries)
-	offset += 8
-	copy(buf[offset:offset+32], f.ChunkHashKey[:])
-	offset += 32
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.ShardCreationTimestamp)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.ShardKeyExpiry)
-	offset += 8
-	copy(buf[offset:offset+48], f.Reserved[:])
-	offset += 48
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.StoredBytesOnDisk)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.MaterializedBytes)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.StoredBytes)
-	offset += 8
-	binary.LittleEndian.PutUint64(buf[offset:offset+8], f.FooterOffset)
-	offset += 8
+func (r *shardReader) buildBookend() {
+	r.buffer = r.buffer[:0]
+	r.buffer = append(r.buffer,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	)
 }

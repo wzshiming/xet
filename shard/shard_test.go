@@ -2,13 +2,14 @@ package shard
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"testing"
 
 	"github.com/wzshiming/xet"
 )
 
-// TestNewShard tests creating a new shard with default values
+// TestNewShard tests that a new shard encodes with the correct default header values.
 func TestNewShard(t *testing.T) {
 	s := NewShard()
 
@@ -16,29 +17,44 @@ func TestNewShard(t *testing.T) {
 		t.Fatal("NewShard returned nil")
 	}
 
-	// Verify header version
-	if s.Header.Version != 2 {
-		t.Errorf("expected version 2, got %d", s.Header.Version)
+	r, err := s.Encode(false)
+	if err != nil {
+		t.Fatalf("Encode failed: %v", err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
 	}
 
-	// Verify footer size is 0 (no footer)
-	if s.Header.FooterSize != 0 {
-		t.Errorf("expected footer size 0, got %d", s.Header.FooterSize)
+	// Header is the first 48 bytes: tag (32) + version (8) + footerSize (8).
+	if len(data) < 48 {
+		t.Fatalf("encoded data too short: %d", len(data))
 	}
 
-	// Verify magic sequence
-	if !bytes.Equal(s.Header.Tag[15:32], shardMagicSequence[:]) {
+	// Verify magic sequence (bytes 15-31 of tag)
+	if !bytes.Equal(data[15:32], shardMagicSequence[:]) {
 		t.Error("magic sequence mismatch")
 	}
 
-	// Verify HF application ID
-	if !bytes.Equal(s.Header.Tag[:14], hfApplicationID[:]) {
+	// Verify HF application ID (bytes 0-13 of tag)
+	if !bytes.Equal(data[:14], hfApplicationID[:]) {
 		t.Error("application ID mismatch")
 	}
 
-	// Verify null byte at position 14
-	if s.Header.Tag[14] != 0x00 {
+	// Verify null byte at position 14 of tag
+	if data[14] != 0x00 {
 		t.Error("expected null byte at position 14")
+	}
+
+	// Verify version field (encoded at bytes 32-39)
+	version := binary.LittleEndian.Uint64(data[32:40])
+	if version != 2 {
+		t.Errorf("expected version 2, got %d", version)
+	}
+
+	// Verify footer size is 0 (no footer, encoded at bytes 40-47)
+	if binary.LittleEndian.Uint64(data[40:48]) != 0 {
+		t.Errorf("expected footer size 0, got %d", binary.LittleEndian.Uint64(data[40:48]))
 	}
 }
 
@@ -46,7 +62,7 @@ func TestNewShard(t *testing.T) {
 func TestSerializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -62,8 +78,12 @@ func TestSerializeEmptyShard(t *testing.T) {
 		t.Errorf("expected size %d, got %d", expectedSize, len(data))
 	}
 
-	// Verify header
-	if !bytes.Equal(data[:32], s.Header.Tag[:]) {
+	// Verify header tag (first 32 bytes of encoded output)
+	var defaultTag [32]byte
+	copy(defaultTag[:14], hfApplicationID[:])
+	defaultTag[14] = 0x00
+	copy(defaultTag[15:], shardMagicSequence[:])
+	if !bytes.Equal(data[:32], defaultTag[:]) {
 		t.Error("header tag mismatch")
 	}
 }
@@ -72,23 +92,19 @@ func TestSerializeEmptyShard(t *testing.T) {
 func TestSerializeDeserializeEmptyShard(t *testing.T) {
 	s := NewShard()
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
 
-	s2, err := Decode(r)
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(r, false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
-	// Verify header
-	if s2.Header.Version != s.Header.Version {
-		t.Errorf("version mismatch: expected %d, got %d", s.Header.Version, s2.Header.Version)
-	}
-
-	if !bytes.Equal(s2.Header.Tag[:], s.Header.Tag[:]) {
-		t.Error("tag mismatch")
+	// Verify header (decoded shard stores no Tag/Version — only FooterSize matters)
+	if s2.FooterSize != s.FooterSize {
+		t.Errorf("footer size mismatch: expected %d, got %d", s.FooterSize, s2.FooterSize)
 	}
 
 	// Verify empty file and CAS info
@@ -132,7 +148,7 @@ func TestSerializeWithFileBlock(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -143,8 +159,8 @@ func TestSerializeWithFileBlock(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -205,7 +221,7 @@ func TestSerializeWithVerification(t *testing.T) {
 
 	s.AddFile(fb)
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -216,8 +232,8 @@ func TestSerializeWithVerification(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -262,13 +278,13 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 			},
 		},
 		MetadataExt: &FileMetadataExt{
-			SHA256Hash: sha256Hash,
+			SHA256Hash: SHA256Hash(sha256Hash),
 		},
 	}
 
 	s.AddFile(fb)
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -279,8 +295,8 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -345,7 +361,7 @@ func TestSerializeWithCASBlock(t *testing.T) {
 
 	s.AddCASBlock(cb)
 
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -356,8 +372,8 @@ func TestSerializeWithCASBlock(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -447,7 +463,7 @@ func TestSerializeWithFooter(t *testing.T) {
 		StoredBytes:            100,
 	}
 
-	r, err := Encode(s, true)
+	r, err := s.Encode(true)
 	if err != nil {
 		t.Fatalf("failed to serialize with footer: %v", err)
 	}
@@ -463,8 +479,8 @@ func TestSerializeWithFooter(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), true); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -538,7 +554,7 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Serialize
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -549,8 +565,8 @@ func TestSerializeComplexShard(t *testing.T) {
 	}
 
 	// Serialize and verify
-	s2, err := Decode(bytes.NewReader(data))
-	if err != nil {
+	s2 := NewShard()
+	if err := s2.Decode(bytes.NewReader(data), false); err != nil {
 		t.Fatalf("failed to deserialize: %v", err)
 	}
 
@@ -624,7 +640,7 @@ func TestDeserializeInvalidMagicSequence(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -638,8 +654,7 @@ func TestDeserializeInvalidMagicSequence(t *testing.T) {
 	data[20] = 0x00
 
 	// Try to deserialize
-	_, err = Decode(bytes.NewReader(data))
-	if err == nil {
+	if err = NewShard().Decode(bytes.NewReader(data), false); err == nil {
 		t.Error("expected error for invalid magic sequence, got nil")
 	}
 }
@@ -649,7 +664,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 	s := NewShard()
 
 	// Serialize a valid shard
-	r, err := Encode(s, false)
+	r, err := s.Encode(false)
 	if err != nil {
 		t.Fatalf("failed to serialize: %v", err)
 	}
@@ -663,8 +678,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 	data[32] = 99
 
 	// Try to deserialize
-	_, err = Decode(bytes.NewReader(data))
-	if err == nil {
+	if err = NewShard().Decode(bytes.NewReader(data), false); err == nil {
 		t.Error("expected error for invalid version, got nil")
 	}
 }
@@ -673,8 +687,7 @@ func TestDeserializeInvalidVersion(t *testing.T) {
 func TestDeserializeTooShort(t *testing.T) {
 	data := make([]byte, 10)
 
-	_, err := Decode(bytes.NewReader(data))
-	if err == nil {
+	if err := NewShard().Decode(bytes.NewReader(data), false); err == nil {
 		t.Error("expected error for data too short, got nil")
 	}
 }

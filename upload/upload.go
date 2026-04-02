@@ -508,7 +508,7 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 			len(chunkIndices) != 0 &&
 			fileSHA256s[fileIdx] != ([32]byte{}) {
 			fileBlock.MetadataExt = &shard.FileMetadataExt{
-				SHA256Hash: shard.EncodeSHA256ForMetadata(fileSHA256s[fileIdx]),
+				SHA256Hash: shard.NewSHA256Hash(fileSHA256s[fileIdx]),
 			}
 			fileBlock.Flags |= shard.FileWithMetadataExt
 		}
