@@ -37,14 +37,12 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
-	cacheFile, contentLength, err := c.spoolReaderToCache(r, "upload-shard")
-	if err != nil {
-		return nil, fmt.Errorf("cache serialized shard: %w", err)
-	}
 
-	var body io.Reader = cacheFile
+	size := shardObj.EncodedSize(false)
+
+	var body io.Reader = r
 	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
+		body = progress.NewProgressReader(body, url, size, c.progressFunc)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
@@ -53,8 +51,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = contentLength
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", size))
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}

@@ -136,6 +136,58 @@ func (s *Shard) AddCASBlock(cb CASBlock) {
 	s.CASInfos = append(s.CASInfos, cb)
 }
 
+// EncodedSize returns the exact number of bytes that Encode will produce.
+//
+// Layout:
+//
+//	48 bytes  header
+//	per file: 48 (block header) + 48*len(Entries) [+ 48*len(Verification) if FileWithVerification] [+ 48 if FileWithMetadataExt]
+//	48 bytes  file bookend
+//	per CAS:  48 (block header) + 48*len(Chunks)
+//	48 bytes  CAS bookend
+//	200 bytes footer (only when withFooter is true)
+func (s *Shard) EncodedSize(withFooter bool) int64 {
+	const (
+		headerSize    = 48
+		bookendSize   = 48
+		fileHdrSize   = 48
+		fileEntrySize = 48
+		verifSize     = 48
+		metaExtSize   = 48
+		casHdrSize    = 48
+		chunkSize     = 48
+		footerSize    = 200
+	)
+
+	size := int64(headerSize)
+
+	for _, fb := range s.Files {
+		size += fileHdrSize
+		size += int64(len(fb.Entries)) * fileEntrySize
+		if fb.Flags&FileWithVerification != 0 {
+			size += int64(len(fb.Verification)) * verifSize
+		}
+		if fb.Flags&FileWithMetadataExt != 0 {
+			size += metaExtSize
+		}
+	}
+
+	size += bookendSize
+
+	for _, cb := range s.CASInfos {
+		size += casHdrSize
+		size += int64(len(cb.Chunks)) * chunkSize
+	}
+
+	size += bookendSize
+
+	if withFooter {
+		size += footerSize
+	}
+
+	return size
+}
+
 // SetFooter creates a Footer for this shard, computing StoredBytesOnDisk,
 // StoredBytes, and MaterializedBytes from the current CAS and file data.
 // Offset fields (FileInfoOffset, CASInfoOffset, FooterOffset) are set

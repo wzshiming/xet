@@ -48,26 +48,6 @@ func (c *Client) createCacheFile(pattern string) (*removeOnCloseFile, error) {
 	return &removeOnCloseFile{File: f, path: f.Name()}, nil
 }
 
-func (c *Client) spoolReaderToCache(reader io.Reader, pattern string) (*removeOnCloseFile, int64, error) {
-	f, err := c.createCacheFile(pattern)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	n, err := io.Copy(f, reader)
-	if err != nil {
-		_ = f.Close()
-		return nil, 0, fmt.Errorf("cache stream to file: %w", err)
-	}
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		_ = f.Close()
-		return nil, 0, fmt.Errorf("rewind cache file: %w", err)
-	}
-
-	return f, n, nil
-}
-
 func stableCacheKey(parts ...string) string {
 	for i, part := range parts {
 		part = strings.TrimSpace(part)
