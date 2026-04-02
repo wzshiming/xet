@@ -98,16 +98,19 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 		// Compute chunk sizes
 		chunkSizes := []uint64{}
 
-		err := xet.ChunkData(reader, func(offset int64, chunk xet.ChunkBytes) error {
-			chunkHash := chunk.Hash()
+		err := xet.ChunkData(reader, func(offset int64, chunk []byte) error {
+			chunkHash := xet.ComputeChunkHash(chunk)
 
 			chunkHashes = append(chunkHashes, chunkHash)
-			chunkSizes = append(chunkSizes, chunk.Size())
+			chunkSizes = append(chunkSizes, uint64(len(chunk)))
+
+			newChunk := make([]byte, len(chunk))
+			copy(newChunk, chunk)
 
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, chunkInfo{
 				FileIndex: index,
-				Data:      chunk.Bytes(),
+				Data:      newChunk,
 				Hash:      chunkHash,
 				Offset:    uint64(offset),
 			})
@@ -129,7 +132,6 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 			copy(fileSHA256[:], sha256Hasher.Sum(nil))
 			fileSHA256s = append(fileSHA256s, fileSHA256)
 		}
-
 	}
 
 	// Step 2: Deduplicate unique chunks

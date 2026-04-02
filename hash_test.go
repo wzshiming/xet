@@ -15,9 +15,9 @@ Input (ASCII): Hello World!
 	Hash (XET string representation):
 	  d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb
 */
-func TestChunkBytesHash(t *testing.T) {
-	data := ChunkBytes("Hello World!")
-	hash := data.Hash()
+func TestComputeChunkHash(t *testing.T) {
+	data := []byte("Hello World!")
+	hash := ComputeChunkHash(data)
 
 	expected, _ := ParseHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
 

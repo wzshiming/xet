@@ -74,30 +74,10 @@ var lookupTable = [256]uint64{
 	0x18f346f7abc9d394, 0x636dc655d61ad33d, 0xcc8bab4939f7f3f6, 0x63c7a906c1dd187b,
 }
 
-// ChunkBytes is a temporary data used during chunking to avoid unnecessary copying.
-// It is not safe to store or modify after the callback returns.
-type ChunkBytes []byte
-
-// Hash computes the hash of the chunk using DATA_KEY
-func (c ChunkBytes) Hash() Hash {
-	return computeChunkHash(c)
-}
-
-// Size returns the size of the chunk in bytes
-func (c ChunkBytes) Size() uint64 {
-	return uint64(len(c))
-}
-
-// Bytes returns a copy of the chunk data as a byte slice.
-// This is used when the chunk data needs to be stored or modified after the callback returns.
-func (c ChunkBytes) Bytes() []byte {
-	newBytes := make([]byte, len(c))
-	copy(newBytes, c)
-	return newBytes
-}
-
 // ChunkData reads data from the provided reader and invokes fn for each chunk.
-func ChunkData(r io.Reader, fn func(offset int64, chunk ChunkBytes) error) error {
+// Note: the chunk data passed to fn is only valid for the duration of the callback, so fn should copy it if it needs to retain it.
+// The offset parameter indicates the cumulative byte offset of the chunk within the stream, which can be used for tracking progress or associating chunks with file offsets.
+func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 	reader := bufio.NewReader(r)
 
 	var offset int64

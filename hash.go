@@ -33,8 +33,8 @@ func (h Hash) String() string {
 	return hashToString(h)
 }
 
-// computeChunkHash computes the hash of a chunk using DATA_KEY
-func computeChunkHash(data []byte) Hash {
+// ComputeChunkHash computes the hash of a chunk using DATA_KEY
+func ComputeChunkHash(data []byte) Hash {
 	hasher, err := blake3.NewKeyed(dataKey[:])
 	if err != nil {
 		panic("failed to create keyed hasher: " + err.Error())

@@ -126,7 +126,7 @@ func (c *Chunk) Hash() (xet.Hash, error) {
 			return xet.Hash{}, err
 		}
 
-		hash := xet.ChunkBytes(uncompressed).Hash()
+		hash := xet.ComputeChunkHash(uncompressed)
 		c.hash = &hash
 	}
 	return *c.hash, nil

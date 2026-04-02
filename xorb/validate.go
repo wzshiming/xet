@@ -86,7 +86,7 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		if err != nil {
 			return fmt.Errorf("decompress chunk: %w", err)
 		}
-		h := xet.ChunkBytes(uncompressed).Hash()
+		h := xet.ComputeChunkHash(uncompressed)
 		chunkHashes = append(chunkHashes, h)
 		chunkSizes = append(chunkSizes, uint64(uncompressedSize))
 		packedEndOffset += 8 + uint64(compressedSize)
