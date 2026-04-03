@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet/xorb"
 )
@@ -204,17 +205,29 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 		desiredWorkers = 1
 	}
 
+	// Build order map from termFetches: the index of first appearance
+	// determines which chunks the reader needs earliest.
+	orderMap := make(map[fetchKey]int, len(termFetches))
+	for i, sf := range termFetches {
+		if _, ok := orderMap[sf.key]; !ok {
+			orderMap[sf.key] = i
+		}
+	}
+
 	jobs := make(chan *xorbPrefetchJob)
+	var active atomic.Int32
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
 			for job := range jobs {
+				active.Add(1)
 				p.runJob(job)
+				active.Add(-1)
 			}
 		}()
 	}
 	go func() {
 		defer close(jobs)
-		p.buildJobs(items, func(job *xorbPrefetchJob) {
+		p.buildJobs(items, orderMap, desiredWorkers, &active, func(job *xorbPrefetchJob) {
 			jobs <- job
 		})
 	}()
@@ -222,26 +235,62 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 	return p
 }
 
-func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, fn func(*xorbPrefetchJob)) {
+func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int, concurrency int, active *atomic.Int32, fn func(*xorbPrefetchJob)) {
 	if len(entries) == 0 {
 		return
 	}
-	orderEntry(entries)
+	orderEntry(entries, orderMap)
 
-	job := &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entries[0]}}
-	for _, entry := range entries[1:] {
-		if job.entries[len(job.entries)-1].task.url == entry.task.url {
-			job.entries = append(job.entries, entry)
-			continue
+	remaining := entries
+	for len(remaining) > 0 {
+		// Find the end of the current URL group (neighboring chunks with same URL).
+		groupEnd := 1
+		for groupEnd < len(remaining) && remaining[groupEnd].task.url == remaining[0].task.url {
+			groupEnd++
 		}
-		fn(job)
-		job = &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entry}}
+
+		// Dynamically adjust batch size based on concurrent usage.
+		freeWorkers := concurrency - int(active.Load())
+		if freeWorkers < 1 {
+			freeWorkers = 1
+		}
+		batchSize := len(remaining) / freeWorkers
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		// Don't cross URL group boundaries.
+		if batchSize > groupEnd {
+			batchSize = groupEnd
+		}
+
+		fn(&xorbPrefetchJob{entries: remaining[:batchSize]})
+		remaining = remaining[batchSize:]
 	}
-	fn(job)
 }
 
-func orderEntry(entries []*xorbPrefetchEntry) {
+func orderEntry(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int) {
+	// Compute minimum order for each URL to determine URL group priority.
+	urlMinOrder := make(map[string]int)
+	for _, e := range entries {
+		o, ok := orderMap[e.task.key]
+		if !ok {
+			o = len(orderMap)
+		}
+		if existing, ok := urlMinOrder[e.task.url]; !ok || o < existing {
+			urlMinOrder[e.task.url] = o
+		}
+	}
+
 	sort.Slice(entries, func(i, j int) bool {
+		ui := entries[i].task.url
+		uj := entries[j].task.url
+
+		if ui != uj {
+			// Order URL groups by which has the earliest-needed entry.
+			return urlMinOrder[ui] < urlMinOrder[uj]
+		}
+
+		// Within the same URL, sort by byte range (actual chunk order).
 		a := entries[i].task.key
 		b := entries[j].task.key
 		if a.Start != b.Start {
@@ -249,9 +298,6 @@ func orderEntry(entries []*xorbPrefetchEntry) {
 		}
 		if a.End != b.End {
 			return a.End < b.End
-		}
-		if entries[i].task.url != entries[j].task.url {
-			return entries[i].task.url < entries[j].task.url
 		}
 		return a.Hash < b.Hash
 	})
