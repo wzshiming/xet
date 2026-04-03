@@ -33,3 +33,5 @@ go.work.sum
 
 /xetc
 /xetd
+
+.DS_Store
