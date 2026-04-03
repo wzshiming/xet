@@ -9,7 +9,6 @@ import (
 	"net/http"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/upload"
 )
@@ -33,25 +32,22 @@ type batchChunkDedupResult struct {
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	url := fmt.Sprintf("%s/shards", c.baseURL)
 
-	r, encodeErr := shardObj.Encode(false)
+	reader, encodeErr := shardObj.Encode(false)
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
 
-	size := shardObj.EncodedSize(false)
+	contentLength := shardObj.EncodedSize(false)
 
-	var body io.Reader = r
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, size, c.progressFunc)
-	}
+	var body io.Reader = reader
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
+	req.ContentLength = contentLength
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", size))
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -75,21 +71,8 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 }
 
 // QueryChunkDeduplication checks if a chunk exists in the global deduplication index
-func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*shard.Shard, error) {
+func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*upload.DeduplicationResult, error) {
 	url := fmt.Sprintf("%s/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
-	cacheKey := stableCacheKey(c.namespace, chunkHash.String())
-	cacheFile, _, hit, err := c.openPersistentCache("query-chunk", cacheKey, ".bin")
-	if err != nil {
-		return nil, fmt.Errorf("open chunk query cache: %w", err)
-	}
-	if hit {
-		defer cacheFile.Close()
-		shardObj := shard.NewShard()
-		decodeErr := shardObj.Decode(cacheFile, false)
-		if decodeErr == nil {
-			return shardObj, nil
-		}
-	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -115,24 +98,22 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 		return nil, err
 	}
 
-	var body io.Reader = resp.Body
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
-	}
-
-	cacheFile, _, err = c.writePersistentCache("query-chunk", cacheKey, ".bin", body)
-	if err != nil {
-		return nil, fmt.Errorf("cache chunk query response: %w", err)
-	}
-	defer cacheFile.Close()
-
 	// Deserialize shard from cached response
 	shardObj := shard.NewShard()
-	if err := shardObj.Decode(cacheFile, false); err != nil {
+	if err := shardObj.Decode(resp.Body, false); err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 
-	return shardObj, nil
+	xorbHash, chunkIndex, ok := findChunkLocationInDedupShard(shardObj, chunkHash)
+	if !ok {
+		return nil, nil
+	}
+	return &upload.DeduplicationResult{
+		ChunkHash:  chunkHash,
+		IsNew:      false,
+		XorbHash:   xorbHash,
+		ChunkIndex: chunkIndex,
+	}, nil
 }
 
 // QueryChunksDeduplication checks multiple chunk hashes against the global
@@ -177,13 +158,8 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 		return nil, err
 	}
 
-	var body io.Reader = resp.Body
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
-	}
-
 	var batchResp batchChunkDedupQueryResponse
-	if err := json.NewDecoder(body).Decode(&batchResp); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 		return nil, fmt.Errorf("decode batch chunk query response: %w", err)
 	}
 
@@ -218,21 +194,13 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
 	results := make(map[xet.Hash]*upload.DeduplicationResult, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
-		shardData, err := c.QueryChunkDeduplication(ctx, chunkHash)
+		result, err := c.QueryChunkDeduplication(ctx, chunkHash)
 		if err != nil {
 			return nil, err
 		}
-
-		result := &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
-		if shardData != nil {
-			xorbHash, chunkIndex, ok := findChunkLocationInDedupShard(shardData, chunkHash)
-			if ok {
-				result.IsNew = false
-				result.XorbHash = xorbHash
-				result.ChunkIndex = chunkIndex
-			}
+		if result == nil {
+			result = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
 		}
-
 		results[chunkHash] = result
 	}
 	return results, nil

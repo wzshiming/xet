@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"os"
 	"sort"
 	"sync"
 
@@ -23,18 +24,80 @@ type DeduplicationResult struct {
 	ChunkIndex uint32
 }
 
+type Chunk struct {
+	Reader *syncReadSeeker
+	Offset int64
+	Size   uint32
+}
+
+// syncReadSeeker wraps io.ReadSeeker with a mutex so concurrent goroutines can
+// each perform an atomic seek+read without interleaving.
+type syncReadSeeker struct {
+	mu sync.Mutex
+	r  io.ReadSeeker
+}
+
+func newSyncReadSeeker(r io.ReadSeeker) *syncReadSeeker {
+	return &syncReadSeeker{r: r}
+}
+
+// readAt atomically seeks to offset and reads exactly len(buf) bytes.
+func (s *syncReadSeeker) readAt(buf []byte, offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.r.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek chunk: %w", err)
+	}
+	if _, err := io.ReadFull(s.r, buf); err != nil {
+		return fmt.Errorf("read chunk: %w", err)
+	}
+	return nil
+}
+
+// lazyChunkSeeker implements io.ReadSeeker over a contiguous slice of a
+// syncReadSeeker. Each Read performs an atomic seek+read via readAt so that
+// concurrent goroutines encoding different xorbs from the same underlying file
+// do not race on the shared ReadSeeker position.
+type lazyChunkSeeker struct {
+	sr   *syncReadSeeker
+	base int64 // absolute file offset where this chunk begins
+	pos  int64 // current read position relative to the chunk start
+}
+
+func (l *lazyChunkSeeker) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		l.pos = offset
+	case io.SeekCurrent:
+		l.pos += offset
+	default:
+		return 0, fmt.Errorf("lazyChunkSeeker: unsupported whence %d", whence)
+	}
+	return l.pos, nil
+}
+
+func (l *lazyChunkSeeker) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := l.sr.readAt(p, l.base+l.pos); err != nil {
+		return 0, err
+	}
+	l.pos += int64(len(p))
+	return len(p), nil
+}
+
 // chunkInfo contains information about a chunk within a file.
 type chunkInfo struct {
 	FileIndex int
-	Data      []byte
 	Hash      xet.Hash
-	Offset    uint64
+	Chunk     Chunk
 	Dedup     *DeduplicationResult
 }
 
 // xorbGroup represents a group of chunks to be packed into a single xorb.
 type xorbGroup struct {
-	Chunks      [][]byte
+	Chunks      []Chunk
 	ChunkHashes []xet.Hash
 	StartIndex  int
 }
@@ -59,8 +122,8 @@ func WithEnableSHA256(enabled bool) func(*options) {
 }
 
 // UploadFile chunks, deduplicates, and uploads a single file using the provided client adapter.
-func UploadFile(ctx context.Context, client ClientAdapter, reader io.Reader, opts ...func(*options)) (xet.Hash, error) {
-	hashes, err := UploadFiles(ctx, client, []io.Reader{reader}, opts...)
+func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...func(*options)) (xet.Hash, error) {
+	hashes, err := UploadFiles(ctx, client, []io.ReadSeeker{readSeeker}, opts...)
 	if err != nil {
 		return xet.Hash{}, err
 	}
@@ -69,7 +132,7 @@ func UploadFile(ctx context.Context, client ClientAdapter, reader io.Reader, opt
 
 // UploadFiles chunks, deduplicates, and uploads multiple files using the
 // provided client adapter. It returns the computed file hashes.
-func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader, opts ...func(*options)) ([]xet.Hash, error) {
+func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.ReadSeeker, opts ...func(*options)) ([]xet.Hash, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -85,8 +148,11 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 	var fileSHA256s [][32]byte
 	fileChunkRanges := make(map[int][]int) // fileIndex -> chunk indices
 
-	for index, reader := range readers {
+	for index, readSeeker := range readSeekers {
+		sr := newSyncReadSeeker(readSeeker)
+
 		var sha256Hasher hash.Hash
+		var reader io.Reader = readSeeker
 		if options.enableSHA256 {
 			sha256Hasher = sha256.New()
 			reader = io.TeeReader(reader, sha256Hasher)
@@ -104,15 +170,15 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readers []io.Reader,
 			chunkHashes = append(chunkHashes, chunkHash)
 			chunkSizes = append(chunkSizes, uint64(len(chunk)))
 
-			newChunk := make([]byte, len(chunk))
-			copy(newChunk, chunk)
-
 			chunkIdx := len(allChunks)
 			allChunks = append(allChunks, chunkInfo{
 				FileIndex: index,
-				Data:      newChunk,
 				Hash:      chunkHash,
-				Offset:    uint64(offset),
+				Chunk: Chunk{
+					Reader: sr,
+					Offset: offset,
+					Size:   uint32(len(chunk)),
+				},
 			})
 
 			fileChunkRanges[index] = append(fileChunkRanges[index], chunkIdx)
@@ -324,38 +390,14 @@ func deduplicateChunksSingle(ctx context.Context, client ClientAdapter, cache ma
 
 // queryDeduplicationChunk checks if a chunk already exists globally.
 func queryDeduplicationChunk(ctx context.Context, client ClientAdapter, chunkHash xet.Hash) *DeduplicationResult {
-	shardData, err := client.QueryChunkDeduplication(ctx, chunkHash)
-	if err == nil && shardData != nil {
-		xorbHash, chunkIndex, ok := findChunkLocationInShard(shardData, chunkHash)
-		if ok {
-			result := &DeduplicationResult{
-				ChunkHash:  chunkHash,
-				IsNew:      false,
-				XorbHash:   xorbHash,
-				ChunkIndex: chunkIndex,
-			}
-			return result
-		}
+	result, err := client.QueryChunkDeduplication(ctx, chunkHash)
+	if err == nil && result != nil {
+		return result
 	}
-
-	// Not found - mark as new
-	result := &DeduplicationResult{
+	return &DeduplicationResult{
 		ChunkHash: chunkHash,
 		IsNew:     true,
 	}
-	return result
-}
-
-func findChunkLocationInShard(shardData *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
-	for _, casBlock := range shardData.CASInfos {
-		for i, casChunk := range casBlock.Chunks {
-			if casChunk.ChunkHash == chunkHash {
-				return casBlock.CASHash, uint32(i), true
-			}
-		}
-	}
-
-	return xet.Hash{}, 0, false
 }
 
 func uniqueChunkHashes(chunks []chunkInfo) []xet.Hash {
@@ -380,7 +422,7 @@ func groupChunksIntoXorbs(chunks []chunkInfo, targetXorbSize uint64) []*xorbGrou
 	var currentSize uint64
 
 	for i, chunk := range chunks {
-		chunkSize := uint64(len(chunk.Data))
+		chunkSize := uint64(chunk.Chunk.Size) // Size is uint32, safe to widen for comparison
 
 		// Finalize the current group before adding a chunk that would reach or
 		// exceed the target size.
@@ -392,13 +434,13 @@ func groupChunksIntoXorbs(chunks []chunkInfo, targetXorbSize uint64) []*xorbGrou
 
 		if currentGroup == nil {
 			currentGroup = &xorbGroup{
-				Chunks:      make([][]byte, 0),
+				Chunks:      make([]Chunk, 0),
 				ChunkHashes: make([]xet.Hash, 0),
 				StartIndex:  i,
 			}
 		}
 
-		currentGroup.Chunks = append(currentGroup.Chunks, chunk.Data)
+		currentGroup.Chunks = append(currentGroup.Chunks, chunk.Chunk)
 		currentGroup.ChunkHashes = append(currentGroup.ChunkHashes, chunk.Hash)
 		currentSize += chunkSize
 	}
@@ -445,20 +487,46 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					return
 				}
 
-				xorbObj := xorb.NewXorb()
-				for _, chunkData := range group.Chunks {
-					if err := xorbObj.AddChunk(chunkData); err != nil {
+				tmpFile, err := os.CreateTemp("", "xet-upload-xorb-*")
+				if err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("create temp file: %w", err)
+						cancel()
+					})
+					return
+				}
+				defer os.Remove(tmpFile.Name())
+				defer tmpFile.Close()
+
+				encoder := xorb.NewEncoder(tmpFile, true)
+				for _, chunk := range group.Chunks {
+					data := make([]byte, chunk.Size)
+					if err := chunk.Reader.readAt(data, chunk.Offset); err != nil {
 						errOnce.Do(func() {
-							firstErr = fmt.Errorf("add chunk to xorb: %w", err)
+							firstErr = fmt.Errorf("read chunk data: %w", err)
+							cancel()
+						})
+						return
+					}
+					if err := encoder.Encode(data); err != nil {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("encode chunk: %w", err)
 							cancel()
 						})
 						return
 					}
 				}
-
-				if _, err := client.UploadXorb(ctx, xorbObj); err != nil {
+				if err := encoder.Close(); err != nil {
 					errOnce.Do(func() {
-						h, _ := xorbObj.Hash()
+						firstErr = fmt.Errorf("finalize xorb: %w", err)
+						cancel()
+					})
+					return
+				}
+
+				if _, err := client.UploadXorb(ctx, encoder.SummoryHash(), tmpFile); err != nil {
+					errOnce.Do(func() {
+						h := encoder.SummoryHash()
 						firstErr = fmt.Errorf("upload xorb %s: %w", h.String(), err)
 						cancel()
 					})
@@ -466,7 +534,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				}
 
 				cacheMu.Lock()
-				xorbHash, _ := xorbObj.Hash()
+				xorbHash := encoder.SummoryHash()
 				for i, chunkHash := range group.ChunkHashes {
 					if result, ok := cache[chunkHash]; ok && result.IsNew {
 						result.XorbHash = xorbHash
@@ -533,7 +601,7 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 		for i, chunkIdx := range chunkIndices {
 			chunk := allChunks[chunkIdx]
 			xorbHash := chunk.Dedup.XorbHash
-			chunkSize := uint32(len(chunk.Data))
+			chunkSize := uint32(chunk.Chunk.Size)
 			chunkIndexInXorb := chunk.Dedup.ChunkIndex
 
 			if i == 0 || xorbHash != currentXorbHash {
@@ -630,7 +698,7 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 		}
 
 		xorbHash := chunk.Dedup.XorbHash
-		chunkSize := uint32(len(chunk.Data))
+		chunkSize := chunk.Chunk.Size // already uint32
 
 		if _, exists := xorbSeenChunks[xorbHash]; !exists {
 			xorbChunksMap[xorbHash] = make([]shard.CASChunkSequenceEntry, 0)

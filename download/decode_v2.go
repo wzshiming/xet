@@ -5,9 +5,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/http"
-
-	"github.com/wzshiming/xet/xorb"
 )
 
 // ReaderV2 implements io.Reader for V2 reconstruction
@@ -16,25 +13,19 @@ type ReaderV2 struct {
 	ctx            context.Context
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
-	termFetches    []selectedFetchV2
+	termFetches    []selectedFetch
 	prefetcher     *xorbPrefetcher
 	initErr        error
 
 	// State for reading
-	termIdx     int
-	chunkIdx    uint32
-	chunkOffset int
-	currentTerm *Term
-	currentXorb *xorb.Xorb
-	localStart  uint32
-	localEnd    uint32
-	err         error
-}
-
-type selectedFetchV2 struct {
-	key        string
-	chunkStart uint32
-	chunkEnd   uint32
+	termIdx      int
+	chunkIdx     uint32
+	chunkOffset  int
+	currentTerm  *Term
+	currentCache *xorbChunkCache
+	localStart   uint32
+	localEnd     uint32
+	err          error
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
@@ -51,7 +42,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		prefetcher:     newXorbPrefetcher(ctx, client, tasks, options.concurrencyValue()),
+		prefetcher:     newXorbPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue()),
 		initErr:        err,
 	}
 }
@@ -68,6 +59,10 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	for n < len(p) {
 		// Check if we're done with all terms
 		if r.termIdx >= len(r.reconstruction.Terms) {
+			if r.currentCache != nil {
+				r.currentCache.Close()
+				r.currentCache = nil
+			}
 			return n, io.EOF
 		}
 
@@ -85,22 +80,21 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		// Check if we're done with current term's chunks
 		if r.chunkIdx >= r.localEnd {
 			r.currentTerm = nil
-			r.currentXorb = nil
 			r.termIdx++
 			continue
 		}
 
-		// Read from current chunk
-		chunk, err := r.currentXorb.Chunk(int(r.chunkIdx))
-		if err != nil {
-			return 0, err
+		// Get chunk on demand by index
+		data, chunkErr := r.currentCache.Chunk(r.chunkIdx)
+		if chunkErr != nil {
+			r.err = chunkErr
+			if n > 0 {
+				return n, nil
+			}
+			return 0, chunkErr
 		}
 
-		// Apply skip for first chunk of first term
-		data, err := chunk.UncompressedData()
-		if err != nil {
-			return 0, err
-		}
+		// Apply skip for the first chunk of the first term
 		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
 			if r.skipBytes >= int64(len(data)) {
 				r.skipBytes -= int64(len(data))
@@ -118,13 +112,11 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 			n += copied
 			r.chunkOffset += copied
 
-			// If we've consumed this chunk, move to next
 			if r.chunkOffset >= len(data) {
 				r.chunkIdx++
 				r.chunkOffset = 0
 			}
 		} else {
-			// Move to next chunk
 			r.chunkIdx++
 			r.chunkOffset = 0
 		}
@@ -138,7 +130,7 @@ func (r *ReaderV2) loadTerm() error {
 	r.currentTerm = term
 
 	selected := r.termFetches[r.termIdx]
-	xorbObj, err := r.prefetcher.Wait(selected.key)
+	cache, err := r.prefetcher.Get(selected.key)
 	if err != nil {
 		return fmt.Errorf("download xorb: %w", err)
 	}
@@ -146,12 +138,7 @@ func (r *ReaderV2) loadTerm() error {
 	localStart := term.Range.Start - selected.chunkStart
 	localEnd := term.Range.End - selected.chunkStart
 
-	// Validate chunk range
-	if localEnd > uint32(xorbObj.ChunkSize()) {
-		return fmt.Errorf("chunk range out of bounds: [%d, %d) vs %d chunks", localStart, localEnd, xorbObj.ChunkSize())
-	}
-
-	r.currentXorb = xorbObj
+	r.currentCache = cache
 	r.localStart = localStart
 	r.localEnd = localEnd
 	r.chunkIdx = localStart
@@ -160,8 +147,8 @@ func (r *ReaderV2) loadTerm() error {
 	return nil
 }
 
-func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetchV2, []xorbFetchTask, error) {
-	selected := make([]selectedFetchV2, len(reconstruction.Terms))
+func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []xorbFetchTask, error) {
+	selected := make([]selectedFetch, len(reconstruction.Terms))
 	tasks := make([]xorbFetchTask, 0, len(reconstruction.Terms))
 	for i := range reconstruction.Terms {
 		term := &reconstruction.Terms[i]
@@ -170,8 +157,13 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetchV2, 
 			return nil, nil, err
 		}
 
-		key := fmt.Sprintf("%s|%s|%d|%d|%d|%d", term.Hash, fetch.URL, rg.Chunks.Start, rg.Chunks.End, rg.Bytes.Start, rg.Bytes.End)
-		selected[i] = selectedFetchV2{
+		key := fetchKey{
+			Hash:  term.Hash,
+			Start: rg.Bytes.Start,
+			End:   rg.Bytes.End,
+		}
+
+		selected[i] = selectedFetch{
 			key:        key,
 			chunkStart: rg.Chunks.Start,
 			chunkEnd:   rg.Chunks.End,
@@ -179,9 +171,6 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetchV2, 
 		tasks = append(tasks, xorbFetchTask{
 			key: key,
 			url: fetch.URL,
-			header: http.Header{
-				"Range": []string{fmt.Sprintf("bytes=%d-%d", rg.Bytes.Start, rg.Bytes.End)},
-			},
 		})
 	}
 	return selected, tasks, nil
@@ -221,16 +210,18 @@ func ExpectedTransferBytesV2(reconstruction *ReconstructionResponseV2) int64 {
 	if err != nil {
 		return 0
 	}
-	seen := make(map[string]struct{}, len(tasks))
+	seen := make(map[fetchKey]struct{}, len(tasks))
 	var total int64
 	for _, task := range tasks {
 		if _, ok := seen[task.key]; ok {
 			continue
 		}
 		seen[task.key] = struct{}{}
-		rng := task.header.Get("Range")
-		var start, end int64
-		if n, _ := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); n == 2 && end >= start {
+
+		start := task.key.Start
+		end := task.key.End
+
+		if end >= start {
 			total += end - start + 1
 		}
 	}

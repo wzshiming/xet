@@ -9,8 +9,8 @@ import (
 )
 
 // UploadFile uploads a single file and returns its hash
-func (c *Client) UploadFile(ctx context.Context, reader io.Reader) (xet.Hash, error) {
-	hash, err := upload.UploadFile(ctx, c, reader,
+func (c *Client) UploadFile(ctx context.Context, readSeeker io.ReadSeeker) (xet.Hash, error) {
+	hash, err := upload.UploadFile(ctx, c, readSeeker,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithEnableSHA256(true),
 	)
@@ -21,8 +21,8 @@ func (c *Client) UploadFile(ctx context.Context, reader io.Reader) (xet.Hash, er
 }
 
 // UploadFiles uploads multiple files and returns their hashes
-func (c *Client) UploadFiles(ctx context.Context, readers []io.Reader) ([]xet.Hash, error) {
-	return upload.UploadFiles(ctx, c, readers,
+func (c *Client) UploadFiles(ctx context.Context, readSeekers []io.ReadSeeker) ([]xet.Hash, error) {
+	return upload.UploadFiles(ctx, c, readSeekers,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithEnableSHA256(true),
 	)

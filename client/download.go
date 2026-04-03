@@ -81,7 +81,7 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		}
 
 		// Build a per-file ReconstructionResponse reusing the shared fetch_info.
-		singleResp := &download.ReconstructionResponse{
+		singleResp := &download.ReconstructionResponseV1{
 			OffsetIntoFirstRange: 0,
 			Terms:                terms,
 			FetchInfo:            batchResp.FetchInfo,

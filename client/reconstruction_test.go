@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 
 	"github.com/wzshiming/xet"
@@ -29,7 +28,7 @@ func TestGetReconstruction(t *testing.T) {
 			t.Errorf("Expected Authorization header 'Bearer test-token', got '%s'", r.Header.Get("Authorization"))
 		}
 
-		resp := download.ReconstructionResponse{
+		resp := download.ReconstructionResponseV1{
 			OffsetIntoFirstRange: 0,
 			Terms: []download.Term{
 				{
@@ -98,7 +97,7 @@ func TestGetReconstructionRange(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusPartialContent)
-		resp := download.ReconstructionResponse{
+		resp := download.ReconstructionResponseV1{
 			OffsetIntoFirstRange: 1000,
 			Terms:                []download.Term{},
 			FetchInfo:            map[string][]download.FetchInfoEntry{},
@@ -234,34 +233,5 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 
 	if reconstruction.OffsetIntoFirstRange != 1000 {
 		t.Errorf("Expected OffsetIntoFirstRange 1000, got %d", reconstruction.OffsetIntoFirstRange)
-	}
-}
-
-func TestGetReconstructionV1UsesPersistentCache(t *testing.T) {
-	var hits int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		resp := download.ReconstructionResponse{
-			OffsetIntoFirstRange: 0,
-			Terms:                []download.Term{},
-			FetchInfo:            map[string][]download.FetchInfoEntry{},
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer server.Close()
-
-	c := NewClient(WithBaseURL(server.URL))
-	c.cacheDirPath = t.TempDir()
-
-	hash := xet.Hash{9, 8, 7}
-	if _, err := c.GetReconstructionV1(context.Background(), hash, nil); err != nil {
-		t.Fatalf("first reconstruction call failed: %v", err)
-	}
-	if _, err := c.GetReconstructionV1(context.Background(), hash, nil); err != nil {
-		t.Fatalf("second reconstruction call failed: %v", err)
-	}
-
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Fatalf("expected one network hit due to cache reuse, got %d", got)
 	}
 }

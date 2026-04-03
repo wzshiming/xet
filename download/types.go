@@ -1,7 +1,7 @@
 package download
 
-// ReconstructionResponse represents the response from the file reconstruction API
-type ReconstructionResponse struct {
+// ReconstructionResponseV1 represents the response from the file reconstruction API
+type ReconstructionResponseV1 struct {
 	OffsetIntoFirstRange int64                       `json:"offset_into_first_range"`
 	Terms                []Term                      `json:"terms"`
 	FetchInfo            map[string][]FetchInfoEntry `json:"fetch_info"`

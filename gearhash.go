@@ -74,6 +74,49 @@ var lookupTable = [256]uint64{
 	0x18f346f7abc9d394, 0x636dc655d61ad33d, 0xcc8bab4939f7f3f6, 0x63c7a906c1dd187b,
 }
 
+// Chunker provides an iterator-like interface for chunking data from a reader using the Gearhash algorithm.
+type Chunker struct {
+	reader *bufio.Reader
+	offset int64
+	done   bool
+	buf    [MaxChunkSize]byte
+}
+
+// NewChunker creates a new Chunker for the given reader.
+// The returned Chunker can be used to iteratively read chunks of data that are determined by the Gearhash algorithm, which provides content-defined chunking for better deduplication and compression efficiency.
+func NewChunker(r io.Reader) *Chunker {
+	return &Chunker{
+		reader: bufio.NewReader(r),
+	}
+}
+
+// Chunk returns the offset of the next chunk and advances the internal state to the following chunk.
+// When the end of the stream is reached, it returns io.EOF. The offset can be used to track the position of each chunk within the original data stream, which is useful for associating chunks with file offsets or for progress tracking during processing.
+func (c *Chunker) Chunk() (offset int64, chunk []byte, err error) {
+	if c.done {
+		return 0, nil, io.EOF
+	}
+
+	offset = c.offset
+	size, err := findChunkBoundary(c.reader, c.buf[:])
+	if err != nil && err != io.EOF {
+		return 0, nil, err
+	}
+
+	if size == 0 {
+		c.done = true
+		return 0, nil, io.EOF
+	}
+
+	c.offset += int64(size)
+
+	if err == io.EOF {
+		c.done = true
+	}
+
+	return offset, c.buf[:size], nil
+}
+
 // ChunkData reads data from the provided reader and invokes fn for each chunk.
 // Note: the chunk data passed to fn is only valid for the duration of the callback, so fn should copy it if it needs to retain it.
 // The offset parameter indicates the cumulative byte offset of the chunk within the stream, which can be used for tracking progress or associating chunks with file offsets.

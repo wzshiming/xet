@@ -732,7 +732,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 			}
 			defer v1Resp.Body.Close()
 
-			var singleResp download.ReconstructionResponse
+			var singleResp download.ReconstructionResponseV1
 			if err := json.NewDecoder(v1Resp.Body).Decode(&singleResp); err != nil {
 				t.Fatalf("decode v1 response %d: %v", i, err)
 			}

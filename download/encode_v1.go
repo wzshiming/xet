@@ -17,7 +17,7 @@ import (
 // convention used by xet-core: ByteRangeStart is an offset into the
 // header-stripped stream, and range requests to the xorb download endpoint
 // are served from the same stripped stream (see handleDownloadXorb).
-func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*ReconstructionResponse, error) {
+func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*ReconstructionResponseV1, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -44,7 +44,7 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		}
 	}
 
-	response := &ReconstructionResponse{
+	response := &ReconstructionResponseV1{
 		OffsetIntoFirstRange: 0,
 		Terms:                []Term{},
 		FetchInfo:            make(map[string][]FetchInfoEntry),

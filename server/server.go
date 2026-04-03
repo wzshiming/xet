@@ -254,6 +254,11 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return
+	}
+
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
@@ -266,8 +271,12 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var body io.Reader = r.Body
+
+	body = io.LimitReader(body, r.ContentLength)
+
 	// Store xorb directly. PutXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, xorbHash, r.Body)
+	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, xorbHash, body)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
@@ -316,9 +325,18 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return
+	}
+
+	var body io.Reader = r.Body
+
+	body = io.LimitReader(body, r.ContentLength)
+
 	// Deserialize and validate shard.
 	shardObj := shard.NewShard()
-	if err := shardObj.Decode(r.Body, false); err != nil {
+	if err := shardObj.Decode(body, false); err != nil {
 		http.Error(w, "Invalid shard format: "+err.Error(), http.StatusBadRequest)
 		return
 	}
