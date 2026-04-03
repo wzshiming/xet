@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/wzshiming/xet/xorb"
 )
@@ -215,19 +214,16 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 	}
 
 	jobs := make(chan *xorbPrefetchJob)
-	var active atomic.Int32
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
 			for job := range jobs {
-				active.Add(1)
 				p.runJob(job)
-				active.Add(-1)
 			}
 		}()
 	}
 	go func() {
 		defer close(jobs)
-		p.buildJobs(items, orderMap, desiredWorkers, &active, func(job *xorbPrefetchJob) {
+		p.buildJobs(items, orderMap, func(job *xorbPrefetchJob) {
 			jobs <- job
 		})
 	}()
@@ -235,34 +231,26 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 	return p
 }
 
-func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int, concurrency int, active *atomic.Int32, fn func(*xorbPrefetchJob)) {
+func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int, fn func(*xorbPrefetchJob)) {
 	if len(entries) == 0 {
 		return
 	}
 	orderEntry(entries, orderMap)
 
-	remaining := entries
-	for len(remaining) > 0 {
-		// Find the end of the current URL group (neighboring chunks with same URL).
-		groupEnd := 1
-		for groupEnd < len(remaining) && remaining[groupEnd].task.url == remaining[0].task.url {
-			groupEnd++
+	// Group all entries with the same URL into a single job to maximize
+	// multipart batching and bandwidth utilization. Concurrency is controlled
+	// by the worker pool and channel backpressure: fn blocks until a worker
+	// is free, which naturally limits how far ahead jobs are queued.
+	job := &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entries[0]}}
+	for _, entry := range entries[1:] {
+		if job.entries[len(job.entries)-1].task.url == entry.task.url {
+			job.entries = append(job.entries, entry)
+			continue
 		}
-
-		// Dynamically adjust batch size based on concurrent usage.
-		freeWorkers := max(1, concurrency-int(active.Load()))
-		batchSize := len(remaining) / freeWorkers
-		if batchSize < 1 {
-			batchSize = 1
-		}
-		// Don't cross URL group boundaries.
-		if batchSize > groupEnd {
-			batchSize = groupEnd
-		}
-
-		fn(&xorbPrefetchJob{entries: remaining[:batchSize]})
-		remaining = remaining[batchSize:]
+		fn(job)
+		job = &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entry}}
 	}
+	fn(job)
 }
 
 func orderEntry(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int) {
@@ -283,8 +271,14 @@ func orderEntry(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int) {
 		uj := entries[j].task.url
 
 		if ui != uj {
-			// Order URL groups by which has the earliest-needed entry.
-			return urlMinOrder[ui] < urlMinOrder[uj]
+			oi := urlMinOrder[ui]
+			oj := urlMinOrder[uj]
+			if oi != oj {
+				// Order URL groups by which has the earliest-needed entry.
+				return oi < oj
+			}
+			// Deterministic tie-breaker to keep URL grouping stable.
+			return ui < uj
 		}
 
 		// Within the same URL, sort by byte range (actual chunk order).

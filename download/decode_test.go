@@ -1,7 +1,6 @@
 package download
 
 import (
-	"sync/atomic"
 	"testing"
 )
 
@@ -79,6 +78,48 @@ func TestOrderEntrySameURLByteRangeOrder(t *testing.T) {
 	}
 }
 
+func TestOrderEntryURLTieBreaker(t *testing.T) {
+	// Two URLs with the same priority (both have min order 0).
+	entries := []*xorbPrefetchEntry{
+		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 0, End: 100}, url: "url-B"}},
+		{task: xorbFetchTask{key: fetchKey{Hash: "h2", Start: 0, End: 100}, url: "url-A"}},
+		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 100, End: 200}, url: "url-B"}},
+		{task: xorbFetchTask{key: fetchKey{Hash: "h2", Start: 100, End: 200}, url: "url-A"}},
+	}
+
+	orderMap := map[fetchKey]int{
+		{Hash: "h2", Start: 0, End: 100}: 0,
+		{Hash: "h1", Start: 0, End: 100}: 0,
+	}
+
+	orderEntry(entries, orderMap)
+
+	// Both URLs have priority 0, so tie-break by URL string.
+	// url-A < url-B, so url-A entries come first.
+	// Entries within same URL are contiguous and sorted by byte range.
+	expected := []struct {
+		url   string
+		start int64
+	}{
+		{"url-A", 0},
+		{"url-A", 100},
+		{"url-B", 0},
+		{"url-B", 100},
+	}
+
+	if len(entries) != len(expected) {
+		t.Fatalf("expected %d entries, got %d", len(expected), len(entries))
+	}
+
+	for i, exp := range expected {
+		got := entries[i]
+		if got.task.url != exp.url || got.task.key.Start != exp.start {
+			t.Errorf("entry[%d]: expected url=%s start=%d, got url=%s start=%d",
+				i, exp.url, exp.start, got.task.url, got.task.key.Start)
+		}
+	}
+}
+
 func TestBuildJobsGroupsByURL(t *testing.T) {
 	entries := []*xorbPrefetchEntry{
 		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 0, End: 100}, url: "url-A"}},
@@ -92,16 +133,13 @@ func TestBuildJobsGroupsByURL(t *testing.T) {
 		{Hash: "h2", Start: 0, End: 100}:   2,
 	}
 
-	var active atomic.Int32
 	p := &xorbPrefetcher{}
 	var jobs []*xorbPrefetchJob
-	p.buildJobs(entries, orderMap, 1, &active, func(job *xorbPrefetchJob) {
+	p.buildJobs(entries, orderMap, func(job *xorbPrefetchJob) {
 		jobs = append(jobs, job)
 	})
 
-	// With concurrency=1 and active=0, batchSize = remaining/1 = remaining,
-	// but limited by URL group boundary.
-	// job1 = url-A (2 entries), job2 = url-B (1 entry).
+	// One job per URL group: job1 = url-A (2 entries), job2 = url-B (1 entry).
 	if len(jobs) != 2 {
 		t.Fatalf("expected 2 jobs, got %d", len(jobs))
 	}
@@ -119,7 +157,9 @@ func TestBuildJobsGroupsByURL(t *testing.T) {
 	}
 }
 
-func TestBuildJobsDynamicBatchSize(t *testing.T) {
+func TestBuildJobsKeepsURLGroupIntact(t *testing.T) {
+	// All entries for the same URL should be grouped into one job
+	// to enable multipart batching and maximize bandwidth.
 	entries := []*xorbPrefetchEntry{
 		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 0, End: 100}, url: "url-A"}},
 		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 100, End: 200}, url: "url-A"}},
@@ -134,51 +174,13 @@ func TestBuildJobsDynamicBatchSize(t *testing.T) {
 		{Hash: "h1", Start: 300, End: 400}: 3,
 	}
 
-	var active atomic.Int32
 	p := &xorbPrefetcher{}
 	var jobs []*xorbPrefetchJob
-	p.buildJobs(entries, orderMap, 4, &active, func(job *xorbPrefetchJob) {
+	p.buildJobs(entries, orderMap, func(job *xorbPrefetchJob) {
 		jobs = append(jobs, job)
 	})
 
-	// With concurrency=4 and active=0, freeWorkers=4,
-	// batchSize = remaining/4 = 1 per iteration.
-	// All same URL, so 4 jobs of 1 entry each.
-	if len(jobs) != 4 {
-		t.Fatalf("expected 4 jobs, got %d", len(jobs))
-	}
-	for i, job := range jobs {
-		if len(job.entries) != 1 {
-			t.Errorf("job[%d]: expected 1 entry, got %d", i, len(job.entries))
-		}
-	}
-}
-
-func TestBuildJobsDynamicWithActiveWorkers(t *testing.T) {
-	entries := []*xorbPrefetchEntry{
-		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 0, End: 100}, url: "url-A"}},
-		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 100, End: 200}, url: "url-A"}},
-		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 200, End: 300}, url: "url-A"}},
-		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 300, End: 400}, url: "url-A"}},
-	}
-
-	orderMap := map[fetchKey]int{
-		{Hash: "h1", Start: 0, End: 100}:   0,
-		{Hash: "h1", Start: 100, End: 200}: 1,
-		{Hash: "h1", Start: 200, End: 300}: 2,
-		{Hash: "h1", Start: 300, End: 400}: 3,
-	}
-
-	var active atomic.Int32
-	active.Store(3) // 3 workers are busy
-	p := &xorbPrefetcher{}
-	var jobs []*xorbPrefetchJob
-	p.buildJobs(entries, orderMap, 4, &active, func(job *xorbPrefetchJob) {
-		jobs = append(jobs, job)
-	})
-
-	// With concurrency=4 and active=3, freeWorkers=1,
-	// batchSize = 4/1 = 4 (all in one batch).
+	// All 4 entries share url-A, so they must be in a single job.
 	if len(jobs) != 1 {
 		t.Fatalf("expected 1 job, got %d", len(jobs))
 	}
@@ -188,7 +190,7 @@ func TestBuildJobsDynamicWithActiveWorkers(t *testing.T) {
 }
 
 func TestBuildJobsURLGroupBoundary(t *testing.T) {
-	// 3 entries from url-A, 2 from url-B, concurrency=2.
+	// 3 entries from url-A, 2 from url-B.
 	entries := []*xorbPrefetchEntry{
 		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 0, End: 100}, url: "url-A"}},
 		{task: xorbFetchTask{key: fetchKey{Hash: "h1", Start: 100, End: 200}, url: "url-A"}},
@@ -205,10 +207,9 @@ func TestBuildJobsURLGroupBoundary(t *testing.T) {
 		{Hash: "h2", Start: 100, End: 200}: 4,
 	}
 
-	var active atomic.Int32
 	p := &xorbPrefetcher{}
 	var jobs []*xorbPrefetchJob
-	p.buildJobs(entries, orderMap, 2, &active, func(job *xorbPrefetchJob) {
+	p.buildJobs(entries, orderMap, func(job *xorbPrefetchJob) {
 		jobs = append(jobs, job)
 	})
 
@@ -222,21 +223,22 @@ func TestBuildJobsURLGroupBoundary(t *testing.T) {
 		}
 	}
 
-	// Verify total entries across all jobs equals input.
-	total := 0
-	for _, job := range jobs {
-		total += len(job.entries)
+	// Two URL groups: url-A (3 entries) and url-B (2 entries).
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobs))
 	}
-	if total != 5 {
-		t.Errorf("expected 5 total entries across jobs, got %d", total)
+	if len(jobs[0].entries) != 3 {
+		t.Errorf("job[0]: expected 3 entries, got %d", len(jobs[0].entries))
+	}
+	if len(jobs[1].entries) != 2 {
+		t.Errorf("job[1]: expected 2 entries, got %d", len(jobs[1].entries))
 	}
 }
 
 func TestBuildJobsEmpty(t *testing.T) {
-	var active atomic.Int32
 	p := &xorbPrefetcher{}
 	var jobs []*xorbPrefetchJob
-	p.buildJobs(nil, nil, 4, &active, func(job *xorbPrefetchJob) {
+	p.buildJobs(nil, nil, func(job *xorbPrefetchJob) {
 		jobs = append(jobs, job)
 	})
 
