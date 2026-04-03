@@ -204,15 +204,6 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 		desiredWorkers = 1
 	}
 
-	// Build order map from termFetches: the index of first appearance
-	// determines which chunks the reader needs earliest.
-	orderMap := make(map[fetchKey]int, len(termFetches))
-	for i, sf := range termFetches {
-		if _, ok := orderMap[sf.key]; !ok {
-			orderMap[sf.key] = i
-		}
-	}
-
 	jobs := make(chan *xorbPrefetchJob)
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
@@ -223,7 +214,7 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 	}
 	go func() {
 		defer close(jobs)
-		p.buildJobs(items, orderMap, func(job *xorbPrefetchJob) {
+		p.buildJobs(items, func(job *xorbPrefetchJob) {
 			jobs <- job
 		})
 	}()
@@ -231,16 +222,12 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 	return p
 }
 
-func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int, fn func(*xorbPrefetchJob)) {
+func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, fn func(*xorbPrefetchJob)) {
 	if len(entries) == 0 {
 		return
 	}
-	orderEntry(entries, orderMap)
+	orderEntry(entries)
 
-	// Group all entries with the same URL into a single job to maximize
-	// multipart batching and bandwidth utilization. Concurrency is controlled
-	// by the worker pool and channel backpressure: fn blocks until a worker
-	// is free, which naturally limits how far ahead jobs are queued.
 	job := &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entries[0]}}
 	for _, entry := range entries[1:] {
 		if job.entries[len(job.entries)-1].task.url == entry.task.url {
@@ -253,35 +240,8 @@ func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fe
 	fn(job)
 }
 
-func orderEntry(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int) {
-	// Compute minimum order for each URL to determine URL group priority.
-	urlMinOrder := make(map[string]int)
-	for _, e := range entries {
-		o, ok := orderMap[e.task.key]
-		if !ok {
-			o = len(orderMap)
-		}
-		if existing, ok := urlMinOrder[e.task.url]; !ok || o < existing {
-			urlMinOrder[e.task.url] = o
-		}
-	}
-
+func orderEntry(entries []*xorbPrefetchEntry) {
 	sort.Slice(entries, func(i, j int) bool {
-		ui := entries[i].task.url
-		uj := entries[j].task.url
-
-		if ui != uj {
-			oi := urlMinOrder[ui]
-			oj := urlMinOrder[uj]
-			if oi != oj {
-				// Order URL groups by which has the earliest-needed entry.
-				return oi < oj
-			}
-			// Deterministic tie-breaker to keep URL grouping stable.
-			return ui < uj
-		}
-
-		// Within the same URL, sort by byte range (actual chunk order).
 		a := entries[i].task.key
 		b := entries[j].task.key
 		if a.Start != b.Start {
@@ -289,6 +249,9 @@ func orderEntry(entries []*xorbPrefetchEntry, orderMap map[fetchKey]int) {
 		}
 		if a.End != b.End {
 			return a.End < b.End
+		}
+		if entries[i].task.url != entries[j].task.url {
+			return entries[i].task.url < entries[j].task.url
 		}
 		return a.Hash < b.Hash
 	})
