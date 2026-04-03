@@ -1,9 +1,11 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/wzshiming/xet/progress"
 )
@@ -91,18 +93,30 @@ func reqError(req *http.Request, resp *http.Response) error {
 		return errNotFound
 	}
 
-	hasRange := req.Header.Get("Range") != ""
+	ranges := req.Header.Get("Range")
 
-	if hasRange {
+	if ranges != "" {
 		if resp.StatusCode != http.StatusPartialContent {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+			return fmt.Errorf("url %s: range: %s: API error (status %d): %s", req.URL.String(), ranges, resp.StatusCode, string(body))
 		}
 	} else {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+			return fmt.Errorf("url %s: API error (status %d): %s", req.URL.String(), resp.StatusCode, string(body))
 		}
 	}
 	return nil
+}
+
+func isNetworkError(err error) bool {
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	return false
 }

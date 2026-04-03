@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
+	"strings"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
@@ -19,9 +21,7 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, hea
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	for k, v := range header {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, header)
 
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -54,9 +54,7 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, hea
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	for k, v := range header {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, header)
 
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -90,15 +88,16 @@ func (c *Client) BatchGetReconstruction(ctx context.Context, fileHashes []xet.Ha
 		}, nil
 	}
 
-	urlStr := c.baseURL + "/reconstructions?"
+	var urlStr strings.Builder
+	urlStr.WriteString(c.baseURL + "/reconstructions?")
 	for i, h := range fileHashes {
 		if i > 0 {
-			urlStr += "&"
+			urlStr.WriteString("&")
 		}
-		urlStr += "file_id=" + h.String()
+		urlStr.WriteString("file_id=" + h.String())
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create batch reconstruction request: %w", err)
 	}

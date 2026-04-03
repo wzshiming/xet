@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/wzshiming/xet/xorb"
@@ -13,7 +16,9 @@ import (
 
 // ClientAdapter provides access to client operations needed for reconstruction decoding
 type ClientAdapter interface {
-	DownloadXorb(ctx context.Context, url string, header http.Header) (*xorb.Decoder, error)
+	DownloadXorb(ctx context.Context, url string, header http.Header) (io.ReadCloser, error)
+
+	DownloadXorbsMultipart(ctx context.Context, url string, header http.Header) (*multipart.Reader, io.Closer, error)
 }
 
 type options struct {
@@ -170,16 +175,23 @@ type fetchKey struct {
 	End   int64
 }
 
+type xorbPrefetchJob struct {
+	entries []*xorbPrefetchEntry
+}
+
 func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []xorbFetchTask, concurrency int) *xorbPrefetcher {
 	entries := make(map[fetchKey]*xorbPrefetchEntry, len(tasks))
+	items := make([]*xorbPrefetchEntry, 0, len(entries))
 	for _, task := range tasks {
 		if _, ok := entries[task.key]; ok {
 			continue
 		}
-		entries[task.key] = &xorbPrefetchEntry{
+		item := &xorbPrefetchEntry{
 			task:  task,
 			ready: make(chan struct{}),
 		}
+		entries[task.key] = item
+		items = append(items, item)
 	}
 	p := &xorbPrefetcher{
 		ctx:     ctx,
@@ -187,77 +199,187 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 		entries: entries,
 	}
 
-	order := make([]*xorbPrefetchEntry, 0, len(entries))
-	seen := make(map[fetchKey]struct{}, len(entries))
-	for _, sel := range termFetches {
-		if _, ok := seen[sel.key]; ok {
-			continue
-		}
-		entry, ok := p.entries[sel.key]
-		if !ok {
-			continue
-		}
-		seen[sel.key] = struct{}{}
-		order = append(order, entry)
-	}
-	for _, task := range tasks {
-		if _, ok := seen[task.key]; ok {
-			continue
-		}
-		entry, ok := p.entries[task.key]
-		if !ok {
-			continue
-		}
-		seen[task.key] = struct{}{}
-		order = append(order, entry)
+	desiredWorkers := concurrency
+	if desiredWorkers <= 0 {
+		desiredWorkers = 1
 	}
 
-	workers := concurrency
-	if workers <= 0 {
-		workers = 1
-	}
-	if workers > len(order) {
-		workers = len(order)
-	}
-	if workers > 0 {
-		jobs := make(chan *xorbPrefetchEntry)
-		for i := 0; i < workers; i++ {
-			go func() {
-				for entry := range jobs {
-					p.runDownload(entry)
-				}
-			}()
-		}
+	jobs := make(chan *xorbPrefetchJob)
+	for i := 0; i < desiredWorkers; i++ {
 		go func() {
-			defer close(jobs)
-			for _, entry := range order {
-				jobs <- entry
+			for job := range jobs {
+				p.runJob(job)
 			}
 		}()
 	}
+	go func() {
+		defer close(jobs)
+		p.buildJobs(items, func(job *xorbPrefetchJob) {
+			jobs <- job
+		})
+	}()
+
 	return p
 }
 
-func (p *xorbPrefetcher) runDownload(entry *xorbPrefetchEntry) {
-	header := http.Header{
-		"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
-	}
-	dec, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
-	if err != nil {
-		entry.err = err
-		close(entry.ready)
+func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, fn func(*xorbPrefetchJob)) {
+	if len(entries) == 0 {
 		return
 	}
-	cache, err := newXorbChunkCache(dec)
-	if err != nil {
-		dec.Close()
-		entry.err = err
-		close(entry.ready)
+	orderEntry(entries)
+
+	job := &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entries[0]}}
+	for _, entry := range entries[1:] {
+		if job.entries[len(job.entries)-1].task.url == entry.task.url {
+			job.entries = append(job.entries, entry)
+			continue
+		}
+		fn(job)
+		job = &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entry}}
+	}
+	fn(job)
+}
+
+func orderEntry(entries []*xorbPrefetchEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		a := entries[i].task.key
+		b := entries[j].task.key
+		if a.Start != b.Start {
+			return a.Start < b.Start
+		}
+		if a.End != b.End {
+			return a.End < b.End
+		}
+		if entries[i].task.url != entries[j].task.url {
+			return entries[i].task.url < entries[j].task.url
+		}
+		return a.Hash < b.Hash
+	})
+}
+
+func (p *xorbPrefetcher) runJob(job *xorbPrefetchJob) {
+	if len(job.entries) == 0 {
 		return
 	}
-	entry.cache = cache
-	close(entry.ready)
-	entry.err = cache.LoadAll()
+	if len(job.entries) > 1 {
+		ranges := make([]string, len(job.entries))
+		for i, entry := range job.entries {
+			ranges[i] = fmt.Sprintf("%d-%d", entry.task.key.Start, entry.task.key.End)
+		}
+		header := http.Header{
+			"Range": {
+				fmt.Sprintf("bytes=%s", strings.Join(ranges, ",")),
+			},
+		}
+		mr, closer, err := p.client.DownloadXorbsMultipart(p.ctx, job.entries[0].task.url, header)
+		if err != nil {
+			p.failEntries(job.entries, err)
+			return
+		}
+
+		if err := p.runStreamJob(job.entries, mr, closer); err != nil {
+			p.failEntries(job.entries, err)
+			return
+		}
+		return
+	}
+
+	for _, entry := range job.entries {
+		header := http.Header{
+			"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
+		}
+		rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
+		if err != nil {
+			entry.err = err
+			close(entry.ready)
+			continue
+		}
+
+		dec := xorb.NewDecoder(rc, false)
+		cache, err := newXorbChunkCache(dec)
+		if err != nil {
+			dec.Close()
+			entry.err = err
+			close(entry.ready)
+			continue
+		}
+		entry.cache = cache
+		close(entry.ready)
+		go func(entry *xorbPrefetchEntry, cache *xorbChunkCache) {
+			entry.err = cache.LoadAll()
+		}(entry, cache)
+	}
+}
+
+func (p *xorbPrefetcher) runStreamJob(entries []*xorbPrefetchEntry, mr *multipart.Reader, closer io.Closer) error {
+	type streamTarget struct {
+		entry *xorbPrefetchEntry
+		cache *xorbChunkCache
+		pipeW *io.PipeWriter
+	}
+
+	targets := make([]streamTarget, len(entries))
+	for i, entry := range entries {
+		pipeR, pipeW := io.Pipe()
+		dec := xorb.NewDecoder(pipeR, false)
+		cache, err := newXorbChunkCache(dec)
+		if err != nil {
+			for j := range i {
+				targets[j].pipeW.CloseWithError(err)
+				targets[j].cache.Close()
+			}
+			pipeW.CloseWithError(err)
+			pipeR.CloseWithError(err)
+			closer.Close()
+			return err
+		}
+		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
+
+		entry.cache = cache
+		close(entry.ready)
+	}
+
+	go func() {
+		defer closer.Close()
+		for i := range targets {
+			part, err := mr.NextPart()
+			if err != nil {
+				if err == io.EOF {
+					err = io.ErrUnexpectedEOF
+				}
+				for j := i; j < len(targets); j++ {
+					targets[j].pipeW.CloseWithError(err)
+				}
+				return
+			}
+
+			_, copyErr := io.Copy(targets[i].pipeW, part)
+			part.Close()
+			if copyErr != nil {
+				targets[i].pipeW.CloseWithError(copyErr)
+				for j := i + 1; j < len(targets); j++ {
+					targets[j].pipeW.CloseWithError(copyErr)
+				}
+				return
+			}
+			targets[i].pipeW.Close()
+		}
+	}()
+
+	go func() {
+		for _, entry := range entries {
+			entry.err = entry.cache.LoadAll()
+		}
+	}()
+
+	return nil
+}
+
+func (p *xorbPrefetcher) failEntries(entries []*xorbPrefetchEntry, err error) {
+	for _, entry := range entries {
+		entry.err = err
+		close(entry.ready)
+	}
 }
 
 func (p *xorbPrefetcher) Get(key fetchKey) (*xorbChunkCache, error) {
