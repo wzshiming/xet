@@ -250,10 +250,7 @@ func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, orderMap map[fe
 		}
 
 		// Dynamically adjust batch size based on concurrent usage.
-		freeWorkers := concurrency - int(active.Load())
-		if freeWorkers < 1 {
-			freeWorkers = 1
-		}
+		freeWorkers := max(1, concurrency-int(active.Load()))
 		batchSize := len(remaining) / freeWorkers
 		if batchSize < 1 {
 			batchSize = 1
