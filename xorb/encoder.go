@@ -25,8 +25,6 @@ type Encoder struct {
 	packedPos   uint64
 	unpackedPos uint64
 
-	buf *[xet.MaxChunkSize]byte
-
 	finalized bool
 	xorbHash  *xet.Hash
 	err       error
@@ -36,7 +34,6 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	return &Encoder{
 		w:          w,
 		withFooter: withFooter,
-		buf:        pool.GetChunkBuf(),
 	}
 }
 
@@ -50,7 +47,9 @@ func (e *Encoder) Wirte(chunk []byte) (int, error) {
 		return 0, e.err
 	}
 
-	compressed, compressionType, err := selectBestCompression(e.buf[:0], chunk)
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+	compressed, compressionType, err := selectBestCompression(tmp[8:8], chunk)
 	if err != nil {
 		e.err = fmt.Errorf("failed to compress chunk: %w", err)
 		return 0, e.err
@@ -60,21 +59,16 @@ func (e *Encoder) Wirte(chunk []byte) (int, error) {
 	uncompressedSize := uint32(len(chunk))
 
 	// 8-byte chunk header
-	header := [8]byte{
-		0,
-		byte(compressedSize),
-		byte(compressedSize >> 8),
-		byte(compressedSize >> 16),
-		byte(compressionType),
-		byte(uncompressedSize),
-		byte(uncompressedSize >> 8),
-		byte(uncompressedSize >> 16),
-	}
-	if _, err := e.w.Write(header[:]); err != nil {
-		e.err = fmt.Errorf("failed to write chunk header: %w", err)
-		return 0, e.err
-	}
-	if _, err := e.w.Write(compressed); err != nil {
+	tmp[0] = 0 // version
+	tmp[1] = byte(compressedSize)
+	tmp[2] = byte(compressedSize >> 8)
+	tmp[3] = byte(compressedSize >> 16)
+	tmp[4] = byte(compressionType)
+	tmp[5] = byte(uncompressedSize)
+	tmp[6] = byte(uncompressedSize >> 8)
+	tmp[7] = byte(uncompressedSize >> 16)
+
+	if _, err := e.w.Write(tmp[:8+compressedSize]); err != nil {
 		e.err = fmt.Errorf("failed to write chunk data: %w", err)
 		return 0, e.err
 	}
@@ -98,10 +92,6 @@ func (e *Encoder) Wirte(chunk []byte) (int, error) {
 // It must be called exactly once after all Encode calls.
 func (e *Encoder) Close() error {
 	if e.err != nil {
-		if e.buf != nil {
-			pool.PutChunkBuf(e.buf)
-			e.buf = nil
-		}
 		return e.err
 	}
 	if e.finalized {
@@ -112,18 +102,10 @@ func (e *Encoder) Close() error {
 	if e.withFooter {
 		if err := e.writeFooter(); err != nil {
 			e.err = err
-			if e.buf != nil {
-				pool.PutChunkBuf(e.buf)
-				e.buf = nil
-			}
 			return err
 		}
 	}
 
-	if e.buf != nil {
-		pool.PutChunkBuf(e.buf)
-		e.buf = nil
-	}
 	return nil
 }
 
@@ -143,7 +125,11 @@ func (e *Encoder) writeFooter() error {
 	// Pre-allocate exact footer size to avoid reallocation.
 	// Layout: main header (40) + hash section (12 + numChunks*32) +
 	//         boundary section (12 + numChunks*8) + trailer (28) + length (4)
-	buf := e.buf[:0]
+
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+
+	buf := tmp[:0]
 
 	hash := e.SummoryHash()
 

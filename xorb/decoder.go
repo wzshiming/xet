@@ -17,8 +17,6 @@ type Decoder struct {
 	r          io.Reader
 	withFooter bool
 
-	buf *[xet.MaxChunkSize]byte
-
 	chunkHashes []xet.Hash
 	chunkSizes  []uint64
 
@@ -31,16 +29,11 @@ func NewDecoder(r io.Reader, withFooter bool) *Decoder {
 	return &Decoder{
 		r:          r,
 		withFooter: withFooter,
-		buf:        pool.GetChunkBuf(),
 	}
 }
 
 // Close releases any resources held by the Decoder, in particular the Closer set via SetCloser.
 func (d *Decoder) Close() error {
-	if d.buf != nil {
-		pool.PutChunkBuf(d.buf)
-		d.buf = nil
-	}
 	if closer, ok := d.r.(io.Closer); ok {
 		closer.Close()
 	}
@@ -83,7 +76,9 @@ func (d *Decoder) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		err := validateWithFooter(d.r, d.buf[:], headerBuf, d.SummoryHash(), d.chunkHashes)
+		tmp := pool.GetChunkBuf()
+		defer pool.PutChunkBuf(tmp)
+		err := validateWithFooter(d.r, tmp[:], headerBuf, d.SummoryHash(), d.chunkHashes)
 		if err != nil {
 			d.err = fmt.Errorf("validate footer: %w", err)
 			return 0, d.err
@@ -111,7 +106,9 @@ func (d *Decoder) Read(p []byte) (int, error) {
 		return 0, d.err
 	}
 
-	uncompressed, err := decompressChunk(d.buf[:0], p[:compressedSize], ct, int(uncompressedSize))
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+	uncompressed, err := decompressChunk(tmp[:0], p[:compressedSize], ct, int(uncompressedSize))
 	if err != nil {
 		d.err = fmt.Errorf("decompress chunk: %w", err)
 		return 0, d.err

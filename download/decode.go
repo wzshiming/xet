@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -66,7 +65,6 @@ type xorbChunkCache struct {
 	dec         *xorb.Decoder
 	file        *os.File
 	index       []chunkRef
-	buf         *[xet.MaxChunkSize]byte
 	writeOffset int64
 	done        bool // decoder exhausted or closed
 	mut         sync.Mutex
@@ -77,7 +75,7 @@ func newXorbChunkCache(dec *xorb.Decoder) (*xorbChunkCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &xorbChunkCache{dec: dec, file: f, buf: pool.GetChunkBuf()}, nil
+	return &xorbChunkCache{dec: dec, file: f}, nil
 }
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
@@ -111,15 +109,19 @@ func (c *xorbChunkCache) load() error {
 	if c.done {
 		return io.EOF
 	}
-	n, err := c.dec.Read(c.buf[:])
-	if err == io.EOF {
-		c.Done()
-		return io.EOF
-	}
+
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+
+	n, err := c.dec.Read(tmp[:])
 	if err != nil {
+		if err == io.EOF {
+			c.Done()
+			return io.EOF
+		}
 		return err
 	}
-	if _, err := c.file.Write(c.buf[:n]); err != nil {
+	if _, err := c.file.Write(tmp[:n]); err != nil {
 		return err
 	}
 	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(n)})
@@ -133,10 +135,10 @@ func (c *xorbChunkCache) LoadAll() error {
 		c.mut.Lock()
 		err := c.load()
 		c.mut.Unlock()
-		if err == io.EOF {
-			return nil
-		}
 		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
 	}
@@ -152,10 +154,6 @@ func (c *xorbChunkCache) Done() {
 // Close closes the underlying decoder and the backing temp file.
 func (c *xorbChunkCache) Close() {
 	c.Done()
-	if c.buf != nil {
-		pool.PutChunkBuf(c.buf)
-		c.buf = nil
-	}
 	if c.file != nil {
 		c.file.Close()
 		os.Remove(c.file.Name())

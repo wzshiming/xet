@@ -500,6 +500,8 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				defer tmpFile.Close()
 
 				buf := pool.GetChunkBuf()
+				defer pool.PutChunkBuf(buf)
+
 				encoder := xorb.NewEncoder(tmpFile, true)
 				for _, chunk := range group.Chunks {
 					if err := chunk.Reader.readAt(buf[:chunk.Size], chunk.Offset); err != nil {
@@ -507,7 +509,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 							firstErr = fmt.Errorf("read chunk data: %w", err)
 							cancel()
 						})
-						pool.PutChunkBuf(buf)
 						return
 					}
 					if _, err := encoder.Wirte(buf[:chunk.Size]); err != nil {
@@ -515,11 +516,10 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 							firstErr = fmt.Errorf("encode chunk: %w", err)
 							cancel()
 						})
-						pool.PutChunkBuf(buf)
 						return
 					}
 				}
-				pool.PutChunkBuf(buf)
+
 				if err := encoder.Close(); err != nil {
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("finalize xorb: %w", err)

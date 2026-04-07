@@ -16,8 +16,8 @@ import (
 // For chunk-only format (no footer), only structural validity is checked.
 // Returns nil if the stream is valid, or a descriptive error otherwise.
 func Validate(r io.Reader, xorbHash xet.Hash) error {
-	tmpBuf := pool.GetChunkBuf()
-	defer pool.PutChunkBuf(tmpBuf)
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
 
 	var headerBuf [8]byte
 	var chunkHashes []xet.Hash
@@ -37,7 +37,7 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		}
 
 		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
-			return validateWithFooter(r, tmpBuf[:], headerBuf, xorbHash, chunkHashes)
+			return validateWithFooter(r, tmp[:], headerBuf, xorbHash, chunkHashes)
 		}
 
 		version := headerBuf[0]
@@ -48,10 +48,10 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		ct := compressionType(headerBuf[4])
 		uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
 
-		if _, err := io.ReadFull(r, tmpBuf[:compressedSize]); err != nil {
+		if _, err := io.ReadFull(r, tmp[:compressedSize]); err != nil {
 			return fmt.Errorf("failed to read compressed chunk data: %w", err)
 		}
-		uncompressedBuf, err = decompressChunk(uncompressedBuf[:0], tmpBuf[:compressedSize], ct, int(uncompressedSize))
+		uncompressedBuf, err = decompressChunk(uncompressedBuf[:0], tmp[:compressedSize], ct, int(uncompressedSize))
 		if err != nil {
 			return fmt.Errorf("decompress chunk: %w", err)
 		}
