@@ -159,11 +159,8 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 			reader = io.TeeReader(reader, sha256Hasher)
 		}
 
-		// Compute chunk hashes
-		chunkHashes := []xet.Hash{}
-
-		// Compute chunk sizes
-		chunkSizes := []uint64{}
+		var chunkHashes []xet.Hash
+		var chunkSizes []uint64
 
 		err := xet.ChunkData(reader, func(offset int64, chunk []byte) error {
 			chunkHash := xet.ComputeChunkHash(chunk)
@@ -526,17 +523,16 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					return
 				}
 
-				if _, err := client.UploadXorb(ctx, encoder.SummoryHash(), tmpFile); err != nil {
+				xorbHash := encoder.SummoryHash()
+				if _, err := client.UploadXorb(ctx, xorbHash, tmpFile); err != nil {
 					errOnce.Do(func() {
-						h := encoder.SummoryHash()
-						firstErr = fmt.Errorf("upload xorb %s: %w", h.String(), err)
+						firstErr = fmt.Errorf("upload xorb %s: %w", xorbHash.String(), err)
 						cancel()
 					})
 					return
 				}
 
 				cacheMu.Lock()
-				xorbHash := encoder.SummoryHash()
 				for i, chunkHash := range group.ChunkHashes {
 					if result, ok := cache[chunkHash]; ok && result.IsNew {
 						result.XorbHash = xorbHash
@@ -556,9 +552,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes []xet.Hash, fileSHA256s [][32]byte, allChunks []chunkInfo, fileChunkRanges map[int][]int) error {
 	// Create shard with default header
 	sh := shard.NewShard()
-
-	// Track unique xorbs
-	xorbMap := make(map[xet.Hash]*shard.CASBlock)
 
 	// Build file blocks
 	for fileIdx, fileHash := range fileHashes {
@@ -646,16 +639,6 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 					currentBytes += chunkSize
 				}
 			}
-
-			// Track this xorb
-			if chunk.Dedup.IsNew {
-				if _, exists := xorbMap[xorbHash]; !exists {
-					xorbMap[xorbHash] = &shard.CASBlock{
-						CASHash: xorbHash,
-						Chunks:  make([]shard.CASChunkSequenceEntry, 0),
-					}
-				}
-			}
 		}
 
 		// Add final term
@@ -689,43 +672,32 @@ func buildAndUploadShard(ctx context.Context, client ClientAdapter, fileHashes [
 		sh.Files = append(sh.Files, fileBlock)
 	}
 
-	// Build CAS blocks by collecting chunk information from all chunks
-	xorbChunksMap := make(map[xet.Hash][]shard.CASChunkSequenceEntry)
-	xorbBytesMap := make(map[xet.Hash]uint32)              // total uncompressed bytes per xorb
-	xorbSeenChunks := make(map[xet.Hash]map[xet.Hash]bool) // track added chunks per xorb
+	// Build CAS blocks
+	casBlocks := make(map[xet.Hash]*shard.CASBlock)
+	casSeenChunks := make(map[xet.Hash]map[xet.Hash]bool)
 
 	for _, chunk := range allChunks {
 		if !chunk.Dedup.IsNew {
 			continue
 		}
-
 		xorbHash := chunk.Dedup.XorbHash
-		chunkSize := chunk.Chunk.Size // already uint32
-
-		if _, exists := xorbSeenChunks[xorbHash]; !exists {
-			xorbChunksMap[xorbHash] = make([]shard.CASChunkSequenceEntry, 0)
-			xorbBytesMap[xorbHash] = 0
-			xorbSeenChunks[xorbHash] = make(map[xet.Hash]bool)
+		if _, exists := casBlocks[xorbHash]; !exists {
+			casBlocks[xorbHash] = &shard.CASBlock{CASHash: xorbHash}
+			casSeenChunks[xorbHash] = make(map[xet.Hash]bool)
 		}
-
-		// Only add each chunk once
-		if !xorbSeenChunks[xorbHash][chunk.Hash] {
-			xorbSeenChunks[xorbHash][chunk.Hash] = true
-			entry := shard.CASChunkSequenceEntry{
+		if !casSeenChunks[xorbHash][chunk.Hash] {
+			casSeenChunks[xorbHash][chunk.Hash] = true
+			casBlock := casBlocks[xorbHash]
+			casBlock.Chunks = append(casBlock.Chunks, shard.CASChunkSequenceEntry{
 				ChunkHash:        chunk.Hash,
-				ByteRangeStart:   xorbBytesMap[xorbHash],
-				UnpackedSegBytes: chunkSize,
-			}
-			xorbChunksMap[xorbHash] = append(xorbChunksMap[xorbHash], entry)
-			xorbBytesMap[xorbHash] += chunkSize
+				ByteRangeStart:   casBlock.NumBytesInCAS,
+				UnpackedSegBytes: chunk.Chunk.Size,
+			})
+			casBlock.NumBytesInCAS += chunk.Chunk.Size
 		}
 	}
 
-	for _, casBlock := range xorbMap {
-		if chunks, ok := xorbChunksMap[casBlock.CASHash]; ok {
-			casBlock.Chunks = chunks
-			casBlock.NumBytesInCAS = xorbBytesMap[casBlock.CASHash]
-		}
+	for _, casBlock := range casBlocks {
 		sh.CASInfos = append(sh.CASInfos, *casBlock)
 	}
 
