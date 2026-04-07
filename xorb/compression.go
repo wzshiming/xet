@@ -21,7 +21,8 @@ const (
 
 // decompressChunk decompresses a chunk using the specified compression type.
 // The result is appended to dst; pass nil to allocate a new slice.
-// For compressionNone with nil dst, data is returned directly to avoid copying.
+// For compressionNone with nil dst, data is returned directly without copying;
+// the caller must not modify the returned slice as it aliases the input.
 func decompressChunk(dst, data []byte, compressionType compressionType, uncompressedSize int) ([]byte, error) {
 	switch compressionType {
 	case compressionNone:

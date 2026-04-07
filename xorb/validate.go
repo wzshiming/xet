@@ -101,7 +101,7 @@ func validateWithFooter(
 		return fmt.Errorf("xorb hash mismatch: footer claims %x, computed %x", info.Hash, computed)
 	}
 	if info.Hash != xorbHash {
-		return fmt.Errorf("xorb hash mismatch: expected %x, computed %x", xorbHash, computed)
+		return fmt.Errorf("xorb hash mismatch: expected %x, got %x", xorbHash, computed)
 	}
 	return nil
 }
