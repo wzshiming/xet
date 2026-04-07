@@ -707,8 +707,9 @@ func extractUploadedChunkHashes(t *testing.T, reqs []RequestRecord) map[string]b
 		}
 
 		dec := xorb.NewDecoder(bytes.NewReader(req.Body), false)
+		var buf [xet.MaxChunkSize]byte
 		for {
-			data, err := dec.Decode()
+			n, err := dec.Read(buf[:])
 			if err == io.EOF {
 				break
 			}
@@ -716,7 +717,7 @@ func extractUploadedChunkHashes(t *testing.T, reqs []RequestRecord) map[string]b
 				t.Errorf("failed to decode xorb while extracting uploaded chunks: %v", err)
 				break
 			}
-			h := xet.ComputeChunkHash(data)
+			h := xet.ComputeChunkHash(buf[:n])
 			result[h.String()] = true
 		}
 	}
@@ -792,8 +793,9 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	for _, req := range xetgoReqs {
 		info := xorbInfo{hash: req.Path}
 		dec := xorb.NewDecoder(bytes.NewReader(req.Body), false)
+		var buf [xet.MaxChunkSize]byte
 		for {
-			data, err := dec.Decode()
+			n, err := dec.Read(buf[:])
 			if err == io.EOF {
 				break
 			}
@@ -801,10 +803,10 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 				t.Errorf("Failed to deserialize xet-go xorb: %v", err)
 				break
 			}
-			h := xet.ComputeChunkHash(data)
+			h := xet.ComputeChunkHash(buf[:n])
 			xetgoChunkHashes[h] = true
 			info.chunkHashes = append(info.chunkHashes, h)
-			info.chunkSizes = append(info.chunkSizes, len(data))
+			info.chunkSizes = append(info.chunkSizes, n)
 		}
 		xetgoXorbs = append(xetgoXorbs, info)
 	}
@@ -812,8 +814,9 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	for _, req := range nativeReqs {
 		info := xorbInfo{hash: req.Path}
 		dec := xorb.NewDecoder(bytes.NewReader(req.Body), false)
+		var buf [xet.MaxChunkSize]byte
 		for {
-			data, err := dec.Decode()
+			n, err := dec.Read(buf[:])
 			if err == io.EOF {
 				break
 			}
@@ -821,10 +824,10 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 				t.Errorf("Failed to deserialize native xorb: %v", err)
 				break
 			}
-			h := xet.ComputeChunkHash(data)
+			h := xet.ComputeChunkHash(buf[:n])
 			nativeChunkHashes[h] = true
 			info.chunkHashes = append(info.chunkHashes, h)
-			info.chunkSizes = append(info.chunkSizes, len(data))
+			info.chunkSizes = append(info.chunkSizes, n)
 		}
 		nativeXorbs = append(nativeXorbs, info)
 	}

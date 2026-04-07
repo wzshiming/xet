@@ -24,7 +24,7 @@ type Encoder struct {
 	packedPos   uint64
 	unpackedPos uint64
 
-	compressedBuf []byte // reusable buffer for compressed data
+	buf [xet.MaxChunkSize]byte
 
 	finalized bool
 	xorbHash  *xet.Hash
@@ -38,25 +38,23 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	}
 }
 
-// Encode compresses chunk and writes the 8-byte header followed by compressed data to w.
-func (e *Encoder) Encode(chunk []byte) error {
+// Wirte compresses chunk and writes the 8-byte header followed by compressed data to w.
+func (e *Encoder) Wirte(chunk []byte) (int, error) {
 	if e.err != nil {
-		return e.err
+		return 0, e.err
 	}
 	if e.finalized {
 		e.err = fmt.Errorf("encoder already finalized")
-		return e.err
+		return 0, e.err
 	}
 
-	var compressionType compressionType
-	var err error
-	e.compressedBuf, compressionType, err = selectBestCompression(e.compressedBuf[:0], chunk)
+	compressed, compressionType, err := selectBestCompression(e.buf[:0], chunk)
 	if err != nil {
 		e.err = fmt.Errorf("failed to compress chunk: %w", err)
-		return e.err
+		return 0, e.err
 	}
 
-	compressedSize := uint32(len(e.compressedBuf))
+	compressedSize := uint32(len(compressed))
 	uncompressedSize := uint32(len(chunk))
 
 	// 8-byte chunk header
@@ -72,11 +70,11 @@ func (e *Encoder) Encode(chunk []byte) error {
 	}
 	if _, err := e.w.Write(header[:]); err != nil {
 		e.err = fmt.Errorf("failed to write chunk header: %w", err)
-		return e.err
+		return 0, e.err
 	}
-	if _, err := e.w.Write(e.compressedBuf); err != nil {
+	if _, err := e.w.Write(compressed); err != nil {
 		e.err = fmt.Errorf("failed to write chunk data: %w", err)
-		return e.err
+		return 0, e.err
 	}
 
 	e.packedPos += 8 + uint64(compressedSize)
@@ -91,7 +89,7 @@ func (e *Encoder) Encode(chunk []byte) error {
 		e.unpackedOffsets = append(e.unpackedOffsets, e.unpackedPos)
 	}
 
-	return nil
+	return len(chunk), nil
 }
 
 // Close writes the footer to w (if withFooter was set) and finalizes the encoder.
@@ -131,8 +129,7 @@ func (e *Encoder) writeFooter() error {
 	// Pre-allocate exact footer size to avoid reallocation.
 	// Layout: main header (40) + hash section (12 + numChunks*32) +
 	//         boundary section (12 + numChunks*8) + trailer (28) + length (4)
-	footerSize := 40 + 12 + int(numChunks)*32 + 12 + int(numChunks)*8 + 28 + 4
-	buf := make([]byte, 0, footerSize)
+	buf := e.buf[:0]
 
 	hash := e.SummoryHash()
 

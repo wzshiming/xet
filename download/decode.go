@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -64,6 +65,7 @@ type xorbChunkCache struct {
 	dec         *xorb.Decoder
 	file        *os.File
 	index       []chunkRef
+	buf         [xet.MaxChunkSize]byte
 	writeOffset int64
 	done        bool // decoder exhausted or closed
 	mut         sync.Mutex
@@ -108,7 +110,7 @@ func (c *xorbChunkCache) load() error {
 	if c.done {
 		return io.EOF
 	}
-	data, err := c.dec.Decode()
+	n, err := c.dec.Read(c.buf[:])
 	if err == io.EOF {
 		c.Done()
 		return io.EOF
@@ -116,11 +118,11 @@ func (c *xorbChunkCache) load() error {
 	if err != nil {
 		return err
 	}
-	if _, err := c.file.Write(data); err != nil {
+	if _, err := c.file.Write(c.buf[:n]); err != nil {
 		return err
 	}
-	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(len(data))})
-	c.writeOffset += int64(len(data))
+	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(n)})
+	c.writeOffset += int64(n)
 	return nil
 }
 

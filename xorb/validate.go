@@ -35,7 +35,7 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 
 		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
 			// Footer found: read it and verify structural + hash integrity.
-			info, err := readFooter(r, headerBuf[:])
+			info, err := readFooter(r, tmpBuf[:], headerBuf)
 			if err != nil {
 				return fmt.Errorf("invalid footer: %w", err)
 			}
@@ -117,7 +117,7 @@ type footerInfo struct {
 //   - Hash section: XBLBHSH (7) + version (1) + N (4) + hashes (32*N)
 //   - Boundary section: XBLBBND (7) + version (1) + N (4) + packed offsets (4*N) + unpacked offsets (4*N)
 //   - Trailer (28) + footer length (4)
-func readFooter(r io.Reader, headerBuf []byte) (footerInfo, error) {
+func readFooter(r io.Reader, buf []byte, headerBuf [8]byte) (footerInfo, error) {
 	// Validate main header version.
 	if headerBuf[7] != 1 {
 		return footerInfo{}, fmt.Errorf("unsupported xorb version: %d (expected 1)", headerBuf[7])
@@ -141,7 +141,7 @@ func readFooter(r io.Reader, headerBuf []byte) (footerInfo, error) {
 	// Remaining: chunk hashes (32*N) + boundary section (12 + 8*N) + trailer (28) + length field (4)
 	// = 40*N + 44 bytes.
 	remainingSize := int(numChunks)*40 + 44
-	remaining := make([]byte, remainingSize)
+	remaining := buf[:remainingSize]
 	if _, err := io.ReadFull(r, remaining); err != nil {
 		return footerInfo{}, fmt.Errorf("failed to read remaining footer data: %w", err)
 	}

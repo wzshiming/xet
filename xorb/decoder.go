@@ -16,6 +16,8 @@ type Decoder struct {
 	r          io.Reader
 	withFooter bool
 
+	buf [xet.MaxChunkSize]byte
+
 	chunkHashes []xet.Hash
 	chunkSizes  []uint64
 
@@ -41,12 +43,12 @@ func (d *Decoder) Close() error {
 
 // Decode reads and returns the next chunk's uncompressed data.
 // Returns io.EOF when all chunks have been consumed.
-func (d *Decoder) Decode() ([]byte, error) {
+func (d *Decoder) Read(p []byte) (int, error) {
 	if d.err != nil {
-		return nil, d.err
+		return 0, d.err
 	}
 	if d.done {
-		return nil, io.EOF
+		return 0, io.EOF
 	}
 
 	var headerBuf [8]byte
@@ -55,33 +57,33 @@ func (d *Decoder) Decode() ([]byte, error) {
 		if d.withFooter {
 			if err == io.EOF {
 				d.err = fmt.Errorf("unexpected EOF: expected footer")
-				return nil, d.err
+				return 0, d.err
 			}
 			d.err = fmt.Errorf("failed to read data: %w", err)
-			return nil, d.err
+			return 0, d.err
 		}
 		d.done = true
-		return nil, io.EOF
+		return 0, io.EOF
 	}
 	if err != nil {
 		d.err = fmt.Errorf("failed to read chunk header: %w", err)
-		return nil, d.err
+		return 0, d.err
 	}
 
 	// Check for footer start (XETBLOB identifier)
 	if bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
 		if !d.withFooter {
 			d.done = true
-			return nil, io.EOF
+			return 0, io.EOF
 		}
-		info, err := readFooter(d.r, headerBuf[:])
+		info, err := readFooter(d.r, d.buf[:], headerBuf)
 		if err != nil {
 			d.err = fmt.Errorf("failed to read footer: %w", err)
-			return nil, d.err
+			return 0, d.err
 		}
 		d.xorbHash = &info.Hash
 		d.done = true
-		return nil, io.EOF
+		return 0, io.EOF
 	}
 
 	// Parse chunk header (8 bytes):
@@ -91,29 +93,34 @@ func (d *Decoder) Decode() ([]byte, error) {
 	//   [5-7]  uncompressed size (little-endian, 3 bytes)
 	if headerBuf[0] != 0 {
 		d.err = fmt.Errorf("unsupported chunk version: %d", headerBuf[0])
-		return nil, d.err
+		return 0, d.err
 	}
 	compressedSize := uint32(headerBuf[1]) | uint32(headerBuf[2])<<8 | uint32(headerBuf[3])<<16
 	ct := compressionType(headerBuf[4])
 	uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
 
-	chunkData := make([]byte, compressedSize)
-	if _, err := io.ReadFull(d.r, chunkData); err != nil {
+	if _, err := io.ReadFull(d.r, p[:compressedSize]); err != nil {
 		d.err = fmt.Errorf("failed to read chunk data: %w", err)
-		return nil, d.err
+		return 0, d.err
 	}
 
-	uncompressed, err := decompressChunk(nil, chunkData, ct, int(uncompressedSize))
+	uncompressed, err := decompressChunk(d.buf[:0], p[:compressedSize], ct, int(uncompressedSize))
 	if err != nil {
 		d.err = fmt.Errorf("decompress chunk: %w", err)
-		return nil, d.err
+		return 0, d.err
 	}
 
 	h := xet.ComputeChunkHash(uncompressed)
 	d.chunkHashes = append(d.chunkHashes, h)
 	d.chunkSizes = append(d.chunkSizes, uint64(uncompressedSize))
 
-	return uncompressed, nil
+	copied := copy(p, uncompressed)
+	if copied < len(uncompressed) {
+		d.err = fmt.Errorf("output buffer too small: need %d bytes", len(uncompressed))
+		return copied, d.err
+	}
+
+	return copied, nil
 }
 
 // SummoryHash returns the overall xorb hash.
