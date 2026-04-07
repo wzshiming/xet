@@ -19,6 +19,7 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 	var headerBuf [8]byte
 	var chunkHashes []xet.Hash
 	var chunkSizes []uint64
+	var uncompressedBuf []byte
 	var packedEndOffset uint64   // cumulative compressed bytes (header + data) per chunk
 	var unpackedEndOffset uint64 // cumulative uncompressed bytes per chunk
 
@@ -82,11 +83,11 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		if _, err := io.ReadFull(r, tmpBuf[:compressedSize]); err != nil {
 			return fmt.Errorf("failed to read compressed chunk data: %w", err)
 		}
-		uncompressed, err := decompressChunk(tmpBuf[:compressedSize], ct, int(uncompressedSize))
+		uncompressedBuf, err = decompressChunk(uncompressedBuf[:0], tmpBuf[:compressedSize], ct, int(uncompressedSize))
 		if err != nil {
 			return fmt.Errorf("decompress chunk: %w", err)
 		}
-		h := xet.ComputeChunkHash(uncompressed)
+		h := xet.ComputeChunkHash(uncompressedBuf)
 		chunkHashes = append(chunkHashes, h)
 		chunkSizes = append(chunkSizes, uint64(uncompressedSize))
 		packedEndOffset += 8 + uint64(compressedSize)

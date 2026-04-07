@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	"github.com/pierrec/lz4/v4"
@@ -18,43 +19,57 @@ const (
 	compressionByteGrouping4 compressionType = 2 // ByteGrouping4 + LZ4
 )
 
-// decompressChunk decompresses a chunk using the specified compression type
-func decompressChunk(data []byte, compressionType compressionType, uncompressedSize int) ([]byte, error) {
+// decompressChunk decompresses a chunk using the specified compression type.
+// The result is appended to dst; pass nil to allocate a new slice.
+func decompressChunk(dst, data []byte, compressionType compressionType, uncompressedSize int) ([]byte, error) {
 	switch compressionType {
 	case compressionNone:
-		return data, nil
+		return append(dst, data...), nil
 	case compressionLZ4:
-		return decompressLZ4(data, uncompressedSize)
+		return decompressLZ4(dst, data, uncompressedSize)
 	case compressionByteGrouping4:
-		return decompressByteGrouping4LZ4(data, uncompressedSize)
+		return decompressByteGrouping4LZ4(dst, data, uncompressedSize)
 	default:
-		return nil, fmt.Errorf("unsupported compression type: %d", compressionType)
+		return dst, fmt.Errorf("unsupported compression type: %d", compressionType)
 	}
 }
 
-// compressLZ4 compresses data using LZ4 Frame format
-func compressLZ4(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	w := lz4.NewWriter(&buf)
+// lz4WriterPool pools lz4.Writer objects to avoid per-call allocation.
+var lz4WriterPool sync.Pool
 
-	_, err := w.Write(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write to LZ4 writer: %w", err)
+// compressLZ4 compresses data using LZ4 Frame format.
+// The result is appended to dst; pass nil to allocate a new slice.
+func compressLZ4(dst, data []byte) ([]byte, error) {
+	buf := bytes.NewBuffer(dst)
+
+	var w *lz4.Writer
+	if v := lz4WriterPool.Get(); v != nil {
+		w = v.(*lz4.Writer)
+		w.Reset(buf)
+	} else {
+		w = lz4.NewWriter(buf)
 	}
 
-	err = w.Close()
-	if err != nil {
-		return nil, fmt.Errorf("failed to close LZ4 writer: %w", err)
+	if _, err := w.Write(data); err != nil {
+		lz4WriterPool.Put(w)
+		return dst, fmt.Errorf("failed to write to LZ4 writer: %w", err)
 	}
 
+	if err := w.Close(); err != nil {
+		lz4WriterPool.Put(w)
+		return dst, fmt.Errorf("failed to close LZ4 writer: %w", err)
+	}
+
+	lz4WriterPool.Put(w)
 	return buf.Bytes(), nil
 }
 
 // lz4ReaderPool pools lz4.Reader objects to avoid per-call allocation.
 var lz4ReaderPool sync.Pool
 
-// decompressLZ4 decompresses LZ4 Frame format data
-func decompressLZ4(data []byte, uncompressedSize int) ([]byte, error) {
+// decompressLZ4 decompresses LZ4 Frame format data.
+// The result is appended to dst; pass nil to allocate a new slice.
+func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	br := bytes.NewReader(data)
 
 	var r *lz4.Reader
@@ -65,45 +80,53 @@ func decompressLZ4(data []byte, uncompressedSize int) ([]byte, error) {
 		r = lz4.NewReader(br)
 	}
 
-	result := make([]byte, uncompressedSize)
-	n, err := io.ReadFull(r, result)
+	off := len(dst)
+	dst = slices.Grow(dst, uncompressedSize)[:off+uncompressedSize]
+
+	n, err := io.ReadFull(r, dst[off:])
 	lz4ReaderPool.Put(r)
 
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, fmt.Errorf("failed to decompress LZ4: %w", err)
+		return dst[:off], fmt.Errorf("failed to decompress LZ4: %w", err)
 	}
 
 	if n != uncompressedSize {
-		return nil, fmt.Errorf("decompressed size mismatch: got %d, expected %d", n, uncompressedSize)
+		return dst[:off], fmt.Errorf("decompressed size mismatch: got %d, expected %d", n, uncompressedSize)
 	}
 
-	return result, nil
+	return dst, nil
 }
 
-// compressByteGrouping4LZ4 applies ByteGrouping4 transform then LZ4 compression
-func compressByteGrouping4LZ4(data []byte) ([]byte, error) {
-	transformed := applyByteGrouping4(data)
-	return compressLZ4(transformed)
+// compressByteGrouping4LZ4 applies ByteGrouping4 transform then LZ4 compression.
+// The result is appended to dst; pass nil to allocate a new slice.
+func compressByteGrouping4LZ4(dst, data []byte) ([]byte, error) {
+	transformed := applyByteGrouping4(nil, data)
+	return compressLZ4(dst, transformed)
 }
 
-// decompressByteGrouping4LZ4 decompresses LZ4 then reverses ByteGrouping4 transform
-func decompressByteGrouping4LZ4(data []byte, uncompressedSize int) ([]byte, error) {
-	decompressed, err := decompressLZ4(data, uncompressedSize)
+// decompressByteGrouping4LZ4 decompresses LZ4 then reverses ByteGrouping4 transform.
+// The result is appended to dst; pass nil to allocate a new slice.
+func decompressByteGrouping4LZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
+	decompressed, err := decompressLZ4(nil, data, uncompressedSize)
 	if err != nil {
-		return nil, err
+		return dst, err
 	}
-	return reverseByteGrouping4(decompressed), nil
+	return reverseByteGrouping4(dst, decompressed), nil
 }
 
-// applyByteGrouping4 reorganizes bytes by position within 4-byte groups
+// applyByteGrouping4 reorganizes bytes by position within 4-byte groups.
 // Original: [A0 A1 A2 A3 | B0 B1 B2 B3 | ...]
 // Grouped: [A0 B0 C0 ... | A1 B1 C1 ... | A2 B2 C2 ... | A3 B3 C3 ...]
-func applyByteGrouping4(data []byte) []byte {
+// The result is appended to dst; pass nil to allocate a new slice.
+func applyByteGrouping4(dst, data []byte) []byte {
 	if len(data) == 0 {
-		return data
+		return dst
 	}
 
-	result := make([]byte, len(data))
+	off := len(dst)
+	dst = slices.Grow(dst, len(data))[:off+len(data)]
+	result := dst[off:]
+
 	writePos := 0
 
 	// Process each byte position within groups (0-3)
@@ -118,16 +141,20 @@ func applyByteGrouping4(data []byte) []byte {
 		}
 	}
 
-	return result
+	return dst
 }
 
-// reverseByteGrouping4 reverses the ByteGrouping4 transform
-func reverseByteGrouping4(data []byte) []byte {
+// reverseByteGrouping4 reverses the ByteGrouping4 transform.
+// The result is appended to dst; pass nil to allocate a new slice.
+func reverseByteGrouping4(dst, data []byte) []byte {
 	if len(data) == 0 {
-		return data
+		return dst
 	}
 
-	result := make([]byte, len(data))
+	off := len(dst)
+	dst = slices.Grow(dst, len(data))[:off+len(data)]
+	result := dst[off:]
+
 	numFullGroups := len(data) / 4
 	remainder := len(data) % 4
 
@@ -150,32 +177,39 @@ func reverseByteGrouping4(data []byte) []byte {
 		}
 	}
 
-	return result
+	return dst
 }
 
-// selectBestCompression tries different compression methods and returns the best one
-func selectBestCompression(data []byte) ([]byte, compressionType, error) {
+// selectBestCompression tries different compression methods and returns the best one.
+// The result is appended to dst; pass nil to allocate a new slice.
+func selectBestCompression(dst, data []byte) ([]byte, compressionType, error) {
 	// Try no compression
 	noneSize := len(data)
-	best := data
 	bestType := compressionNone
 	bestSize := noneSize
 
 	// Try LZ4
-	lz4Data, err := compressLZ4(data)
+	lz4Data, err := compressLZ4(nil, data)
 	if err == nil && len(lz4Data) < bestSize {
-		best = lz4Data
 		bestType = compressionLZ4
 		bestSize = len(lz4Data)
 	}
 
 	// Try ByteGrouping4 + LZ4
-	bg4Data, err := compressByteGrouping4LZ4(data)
+	bg4Data, err := compressByteGrouping4LZ4(nil, data)
 	if err == nil && len(bg4Data) < bestSize {
-		best = bg4Data
 		bestType = compressionByteGrouping4
-		bestSize = len(bg4Data)
 	}
 
-	return best, bestType, nil
+	// Append the best result to dst
+	switch bestType {
+	case compressionNone:
+		dst = append(dst, data...)
+	case compressionLZ4:
+		dst = append(dst, lz4Data...)
+	case compressionByteGrouping4:
+		dst = append(dst, bg4Data...)
+	}
+
+	return dst, bestType, nil
 }

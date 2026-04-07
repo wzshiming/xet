@@ -24,6 +24,8 @@ type Encoder struct {
 	packedPos   uint64
 	unpackedPos uint64
 
+	compressedBuf []byte // reusable buffer for compressed data
+
 	finalized bool
 	xorbHash  *xet.Hash
 	err       error
@@ -46,13 +48,15 @@ func (e *Encoder) Encode(chunk []byte) error {
 		return e.err
 	}
 
-	compressedData, compressionType, err := selectBestCompression(chunk)
+	var compressionType compressionType
+	var err error
+	e.compressedBuf, compressionType, err = selectBestCompression(e.compressedBuf[:0], chunk)
 	if err != nil {
 		e.err = fmt.Errorf("failed to compress chunk: %w", err)
 		return e.err
 	}
 
-	compressedSize := uint32(len(compressedData))
+	compressedSize := uint32(len(e.compressedBuf))
 	uncompressedSize := uint32(len(chunk))
 
 	// 8-byte chunk header
@@ -70,7 +74,7 @@ func (e *Encoder) Encode(chunk []byte) error {
 		e.err = fmt.Errorf("failed to write chunk header: %w", err)
 		return e.err
 	}
-	if _, err := e.w.Write(compressedData); err != nil {
+	if _, err := e.w.Write(e.compressedBuf); err != nil {
 		e.err = fmt.Errorf("failed to write chunk data: %w", err)
 		return e.err
 	}

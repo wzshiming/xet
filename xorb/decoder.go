@@ -103,7 +103,7 @@ func (d *Decoder) Decode() ([]byte, error) {
 		return nil, d.err
 	}
 
-	uncompressed, err := decompressChunk(chunkData, ct, int(uncompressedSize))
+	uncompressed, err := decompressChunk(nil, chunkData, ct, int(uncompressedSize))
 	if err != nil {
 		d.err = fmt.Errorf("decompress chunk: %w", err)
 		return nil, d.err
