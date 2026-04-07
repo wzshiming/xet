@@ -76,12 +76,13 @@ func (d *Decoder) Read(p []byte) (int, error) {
 			d.done = true
 			return 0, io.EOF
 		}
-		info, err := readFooter(d.r, d.buf[:], headerBuf)
+
+		err := validateWithFooter(d.r, d.buf[:], headerBuf, d.SummoryHash(), d.chunkHashes)
 		if err != nil {
-			d.err = fmt.Errorf("failed to read footer: %w", err)
+			d.err = fmt.Errorf("validate footer: %w", err)
 			return 0, d.err
 		}
-		d.xorbHash = &info.Hash
+
 		d.done = true
 		return 0, io.EOF
 	}
