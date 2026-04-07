@@ -2,48 +2,49 @@ package xet
 
 import (
 	"encoding/binary"
-	"fmt"
+	"strconv"
+	"sync"
+)
+
+var (
+	nodesPool = sync.Pool{New: func() any {
+		return []node{}
+	}}
 )
 
 // merkleTree represents a Merkle tree with variable fan-out
 type merkleTree struct {
-	leaves []Hash
-	sizes  []uint64 // Size in bytes of each leaf chunk
+	node []node
 }
 
 // newTree creates a new Merkle tree
 func newTree() *merkleTree {
 	return &merkleTree{
-		leaves: make([]Hash, 0),
-		sizes:  make([]uint64, 0),
+		node: nodesPool.Get().([]node)[:0],
 	}
 }
 
 // AddLeaf adds a leaf (chunk hash and size) to the tree
 func (t *merkleTree) AddLeaf(hash Hash, size uint64) {
-	t.leaves = append(t.leaves, hash)
-	t.sizes = append(t.sizes, size)
+	t.node = append(t.node, node{
+		hash: hash,
+		size: size,
+	})
 }
 
 // ComputeRoot computes the Merkle tree root hash
 func (t *merkleTree) ComputeRoot() Hash {
-	if len(t.leaves) == 0 {
+	if len(t.node) == 0 {
 		// Return ZERO_HASH (32 zero bytes)
 		return Hash{}
 	}
 
 	// Build initial list of entries
-	entries := make([]node, len(t.leaves))
-	for i := range t.leaves {
-		entries[i] = node{
-			hash: t.leaves[i],
-			size: t.sizes[i],
-		}
-	}
+	entries := t.node
 
 	// Iteratively collapse until single root remains
 	for len(entries) > 1 {
-		nextLevel := make([]node, 0)
+		nextLevel := nodesPool.Get().([]node)[:0]
 		readIdx := 0
 
 		for readIdx < len(entries) {
@@ -52,16 +53,21 @@ func (t *merkleTree) ComputeRoot() Hash {
 			cutEnd := readIdx + cutSize
 
 			// Merge this group
-			merged := t.mergeNodes(entries[readIdx:cutEnd])
+			merged := mergeNodes(entries[readIdx:cutEnd])
 			nextLevel = append(nextLevel, merged)
 
 			readIdx = cutEnd
 		}
 
+		nodesPool.Put(entries)
 		entries = nextLevel
 	}
 
-	return entries[0].hash
+	hash := entries[0].hash
+	t.node = nil
+
+	nodesPool.Put(entries)
+	return hash
 }
 
 // node represents a node in the Merkle tree
@@ -99,17 +105,18 @@ func nextMergeCut(nodes []node) int {
 }
 
 // mergeNodes merges a sequence of nodes into a single parent node
-func (t *merkleTree) mergeNodes(nodes []node) node {
+func mergeNodes(nodes []node) node {
 	// Build the input for the internal node hash
 	// Format: "{hash_hex} : {size}\n" for each child
-	var input []byte
+	// Each line: 64 (hash hex) + 3 (" : ") + 6 (chunk max digits) + 1 ("\n") = 88 bytes max
+	input := make([]byte, 0, len(nodes)*74)
 	var totalSize uint64
 
 	for _, n := range nodes {
-		hashStr := n.hash.String()
-		sizeStr := fmt.Sprintf("%d", n.size)
-		line := hashStr + " : " + sizeStr + "\n"
-		input = append(input, []byte(line)...)
+		input = append(input, n.hash.String()...)
+		input = append(input, " : "...)
+		input = strconv.AppendUint(input, n.size, 10)
+		input = append(input, '\n')
 		totalSize += n.size
 	}
 
