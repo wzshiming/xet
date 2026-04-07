@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -65,7 +66,7 @@ type xorbChunkCache struct {
 	dec         *xorb.Decoder
 	file        *os.File
 	index       []chunkRef
-	buf         [xet.MaxChunkSize]byte
+	buf         *[xet.MaxChunkSize]byte
 	writeOffset int64
 	done        bool // decoder exhausted or closed
 	mut         sync.Mutex
@@ -76,7 +77,7 @@ func newXorbChunkCache(dec *xorb.Decoder) (*xorbChunkCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &xorbChunkCache{dec: dec, file: f}, nil
+	return &xorbChunkCache{dec: dec, file: f, buf: pool.GetChunkBuf()}, nil
 }
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
@@ -151,6 +152,10 @@ func (c *xorbChunkCache) Done() {
 // Close closes the underlying decoder and the backing temp file.
 func (c *xorbChunkCache) Close() {
 	c.Done()
+	if c.buf != nil {
+		pool.PutChunkBuf(c.buf)
+		c.buf = nil
+	}
 	if c.file != nil {
 		c.file.Close()
 		os.Remove(c.file.Name())

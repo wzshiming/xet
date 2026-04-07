@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // Validate reads the xorb stream and verifies its structural and hash integrity.
@@ -15,7 +16,9 @@ import (
 // For chunk-only format (no footer), only structural validity is checked.
 // Returns nil if the stream is valid, or a descriptive error otherwise.
 func Validate(r io.Reader, xorbHash xet.Hash) error {
-	var tmpBuf [xet.MaxChunkSize]byte
+	tmpBuf := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmpBuf)
+
 	var headerBuf [8]byte
 	var chunkHashes []xet.Hash
 	var chunkSizes []uint64

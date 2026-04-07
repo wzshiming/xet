@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // Decoder reads xorb data chunk-by-chunk from an io.Reader.
@@ -16,7 +17,7 @@ type Decoder struct {
 	r          io.Reader
 	withFooter bool
 
-	buf [xet.MaxChunkSize]byte
+	buf *[xet.MaxChunkSize]byte
 
 	chunkHashes []xet.Hash
 	chunkSizes  []uint64
@@ -30,11 +31,16 @@ func NewDecoder(r io.Reader, withFooter bool) *Decoder {
 	return &Decoder{
 		r:          r,
 		withFooter: withFooter,
+		buf:        pool.GetChunkBuf(),
 	}
 }
 
 // Close releases any resources held by the Decoder, in particular the Closer set via SetCloser.
 func (d *Decoder) Close() error {
+	if d.buf != nil {
+		pool.PutChunkBuf(d.buf)
+		d.buf = nil
+	}
 	if closer, ok := d.r.(io.Closer); ok {
 		closer.Close()
 	}

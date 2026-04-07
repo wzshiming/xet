@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // Encoder writes xorb data chunk-by-chunk to an io.Writer.
@@ -24,7 +25,7 @@ type Encoder struct {
 	packedPos   uint64
 	unpackedPos uint64
 
-	buf [xet.MaxChunkSize]byte
+	buf *[xet.MaxChunkSize]byte
 
 	finalized bool
 	xorbHash  *xet.Hash
@@ -35,6 +36,7 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	return &Encoder{
 		w:          w,
 		withFooter: withFooter,
+		buf:        pool.GetChunkBuf(),
 	}
 }
 
@@ -96,6 +98,10 @@ func (e *Encoder) Wirte(chunk []byte) (int, error) {
 // It must be called exactly once after all Encode calls.
 func (e *Encoder) Close() error {
 	if e.err != nil {
+		if e.buf != nil {
+			pool.PutChunkBuf(e.buf)
+			e.buf = nil
+		}
 		return e.err
 	}
 	if e.finalized {
@@ -106,10 +112,18 @@ func (e *Encoder) Close() error {
 	if e.withFooter {
 		if err := e.writeFooter(); err != nil {
 			e.err = err
+			if e.buf != nil {
+				pool.PutChunkBuf(e.buf)
+				e.buf = nil
+			}
 			return err
 		}
 	}
 
+	if e.buf != nil {
+		pool.PutChunkBuf(e.buf)
+		e.buf = nil
+	}
 	return nil
 }
 
