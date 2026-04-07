@@ -247,10 +247,8 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, cache map[xet.
 		return
 	}
 
-	if batchClient, ok := client.(BatchDeduplicationClientAdapter); ok {
-		if deduplicateChunksBatch(ctx, batchClient, cache, probeChunkHashes, concurrency) {
-			return
-		}
+	if deduplicateChunksBatch(ctx, client, cache, probeChunkHashes, concurrency) {
+		return
 	}
 
 	deduplicateChunksSingle(ctx, client, cache, probeChunkHashes, concurrency)
@@ -289,7 +287,7 @@ func isChunkHashGlobalDedupEligible(chunkHash xet.Hash) bool {
 	return value%dedupModulus == 0
 }
 
-func deduplicateChunksBatch(ctx context.Context, client BatchDeduplicationClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) bool {
+func deduplicateChunksBatch(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, chunkHashes []xet.Hash, concurrency int) bool {
 	if len(chunkHashes) == 0 {
 		return true
 	}
