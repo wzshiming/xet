@@ -21,9 +21,13 @@ const (
 
 // decompressChunk decompresses a chunk using the specified compression type.
 // The result is appended to dst; pass nil to allocate a new slice.
+// For compressionNone with nil dst, data is returned directly to avoid copying.
 func decompressChunk(dst, data []byte, compressionType compressionType, uncompressedSize int) ([]byte, error) {
 	switch compressionType {
 	case compressionNone:
+		if dst == nil {
+			return data, nil
+		}
 		return append(dst, data...), nil
 	case compressionLZ4:
 		return decompressLZ4(dst, data, uncompressedSize)
@@ -49,6 +53,10 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 	} else {
 		w = lz4.NewWriter(buf)
 	}
+	defer func() {
+		w.Reset(io.Discard)
+		lz4WriterPool.Put(w)
+	}()
 
 	if _, err := w.Write(data); err != nil {
 		return dst, fmt.Errorf("failed to write to LZ4 writer: %w", err)
@@ -58,7 +66,6 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 		return dst, fmt.Errorf("failed to close LZ4 writer: %w", err)
 	}
 
-	lz4WriterPool.Put(w)
 	return buf.Bytes(), nil
 }
 
@@ -82,6 +89,7 @@ func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	dst = slices.Grow(dst, uncompressedSize)[:off+uncompressedSize]
 
 	n, err := io.ReadFull(r, dst[off:])
+	r.Reset(bytes.NewReader(nil))
 	lz4ReaderPool.Put(r)
 
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {

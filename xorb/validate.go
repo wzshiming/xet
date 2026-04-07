@@ -34,42 +34,7 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		}
 
 		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
-			// Footer found: read it and verify structural + hash integrity.
-			info, err := readFooter(r, tmpBuf[:], headerBuf)
-			if err != nil {
-				return fmt.Errorf("invalid footer: %w", err)
-			}
-
-			// Verify chunk count matches.
-			if len(info.ChunkHashes) != len(chunkHashes) {
-				return fmt.Errorf("chunk count mismatch: footer has %d, stream has %d", len(info.ChunkHashes), len(chunkHashes))
-			}
-			// Verify each chunk hash against the footer.
-			for i, h := range chunkHashes {
-				if h != info.ChunkHashes[i] {
-					return fmt.Errorf("chunk %d hash mismatch: footer claims %x, computed %x", i, info.ChunkHashes[i], h)
-				}
-			}
-
-			// Verify cumulative packed/unpacked offsets against boundary section.
-			if len(info.ChunkPackedEndOffsets) > 0 {
-				last := len(info.ChunkPackedEndOffsets) - 1
-				if info.ChunkPackedEndOffsets[last] != packedEndOffset {
-					return fmt.Errorf("packed offset mismatch: footer claims %d, stream has %d", info.ChunkPackedEndOffsets[last], packedEndOffset)
-				}
-				if info.ChunkUnpackedEndOffsets[last] != unpackedEndOffset {
-					return fmt.Errorf("unpacked offset mismatch: footer claims %d, stream has %d", info.ChunkUnpackedEndOffsets[last], unpackedEndOffset)
-				}
-			}
-
-			computed := xet.ComputeXorbHash(chunkHashes, chunkSizes)
-			if info.Hash != computed {
-				return fmt.Errorf("xorb hash mismatch: footer claims %x, computed %x", info.Hash, computed)
-			}
-			if info.Hash != xorbHash {
-				return fmt.Errorf("xorb hash mismatch: expected %x, computed %x", xorbHash, computed)
-			}
-			return nil
+			return validateWithFooter(r, tmpBuf[:], headerBuf, xorbHash, chunkHashes, chunkSizes, packedEndOffset, unpackedEndOffset)
 		}
 
 		version := headerBuf[0]
@@ -93,6 +58,52 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		packedEndOffset += 8 + uint64(compressedSize)
 		unpackedEndOffset += uint64(uncompressedSize)
 	}
+}
+
+// validateWithFooter reads the footer from the stream and validates it against
+// the provided chunk data (hashes, sizes, offsets) and expected xorb hash.
+// headerBuf contains the first 8 bytes already read (XETBLOB identifier + version byte).
+func validateWithFooter(
+	r io.Reader, buf []byte, headerBuf [8]byte,
+	xorbHash xet.Hash,
+	chunkHashes []xet.Hash, chunkSizes []uint64,
+	packedEndOffset, unpackedEndOffset uint64,
+) error {
+	info, err := readFooter(r, buf, headerBuf)
+	if err != nil {
+		return fmt.Errorf("invalid footer: %w", err)
+	}
+
+	// Verify chunk count matches.
+	if len(info.ChunkHashes) != len(chunkHashes) {
+		return fmt.Errorf("chunk count mismatch: footer has %d, stream has %d", len(info.ChunkHashes), len(chunkHashes))
+	}
+	// Verify each chunk hash against the footer.
+	for i, h := range chunkHashes {
+		if h != info.ChunkHashes[i] {
+			return fmt.Errorf("chunk %d hash mismatch: footer claims %x, computed %x", i, info.ChunkHashes[i], h)
+		}
+	}
+
+	// Verify cumulative packed/unpacked offsets against boundary section.
+	if len(info.ChunkPackedEndOffsets) > 0 {
+		last := len(info.ChunkPackedEndOffsets) - 1
+		if info.ChunkPackedEndOffsets[last] != packedEndOffset {
+			return fmt.Errorf("packed offset mismatch: footer claims %d, stream has %d", info.ChunkPackedEndOffsets[last], packedEndOffset)
+		}
+		if info.ChunkUnpackedEndOffsets[last] != unpackedEndOffset {
+			return fmt.Errorf("unpacked offset mismatch: footer claims %d, stream has %d", info.ChunkUnpackedEndOffsets[last], unpackedEndOffset)
+		}
+	}
+
+	computed := xet.ComputeXorbHash(chunkHashes, chunkSizes)
+	if info.Hash != computed {
+		return fmt.Errorf("xorb hash mismatch: footer claims %x, computed %x", info.Hash, computed)
+	}
+	if info.Hash != xorbHash {
+		return fmt.Errorf("xorb hash mismatch: expected %x, computed %x", xorbHash, computed)
+	}
+	return nil
 }
 
 // footerInfo holds the integrity data parsed from an xorb footer.
