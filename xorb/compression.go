@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"io"
 	"slices"
-	"sync"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // compressionType represents the type of compression used
@@ -39,25 +38,13 @@ func decompressChunk(dst, data []byte, compressionType compressionType, uncompre
 	}
 }
 
-// lz4WriterPool pools lz4.Writer objects to avoid per-call allocation.
-var lz4WriterPool sync.Pool
-
 // compressLZ4 compresses data using LZ4 Frame format.
 // The result is appended to dst; pass nil to allocate a new slice.
 func compressLZ4(dst, data []byte) ([]byte, error) {
 	buf := bytes.NewBuffer(dst)
 
-	var w *lz4.Writer
-	if v := lz4WriterPool.Get(); v != nil {
-		w = v.(*lz4.Writer)
-		w.Reset(buf)
-	} else {
-		w = lz4.NewWriter(buf)
-	}
-	defer func() {
-		w.Reset(io.Discard)
-		lz4WriterPool.Put(w)
-	}()
+	w := pool.GetLZ4Writer(buf)
+	defer pool.PutLZ4Writer(w)
 
 	if _, err := w.Write(data); err != nil {
 		return dst, fmt.Errorf("failed to write to LZ4 writer: %w", err)
@@ -70,28 +57,18 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// lz4ReaderPool pools lz4.Reader objects to avoid per-call allocation.
-var lz4ReaderPool sync.Pool
-
 // decompressLZ4 decompresses LZ4 Frame format data.
 // The result is appended to dst; pass nil to allocate a new slice.
 func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	br := bytes.NewReader(data)
 
-	var r *lz4.Reader
-	if v := lz4ReaderPool.Get(); v != nil {
-		r = v.(*lz4.Reader)
-		r.Reset(br)
-	} else {
-		r = lz4.NewReader(br)
-	}
+	r := pool.GetLZ4Reader(br)
 
 	off := len(dst)
 	dst = slices.Grow(dst, uncompressedSize)[:off+uncompressedSize]
 
 	n, err := io.ReadFull(r, dst[off:])
-	r.Reset(bytes.NewReader(nil))
-	lz4ReaderPool.Put(r)
+	pool.PutLZ4Reader(r)
 
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return dst[:off], fmt.Errorf("failed to decompress LZ4: %w", err)
