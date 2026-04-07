@@ -51,12 +51,10 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 	}
 
 	if _, err := w.Write(data); err != nil {
-		lz4WriterPool.Put(w)
 		return dst, fmt.Errorf("failed to write to LZ4 writer: %w", err)
 	}
 
 	if err := w.Close(); err != nil {
-		lz4WriterPool.Put(w)
 		return dst, fmt.Errorf("failed to close LZ4 writer: %w", err)
 	}
 
