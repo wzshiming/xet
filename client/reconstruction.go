@@ -78,9 +78,9 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, hea
 	return &reconstructionResp, nil
 }
 
-// BatchGetReconstruction retrieves reconstruction information for multiple files in a single request.
+// GetBatchReconstruction retrieves reconstruction information for multiple files in a single request.
 // It calls GET /reconstructions?file_id=<hex>&file_id=<hex>&... and returns the aggregated response.
-func (c *Client) BatchGetReconstruction(ctx context.Context, fileHashes []xet.Hash) (*download.BatchReconstructionResponse, error) {
+func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Hash) (*download.BatchReconstructionResponse, error) {
 	if len(fileHashes) == 0 {
 		return &download.BatchReconstructionResponse{
 			Files:     make(map[string][]download.Term),

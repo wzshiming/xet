@@ -66,9 +66,9 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		return nil, nil, nil
 	}
 
-	batchResp, err := c.BatchGetReconstruction(ctx, fileHashes)
+	batchResp, err := c.GetBatchReconstruction(ctx, fileHashes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("batch get reconstruction: %w", err)
+		return nil, nil, fmt.Errorf("get batch reconstruction: %w", err)
 	}
 
 	readers := make([]io.Reader, len(fileHashes))
