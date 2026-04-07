@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // Encoder writes xorb data chunk-by-chunk to an io.Writer.
@@ -36,43 +37,40 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	}
 }
 
-// Encode compresses chunk and writes the 8-byte header followed by compressed data to w.
-func (e *Encoder) Encode(chunk []byte) error {
+// Wirte compresses chunk and writes the 8-byte header followed by compressed data to w.
+func (e *Encoder) Wirte(chunk []byte) (int, error) {
 	if e.err != nil {
-		return e.err
+		return 0, e.err
 	}
 	if e.finalized {
 		e.err = fmt.Errorf("encoder already finalized")
-		return e.err
+		return 0, e.err
 	}
 
-	compressedData, compressionType, err := selectBestCompression(chunk)
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+	compressed, compressionType, err := selectBestCompression(tmp[8:8], chunk)
 	if err != nil {
 		e.err = fmt.Errorf("failed to compress chunk: %w", err)
-		return e.err
+		return 0, e.err
 	}
 
-	compressedSize := uint32(len(compressedData))
+	compressedSize := uint32(len(compressed))
 	uncompressedSize := uint32(len(chunk))
 
 	// 8-byte chunk header
-	header := [8]byte{
-		0,
-		byte(compressedSize),
-		byte(compressedSize >> 8),
-		byte(compressedSize >> 16),
-		byte(compressionType),
-		byte(uncompressedSize),
-		byte(uncompressedSize >> 8),
-		byte(uncompressedSize >> 16),
-	}
-	if _, err := e.w.Write(header[:]); err != nil {
-		e.err = fmt.Errorf("failed to write chunk header: %w", err)
-		return e.err
-	}
-	if _, err := e.w.Write(compressedData); err != nil {
+	tmp[0] = 0 // version
+	tmp[1] = byte(compressedSize)
+	tmp[2] = byte(compressedSize >> 8)
+	tmp[3] = byte(compressedSize >> 16)
+	tmp[4] = byte(compressionType)
+	tmp[5] = byte(uncompressedSize)
+	tmp[6] = byte(uncompressedSize >> 8)
+	tmp[7] = byte(uncompressedSize >> 16)
+
+	if _, err := e.w.Write(tmp[:8+compressedSize]); err != nil {
 		e.err = fmt.Errorf("failed to write chunk data: %w", err)
-		return e.err
+		return 0, e.err
 	}
 
 	e.packedPos += 8 + uint64(compressedSize)
@@ -87,7 +85,7 @@ func (e *Encoder) Encode(chunk []byte) error {
 		e.unpackedOffsets = append(e.unpackedOffsets, e.unpackedPos)
 	}
 
-	return nil
+	return len(chunk), nil
 }
 
 // Close writes the footer to w (if withFooter was set) and finalizes the encoder.
@@ -127,8 +125,11 @@ func (e *Encoder) writeFooter() error {
 	// Pre-allocate exact footer size to avoid reallocation.
 	// Layout: main header (40) + hash section (12 + numChunks*32) +
 	//         boundary section (12 + numChunks*8) + trailer (28) + length (4)
-	footerSize := 40 + 12 + int(numChunks)*32 + 12 + int(numChunks)*8 + 28 + 4
-	buf := make([]byte, 0, footerSize)
+
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+
+	buf := tmp[:0]
 
 	hash := e.SummoryHash()
 

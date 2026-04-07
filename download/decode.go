@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/wzshiming/xet/internal/pool"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -108,19 +109,23 @@ func (c *xorbChunkCache) load() error {
 	if c.done {
 		return io.EOF
 	}
-	data, err := c.dec.Decode()
-	if err == io.EOF {
-		c.Done()
-		return io.EOF
-	}
+
+	tmp := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(tmp)
+
+	n, err := c.dec.Read(tmp[:])
 	if err != nil {
+		if err == io.EOF {
+			c.Done()
+			return io.EOF
+		}
 		return err
 	}
-	if _, err := c.file.Write(data); err != nil {
+	if _, err := c.file.Write(tmp[:n]); err != nil {
 		return err
 	}
-	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(len(data))})
-	c.writeOffset += int64(len(data))
+	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(n)})
+	c.writeOffset += int64(n)
 	return nil
 }
 
@@ -130,10 +135,10 @@ func (c *xorbChunkCache) LoadAll() error {
 		c.mut.Lock()
 		err := c.load()
 		c.mut.Unlock()
-		if err == io.EOF {
-			return nil
-		}
 		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
 	}

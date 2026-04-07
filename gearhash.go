@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // Gearhash lookup table (256 64-bit constants from XET specification)
@@ -124,7 +126,8 @@ func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 	reader := bufio.NewReader(r)
 
 	var offset int64
-	var buf [MaxChunkSize]byte
+	buf := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(buf)
 
 	for {
 		chunkSize, err := findChunkBoundary(reader, buf[:])
