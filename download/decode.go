@@ -187,6 +187,13 @@ type xorbPrefetchJob struct {
 func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []xorbFetchTask, concurrency int) *xorbPrefetcher {
 	entries := make(map[fetchKey]*xorbPrefetchEntry, len(tasks))
 	items := make([]*xorbPrefetchEntry, 0, len(entries))
+	termOrder := make(map[fetchKey]int, len(termFetches))
+	for i, selected := range termFetches {
+		if _, ok := termOrder[selected.key]; ok {
+			continue
+		}
+		termOrder[selected.key] = i
+	}
 	for _, task := range tasks {
 		if _, ok := entries[task.key]; ok {
 			continue
@@ -198,6 +205,12 @@ func newXorbPrefetcher(ctx context.Context, client ClientAdapter, termFetches []
 		entries[task.key] = item
 		items = append(items, item)
 	}
+	if len(items) == 0 {
+		return &xorbPrefetcher{ctx: ctx, client: client, entries: entries}
+	}
+
+	orderEntry(items, termOrder)
+
 	p := &xorbPrefetcher{
 		ctx:     ctx,
 		client:  client,
@@ -231,11 +244,11 @@ func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, fn func(*xorbPr
 	if len(entries) == 0 {
 		return
 	}
-	orderEntry(entries)
 
 	job := &xorbPrefetchJob{entries: []*xorbPrefetchEntry{entries[0]}}
 	for _, entry := range entries[1:] {
-		if job.entries[len(job.entries)-1].task.url == entry.task.url {
+		if len(job.entries) < 8 &&
+			job.entries[len(job.entries)-1].task.url == entry.task.url {
 			job.entries = append(job.entries, entry)
 			continue
 		}
@@ -245,10 +258,18 @@ func (p *xorbPrefetcher) buildJobs(entries []*xorbPrefetchEntry, fn func(*xorbPr
 	fn(job)
 }
 
-func orderEntry(entries []*xorbPrefetchEntry) {
+func orderEntry(entries []*xorbPrefetchEntry, termOrder map[fetchKey]int) {
 	sort.Slice(entries, func(i, j int) bool {
 		a := entries[i].task.key
 		b := entries[j].task.key
+		orderA, okA := termOrder[a]
+		orderB, okB := termOrder[b]
+		if okA && okB && orderA != orderB {
+			return orderA < orderB
+		}
+		if okA != okB {
+			return okA
+		}
 		if a.Start != b.Start {
 			return a.Start < b.Start
 		}

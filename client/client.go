@@ -98,12 +98,12 @@ func reqError(req *http.Request, resp *http.Response) error {
 	if ranges != "" {
 		if resp.StatusCode != http.StatusPartialContent {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: range: %s: API error (status %d): %s", req.URL.String(), ranges, resp.StatusCode, string(body))
+			return fmt.Errorf("url %s: range: %s: API error (status %s): %s", req.URL.String(), ranges, resp.Status, string(body))
 		}
 	} else {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: API error (status %d): %s", req.URL.String(), resp.StatusCode, string(body))
+			return fmt.Errorf("url %s: API error (status %s): %s", req.URL.String(), resp.Status, string(body))
 		}
 	}
 	return nil
