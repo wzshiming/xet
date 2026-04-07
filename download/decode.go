@@ -299,7 +299,7 @@ func (p *xorbPrefetcher) runJob(job *xorbPrefetchJob) {
 		}
 		mr, closer, err := p.client.DownloadXorbsMultipart(p.ctx, job.entries[0].task.url, header)
 		if err != nil {
-			p.failEntries(job.entries, err)
+			p.runSingleRangeEntries(job.entries)
 			return
 		}
 
@@ -310,7 +310,11 @@ func (p *xorbPrefetcher) runJob(job *xorbPrefetchJob) {
 		return
 	}
 
-	for _, entry := range job.entries {
+	p.runSingleRangeEntries(job.entries)
+}
+
+func (p *xorbPrefetcher) runSingleRangeEntries(entries []*xorbPrefetchEntry) {
+	for _, entry := range entries {
 		header := http.Header{
 			"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
 		}
