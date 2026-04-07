@@ -509,7 +509,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 						})
 						return
 					}
-					if _, err := encoder.Wirte(buf[:chunk.Size]); err != nil {
+					if _, err := encoder.Write(buf[:chunk.Size]); err != nil {
 						errOnce.Do(func() {
 							firstErr = fmt.Errorf("encode chunk: %w", err)
 							cancel()

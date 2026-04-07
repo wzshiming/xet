@@ -37,8 +37,8 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	}
 }
 
-// Wirte compresses chunk and writes the 8-byte header followed by compressed data to w.
-func (e *Encoder) Wirte(chunk []byte) (int, error) {
+// Write compresses chunk and writes the 8-byte header followed by compressed data to w.
+func (e *Encoder) Write(chunk []byte) (int, error) {
 	if e.err != nil {
 		return 0, e.err
 	}
