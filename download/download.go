@@ -1,19 +1,5 @@
 package download
 
-import (
-	"context"
-	"io"
-	"mime/multipart"
-	"net/http"
-)
-
-// ClientAdapter provides access to client operations needed for reconstruction decoding
-type ClientAdapter interface {
-	DownloadXorb(ctx context.Context, url string, header http.Header) (io.ReadCloser, error)
-
-	DownloadXorbsMultipart(ctx context.Context, url string, header http.Header) (*multipart.Reader, io.Closer, error)
-}
-
 type options struct {
 	concurrency int
 	retries     int
