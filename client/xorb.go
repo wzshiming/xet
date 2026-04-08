@@ -29,15 +29,9 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		if !isNetworkError(err) {
-			return false, fmt.Errorf("do request: %w", err)
-		}
-		resp, err = c.httpClient.Do(req)
-		if err != nil {
-			return false, fmt.Errorf("network error on retry: %w", err)
-		}
+		return false, err
 	}
 	defer resp.Body.Close()
 
@@ -68,36 +62,46 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
 
-	var body io.Reader = reader
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
-	}
+	attempts := max(c.uploadRetries+1, 1)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.ContentLength = contentLength
-	req.Header.Set("Content-Type", "application/octet-stream")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		if !isNetworkError(err) {
-			return nil, fmt.Errorf("do request: %w", err)
-		}
-
+	var resp *http.Response
+	var req *http.Request
+	var lastErr error
+	for i := 0; i < attempts; i++ {
 		if _, err := reader.Seek(0, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("seek to start: %w", err)
 		}
 
-		resp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("network error on retry: %w", err)
+		var body io.Reader = reader
+		if c.progressFunc != nil {
+			body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
 		}
+
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+
+		req.ContentLength = contentLength
+		req.Header.Set("Content-Type", "application/octet-stream")
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+
+		resp, err = c.httpClient.Do(req)
+		if err == nil {
+			break
+		}
+		if !isNetworkError(err) {
+			return nil, fmt.Errorf("do request: %w", err)
+		}
+		lastErr = err
+		if req.Context().Err() != nil {
+			break
+		}
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
 	}
 	defer resp.Body.Close()
 
@@ -122,15 +126,9 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Heade
 	}
 	maps.Copy(req.Header, header)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		if !isNetworkError(err) {
-			return nil, fmt.Errorf("do request: %w", err)
-		}
-		resp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("network error on retry: %w", err)
-		}
+		return nil, err
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -166,15 +164,9 @@ func (c *Client) DownloadXorbsMultipart(ctx context.Context, url string, header 
 	}
 	maps.Copy(req.Header, header)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		if !isNetworkError(err) {
-			return nil, nil, fmt.Errorf("do request: %w", err)
-		}
-		resp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, nil, fmt.Errorf("network error on retry: %w", err)
-		}
+		return nil, nil, err
 	}
 
 	if err := reqError(req, resp); err != nil {

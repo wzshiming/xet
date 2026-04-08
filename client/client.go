@@ -12,13 +12,15 @@ import (
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL      string
-	httpClient   *http.Client
-	token        string
-	namespace    string
-	cacheDirPath string
-	concurrency  int
-	progressFunc progress.ProgressFunc
+	baseURL         string
+	httpClient      *http.Client
+	token           string
+	namespace       string
+	cacheDirPath    string
+	concurrency     int
+	downloadRetries int
+	uploadRetries   int
+	progressFunc    progress.ProgressFunc
 }
 
 type Options func(*Client)
@@ -72,12 +74,36 @@ func WithConcurrency(concurrency int) Options {
 	}
 }
 
+// WithDownloadRetries sets the number of retries for download-related GET/HEAD requests
+// when transient network errors occur. Values less than 0 are treated as 0.
+func WithDownloadRetries(retries int) Options {
+	return func(c *Client) {
+		if retries < 0 {
+			retries = 0
+		}
+		c.downloadRetries = retries
+	}
+}
+
+// WithUploadRetries sets the number of retries for upload-related POST requests
+// when transient network errors occur. Values less than 0 are treated as 0.
+func WithUploadRetries(retries int) Options {
+	return func(c *Client) {
+		if retries < 0 {
+			retries = 0
+		}
+		c.uploadRetries = retries
+	}
+}
+
 // NewClient creates a new API client
 func NewClient(opts ...Options) *Client {
 	c := &Client{
-		httpClient:  &http.Client{},
-		namespace:   "default",
-		concurrency: 4,
+		httpClient:      &http.Client{},
+		namespace:       "default",
+		concurrency:     4,
+		downloadRetries: 5,
+		uploadRetries:   5,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -119,4 +145,40 @@ func isNetworkError(err error) bool {
 		return true
 	}
 	return false
+}
+
+func isServerError(statusCode int) bool {
+	return statusCode == http.StatusInternalServerError ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
+	attempts := max(c.downloadRetries+1, 1)
+
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		resp, err := c.httpClient.Do(req)
+		if err == nil {
+			if isServerError(resp.StatusCode) {
+				lastErr = fmt.Errorf("server error status %s", resp.Status)
+				resp.Body.Close()
+				if req.Context().Err() != nil {
+					break
+				}
+				continue
+			}
+			return resp, nil
+		}
+		if !isNetworkError(err) {
+			return nil, fmt.Errorf("do request: %w", err)
+		}
+		lastErr = err
+		if req.Context().Err() != nil {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
 }

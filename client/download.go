@@ -35,6 +35,7 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	reader := download.NewReaderV1(ctx, c, reconstructionResp,
 		download.WithConcurrency(c.concurrency),
+		download.WithRetries(c.downloadRetries),
 	)
 
 	return reader, expectedLength, nil
@@ -52,6 +53,7 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	reader := download.NewReaderV2(ctx, c, reconstructionResp,
 		download.WithConcurrency(c.concurrency),
+		download.WithRetries(c.downloadRetries),
 	)
 
 	return reader, expectedLength, nil
@@ -90,6 +92,7 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		sizes[i] = download.ExpectedLengthV1(singleResp)
 		readers[i] = download.NewReaderV1(ctx, c, singleResp,
 			download.WithConcurrency(c.concurrency),
+			download.WithRetries(c.downloadRetries),
 		)
 	}
 

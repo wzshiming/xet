@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wzshiming/xet"
@@ -68,6 +69,48 @@ func TestGetReconstruction(t *testing.T) {
 	}
 	if reconstruction.Terms[0].Hash != "chunk1" {
 		t.Errorf("Expected term hash 'chunk1', got '%s'", reconstruction.Terms[0].Hash)
+	}
+}
+
+func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
+	testHash := xet.Hash([32]byte{0x11})
+	var calls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/reconstructions/"+testHash.String() {
+			t.Fatalf("Unexpected path: %s", r.URL.Path)
+		}
+
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			if _, err := w.Write([]byte("temporary backend error")); err != nil {
+				t.Fatalf("write error body: %v", err)
+			}
+			return
+		}
+
+		resp := download.ReconstructionResponseV1{
+			OffsetIntoFirstRange: 0,
+			Terms:                []download.Term{},
+			FetchInfo:            map[string][]download.FetchInfoEntry{},
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	c := NewClient(
+		WithBaseURL(server.URL),
+		WithDownloadRetries(2),
+	)
+
+	if _, err := c.GetReconstructionV1(context.Background(), testHash, nil); err != nil {
+		t.Fatalf("GetReconstructionV1 failed: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected 2 attempts, got %d", got)
 	}
 }
 

@@ -42,7 +42,7 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		prefetcher:     newXorbPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue()),
+		prefetcher:     newXorbPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue(), options.retries),
 		initErr:        err,
 	}
 }

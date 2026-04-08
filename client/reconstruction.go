@@ -27,9 +27,9 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, hea
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -60,9 +60,9 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, hea
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		return nil, fmt.Errorf("do request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -105,7 +105,7 @@ func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Ha
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("do batch reconstruction request: %w", err)
 	}
