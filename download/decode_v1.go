@@ -22,7 +22,7 @@ type ReaderV1 struct {
 	chunkIdx     uint32
 	chunkOffset  int
 	currentTerm  *Term
-	currentCache *xorbChunkCache
+	currentCache *chunkCache
 	localStart   uint32 // Local chunk index start (relative to downloaded xorb)
 	localEnd     uint32 // Local chunk index end (relative to downloaded xorb)
 	err          error
