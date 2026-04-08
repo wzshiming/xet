@@ -49,7 +49,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	var resp *http.Response
 	var req *http.Request
 	var lastErr error
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)

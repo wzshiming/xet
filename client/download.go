@@ -33,10 +33,14 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	expectedLength := download.ExpectedLengthV1(reconstructionResp)
 
 	// Create a reader that reconstructs the file on-demand
-	reader := download.NewReaderV1(ctx, c, reconstructionResp,
+	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithRetries(c.downloadRetries),
-	)
+	}
+	if c.progressFunc != nil {
+		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+	}
+	reader := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
 
 	return reader, expectedLength, nil
 }
@@ -51,10 +55,14 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	expectedLength := download.ExpectedLengthV2(reconstructionResp)
 
 	// Create a reader that reconstructs the file on-demand
-	reader := download.NewReaderV2(ctx, c, reconstructionResp,
+	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithRetries(c.downloadRetries),
-	)
+	}
+	if c.progressFunc != nil {
+		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+	}
+	reader := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
 
 	return reader, expectedLength, nil
 }
@@ -90,10 +98,14 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		readers[i] = download.NewReaderV1(ctx, c, singleResp,
+		opts := []download.Option{
 			download.WithConcurrency(c.concurrency),
 			download.WithRetries(c.downloadRetries),
-		)
+		}
+		if c.progressFunc != nil {
+			opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+		}
+		readers[i] = download.NewReaderV1(ctx, c, singleResp, opts...)
 	}
 
 	return readers, sizes, nil

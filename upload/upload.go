@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"maps"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
+	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -103,24 +107,37 @@ type xorbGroup struct {
 type options struct {
 	concurrency  int
 	enableSHA256 bool
+	progressFunc progress.ProgressFunc
 }
 
+// Option is a functional option for UploadFile and UploadFiles.
+type Option func(*options)
+
 // WithConcurrency configures how many upload tasks run concurrently.
-func WithConcurrency(concurrency int) func(*options) {
+func WithConcurrency(concurrency int) Option {
 	return func(o *options) {
 		o.concurrency = concurrency
 	}
 }
 
 // WithEnableSHA256 configures whether to compute and include SHA-256 hashes in the shard metadata.
-func WithEnableSHA256(enabled bool) func(*options) {
+func WithEnableSHA256(enabled bool) Option {
 	return func(o *options) {
 		o.enableSHA256 = enabled
 	}
 }
 
+// WithProgressFunc sets a callback to receive upload progress updates.
+// Progress is reported at xorb-task granularity and committed only after a
+// xorb upload succeeds, so retries never inflate the current value.
+func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
+	return func(o *options) {
+		o.progressFunc = progressFunc
+	}
+}
+
 // UploadFile chunks, deduplicates, and uploads a single file using the provided client adapter.
-func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...func(*options)) (xet.Hash, error) {
+func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...Option) (xet.Hash, error) {
 	hashes, err := UploadFiles(ctx, client, []io.ReadSeeker{readSeeker}, opts...)
 	if err != nil {
 		return xet.Hash{}, err
@@ -130,7 +147,7 @@ func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSee
 
 // UploadFiles chunks, deduplicates, and uploads multiple files using the
 // provided client adapter. It returns the computed file hashes.
-func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.ReadSeeker, opts ...func(*options)) ([]xet.Hash, error) {
+func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.ReadSeeker, opts ...Option) ([]xet.Hash, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -243,7 +260,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	}
 
 	// Step 4: Upload xorbs
-	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency); err != nil {
+	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency, options.progressFunc); err != nil {
 		return nil, fmt.Errorf("upload xorbs: %w", err)
 	}
 
@@ -274,9 +291,7 @@ func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 		return fmt.Errorf("query dedup shards: %w", err)
 	}
 
-	for h, v := range m {
-		cache[h] = v
-	}
+	maps.Copy(cache, m)
 	return nil
 }
 
@@ -367,7 +382,14 @@ func isChunkHashGlobalDedupEligible(chunkHash xet.Hash) bool {
 }
 
 // uploadXorbs serializes and uploads all xorbs.
-func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int) error {
+type preparedXorb struct {
+	hash        xet.Hash
+	path        string
+	size        int64
+	chunkHashes []xet.Hash
+}
+
+func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int, progressFunc progress.ProgressFunc) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -381,21 +403,23 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	queue := make(chan *xorbGroup, len(groups))
+	prepareQueue := make(chan *xorbGroup, len(groups))
 	for _, group := range groups {
-		queue <- group
+		prepareQueue <- group
 	}
-	close(queue)
+	close(prepareQueue)
 
 	var firstErr error
 	var errOnce sync.Once
 	var cacheMu sync.Mutex
+	prepared := make([]preparedXorb, 0, len(groups))
+	var preparedMu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for range concurrency {
 		go func() {
 			defer wg.Done()
-			for group := range queue {
+			for group := range prepareQueue {
 				if ctx.Err() != nil {
 					return
 				}
@@ -408,8 +432,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					})
 					return
 				}
-				defer os.Remove(tmpFile.Name())
-				defer tmpFile.Close()
+				tmpPath := tmpFile.Name()
 
 				buf := pool.GetChunkBuf()
 				defer pool.PutChunkBuf(buf)
@@ -433,6 +456,8 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				}
 
 				if err := encoder.Close(); err != nil {
+					tmpFile.Close()
+					os.Remove(tmpPath)
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("finalize xorb: %w", err)
 						cancel()
@@ -441,8 +466,30 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				}
 
 				xorbHash := encoder.SummoryHash()
+				stat, err := tmpFile.Stat()
+				if err != nil {
+					tmpFile.Close()
+					os.Remove(tmpPath)
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("stat xorb temp file: %w", err)
+						cancel()
+					})
+					return
+				}
+				size := stat.Size()
+
+				if err := tmpFile.Close(); err != nil {
+					os.Remove(tmpPath)
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("close xorb temp file: %w", err)
+						cancel()
+					})
+					return
+				}
+
 				exists, err := client.HasXorb(ctx, xorbHash)
 				if err != nil {
+					os.Remove(tmpPath)
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("check xorb %s exists: %w", xorbHash.String(), err)
 						cancel()
@@ -451,6 +498,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 				}
 
 				if exists {
+					os.Remove(tmpPath)
 					cacheMu.Lock()
 					for i, chunkHash := range group.ChunkHashes {
 						if result, ok := cache[chunkHash]; ok && result.IsNew {
@@ -462,26 +510,94 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					continue
 				}
 
-				if _, err := client.UploadXorb(ctx, xorbHash, tmpFile); err != nil {
+				preparedMu.Lock()
+				prepared = append(prepared, preparedXorb{
+					hash:        xorbHash,
+					path:        tmpPath,
+					size:        size,
+					chunkHashes: append([]xet.Hash(nil), group.ChunkHashes...),
+				})
+				preparedMu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	if firstErr != nil {
+		for _, item := range prepared {
+			_ = os.Remove(item.path)
+		}
+		return firstErr
+	}
+
+	uploadQueue := make(chan preparedXorb, len(prepared))
+	for _, item := range prepared {
+		uploadQueue <- item
+	}
+	close(uploadQueue)
+
+	if progressFunc != nil {
+		for _, item := range prepared {
+			progressFunc(item.hash.String(), 0, item.size)
+		}
+	}
+
+	var doneBytes atomic.Int64
+	wg = sync.WaitGroup{}
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for item := range uploadQueue {
+				if ctx.Err() != nil {
+					return
+				}
+
+				f, err := os.Open(filepath.Clean(item.path))
+				if err != nil {
 					errOnce.Do(func() {
-						firstErr = fmt.Errorf("upload xorb %s: %w", xorbHash.String(), err)
+						firstErr = fmt.Errorf("open xorb temp file: %w", err)
+						cancel()
+					})
+					return
+				}
+
+				_, err = client.UploadXorb(ctx, item.hash, f)
+				_ = f.Close()
+				_ = os.Remove(item.path)
+				if err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("upload xorb %s: %w", item.hash.String(), err)
 						cancel()
 					})
 					return
 				}
 
 				cacheMu.Lock()
-				for i, chunkHash := range group.ChunkHashes {
+				for i, chunkHash := range item.chunkHashes {
 					if result, ok := cache[chunkHash]; ok && result.IsNew {
-						result.XorbHash = xorbHash
+						result.XorbHash = item.hash
 						result.ChunkIndex = uint32(i)
 					}
 				}
 				cacheMu.Unlock()
+
+				if progressFunc != nil {
+					doneBytes.Add(item.size)
+					progressFunc(item.hash.String(), item.size, item.size)
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
-	return firstErr
+	if firstErr != nil {
+		for _, item := range prepared {
+			_ = os.Remove(item.path)
+		}
+		return firstErr
+	}
+
+	_ = doneBytes.Load()
+	return nil
 }

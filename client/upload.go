@@ -12,6 +12,7 @@ import (
 func (c *Client) UploadFile(ctx context.Context, readSeeker io.ReadSeeker) (xet.Hash, error) {
 	hash, err := upload.UploadFile(ctx, c, readSeeker,
 		upload.WithConcurrency(c.concurrency),
+		upload.WithProgressFunc(c.progressFunc),
 		upload.WithEnableSHA256(true),
 	)
 	if err != nil {
@@ -24,6 +25,7 @@ func (c *Client) UploadFile(ctx context.Context, readSeeker io.ReadSeeker) (xet.
 func (c *Client) UploadFiles(ctx context.Context, readSeekers []io.ReadSeeker) ([]xet.Hash, error) {
 	return upload.UploadFiles(ctx, c, readSeekers,
 		upload.WithConcurrency(c.concurrency),
+		upload.WithProgressFunc(c.progressFunc),
 		upload.WithEnableSHA256(true),
 	)
 }

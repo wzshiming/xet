@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/upload"
 )
 
@@ -67,15 +66,12 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 	var resp *http.Response
 	var req *http.Request
 	var lastErr error
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		if _, err := reader.Seek(0, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("seek to start: %w", err)
 		}
 
 		var body io.Reader = reader
-		if c.progressFunc != nil {
-			body = progress.NewProgressReader(body, url, contentLength, c.progressFunc)
-		}
 
 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 		if err != nil {
@@ -137,9 +133,6 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Heade
 	}
 
 	var body io.Reader = resp.Body
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
-	}
 
 	// resp.Body is owned by the Decoder; it will be closed via SetCloser.
 	return struct {
@@ -191,9 +184,6 @@ func (c *Client) DownloadXorbsMultipart(ctx context.Context, url string, header 
 	}
 
 	var body io.Reader = resp.Body
-	if c.progressFunc != nil {
-		body = progress.NewProgressReader(body, url, resp.ContentLength, c.progressFunc)
-	}
 
 	return multipart.NewReader(body, boundary), resp.Body, nil
 }

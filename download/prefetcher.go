@@ -10,7 +10,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
+	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -50,9 +52,17 @@ type prefetcher struct {
 
 	store    *chunkStore
 	storeMut sync.Mutex
+
+	// Progress tracking: total is computed from unique fetch-key byte ranges
+	// before any download starts; done is incremented only when an entry
+	// successfully completes, so retries never inflate the reported value.
+	progressFunc  progress.ProgressFunc
+	progressName  string
+	progressTotal int64
+	progressDone  atomic.Int64
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, concurrency int, retries int) *prefetcher {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) *prefetcher {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -73,17 +83,47 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries[task.key] = item
 		items = append(items, item)
 	}
+	concurrency := opts.concurrencyValue()
+	retries := opts.retries
+
+	// Compute the total expected transfer bytes from all unique fetch-key byte ranges.
+	// This is done before any network activity so the total is always known upfront.
+	var progressTotal int64
+	if opts.progressFunc != nil {
+		seen := make(map[fetchKey]struct{}, len(tasks))
+		for _, task := range tasks {
+			if _, ok := seen[task.key]; ok {
+				continue
+			}
+			seen[task.key] = struct{}{}
+			if task.key.End >= task.key.Start {
+				progressTotal += task.key.End - task.key.Start + 1
+			}
+		}
+	}
+
 	if len(items) == 0 {
-		return &prefetcher{ctx: ctx, client: client, entries: entries, retries: retries}
+		return &prefetcher{
+			ctx:           ctx,
+			client:        client,
+			entries:       entries,
+			retries:       retries,
+			progressFunc:  opts.progressFunc,
+			progressName:  opts.progressName,
+			progressTotal: progressTotal,
+		}
 	}
 
 	orderEntry(items, termOrder)
 
 	p := &prefetcher{
-		ctx:     ctx,
-		client:  client,
-		entries: entries,
-		retries: retries,
+		ctx:           ctx,
+		client:        client,
+		entries:       entries,
+		retries:       retries,
+		progressFunc:  opts.progressFunc,
+		progressName:  opts.progressName,
+		progressTotal: progressTotal,
 	}
 
 	desiredWorkers := concurrency
@@ -245,6 +285,9 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 		entry.cache = cache
 		entry.err = err
 		close(entry.ready)
+		if err == nil {
+			p.markEntryDone(entry.task.key)
+		}
 	}
 }
 
@@ -313,9 +356,23 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 		target.entry.cache = target.cache
 		target.entry.err = nil
 		close(target.entry.ready)
+		p.markEntryDone(target.entry.task.key)
 	}
 
 	return nil
+}
+
+// markEntryDone adds the byte span of key to the completed-bytes counter and
+// fires the progress callback. It is called exactly once per entry, only on
+// success, so retries never inflate the reported current value.
+func (p *prefetcher) markEntryDone(key fetchKey) {
+	if p.progressFunc == nil {
+		return
+	}
+	if key.End >= key.Start {
+		done := p.progressDone.Add(key.End - key.Start + 1)
+		p.progressFunc(p.progressName, done, p.progressTotal)
+	}
 }
 
 func (p *prefetcher) newChunkCache(dec *xorb.Decoder) (*chunkCache, error) {

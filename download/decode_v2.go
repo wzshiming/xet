@@ -29,7 +29,7 @@ type ReaderV2 struct {
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...func(*options)) io.Reader {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) io.Reader {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -42,7 +42,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		prefetcher:     newPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue(), options.retries),
+		prefetcher:     newPrefetcher(ctx, client, termFetches, tasks, options),
 		initErr:        err,
 	}
 }

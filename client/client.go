@@ -158,7 +158,7 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 	attempts := max(c.downloadRetries+1, 1)
 
 	var lastErr error
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		resp, err := c.httpClient.Do(req)
 		if err == nil {
 			if isServerError(resp.StatusCode) {
