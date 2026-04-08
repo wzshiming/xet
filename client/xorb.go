@@ -51,53 +51,48 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
 func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
+	startOffset, err := reader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("seek current: %w", err)
+	}
+
 	contentLength, err := reader.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("seek to end: %w", err)
 	}
-	if _, err := reader.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek to start: %w", err)
+	if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek to start offset: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
 
-	attempts := max(c.uploadRetries+1, 1)
-
-	var resp *http.Response
-	var req *http.Request
-	var lastErr error
-	for range attempts {
-		if _, err := reader.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek to start: %w", err)
+	makeBody := func() (io.ReadCloser, error) {
+		if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("seek to start offset: %w", err)
 		}
-
-		var body io.Reader = reader
-
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, body)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-
-		req.ContentLength = contentLength
-		req.Header.Set("Content-Type", "application/octet-stream")
-		if c.token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.token)
-		}
-
-		resp, err = c.httpClient.Do(req)
-		if err == nil {
-			break
-		}
-		if !isNetworkError(err) {
-			return nil, fmt.Errorf("do request: %w", err)
-		}
-		lastErr = err
-		if req.Context().Err() != nil {
-			break
-		}
+		return io.NopCloser(reader), nil
 	}
-	if resp == nil {
-		return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
+
+	body, err := makeBody()
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.GetBody = makeBody
+	req.ContentLength = contentLength - startOffset
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.doWithNetworkRetry(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 

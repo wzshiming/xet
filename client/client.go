@@ -12,15 +12,14 @@ import (
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL         string
-	httpClient      *http.Client
-	token           string
-	namespace       string
-	cacheDirPath    string
-	concurrency     int
-	downloadRetries int
-	uploadRetries   int
-	progressFunc    progress.ProgressFunc
+	baseURL      string
+	httpClient   *http.Client
+	token        string
+	namespace    string
+	cacheDirPath string
+	concurrency  int
+	retries      int
+	progressFunc progress.ProgressFunc
 }
 
 type Options func(*Client)
@@ -74,36 +73,48 @@ func WithConcurrency(concurrency int) Options {
 	}
 }
 
-// WithDownloadRetries sets the number of retries for download-related GET/HEAD requests
-// when transient network errors occur. Values less than 0 are treated as 0.
+// WithDownloadRetries sets the number of retries for network requests.
+// Kept for backward compatibility; it now shares one unified retry setting.
+// Values less than 0 are treated as 0.
 func WithDownloadRetries(retries int) Options {
 	return func(c *Client) {
 		if retries < 0 {
 			retries = 0
 		}
-		c.downloadRetries = retries
+		c.retries = retries
 	}
 }
 
-// WithUploadRetries sets the number of retries for upload-related POST requests
-// when transient network errors occur. Values less than 0 are treated as 0.
+// WithUploadRetries sets the number of retries for network requests.
+// Kept for backward compatibility; it now shares one unified retry setting.
+// Values less than 0 are treated as 0.
 func WithUploadRetries(retries int) Options {
 	return func(c *Client) {
 		if retries < 0 {
 			retries = 0
 		}
-		c.uploadRetries = retries
+		c.retries = retries
+	}
+}
+
+// WithRetries sets the number of retries for all network requests when transient
+// network errors occur. Values less than 0 are treated as 0.
+func WithRetries(retries int) Options {
+	return func(c *Client) {
+		if retries < 0 {
+			retries = 0
+		}
+		c.retries = retries
 	}
 }
 
 // NewClient creates a new API client
 func NewClient(opts ...Options) *Client {
 	c := &Client{
-		httpClient:      &http.Client{},
-		namespace:       "default",
-		concurrency:     4,
-		downloadRetries: 5,
-		uploadRetries:   5,
+		httpClient:  &http.Client{},
+		namespace:   "default",
+		concurrency: 4,
+		retries:     5,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -154,11 +165,38 @@ func isServerError(statusCode int) bool {
 		statusCode == http.StatusGatewayTimeout
 }
 
+func (c *Client) retryAttempts() int {
+	return max(c.retries+1, 1)
+}
+
+func resetRequestBody(req *http.Request) error {
+	if req.Body == nil {
+		return nil
+	}
+
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return err
+		}
+		req.Body = body
+		return nil
+	}
+
+	return fmt.Errorf("request body is not retryable")
+}
+
 func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
-	attempts := max(c.downloadRetries+1, 1)
+	attempts := c.retryAttempts()
 
 	var lastErr error
-	for range attempts {
+	for i := range attempts {
+		if i > 0 {
+			if err := resetRequestBody(req); err != nil {
+				return nil, fmt.Errorf("reset request body: %w", err)
+			}
+		}
+
 		resp, err := c.httpClient.Do(req)
 		if err == nil {
 			if isServerError(resp.StatusCode) {

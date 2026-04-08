@@ -35,7 +35,7 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithRetries(c.downloadRetries),
+		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
@@ -57,7 +57,7 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithRetries(c.downloadRetries),
+		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
@@ -100,7 +100,7 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		sizes[i] = download.ExpectedLengthV1(singleResp)
 		opts := []download.Option{
 			download.WithConcurrency(c.concurrency),
-			download.WithRetries(c.downloadRetries),
+			download.WithRetries(c.retries),
 		}
 		if c.progressFunc != nil {
 			opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))

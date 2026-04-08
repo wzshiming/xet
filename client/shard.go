@@ -44,37 +44,20 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	}
 	contentLength = int64(len(bodyBytes))
 
-	attempts := max(c.uploadRetries+1, 1)
-
-	var resp *http.Response
-	var req *http.Request
-	var lastErr error
-	for range attempts {
-		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-
-		req.ContentLength = contentLength
-		req.Header.Set("Content-Type", "application/octet-stream")
-		if c.token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.token)
-		}
-
-		resp, err = c.httpClient.Do(req)
-		if err == nil {
-			break
-		}
-		if !isNetworkError(err) {
-			return nil, fmt.Errorf("do request: %w", err)
-		}
-		lastErr = err
-		if req.Context().Err() != nil {
-			break
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
 	}
-	if resp == nil {
-		return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
+
+	req.ContentLength = contentLength
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.doWithNetworkRetry(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
