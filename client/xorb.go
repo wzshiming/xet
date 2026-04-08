@@ -16,6 +16,45 @@ import (
 	"github.com/wzshiming/xet/upload"
 )
 
+// HasXorb checks whether a xorb already exists on the server.
+func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("create request: %w", err)
+	}
+
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if !isNetworkError(err) {
+			return false, fmt.Errorf("do request: %w", err)
+		}
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return false, fmt.Errorf("network error on retry: %w", err)
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		return true, nil
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+
+	if err := reqError(req, resp); err != nil {
+		return false, err
+	}
+
+	return false, nil
+}
+
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
 func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {

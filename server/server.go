@@ -82,14 +82,44 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/reconstructions", s.handleBatchGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleHasXorb).Methods(http.MethodHead)
+	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 
-	// Download endpoint for xorb data, used by xet-core and the Go client.
-	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}/data", s.handleDownloadXorb).Methods(http.MethodGet)
-
 	s.root.NotFoundHandler = s.next
+}
+
+// handleHasXorb handles HEAD /v1/xorbs/{namespace}/{xorb_hash}
+func (s *Handler) handleHasXorb(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	xorbHashStr := vars["xorb_hash"]
+
+	xorbHash, err := xet.ParseHash(xorbHashStr)
+	if err != nil {
+		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
+		return
+	}
+
+	exists, err := s.storage.HasXorb(r.Context(), namespace, xorbHash)
+	if err != nil {
+		http.Error(w, "Failed to check xorb", http.StatusInternalServerError)
+		return
+	}
+
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 type batchChunkDedupQueryRequest struct {
@@ -291,7 +321,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}/data
+// handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}
 func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)

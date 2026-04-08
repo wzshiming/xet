@@ -70,8 +70,10 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	return &uploadResp, nil
 }
 
-// QueryChunkDeduplication checks if a chunk exists in the global deduplication index
-func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash) (*upload.DeduplicationResult, error) {
+// QueryDedupShard downloads the deduplication shard for the given chunk hash and
+// returns all chunk locations indexed by that shard, enabling local O(1) lookups
+// for any chunk that shares the same shard (xet-core style local dedup).
+func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
 	url := fmt.Sprintf("%s/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -90,41 +92,52 @@ func (c *Client) QueryChunkDeduplication(ctx context.Context, chunkHash xet.Hash
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		// Chunk not found - this is expected for new chunks
-		return nil, nil
+		return map[xet.Hash]*upload.DeduplicationResult{
+			chunkHash: {
+				ChunkHash: chunkHash,
+				IsNew:     true,
+			},
+		}, nil
 	}
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
 	}
 
-	// Deserialize shard from cached response
 	shardObj := shard.NewShard()
 	if err := shardObj.Decode(resp.Body, false); err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 
-	xorbHash, chunkIndex, ok := findChunkLocationInDedupShard(shardObj, chunkHash)
-	if !ok {
-		return nil, nil
+	results := map[xet.Hash]*upload.DeduplicationResult{
+		chunkHash: {
+			ChunkHash: chunkHash,
+			IsNew:     true,
+		},
 	}
-	return &upload.DeduplicationResult{
-		ChunkHash:  chunkHash,
-		IsNew:      false,
-		XorbHash:   xorbHash,
-		ChunkIndex: chunkIndex,
-	}, nil
+	for _, casBlock := range shardObj.CASInfos {
+		for i, casChunk := range casBlock.Chunks {
+			results[casChunk.ChunkHash] = &upload.DeduplicationResult{
+				ChunkHash:  casChunk.ChunkHash,
+				IsNew:      false,
+				XorbHash:   casBlock.CASHash,
+				ChunkIndex: uint32(i),
+			}
+		}
+	}
+
+	return results, nil
 }
 
-// QueryChunksDeduplication checks multiple chunk hashes against the global
+// QueryDedupShards checks multiple chunk hashes against the global
 // deduplication index. It prefers the batch endpoint and falls back to single
 // chunk queries when the batch endpoint is unavailable.
-func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
-	results := make(map[xet.Hash]*upload.DeduplicationResult, len(chunkHashes))
+func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
 	if len(chunkHashes) == 0 {
-		return results, nil
+		return nil, nil
 	}
 
+	results := make(map[xet.Hash]*upload.DeduplicationResult, len(chunkHashes))
 	requestBody := batchChunkDedupQueryRequest{ChunkHashes: make([]string, len(chunkHashes))}
 	for i, chunkHash := range chunkHashes {
 		requestBody.ChunkHashes[i] = chunkHash.String()
@@ -169,7 +182,10 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 			continue
 		}
 
-		result := &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+		result := &upload.DeduplicationResult{
+			ChunkHash: chunkHash,
+			IsNew:     true,
+		}
 		if item.Found {
 			if item.XorbHash != "" {
 				if xorbHash, err := xet.ParseHash(item.XorbHash); err == nil {
@@ -184,36 +200,29 @@ func (c *Client) QueryChunksDeduplication(ctx context.Context, chunkHashes []xet
 
 	for _, chunkHash := range chunkHashes {
 		if _, ok := results[chunkHash]; !ok {
-			results[chunkHash] = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+			results[chunkHash] = &upload.DeduplicationResult{
+				ChunkHash: chunkHash,
+				IsNew:     true,
+			}
 		}
 	}
-
 	return results, nil
 }
 
 func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHashes []xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
 	results := make(map[xet.Hash]*upload.DeduplicationResult, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
-		result, err := c.QueryChunkDeduplication(ctx, chunkHash)
+		result, err := c.QueryDedupShard(ctx, chunkHash)
 		if err != nil {
 			return nil, err
 		}
-		if result == nil {
-			result = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
+
+		for _, dedupResult := range result {
+			if _, ok := results[dedupResult.ChunkHash]; ok {
+				continue
+			}
+			results[dedupResult.ChunkHash] = dedupResult
 		}
-		results[chunkHash] = result
 	}
 	return results, nil
-}
-
-func findChunkLocationInDedupShard(shardData *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
-	for _, casBlock := range shardData.CASInfos {
-		for i, casChunk := range casBlock.Chunks {
-			if casChunk.ChunkHash == chunkHash {
-				return casBlock.CASHash, uint32(i), true
-			}
-		}
-	}
-
-	return xet.Hash{}, 0, false
 }
