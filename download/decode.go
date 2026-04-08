@@ -75,20 +75,88 @@ type chunkRef struct {
 // position referenced by multiple reconstruction terms) can be re-read without a
 // second download, while keeping memory usage low.
 type xorbChunkCache struct {
-	dec         *xorb.Decoder
-	file        *os.File
-	index       []chunkRef
-	writeOffset int64
-	done        bool // decoder exhausted or closed
-	mut         sync.Mutex
+	dec   *xorb.Decoder
+	store *xorbChunkStore
+	index []chunkRef
+	done  bool // decoder exhausted or closed
+	mut   sync.Mutex
 }
 
-func newXorbChunkCache(dec *xorb.Decoder) (*xorbChunkCache, error) {
+type xorbChunkStore struct {
+	file        *os.File
+	writeOffset int64
+	refCount    int
+	mut         sync.RWMutex
+}
+
+func newXorbChunkStore() (*xorbChunkStore, error) {
 	f, err := os.CreateTemp("", "xorb-chunk-*")
 	if err != nil {
 		return nil, err
 	}
-	return &xorbChunkCache{dec: dec, file: f}, nil
+	return &xorbChunkStore{file: f}, nil
+}
+
+func (s *xorbChunkStore) acquire() error {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.file == nil {
+		return os.ErrClosed
+	}
+	s.refCount++
+	return nil
+}
+
+func (s *xorbChunkStore) append(data []byte) (int64, error) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.file == nil {
+		return 0, os.ErrClosed
+	}
+	offset := s.writeOffset
+	n, err := s.file.Write(data)
+	if err != nil {
+		return 0, err
+	}
+	if n != len(data) {
+		return 0, io.ErrShortWrite
+	}
+	s.writeOffset += int64(n)
+	return offset, nil
+}
+
+func (s *xorbChunkStore) readAt(buf []byte, offset int64) error {
+	s.mut.RLock()
+	defer s.mut.RUnlock()
+	if s.file == nil {
+		return os.ErrClosed
+	}
+	_, err := s.file.ReadAt(buf, offset)
+	return err
+}
+
+func (s *xorbChunkStore) release() {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	if s.file == nil {
+		return
+	}
+	if s.refCount > 0 {
+		s.refCount--
+	}
+	if s.refCount == 0 {
+		name := s.file.Name()
+		s.file.Close()
+		os.Remove(name)
+		s.file = nil
+	}
+}
+
+func newXorbChunkCache(dec *xorb.Decoder, store *xorbChunkStore) (*xorbChunkCache, error) {
+	if err := store.acquire(); err != nil {
+		return nil, err
+	}
+	return &xorbChunkCache{dec: dec, store: store}, nil
 }
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
@@ -99,7 +167,7 @@ func (c *xorbChunkCache) Chunk(idx uint32) ([]byte, error) {
 	if int(idx) < len(c.index) {
 		ref := c.index[idx]
 		data := make([]byte, ref.length)
-		if _, err := c.file.ReadAt(data, ref.offset); err != nil {
+		if err := c.store.readAt(data, ref.offset); err != nil {
 			return nil, err
 		}
 		return data, nil
@@ -112,7 +180,7 @@ func (c *xorbChunkCache) Chunk(idx uint32) ([]byte, error) {
 	}
 	ref := c.index[idx]
 	data := make([]byte, ref.length)
-	if _, err := c.file.ReadAt(data, ref.offset); err != nil {
+	if err := c.store.readAt(data, ref.offset); err != nil {
 		return nil, err
 	}
 	return data, nil
@@ -134,11 +202,11 @@ func (c *xorbChunkCache) load() error {
 		}
 		return err
 	}
-	if _, err := c.file.Write(tmp[:n]); err != nil {
+	offset, err := c.store.append(tmp[:n])
+	if err != nil {
 		return err
 	}
-	c.index = append(c.index, chunkRef{offset: c.writeOffset, length: int32(n)})
-	c.writeOffset += int64(n)
+	c.index = append(c.index, chunkRef{offset: offset, length: int32(n)})
 	return nil
 }
 
@@ -167,10 +235,9 @@ func (c *xorbChunkCache) Done() {
 // Close closes the underlying decoder and the backing temp file.
 func (c *xorbChunkCache) Close() {
 	c.Done()
-	if c.file != nil {
-		c.file.Close()
-		os.Remove(c.file.Name())
-		c.file = nil
+	if c.store != nil {
+		c.store.release()
+		c.store = nil
 	}
 }
 
@@ -179,6 +246,9 @@ type xorbPrefetcher struct {
 	client  ClientAdapter
 	entries map[fetchKey]*xorbPrefetchEntry
 	retries int
+
+	store    *xorbChunkStore
+	storeMut sync.Mutex
 }
 
 type xorbPrefetchEntry struct {
@@ -367,7 +437,7 @@ func (p *xorbPrefetcher) runSingleRangeEntries(entries []*xorbPrefetchEntry) {
 			}
 
 			dec := xorb.NewDecoder(rc, false)
-			cache, err = newXorbChunkCache(dec)
+			cache, err = p.newChunkCache(dec)
 			if err != nil {
 				dec.Close()
 				if attempt < maxAttempts {
@@ -405,7 +475,7 @@ func (p *xorbPrefetcher) runStreamJob(entries []*xorbPrefetchEntry, mr *multipar
 	for i, entry := range entries {
 		pipeR, pipeW := io.Pipe()
 		dec := xorb.NewDecoder(pipeR, false)
-		cache, err := newXorbChunkCache(dec)
+		cache, err := p.newChunkCache(dec)
 		if err != nil {
 			for j := range i {
 				targets[j].pipeW.CloseWithError(err)
@@ -462,6 +532,21 @@ func (p *xorbPrefetcher) runStreamJob(entries []*xorbPrefetchEntry, mr *multipar
 	}
 
 	return nil
+}
+
+func (p *xorbPrefetcher) newChunkCache(dec *xorb.Decoder) (*xorbChunkCache, error) {
+	p.storeMut.Lock()
+	defer p.storeMut.Unlock()
+
+	if p.store == nil {
+		store, err := newXorbChunkStore()
+		if err != nil {
+			return nil, err
+		}
+		p.store = store
+	}
+
+	return newXorbChunkCache(dec, p.store)
 }
 
 func shouldRetryXorbLoadError(err error) bool {
