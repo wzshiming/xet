@@ -14,7 +14,7 @@ type ReaderV2 struct {
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
 	termFetches    []selectedFetch
-	prefetcher     *xorbPrefetcher
+	prefetcher     *prefetcher
 	initErr        error
 
 	// State for reading
@@ -42,7 +42,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		prefetcher:     newXorbPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue(), options.retries),
+		prefetcher:     newPrefetcher(ctx, client, termFetches, tasks, options.concurrencyValue(), options.retries),
 		initErr:        err,
 	}
 }
@@ -147,9 +147,9 @@ func (r *ReaderV2) loadTerm() error {
 	return nil
 }
 
-func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []xorbFetchTask, error) {
+func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []fetchTask, error) {
 	selected := make([]selectedFetch, len(reconstruction.Terms))
-	tasks := make([]xorbFetchTask, 0, len(reconstruction.Terms))
+	tasks := make([]fetchTask, 0, len(reconstruction.Terms))
 	for i := range reconstruction.Terms {
 		term := &reconstruction.Terms[i]
 		fetch, rg, err := selectFetchInfoV2(reconstruction, term)
@@ -168,7 +168,7 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 			chunkStart: rg.Chunks.Start,
 			chunkEnd:   rg.Chunks.End,
 		}
-		tasks = append(tasks, xorbFetchTask{
+		tasks = append(tasks, fetchTask{
 			key: key,
 			url: fetch.URL,
 		})
