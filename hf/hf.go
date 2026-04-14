@@ -134,7 +134,7 @@ func resolveRepoToken(ctx context.Context, httpClient *http.Client, repoOrURL, h
 		return XETToken{}, fmt.Errorf("missing Hugging Face token")
 	}
 
-	target, err := parseUploadTarget(repoOrURL, opts)
+	target, err := parseTarget(repoOrURL, opts)
 	if err != nil {
 		return XETToken{}, err
 	}
@@ -185,29 +185,29 @@ func resolveRepoToken(ctx context.Context, httpClient *http.Client, repoOrURL, h
 	}, nil
 }
 
-type uploadTarget struct {
+type repoInfo struct {
 	Endpoint string
 	RepoType string
 	RepoID   string
 	Revision string
 }
 
-func parseUploadTarget(repoOrURL string, opts UploadOptions) (uploadTarget, error) {
+func parseTarget(repoOrURL string, opts UploadOptions) (repoInfo, error) {
 	if repoOrURL == "" {
-		return uploadTarget{}, fmt.Errorf("missing Hugging Face repo")
+		return repoInfo{}, fmt.Errorf("missing Hugging Face repo")
 	}
 
 	if parsed, err := url.Parse(repoOrURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		return parseUploadURLTarget(parsed, opts)
+		return parseURLTarget(parsed, opts)
 	}
 
-	return parseUploadRepoTarget(strings.Trim(repoOrURL, "/"), opts)
+	return parseRepoTarget(strings.Trim(repoOrURL, "/"), opts)
 }
 
-func parseUploadURLTarget(parsed *url.URL, opts UploadOptions) (uploadTarget, error) {
+func parseURLTarget(parsed *url.URL, opts UploadOptions) (repoInfo, error) {
 	parts, err := splitPathParts(parsed.EscapedPath())
 	if err != nil {
-		return uploadTarget{}, fmt.Errorf("parse Hugging Face repo URL: %w", err)
+		return repoInfo{}, fmt.Errorf("parse Hugging Face repo URL: %w", err)
 	}
 
 	endpoint := strings.TrimRight(opts.Endpoint, "/")
@@ -218,7 +218,7 @@ func parseUploadURLTarget(parsed *url.URL, opts UploadOptions) (uploadTarget, er
 	return buildUploadTarget(parts, endpoint, opts)
 }
 
-func parseUploadRepoTarget(repo string, opts UploadOptions) (uploadTarget, error) {
+func parseRepoTarget(repo string, opts UploadOptions) (repoInfo, error) {
 	parts := strings.Split(strings.Trim(repo, "/"), "/")
 	endpoint := strings.TrimRight(opts.Endpoint, "/")
 	if endpoint == "" {
@@ -228,7 +228,7 @@ func parseUploadRepoTarget(repo string, opts UploadOptions) (uploadTarget, error
 	return buildUploadTarget(parts, endpoint, opts)
 }
 
-func buildUploadTarget(parts []string, endpoint string, opts UploadOptions) (uploadTarget, error) {
+func buildUploadTarget(parts []string, endpoint string, opts UploadOptions) (repoInfo, error) {
 	parts = compactParts(parts)
 
 	repoType := normalizeRepoType(opts.RepoType)
@@ -249,7 +249,7 @@ func buildUploadTarget(parts []string, endpoint string, opts UploadOptions) (upl
 	}
 
 	if len(parts) < start+2 {
-		return uploadTarget{}, fmt.Errorf("invalid Hugging Face repo %q", strings.Join(parts, "/"))
+		return repoInfo{}, fmt.Errorf("invalid Hugging Face repo %q", strings.Join(parts, "/"))
 	}
 
 	repoID := parts[start] + "/" + parts[start+1]
@@ -261,7 +261,7 @@ func buildUploadTarget(parts []string, endpoint string, opts UploadOptions) (upl
 		revision = "main"
 	}
 
-	return uploadTarget{
+	return repoInfo{
 		Endpoint: endpoint,
 		RepoType: repoType,
 		RepoID:   repoID,
