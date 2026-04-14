@@ -216,7 +216,7 @@ func parseURLTarget(parsed *url.URL, opts UploadOptions) (repoInfo, error) {
 		endpoint = fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
 	}
 
-	return buildUploadTarget(parts, endpoint, opts)
+	return buildTarget(parts, endpoint, opts)
 }
 
 func parseRepoTarget(repo string, opts UploadOptions) (repoInfo, error) {
@@ -226,10 +226,10 @@ func parseRepoTarget(repo string, opts UploadOptions) (repoInfo, error) {
 		endpoint = "https://huggingface.co"
 	}
 
-	return buildUploadTarget(parts, endpoint, opts)
+	return buildTarget(parts, endpoint, opts)
 }
 
-func buildUploadTarget(parts []string, endpoint string, opts UploadOptions) (repoInfo, error) {
+func buildTarget(parts []string, endpoint string, opts UploadOptions) (repoInfo, error) {
 	parts = compactParts(parts)
 
 	repoType := normalizeRepoType(opts.RepoType)
