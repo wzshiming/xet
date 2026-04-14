@@ -142,12 +142,13 @@ func resolveRepoToken(ctx context.Context, httpClient *http.Client, repoOrURL, h
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
-	tokenURL := fmt.Sprintf("%s/api/%ss/%s/xet-%s-token/%s",
+	tokenURL := fmt.Sprintf("%s/api/%ss/%s/xet-%s-token/%s?%d",
 		strings.TrimRight(target.Endpoint, "/"),
 		target.RepoType,
 		target.RepoID,
 		mode,
 		url.PathEscape(target.Revision),
+		time.Now().Unix(), // avoid caching by including a timestamp query parameter
 	)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
