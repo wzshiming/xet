@@ -75,7 +75,7 @@ func TestResolveUploadFromRepoURL(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETWriteToken(context.Background(), tokenSrv.URL+"/datasets/org/repo", "hf-token", UploadOptions{})
+	info, err := ResolveXETWriteToken(context.Background(), nil, tokenSrv.URL+"/datasets/org/repo", "hf-token", UploadOptions{})
 	if err != nil {
 		t.Fatalf("ResolveUpload returned error: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestResolveUploadFromRepoIDWithEncodedRevision(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETWriteToken(context.Background(), "org/repo", "hf-token", UploadOptions{
+	info, err := ResolveXETWriteToken(context.Background(), nil, "org/repo", "hf-token", UploadOptions{
 		Endpoint: tokenSrv.URL,
 		Revision: "refs/pr/1",
 	})
@@ -119,7 +119,7 @@ func TestResolveUploadFromRepoIDWithEncodedRevision(t *testing.T) {
 }
 
 func TestResolveUploadMissingToken(t *testing.T) {
-	_, err := ResolveXETWriteToken(context.Background(), "org/repo", "", UploadOptions{})
+	_, err := ResolveXETWriteToken(context.Background(), nil, "org/repo", "", UploadOptions{})
 	if err == nil || !strings.Contains(err.Error(), "missing Hugging Face token") {
 		t.Fatalf("expected missing token error, got %v", err)
 	}
@@ -142,7 +142,7 @@ func TestResolveReadFromRepoURL(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETReadToken(context.Background(), tokenSrv.URL+"/org/repo", "hf-token", UploadOptions{})
+	info, err := ResolveXETReadToken(context.Background(), nil, tokenSrv.URL+"/org/repo", "hf-token", UploadOptions{})
 	if err != nil {
 		t.Fatalf("ResolveRead returned error: %v", err)
 	}

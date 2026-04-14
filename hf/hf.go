@@ -121,15 +121,15 @@ func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Re
 	return &result, nil
 }
 
-func ResolveXETWriteToken(ctx context.Context, repoOrURL, hubToken string, opts UploadOptions) (XETToken, error) {
-	return resolveRepoToken(ctx, repoOrURL, hubToken, opts, "write")
+func ResolveXETWriteToken(ctx context.Context, httpClient *http.Client, repoOrURL, hubToken string, opts UploadOptions) (XETToken, error) {
+	return resolveRepoToken(ctx, httpClient, repoOrURL, hubToken, opts, "write")
 }
 
-func ResolveXETReadToken(ctx context.Context, repoOrURL, hubToken string, opts UploadOptions) (XETToken, error) {
-	return resolveRepoToken(ctx, repoOrURL, hubToken, opts, "read")
+func ResolveXETReadToken(ctx context.Context, httpClient *http.Client, repoOrURL, hubToken string, opts UploadOptions) (XETToken, error) {
+	return resolveRepoToken(ctx, httpClient, repoOrURL, hubToken, opts, "read")
 }
 
-func resolveRepoToken(ctx context.Context, repoOrURL, hubToken string, opts UploadOptions, mode string) (XETToken, error) {
+func resolveRepoToken(ctx context.Context, httpClient *http.Client, repoOrURL, hubToken string, opts UploadOptions, mode string) (XETToken, error) {
 	if hubToken == "" {
 		return XETToken{}, fmt.Errorf("missing Hugging Face token")
 	}
@@ -139,7 +139,9 @@ func resolveRepoToken(ctx context.Context, repoOrURL, hubToken string, opts Uplo
 		return XETToken{}, err
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
 	tokenURL := fmt.Sprintf("%s/api/%ss/%s/xet-%s-token/%s",
 		strings.TrimRight(target.Endpoint, "/"),
 		target.RepoType,

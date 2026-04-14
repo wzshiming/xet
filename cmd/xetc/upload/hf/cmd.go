@@ -32,7 +32,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("--token is required")
 			}
 
-			hfInfo, err := hf.ResolveXETWriteToken(cmd.Context(), hfRepo, hfToken, hf.UploadOptions{
+			hfInfo, err := hf.ResolveXETWriteToken(cmd.Context(), nil, hfRepo, hfToken, hf.UploadOptions{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
 				Revision: hfRevision,

@@ -39,7 +39,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), hfRepo, hfToken, hf.UploadOptions{
+			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), nil, hfRepo, hfToken, hf.UploadOptions{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
 				Revision: hfRevision,
