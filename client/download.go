@@ -30,8 +30,6 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 	}
 
-	expectedLength := download.ExpectedLengthV1(reconstructionResp)
-
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
@@ -40,7 +38,12 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
 	}
-	reader := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
+	}
+
+	expectedLength := download.ExpectedLengthV1(reconstructionResp)
 
 	return reader, expectedLength, nil
 }
@@ -52,8 +55,6 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 		return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
 	}
 
-	expectedLength := download.ExpectedLengthV2(reconstructionResp)
-
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
@@ -62,7 +63,12 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
 	}
-	reader := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
+	}
+
+	expectedLength := download.ExpectedLengthV2(reconstructionResp)
 
 	return reader, expectedLength, nil
 }
@@ -105,8 +111,21 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		if c.progressFunc != nil {
 			opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
 		}
-		readers[i] = download.NewReaderV1(ctx, c, singleResp, opts...)
+		reader, err := download.NewReaderV1(ctx, c, singleResp, opts...)
+		if err != nil {
+			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
+		} else {
+			readers[i] = reader
+		}
 	}
 
 	return readers, sizes, nil
+}
+
+type errReader struct {
+	err error
+}
+
+func (e errReader) Read(p []byte) (n int, err error) {
+	return 0, e.err
 }

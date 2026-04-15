@@ -20,11 +20,12 @@ type chunkRef struct {
 // position referenced by multiple reconstruction terms) can be re-read without a
 // second download, while keeping memory usage low.
 type chunkCache struct {
-	dec   *xorb.Decoder
-	store *chunkStore
-	index []chunkRef
-	done  bool // decoder exhausted or closed
-	mut   sync.Mutex
+	dec       *xorb.Decoder
+	store     *chunkStore
+	index     []chunkRef
+	done      bool // decoder exhausted or closed
+	mut       sync.Mutex
+	closeOnce sync.Once
 }
 
 type chunkStore struct {
@@ -35,11 +36,11 @@ type chunkStore struct {
 }
 
 func newChunkStore() (*chunkStore, error) {
-	f, err := os.CreateTemp("", "xorb-chunk-*")
+	f, err := os.CreateTemp("", "xorb-chunks-*")
 	if err != nil {
 		return nil, err
 	}
-	return &chunkStore{file: f}, nil
+	return &chunkStore{file: f, refCount: 1}, nil
 }
 
 func (s *chunkStore) acquire() error {
@@ -58,16 +59,16 @@ func (s *chunkStore) append(data []byte) (int64, error) {
 	if s.file == nil {
 		return 0, os.ErrClosed
 	}
-	offset := s.writeOffset
-	n, err := s.file.Write(data)
+	n, err := s.file.WriteAt(data, s.writeOffset)
 	if err != nil {
 		return 0, err
 	}
 	if n != len(data) {
 		return 0, io.ErrShortWrite
 	}
+	writeOffset := s.writeOffset
 	s.writeOffset += int64(n)
-	return offset, nil
+	return writeOffset, nil
 }
 
 func (s *chunkStore) readAt(buf []byte, offset int64) error {
@@ -177,11 +178,16 @@ func (c *chunkCache) Done() {
 	}
 }
 
-// Close closes the underlying decoder and the backing temp file.
+// Close closes the underlying decoder and releases the backing temp file reference.
+// Safe to call multiple times; only the first call has effect.
 func (c *chunkCache) Close() {
-	c.Done()
-	if c.store != nil {
-		c.store.release()
-		c.store = nil
-	}
+	c.closeOnce.Do(func() {
+		c.mut.Lock()
+		defer c.mut.Unlock()
+		c.Done()
+		if c.store != nil {
+			c.store.release()
+			c.store = nil
+		}
+	})
 }

@@ -14,8 +14,8 @@ type ReaderV2 struct {
 	reconstruction *ReconstructionResponseV2
 	skipBytes      int64
 	termFetches    []selectedFetch
+	remainingUses  map[fetchKey]int
 	prefetcher     *prefetcher
-	initErr        error
 
 	// State for reading
 	termIdx      int
@@ -29,29 +29,33 @@ type ReaderV2 struct {
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) io.Reader {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.Reader, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
 	}
 
 	termFetches, tasks, err := planReaderV2(reconstruction)
+	if err != nil {
+		return nil, fmt.Errorf("plan reader: %w", err)
+	}
+
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, options)
+	if err != nil {
+		return nil, fmt.Errorf("initialize prefetcher: %w", err)
+	}
 	return &ReaderV2{
 		client:         client,
 		ctx:            ctx,
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		prefetcher:     newPrefetcher(ctx, client, termFetches, tasks, options),
-		initErr:        err,
-	}
+		remainingUses:  countFetchUses(termFetches),
+		prefetcher:     prefetcher,
+	}, nil
 }
 
 func (r *ReaderV2) Read(p []byte) (n int, err error) {
-	if r.initErr != nil {
-		return 0, r.initErr
-	}
-
 	if r.err != nil {
 		return 0, r.err
 	}
@@ -59,10 +63,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	for n < len(p) {
 		// Check if we're done with all terms
 		if r.termIdx >= len(r.reconstruction.Terms) {
-			if r.currentCache != nil {
-				r.currentCache.Close()
-				r.currentCache = nil
-			}
+			r.cleanup()
 			return n, io.EOF
 		}
 
@@ -70,6 +71,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		if r.currentTerm == nil {
 			if err := r.loadTerm(); err != nil {
 				r.err = err
+				r.cleanup()
 				if n > 0 {
 					return n, nil
 				}
@@ -79,8 +81,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 
 		// Check if we're done with current term's chunks
 		if r.chunkIdx >= r.localEnd {
-			r.currentTerm = nil
-			r.termIdx++
+			r.finishCurrentTerm()
 			continue
 		}
 
@@ -88,6 +89,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		data, chunkErr := r.currentCache.Chunk(r.chunkIdx)
 		if chunkErr != nil {
 			r.err = chunkErr
+			r.cleanup()
 			if n > 0 {
 				return n, nil
 			}
@@ -123,6 +125,38 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	}
 
 	return n, nil
+}
+
+// cleanup closes the prefetcher (which releases all caches and the shared temp file).
+func (r *ReaderV2) cleanup() {
+	if r.prefetcher != nil {
+		r.prefetcher.Close()
+	}
+	r.currentCache = nil
+	r.currentTerm = nil
+}
+
+// finishCurrentTerm decrements the use count for the current fetchKey and
+// closes the cache when no more terms reference it.
+func (r *ReaderV2) finishCurrentTerm() {
+	if r.currentTerm == nil {
+		return
+	}
+
+	key := r.termFetches[r.termIdx].key
+	remaining := r.remainingUses[key] - 1
+	if remaining <= 0 {
+		delete(r.remainingUses, key)
+		if r.currentCache != nil {
+			r.currentCache.Close()
+			r.currentCache = nil
+		}
+	} else {
+		r.remainingUses[key] = remaining
+	}
+
+	r.currentTerm = nil
+	r.termIdx++
 }
 
 func (r *ReaderV2) loadTerm() error {

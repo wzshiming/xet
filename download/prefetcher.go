@@ -51,8 +51,10 @@ type prefetcher struct {
 	entries map[fetchKey]*prefetchEntry
 	retries int
 
-	store    *chunkStore
-	storeMut sync.Mutex
+	store     *chunkStore
+	storeMut  sync.Mutex
+	closeOnce sync.Once
+	closed    atomic.Bool
 
 	// Progress tracking: total is computed from unique fetch-key byte ranges
 	// before any download starts; done is incremented only when an entry
@@ -63,7 +65,7 @@ type prefetcher struct {
 	progressDone  atomic.Int64
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) *prefetcher {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -112,16 +114,22 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 			progressFunc:  opts.progressFunc,
 			progressName:  opts.progressName,
 			progressTotal: progressTotal,
-		}
+		}, nil
 	}
 
 	orderEntry(items, termOrder)
+
+	store, err := newChunkStore()
+	if err != nil {
+		return nil, err
+	}
 
 	p := &prefetcher{
 		ctx:           ctx,
 		client:        client,
 		entries:       entries,
 		retries:       retries,
+		store:         store,
 		progressFunc:  opts.progressFunc,
 		progressName:  opts.progressName,
 		progressTotal: progressTotal,
@@ -147,7 +155,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		})
 	}()
 
-	return p
+	return p, nil
 }
 
 func (p *prefetcher) buildJobs(entries []*prefetchEntry, fn func(*prefetchJob)) {
@@ -380,18 +388,35 @@ func (p *prefetcher) markEntryDone(key fetchKey) {
 }
 
 func (p *prefetcher) newChunkCache(dec *xorb.Decoder) (*chunkCache, error) {
-	p.storeMut.Lock()
-	defer p.storeMut.Unlock()
-
-	if p.store == nil {
-		store, err := newChunkStore()
-		if err != nil {
-			return nil, err
-		}
-		p.store = store
+	if p.closed.Load() {
+		// prefetcher already closed; don't create new caches
+		return nil, errors.New("prefetcher closed")
 	}
 
 	return newChunkCache(dec, p.store)
+}
+
+// Close releases all resources held by the prefetcher: it closes every cached
+// entry and drops the prefetcher's own reference to the shared chunkStore so
+// that the backing temp file is deleted once all consumers are done with it.
+func (p *prefetcher) Close() {
+	p.closeOnce.Do(func() {
+		p.closed.Store(true)
+
+		for _, entry := range p.entries {
+			if entry.cache != nil {
+				entry.cache.Close()
+			}
+		}
+
+		p.storeMut.Lock()
+		defer p.storeMut.Unlock()
+		if p.store != nil {
+			// Release the initial reference that newChunkStore gave to the prefetcher.
+			p.store.release()
+			p.store = nil
+		}
+	})
 }
 
 func shouldRetryXorbLoadError(err error) bool {
@@ -418,4 +443,14 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
+}
+
+// countFetchUses returns a map of how many reconstruction terms reference each fetchKey.
+// Used by the reader to know when it is safe to close a chunkCache.
+func countFetchUses(termFetches []selectedFetch) map[fetchKey]int {
+	counts := make(map[fetchKey]int, len(termFetches))
+	for _, fetch := range termFetches {
+		counts[fetch.key]++
+	}
+	return counts
 }
