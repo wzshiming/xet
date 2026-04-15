@@ -12,7 +12,7 @@ import (
 
 func NewCommand() *cobra.Command {
 	var (
-		hfRepo      string
+		hfRepoID    string
 		hfToken     string
 		hfEndpoint  string
 		hfRepoType  string
@@ -27,11 +27,18 @@ func NewCommand() *cobra.Command {
 		Short: "Download a file using Hugging Face xet-read-token API",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if hfRepo == "" {
-				return fmt.Errorf("--repo is required")
+			if hfRepoID == "" {
+				return fmt.Errorf("--repo-id is required")
 			}
 			if hfToken == "" {
 				return fmt.Errorf("--token is required")
+			}
+
+			target := hf.Target{
+				Endpoint: hfEndpoint,
+				RepoType: hfRepoType,
+				RepoID:   hfRepoID,
+				Revision: hfRevision,
 			}
 
 			fileHash, err := xet.ParseHash(args[0])
@@ -39,11 +46,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), nil, hfRepo, hfToken, hf.UploadOptions{
-				Endpoint: hfEndpoint,
-				RepoType: hfRepoType,
-				Revision: hfRevision,
-			})
+			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), nil, target, hfToken)
 			if err != nil {
 				return fmt.Errorf("resolve Hugging Face download target: %w", err)
 			}
@@ -52,7 +55,7 @@ func NewCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&hfRepo, "repo", "", "Hugging Face repo ID or repo URL")
+	cmd.Flags().StringVar(&hfRepoID, "repo-id", "", "Hugging Face repo ID, e.g. org/repo")
 	cmd.Flags().StringVar(&hfToken, "token", "", "Hugging Face access token")
 	cmd.Flags().StringVar(&hfEndpoint, "endpoint", common.DefaultHFEndpoint, "Hugging Face Hub endpoint override")
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")

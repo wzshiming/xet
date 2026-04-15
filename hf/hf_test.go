@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -30,19 +29,19 @@ func TestResolveHuggingFace(t *testing.T) {
 	}))
 	defer resolveSrv.Close()
 
-	info, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
+	hash, token, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
 	if err != nil {
 		t.Fatalf("Resolve returned error: %v", err)
 	}
 
-	if got := info.Hash.String(); got != sampleHash {
+	if got := hash.String(); got != sampleHash {
 		t.Fatalf("unexpected hash: %s", got)
 	}
-	if info.BaseURL != "https://override.cas" {
-		t.Fatalf("unexpected baseURL: %s", info.BaseURL)
+	if token.BaseURL != "https://override.cas" {
+		t.Fatalf("unexpected baseURL: %s", token.BaseURL)
 	}
-	if info.Token != "token-123" {
-		t.Fatalf("unexpected token: %s", info.Token)
+	if token.Token != "token-123" {
+		t.Fatalf("unexpected token: %s", token.Token)
 	}
 }
 
@@ -52,13 +51,13 @@ func TestResolveHuggingFaceMissingHeaders(t *testing.T) {
 	}))
 	defer resolveSrv.Close()
 
-	_, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
+	_, _, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
 	if err == nil {
 		t.Fatalf("expected error due to missing headers")
 	}
 }
 
-func TestResolveUploadFromRepoURL(t *testing.T) {
+func TestResolveUploadWithExplicitTarget(t *testing.T) {
 	const wantPath = "/api/datasets/org/repo/xet-write-token/main"
 
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +74,9 @@ func TestResolveUploadFromRepoURL(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETWriteToken(context.Background(), nil, tokenSrv.URL+"/datasets/org/repo", "hf-token", UploadOptions{})
+	target := Target{Endpoint: tokenSrv.URL, RepoType: "dataset", RepoID: "org/repo", Revision: "main"}
+
+	info, err := ResolveXETWriteToken(context.Background(), nil, target, "hf-token")
 	if err != nil {
 		t.Fatalf("ResolveUpload returned error: %v", err)
 	}
@@ -86,13 +87,10 @@ func TestResolveUploadFromRepoURL(t *testing.T) {
 	if info.Token != "cas-write-token" {
 		t.Fatalf("unexpected token: %s", info.Token)
 	}
-	if info.RepoType != "dataset" || info.RepoID != "org/repo" || info.Revision != "main" {
-		t.Fatalf("unexpected target info: %#v", info)
-	}
 }
 
-func TestResolveUploadFromRepoIDWithEncodedRevision(t *testing.T) {
-	const wantPath = "/api/models/org/repo/xet-write-token/refs%2Fpr%2F1"
+func TestResolveUploadWithExplicitOverrides(t *testing.T) {
+	const wantPath = "/api/spaces/org/repo/xet-write-token/custom-rev"
 
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.EscapedPath() != wantPath {
@@ -102,30 +100,27 @@ func TestResolveUploadFromRepoIDWithEncodedRevision(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETWriteToken(context.Background(), nil, "org/repo", "hf-token", UploadOptions{
+	target := Target{
 		Endpoint: tokenSrv.URL,
-		Revision: "refs/pr/1",
-	})
+		RepoType: "space",
+		RepoID:   "org/repo",
+		Revision: "custom-rev",
+	}
+
+	info, err := ResolveXETWriteToken(context.Background(), nil, target, "hf-token")
 	if err != nil {
 		t.Fatalf("ResolveUpload returned error: %v", err)
 	}
 
-	if info.RepoType != "model" {
-		t.Fatalf("unexpected repo type: %s", info.RepoType)
+	if info.Token != "cas-write-token" {
+		t.Fatalf("unexpected token: %s", info.Token)
 	}
-	if info.Revision != "refs/pr/1" {
-		t.Fatalf("unexpected revision: %s", info.Revision)
-	}
-}
-
-func TestResolveUploadMissingToken(t *testing.T) {
-	_, err := ResolveXETWriteToken(context.Background(), nil, "org/repo", "", UploadOptions{})
-	if err == nil || !strings.Contains(err.Error(), "missing Hugging Face token") {
-		t.Fatalf("expected missing token error, got %v", err)
+	if info.BaseURL != "https://cas-upload.example.com" {
+		t.Fatalf("unexpected baseURL: %s", info.BaseURL)
 	}
 }
 
-func TestResolveReadFromRepoURL(t *testing.T) {
+func TestResolveReadWithExplicitTarget(t *testing.T) {
 	const wantPath = "/api/models/org/repo/xet-read-token/main"
 
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +137,9 @@ func TestResolveReadFromRepoURL(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	info, err := ResolveXETReadToken(context.Background(), nil, tokenSrv.URL+"/org/repo", "hf-token", UploadOptions{})
+	target := Target{Endpoint: tokenSrv.URL, RepoID: "org/repo"}
+
+	info, err := ResolveXETReadToken(context.Background(), nil, target, "hf-token")
 	if err != nil {
 		t.Fatalf("ResolveRead returned error: %v", err)
 	}
@@ -152,8 +149,5 @@ func TestResolveReadFromRepoURL(t *testing.T) {
 	}
 	if info.Token != "cas-read-token" {
 		t.Fatalf("unexpected token: %s", info.Token)
-	}
-	if info.RepoType != "model" || info.RepoID != "org/repo" || info.Revision != "main" {
-		t.Fatalf("unexpected target info: %#v", info)
 	}
 }
