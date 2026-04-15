@@ -38,6 +38,7 @@ type prefetchEntry struct {
 	cache *chunkCache
 	err   error
 	ready chan struct{}
+	once  sync.Once
 }
 
 type prefetchJob struct {
@@ -156,8 +157,7 @@ func (p *prefetcher) buildJobs(entries []*prefetchEntry, fn func(*prefetchJob)) 
 
 	job := &prefetchJob{entries: []*prefetchEntry{entries[0]}}
 	for _, entry := range entries[1:] {
-		if len(job.entries) < 8 &&
-			job.entries[len(job.entries)-1].task.url == entry.task.url {
+		if job.entries[len(job.entries)-1].task.url == entry.task.url {
 			job.entries = append(job.entries, entry)
 			continue
 		}
@@ -269,25 +269,16 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 				}
 				break
 			}
-
-			err = cache.LoadAll()
-			if err == nil {
-				break
-			}
-
-			cache.Close()
-			cache = nil
-			if !shouldRetryXorbLoadError(err) || attempt == maxAttempts {
-				break
-			}
+			break
 		}
 
-		entry.cache = cache
-		entry.err = err
-		close(entry.ready)
-		if err == nil {
-			p.markEntryDone(entry.task.key)
+		if err != nil {
+			p.failEntry(entry, err)
+			continue
 		}
+
+		p.publishEntry(entry, cache)
+		go p.warmEntry(entry, cache)
 	}
 }
 
@@ -314,6 +305,10 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			return err
 		}
 		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
+	}
+
+	for _, target := range targets {
+		p.publishEntry(target.entry, target.cache)
 	}
 
 	go func() {
@@ -344,22 +339,31 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 	}()
 
 	for _, target := range targets {
-		if err := target.cache.LoadAll(); err != nil {
-			for _, t := range targets {
-				t.cache.Close()
-			}
-			return err
-		}
-	}
-
-	for _, target := range targets {
-		target.entry.cache = target.cache
-		target.entry.err = nil
-		close(target.entry.ready)
-		p.markEntryDone(target.entry.task.key)
+		go p.warmEntry(target.entry, target.cache)
 	}
 
 	return nil
+}
+
+func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
+	entry.cache = cache
+	entry.err = nil
+	entry.once.Do(func() {
+		close(entry.ready)
+	})
+}
+
+func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
+	entry.err = err
+	entry.once.Do(func() {
+		close(entry.ready)
+	})
+}
+
+func (p *prefetcher) warmEntry(entry *prefetchEntry, cache *chunkCache) {
+	if err := cache.LoadAll(); err == nil {
+		p.markEntryDone(entry.task.key)
+	}
 }
 
 // markEntryDone adds the byte span of key to the completed-bytes counter and
@@ -399,8 +403,7 @@ func shouldRetryXorbLoadError(err error) bool {
 
 func (p *prefetcher) failEntries(entries []*prefetchEntry, err error) {
 	for _, entry := range entries {
-		entry.err = err
-		close(entry.ready)
+		p.failEntry(entry, err)
 	}
 }
 
