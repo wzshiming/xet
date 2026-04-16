@@ -80,14 +80,16 @@ func VerifyObject(ctx context.Context, action *Action, obj BatchObject) error {
 	if err != nil {
 		return fmt.Errorf("do LFS verify request: %w", err)
 	}
-
-	respBody, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	trimmedBody := strings.TrimSpace(string(respBody))
+	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
 
-	return fmt.Errorf("LFS verify failed (status %d): %s", resp.StatusCode, trimmedBody)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("LFS verify failed with status %d and error reading response body: %w", resp.StatusCode, err)
+	}
+
+	return fmt.Errorf("LFS verify failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 }
