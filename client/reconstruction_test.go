@@ -102,7 +102,7 @@ func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 
 	c := NewClient(
 		WithBaseURL(server.URL),
-		WithDownloadRetries(2),
+		WithRetries(2),
 	)
 
 	if _, err := c.GetReconstructionV1(context.Background(), testHash, nil); err != nil {

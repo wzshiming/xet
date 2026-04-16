@@ -73,30 +73,6 @@ func WithConcurrency(concurrency int) Options {
 	}
 }
 
-// WithDownloadRetries sets the number of retries for network requests.
-// Kept for backward compatibility; it now shares one unified retry setting.
-// Values less than 0 are treated as 0.
-func WithDownloadRetries(retries int) Options {
-	return func(c *Client) {
-		if retries < 0 {
-			retries = 0
-		}
-		c.retries = retries
-	}
-}
-
-// WithUploadRetries sets the number of retries for network requests.
-// Kept for backward compatibility; it now shares one unified retry setting.
-// Values less than 0 are treated as 0.
-func WithUploadRetries(retries int) Options {
-	return func(c *Client) {
-		if retries < 0 {
-			retries = 0
-		}
-		c.retries = retries
-	}
-}
-
 // WithRetries sets the number of retries for all network requests when transient
 // network errors occur. Values less than 0 are treated as 0.
 func WithRetries(retries int) Options {
