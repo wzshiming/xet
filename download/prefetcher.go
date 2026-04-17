@@ -459,9 +459,13 @@ func (p *prefetcher) saveToCache(entry *prefetchEntry) {
 	for i := uint32(0); i < numChunks; i++ {
 		data, err := entry.cache.Chunk(i)
 		if err != nil {
+			// Best effort: stop caching on first read error.
 			return
 		}
-		_ = p.persistentCache.Put(entry.task.key.Hash, entry.chunkStart+i, data)
+		if err := p.persistentCache.Put(entry.task.key.Hash, entry.chunkStart+i, data); err != nil {
+			// Best effort: stop caching on first write error.
+			return
+		}
 	}
 }
 

@@ -144,8 +144,9 @@ func TestChunkCacheAtomicWrite(t *testing.T) {
 		t.Fatalf("ReadDir: %v", err)
 	}
 	for _, e := range entries {
-		if e.Name()[0] == '.' {
-			t.Fatalf("temp file left behind: %s", e.Name())
+		name := e.Name()
+		if len(name) > 0 && name[0] == '.' {
+			t.Fatalf("temp file left behind: %s", name)
 		}
 	}
 }
