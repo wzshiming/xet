@@ -23,7 +23,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "xetc",
-		Short:         "XET content-addressable storage tool",
+		Short:         "xet command-line tool",
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
