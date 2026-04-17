@@ -16,7 +16,6 @@ type Client struct {
 	httpClient   *http.Client
 	token        string
 	namespace    string
-	cacheDirPath string
 	concurrency  int
 	retries      int
 	progressFunc progress.ProgressFunc
@@ -49,13 +48,6 @@ func WithToken(token string) Options {
 func WithNamespace(namespace string) Options {
 	return func(c *Client) {
 		c.namespace = namespace
-	}
-}
-
-// WithCacheDir sets the directory path for caching API responses and serialized data. If not set, caching is disabled.
-func WithCacheDir(dir string) Options {
-	return func(c *Client) {
-		c.cacheDirPath = dir
 	}
 }
 
