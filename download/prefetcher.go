@@ -47,10 +47,7 @@ type prefetcher struct {
 	entries map[fetchKey]*prefetchEntry
 	retries int
 
-	store     *chunkStore
-	storeMut  sync.Mutex
-	closeOnce sync.Once
-	closed    atomic.Bool
+	store *chunkStore
 
 	// Progress tracking: total is computed from unique fetch-key byte ranges
 	// before any download starts; done is incremented only when an entry
@@ -82,7 +79,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries[task.key] = item
 		items = append(items, item)
 	}
-	concurrency := opts.concurrencyValue()
+	concurrency := opts.concurrency
 	retries := opts.retries
 
 	// Compute the total expected transfer bytes from all unique fetch-key byte ranges.
@@ -269,7 +266,7 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 			}
 
 			dec := xorb.NewDecoder(rc, false)
-			cache, err = p.newChunkCache(dec)
+			cache, err = newChunkCache(dec, p.store)
 			if err != nil {
 				dec.Close()
 				if attempt < maxAttempts {
@@ -301,11 +298,11 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 	for i, entry := range entries {
 		pipeR, pipeW := io.Pipe()
 		dec := xorb.NewDecoder(pipeR, false)
-		cache, err := p.newChunkCache(dec)
+		cache, err := newChunkCache(dec, p.store)
 		if err != nil {
 			for j := range i {
 				targets[j].pipeW.CloseWithError(err)
-				targets[j].cache.Close()
+				targets[j].cache.Done()
 			}
 			pipeW.CloseWithError(err)
 			pipeR.CloseWithError(err)
@@ -313,41 +310,35 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			return err
 		}
 		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
+
+		p.publishEntry(entry, cache)
 	}
 
-	for _, target := range targets {
-		p.publishEntry(target.entry, target.cache)
-	}
-
-	go func() {
-		defer closer.Close()
-		for i := range targets {
-			part, err := mr.NextPart()
-			if err != nil {
-				if err == io.EOF {
-					err = io.ErrUnexpectedEOF
-				}
-				for j := i; j < len(targets); j++ {
-					targets[j].pipeW.CloseWithError(err)
-				}
-				return
+	defer closer.Close()
+	for i := range targets {
+		part, err := mr.NextPart()
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
 			}
-
-			_, copyErr := io.Copy(targets[i].pipeW, part)
-			part.Close()
-			if copyErr != nil {
-				targets[i].pipeW.CloseWithError(copyErr)
-				for j := i + 1; j < len(targets); j++ {
-					targets[j].pipeW.CloseWithError(copyErr)
-				}
-				return
+			for j := i; j < len(targets); j++ {
+				targets[j].pipeW.CloseWithError(err)
 			}
-			targets[i].pipeW.Close()
+			return err
 		}
-	}()
 
-	for _, target := range targets {
-		p.warmEntry(target.entry, target.cache)
+		_, copyErr := io.Copy(targets[i].pipeW, part)
+		part.Close()
+		if copyErr != nil {
+			targets[i].pipeW.CloseWithError(copyErr)
+			for j := i + 1; j < len(targets); j++ {
+				targets[j].pipeW.CloseWithError(copyErr)
+			}
+			return copyErr
+		}
+		targets[i].pipeW.Close()
+
+		p.warmEntry(targets[i].entry, targets[i].cache)
 	}
 
 	return nil
@@ -387,36 +378,19 @@ func (p *prefetcher) markEntryDone(key fetchKey) {
 	}
 }
 
-func (p *prefetcher) newChunkCache(dec *xorb.Decoder) (*chunkCache, error) {
-	if p.closed.Load() {
-		// prefetcher already closed; don't create new caches
-		return nil, errors.New("prefetcher closed")
-	}
-
-	return newChunkCache(dec, p.store)
-}
-
 // Close releases all resources held by the prefetcher: it closes every cached
 // entry and drops the prefetcher's own reference to the shared chunkStore so
 // that the backing temp file is deleted once all consumers are done with it.
 func (p *prefetcher) Close() {
-	p.closeOnce.Do(func() {
-		p.closed.Store(true)
-
-		for _, entry := range p.entries {
-			if entry.cache != nil {
-				entry.cache.Close()
-			}
+	for _, entry := range p.entries {
+		if entry.cache != nil {
+			entry.cache.Done()
 		}
+	}
 
-		p.storeMut.Lock()
-		defer p.storeMut.Unlock()
-		if p.store != nil {
-			// Release the initial reference that newChunkStore gave to the prefetcher.
-			p.store.release()
-			p.store = nil
-		}
-	})
+	if p.store != nil {
+		p.store.Close()
+	}
 }
 
 func shouldRetryXorbLoadError(err error) bool {
@@ -443,14 +417,4 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
-}
-
-// countFetchUses returns a map of how many reconstruction terms reference each fetchKey.
-// Used by the reader to know when it is safe to close a chunkCache.
-func countFetchUses(termFetches []selectedFetch) map[fetchKey]int {
-	counts := make(map[fetchKey]int, len(termFetches))
-	for _, fetch := range termFetches {
-		counts[fetch.key]++
-	}
-	return counts
 }

@@ -20,18 +20,16 @@ type chunkRef struct {
 // position referenced by multiple reconstruction terms) can be re-read without a
 // second download, while keeping memory usage low.
 type chunkCache struct {
-	dec       *xorb.Decoder
-	store     *chunkStore
-	index     []chunkRef
-	done      bool // decoder exhausted or closed
-	mut       sync.Mutex
-	closeOnce sync.Once
+	dec   *xorb.Decoder
+	store *chunkStore
+	index []chunkRef
+	done  bool // decoder exhausted or closed
+	mut   sync.Mutex
 }
 
 type chunkStore struct {
 	file        *os.File
 	writeOffset int64
-	refCount    int
 	mut         sync.RWMutex
 }
 
@@ -40,17 +38,7 @@ func newChunkStore() (*chunkStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &chunkStore{file: f, refCount: 1}, nil
-}
-
-func (s *chunkStore) acquire() error {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	if s.file == nil {
-		return os.ErrClosed
-	}
-	s.refCount++
-	return nil
+	return &chunkStore{file: f}, nil
 }
 
 func (s *chunkStore) append(data []byte) (int64, error) {
@@ -71,37 +59,38 @@ func (s *chunkStore) append(data []byte) (int64, error) {
 	return writeOffset, nil
 }
 
-func (s *chunkStore) readAt(buf []byte, offset int64) error {
+func (s *chunkStore) readAt(buf []byte, offset int64) (int64, error) {
 	s.mut.RLock()
 	defer s.mut.RUnlock()
 	if s.file == nil {
-		return os.ErrClosed
+		return 0, os.ErrClosed
 	}
-	_, err := s.file.ReadAt(buf, offset)
-	return err
+
+	var n int
+	for n != len(buf) {
+		sn, err := s.file.ReadAt(buf[n:], offset+int64(n))
+		n += sn
+		if err != nil {
+			return int64(n), err
+		}
+	}
+	return int64(n), nil
 }
 
-func (s *chunkStore) release() {
+func (s *chunkStore) Close() error {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 	if s.file == nil {
-		return
+		return nil
 	}
-	if s.refCount > 0 {
-		s.refCount--
-	}
-	if s.refCount == 0 {
-		name := s.file.Name()
-		s.file.Close()
-		os.Remove(name)
-		s.file = nil
-	}
+	name := s.file.Name()
+	s.file.Close()
+	os.Remove(name)
+	s.file = nil
+	return nil
 }
 
 func newChunkCache(dec *xorb.Decoder, store *chunkStore) (*chunkCache, error) {
-	if err := store.acquire(); err != nil {
-		return nil, err
-	}
 	return &chunkCache{dec: dec, store: store}, nil
 }
 
@@ -113,8 +102,12 @@ func (c *chunkCache) Chunk(idx uint32) ([]byte, error) {
 	if int(idx) < len(c.index) {
 		ref := c.index[idx]
 		data := make([]byte, ref.length)
-		if err := c.store.readAt(data, ref.offset); err != nil {
+		n, err := c.store.readAt(data, ref.offset)
+		if err != nil {
 			return nil, err
+		}
+		if int64(n) != int64(ref.length) {
+			return nil, io.ErrUnexpectedEOF
 		}
 		return data, nil
 	}
@@ -126,8 +119,12 @@ func (c *chunkCache) Chunk(idx uint32) ([]byte, error) {
 	}
 	ref := c.index[idx]
 	data := make([]byte, ref.length)
-	if err := c.store.readAt(data, ref.offset); err != nil {
+	n, err := c.store.readAt(data, ref.offset)
+	if err != nil {
 		return nil, err
+	}
+	if int64(n) != int64(ref.length) {
+		return nil, io.ErrUnexpectedEOF
 	}
 	return data, nil
 }
@@ -176,18 +173,4 @@ func (c *chunkCache) Done() {
 		c.done = true
 		c.dec.Close()
 	}
-}
-
-// Close closes the underlying decoder and releases the backing temp file reference.
-// Safe to call multiple times; only the first call has effect.
-func (c *chunkCache) Close() {
-	c.closeOnce.Do(func() {
-		c.mut.Lock()
-		defer c.mut.Unlock()
-		c.Done()
-		if c.store != nil {
-			c.store.release()
-			c.store = nil
-		}
-	})
 }

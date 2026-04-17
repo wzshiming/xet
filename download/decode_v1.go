@@ -14,7 +14,6 @@ type ReaderV1 struct {
 	reconstruction *ReconstructionResponseV1
 	skipBytes      int64
 	termFetches    []selectedFetch
-	remainingUses  map[fetchKey]int
 	prefetcher     *prefetcher
 
 	// State for reading
@@ -51,7 +50,6 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		reconstruction: reconstruction,
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
-		remainingUses:  countFetchUses(termFetches),
 		prefetcher:     prefetcher,
 	}, nil
 }
@@ -133,6 +131,10 @@ func (r *ReaderV1) cleanup() {
 	if r.prefetcher != nil {
 		r.prefetcher.Close()
 	}
+	r.prefetcher = nil
+	if r.currentCache != nil {
+		r.currentCache.Done()
+	}
 	r.currentCache = nil
 	r.currentTerm = nil
 }
@@ -142,18 +144,6 @@ func (r *ReaderV1) cleanup() {
 func (r *ReaderV1) finishCurrentTerm() {
 	if r.currentTerm == nil {
 		return
-	}
-
-	key := r.termFetches[r.termIdx].key
-	remaining := r.remainingUses[key] - 1
-	if remaining <= 0 {
-		delete(r.remainingUses, key)
-		if r.currentCache != nil {
-			r.currentCache.Close()
-			r.currentCache = nil
-		}
-	} else {
-		r.remainingUses[key] = remaining
 	}
 
 	r.currentTerm = nil

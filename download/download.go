@@ -44,10 +44,3 @@ func WithProgressFunc(name string, progressFunc progress.ProgressFunc) Option {
 		o.progressFunc = progressFunc
 	}
 }
-
-func (o *options) concurrencyValue() int {
-	if o == nil || o.concurrency <= 0 {
-		return 1
-	}
-	return o.concurrency
-}
