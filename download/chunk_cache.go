@@ -19,12 +19,16 @@ type chunkRef struct {
 // Decoded chunks are written to disk so that dedup'd xorb chunks (the same chunk
 // position referenced by multiple reconstruction terms) can be re-read without a
 // second download, while keeping memory usage low.
+//
+// When persistentRead is set, all Chunk calls are served directly from the
+// persistent cache and the decoder/store fields are unused.
 type chunkCache struct {
-	dec   *xorb.Decoder
-	store *chunkStore
-	index []chunkRef
-	done  bool // decoder exhausted or closed
-	mut   sync.Mutex
+	dec            *xorb.Decoder
+	store          *chunkStore
+	index          []chunkRef
+	done           bool // decoder exhausted or closed
+	mut            sync.Mutex
+	persistentRead func(idx uint32) ([]byte, error)
 }
 
 type chunkStore struct {
@@ -96,9 +100,13 @@ func newChunkCache(dec *xorb.Decoder, store *chunkStore) (*chunkCache, error) {
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
 // Already-decoded chunks are served from the backing temp file.
+// When backed by a persistent cache, chunks are served directly from disk.
 func (c *chunkCache) Chunk(idx uint32) ([]byte, error) {
 	c.mut.Lock()
 	defer c.mut.Unlock()
+	if c.persistentRead != nil {
+		return c.persistentRead(idx)
+	}
 	if int(idx) < len(c.index) {
 		ref := c.index[idx]
 		data := make([]byte, ref.length)

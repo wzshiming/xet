@@ -37,24 +37,35 @@ type selectedFetch struct {
 }
 
 type prefetchEntry struct {
-	task  fetchTask
-	cache *chunkCache
-	err   error
-	ready chan struct{}
-	once  sync.Once
+	task       fetchTask
+	chunkStart uint32
+	chunkEnd   uint32
+	cache      *chunkCache
+	err        error
+	ready      chan struct{}
+	once       sync.Once
 }
 
 type prefetcher struct {
-	ctx          context.Context
-	client       ClientAdapter
-	entries      map[fetchKey]*prefetchEntry
-	retries      int
-	progressFunc progress.ProgressFunc
+	ctx             context.Context
+	client          ClientAdapter
+	entries         map[fetchKey]*prefetchEntry
+	retries         int
+	progressFunc    progress.ProgressFunc
+	persistentCache *ChunkCache
 
 	store *chunkStore
 }
 
 func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) (*prefetcher, error) {
+	// Build chunk range map from termFetches so each entry knows its absolute chunk range.
+	chunkRanges := make(map[fetchKey][2]uint32, len(termFetches))
+	for _, sf := range termFetches {
+		if _, ok := chunkRanges[sf.key]; !ok {
+			chunkRanges[sf.key] = [2]uint32{sf.chunkStart, sf.chunkEnd}
+		}
+	}
+
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -68,9 +79,12 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		if _, ok := entries[task.key]; ok {
 			continue
 		}
+		cr := chunkRanges[task.key]
 		item := &prefetchEntry{
-			task:  task,
-			ready: make(chan struct{}),
+			task:       task,
+			chunkStart: cr[0],
+			chunkEnd:   cr[1],
+			ready:      make(chan struct{}),
 		}
 		entries[task.key] = item
 		items = append(items, item)
@@ -80,10 +94,11 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 
 	if len(items) == 0 {
 		return &prefetcher{
-			ctx:     ctx,
-			client:  client,
-			entries: entries,
-			retries: retries,
+			ctx:             ctx,
+			client:          client,
+			entries:         entries,
+			retries:         retries,
+			persistentCache: opts.persistentCache,
 		}, nil
 	}
 
@@ -95,12 +110,13 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	}
 
 	p := &prefetcher{
-		ctx:          ctx,
-		client:       client,
-		entries:      entries,
-		retries:      retries,
-		store:        store,
-		progressFunc: opts.progressFunc,
+		ctx:             ctx,
+		client:          client,
+		entries:         entries,
+		retries:         retries,
+		store:           store,
+		progressFunc:    opts.progressFunc,
+		persistentCache: opts.persistentCache,
 	}
 
 	if opts.progressFunc != nil {
@@ -182,6 +198,22 @@ func (p *prefetcher) runJob(entries []*prefetchEntry) {
 	if len(entries) == 0 {
 		return
 	}
+
+	// Check persistent cache for each entry; serve cache hits without downloading.
+	if p.persistentCache != nil {
+		var uncached []*prefetchEntry
+		for _, entry := range entries {
+			if p.tryLoadFromCache(entry) {
+				continue
+			}
+			uncached = append(uncached, entry)
+		}
+		entries = uncached
+		if len(entries) == 0 {
+			return
+		}
+	}
+
 	if len(entries) > 1 {
 		// Try multipart download first, with retries
 		maxAttempts := max(p.retries+1, 1)
@@ -272,6 +304,7 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 				}
 				break
 			}
+			p.saveToCache(entry)
 			p.markEntryDone(entry)
 			break
 		}
@@ -342,6 +375,7 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			return i + 1, err
 		}
 
+		p.saveToCache(targets[i].entry)
 		p.markEntryDone(targets[i].entry)
 	}
 
@@ -385,6 +419,49 @@ func (p *prefetcher) Close() {
 
 	if p.store != nil {
 		p.store.Close()
+	}
+}
+
+// tryLoadFromCache attempts to serve an entry entirely from the persistent
+// chunk cache. Returns true if all chunks were found and the entry was
+// published; false otherwise (the caller should fall back to downloading).
+func (p *prefetcher) tryLoadFromCache(entry *prefetchEntry) bool {
+	if !p.persistentCache.HasRange(entry.task.key.Hash, entry.chunkStart, entry.chunkEnd) {
+		return false
+	}
+
+	xorbHash := entry.task.key.Hash
+	chunkStart := entry.chunkStart
+	pc := p.persistentCache
+	cc := &chunkCache{
+		done: true,
+		persistentRead: func(idx uint32) ([]byte, error) {
+			data, ok := pc.Get(xorbHash, chunkStart+idx)
+			if !ok {
+				return nil, fmt.Errorf("chunk %d not in persistent cache", chunkStart+idx)
+			}
+			return data, nil
+		},
+	}
+
+	p.publishEntry(entry, cc)
+	p.markEntryDone(entry)
+	return true
+}
+
+// saveToCache writes all decoded chunks from a completed entry into the
+// persistent chunk cache. Errors are silently ignored (best effort).
+func (p *prefetcher) saveToCache(entry *prefetchEntry) {
+	if p.persistentCache == nil {
+		return
+	}
+	numChunks := entry.chunkEnd - entry.chunkStart
+	for i := uint32(0); i < numChunks; i++ {
+		data, err := entry.cache.Chunk(i)
+		if err != nil {
+			return
+		}
+		_ = p.persistentCache.Put(entry.task.key.Hash, entry.chunkStart+i, data)
 	}
 }
 

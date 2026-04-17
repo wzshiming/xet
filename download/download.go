@@ -8,9 +8,10 @@ import (
 type Option func(*options)
 
 type options struct {
-	concurrency  int
-	retries      int
-	progressFunc progress.ProgressFunc
+	concurrency     int
+	retries         int
+	progressFunc    progress.ProgressFunc
+	persistentCache *ChunkCache
 }
 
 // WithConcurrency configures how many xorb ranges are prefetched concurrently.
@@ -40,5 +41,15 @@ func WithRetries(retries int) Option {
 func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
+	}
+}
+
+// WithChunkCache sets a persistent, cross-file chunk cache that is reused
+// across multiple downloads. Decoded chunks are stored on disk keyed by
+// (xorbHash, absoluteChunkIndex). On a cache hit the network download and
+// decoding are skipped entirely.
+func WithChunkCache(cache *ChunkCache) Option {
+	return func(o *options) {
+		o.persistentCache = cache
 	}
 }

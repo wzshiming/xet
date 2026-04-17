@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -46,6 +47,7 @@ type Client struct {
 	concurrency  int
 	retries      int
 	progressFunc progress.ProgressFunc
+	chunkCache   *download.ChunkCache
 }
 
 type Options func(*Client)
@@ -90,6 +92,16 @@ func WithNamespace(namespace string) Options {
 func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
 	return func(c *Client) {
 		c.progressFunc = progressFunc
+	}
+}
+
+// WithChunkCache sets a persistent, cross-file chunk cache that is shared
+// across all download calls on this client. Decoded chunks are stored on disk
+// and survive process restarts. On a cache hit the network download and
+// decoding of the corresponding chunk are skipped entirely.
+func WithChunkCache(cache *download.ChunkCache) Options {
+	return func(c *Client) {
+		c.chunkCache = cache
 	}
 }
 
