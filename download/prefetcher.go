@@ -41,10 +41,6 @@ type prefetchEntry struct {
 	once  sync.Once
 }
 
-type prefetchJob struct {
-	entries []*prefetchEntry
-}
-
 type prefetcher struct {
 	ctx     context.Context
 	client  ClientAdapter
@@ -140,39 +136,43 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		desiredWorkers = 1
 	}
 
-	jobs := make(chan *prefetchJob)
+	jobs := make(chan []*prefetchEntry)
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
-			for job := range jobs {
-				p.runJob(job)
+			for entries := range jobs {
+				p.runJob(entries)
 			}
 		}()
 	}
 	go func() {
 		defer close(jobs)
-		p.buildJobs(items, func(job *prefetchJob) {
-			jobs <- job
+		remaining := len(items)
+		groupByURL(items, func(entries []*prefetchEntry) {
+			for len(entries) > 0 {
+				size := max(remaining/concurrency, 1)
+				n := min(size, len(entries))
+				jobs <- entries[:n]
+				entries = entries[n:]
+				remaining -= n
+			}
 		})
 	}()
 
 	return p, nil
 }
 
-func (p *prefetcher) buildJobs(entries []*prefetchEntry, fn func(*prefetchJob)) {
+func groupByURL(entries []*prefetchEntry, fn func([]*prefetchEntry)) {
 	if len(entries) == 0 {
 		return
 	}
-
-	job := &prefetchJob{entries: []*prefetchEntry{entries[0]}}
-	for _, entry := range entries[1:] {
-		if job.entries[len(job.entries)-1].task.url == entry.task.url {
-			job.entries = append(job.entries, entry)
-			continue
+	start := 0
+	for i := 1; i < len(entries); i++ {
+		if entries[i].task.url != entries[start].task.url {
+			fn(entries[start:i])
+			start = i
 		}
-		fn(job)
-		job = &prefetchJob{entries: []*prefetchEntry{entry}}
 	}
-	fn(job)
+	fn(entries[start:])
 }
 
 func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
@@ -200,16 +200,16 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 	})
 }
 
-func (p *prefetcher) runJob(job *prefetchJob) {
-	if len(job.entries) == 0 {
+func (p *prefetcher) runJob(entries []*prefetchEntry) {
+	if len(entries) == 0 {
 		return
 	}
-	if len(job.entries) > 1 {
+	if len(entries) > 1 {
 		// Try multipart download first, with retries
 		maxAttempts := max(p.retries+1, 1)
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			ranges := make([]string, len(job.entries))
-			for i, entry := range job.entries {
+			ranges := make([]string, len(entries))
+			for i, entry := range entries {
 				ranges[i] = fmt.Sprintf("%d-%d", entry.task.key.Start, entry.task.key.End)
 			}
 			header := http.Header{
@@ -217,31 +217,31 @@ func (p *prefetcher) runJob(job *prefetchJob) {
 					fmt.Sprintf("bytes=%s", strings.Join(ranges, ",")),
 				},
 			}
-			mr, closer, err := p.client.DownloadXorbsMultipart(p.ctx, job.entries[0].task.url, header)
+			mr, closer, err := p.client.DownloadXorbsMultipart(p.ctx, entries[0].task.url, header)
 			if err != nil {
 				if attempt < maxAttempts && shouldRetryXorbLoadError(err) {
 					continue
 				}
 				// Fall back to single-range retrieval
-				p.runSingleRangeEntries(job.entries)
+				p.runSingleRangeEntries(entries)
 				return
 			}
 
-			err = p.runStreamJob(job.entries, mr, closer)
+			err = p.runStreamJob(entries, mr, closer)
 			if err == nil {
 				return
 			}
 
 			// Stream failed; fall back to single-range if this was the last attempt
 			if attempt == maxAttempts || !shouldRetryXorbLoadError(err) {
-				p.failEntries(job.entries, err)
+				p.failEntries(entries, err)
 				return
 			}
 		}
 		return
 	}
 
-	p.runSingleRangeEntries(job.entries)
+	p.runSingleRangeEntries(entries)
 }
 
 func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
@@ -286,7 +286,7 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 		}
 
 		p.publishEntry(entry, cache)
-		go p.warmEntry(entry, cache)
+		p.warmEntry(entry, cache)
 	}
 }
 
@@ -347,7 +347,7 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 	}()
 
 	for _, target := range targets {
-		go p.warmEntry(target.entry, target.cache)
+		p.warmEntry(target.entry, target.cache)
 	}
 
 	return nil
