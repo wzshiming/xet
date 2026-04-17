@@ -11,7 +11,6 @@ type options struct {
 	concurrency  int
 	retries      int
 	progressFunc progress.ProgressFunc
-	progressName string
 }
 
 // WithConcurrency configures how many xorb ranges are prefetched concurrently.
@@ -38,9 +37,8 @@ func WithRetries(retries int) Option {
 // knows the expected transfer size before any xorb is fetched.
 // progress is reported only when individual fetch entries complete successfully,
 // so retries do not inflate the reported current value.
-func WithProgressFunc(name string, progressFunc progress.ProgressFunc) Option {
+func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
-		o.progressName = name
 		o.progressFunc = progressFunc
 	}
 }

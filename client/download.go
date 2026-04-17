@@ -36,7 +36,7 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
-		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
 	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
 	if err != nil {
@@ -61,7 +61,7 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
-		opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
 	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
 	if err != nil {
@@ -109,7 +109,7 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 			download.WithRetries(c.retries),
 		}
 		if c.progressFunc != nil {
-			opts = append(opts, download.WithProgressFunc(fileHash.String(), c.progressFunc))
+			opts = append(opts, download.WithProgressFunc(c.progressFunc))
 		}
 		reader, err := download.NewReaderV1(ctx, c, singleResp, opts...)
 		if err != nil {

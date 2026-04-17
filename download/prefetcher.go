@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
@@ -20,6 +19,10 @@ type fetchKey struct {
 	Hash  string
 	Start int64
 	End   int64
+}
+
+func (k fetchKey) String() string {
+	return fmt.Sprintf("%s:%d-%d", k.Hash, k.Start, k.End)
 }
 
 type fetchTask struct {
@@ -42,20 +45,13 @@ type prefetchEntry struct {
 }
 
 type prefetcher struct {
-	ctx     context.Context
-	client  ClientAdapter
-	entries map[fetchKey]*prefetchEntry
-	retries int
+	ctx          context.Context
+	client       ClientAdapter
+	entries      map[fetchKey]*prefetchEntry
+	retries      int
+	progressFunc progress.ProgressFunc
 
 	store *chunkStore
-
-	// Progress tracking: total is computed from unique fetch-key byte ranges
-	// before any download starts; done is incremented only when an entry
-	// successfully completes, so retries never inflate the reported value.
-	progressFunc  progress.ProgressFunc
-	progressName  string
-	progressTotal int64
-	progressDone  atomic.Int64
 }
 
 func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) (*prefetcher, error) {
@@ -82,31 +78,12 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	concurrency := opts.concurrency
 	retries := opts.retries
 
-	// Compute the total expected transfer bytes from all unique fetch-key byte ranges.
-	// This is done before any network activity so the total is always known upfront.
-	var progressTotal int64
-	if opts.progressFunc != nil {
-		seen := make(map[fetchKey]struct{}, len(tasks))
-		for _, task := range tasks {
-			if _, ok := seen[task.key]; ok {
-				continue
-			}
-			seen[task.key] = struct{}{}
-			if task.key.End >= task.key.Start {
-				progressTotal += task.key.End - task.key.Start + 1
-			}
-		}
-	}
-
 	if len(items) == 0 {
 		return &prefetcher{
-			ctx:           ctx,
-			client:        client,
-			entries:       entries,
-			retries:       retries,
-			progressFunc:  opts.progressFunc,
-			progressName:  opts.progressName,
-			progressTotal: progressTotal,
+			ctx:     ctx,
+			client:  client,
+			entries: entries,
+			retries: retries,
 		}, nil
 	}
 
@@ -118,14 +95,18 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	}
 
 	p := &prefetcher{
-		ctx:           ctx,
-		client:        client,
-		entries:       entries,
-		retries:       retries,
-		store:         store,
-		progressFunc:  opts.progressFunc,
-		progressName:  opts.progressName,
-		progressTotal: progressTotal,
+		ctx:          ctx,
+		client:       client,
+		entries:      entries,
+		retries:      retries,
+		store:        store,
+		progressFunc: opts.progressFunc,
+	}
+
+	if opts.progressFunc != nil {
+		for _, item := range items {
+			opts.progressFunc(item.task.key.String(), 0, item.task.key.End-item.task.key.Start)
+		}
 	}
 
 	desiredWorkers := concurrency
@@ -224,8 +205,15 @@ func (p *prefetcher) runJob(entries []*prefetchEntry) {
 				return
 			}
 
-			err = p.runStreamJob(entries, mr, closer)
+			n, err := p.runStreamJob(entries, mr, closer)
 			if err == nil {
+				return
+			}
+
+			entries = entries[n:]
+
+			if len(entries) == 1 {
+				p.runSingleRangeEntries(entries)
 				return
 			}
 
@@ -274,6 +262,17 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 				}
 				break
 			}
+
+			p.publishEntry(entry, cache)
+			err = cache.LoadAll()
+			if err != nil {
+				dec.Close()
+				if attempt < maxAttempts {
+					continue
+				}
+				break
+			}
+			p.markEntryDone(entry)
 			break
 		}
 
@@ -281,13 +280,10 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 			p.failEntry(entry, err)
 			continue
 		}
-
-		p.publishEntry(entry, cache)
-		p.warmEntry(entry, cache)
 	}
 }
 
-func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader, closer io.Closer) error {
+func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader, closer io.Closer) (int, error) {
 	type streamTarget struct {
 		entry *prefetchEntry
 		cache *chunkCache
@@ -307,7 +303,7 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			pipeW.CloseWithError(err)
 			pipeR.CloseWithError(err)
 			closer.Close()
-			return err
+			return 0, err
 		}
 		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
 
@@ -324,7 +320,7 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			for j := i; j < len(targets); j++ {
 				targets[j].pipeW.CloseWithError(err)
 			}
-			return err
+			return i, err
 		}
 
 		_, copyErr := io.Copy(targets[i].pipeW, part)
@@ -334,14 +330,22 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			for j := i + 1; j < len(targets); j++ {
 				targets[j].pipeW.CloseWithError(copyErr)
 			}
-			return copyErr
+			return i, copyErr
 		}
 		targets[i].pipeW.Close()
 
-		p.warmEntry(targets[i].entry, targets[i].cache)
+		err = targets[i].cache.LoadAll()
+		if err != nil {
+			for j := i + 1; j < len(targets); j++ {
+				targets[j].cache.Done()
+			}
+			return i + 1, err
+		}
+
+		p.markEntryDone(targets[i].entry)
 	}
 
-	return nil
+	return len(targets), nil
 }
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
@@ -350,6 +354,9 @@ func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
 	entry.once.Do(func() {
 		close(entry.ready)
 	})
+	if p.progressFunc != nil {
+		p.progressFunc(entry.task.key.String(), 0, entry.task.key.End-entry.task.key.Start)
+	}
 }
 
 func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
@@ -359,22 +366,10 @@ func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
 	})
 }
 
-func (p *prefetcher) warmEntry(entry *prefetchEntry, cache *chunkCache) {
-	if err := cache.LoadAll(); err == nil {
-		p.markEntryDone(entry.task.key)
-	}
-}
-
-// markEntryDone adds the byte span of key to the completed-bytes counter and
-// fires the progress callback. It is called exactly once per entry, only on
-// success, so retries never inflate the reported current value.
-func (p *prefetcher) markEntryDone(key fetchKey) {
-	if p.progressFunc == nil {
-		return
-	}
-	if key.End >= key.Start {
-		done := p.progressDone.Add(key.End - key.Start + 1)
-		p.progressFunc(p.progressName, done, p.progressTotal)
+func (p *prefetcher) markEntryDone(entry *prefetchEntry) {
+	if p.progressFunc != nil {
+		size := entry.task.key.End - entry.task.key.Start
+		p.progressFunc(entry.task.key.String(), size, size)
 	}
 }
 
