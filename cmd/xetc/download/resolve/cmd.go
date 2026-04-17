@@ -20,14 +20,14 @@ func NewCommand() *cobra.Command {
 		Short: "Resolve a Hugging Face URL and download through CAS",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			hash, token, err := hf.ResolveDownload(cmd.Context(), nil, args[0])
+			hash, provider, err := hf.ResolveDownload(cmd.Context(), nil, args[0])
 			if err != nil {
 				return fmt.Errorf("resolve download target: %w", err)
 			}
 			if _, err := fmt.Fprintf(os.Stderr, "%s Resolved Hugging Face file hash: %s\n", args[1], hash.String()); err != nil {
 				return err
 			}
-			return common.ExecuteDownload(cmd.Context(), hash, args[1], token.BaseURL, token.Token, "default", concurrency, resume, os.Stderr)
+			return common.ExecuteDownload(cmd.Context(), hash, args[1], provider, "default", concurrency, resume, os.Stderr)
 		},
 	}
 

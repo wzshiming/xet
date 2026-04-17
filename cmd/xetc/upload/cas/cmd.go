@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -20,7 +21,8 @@ func NewCommand() *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return common.ExecuteUpload(cmd.Context(), args[0], baseURL, token, namespace, concurrency, os.Stderr)
+			provider := client.StaticAuthProvider(baseURL, token)
+			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr)
 		},
 	}
 

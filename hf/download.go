@@ -12,10 +12,13 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/client"
 )
 
-// ResolveDownload resolves a download URL to its corresponding file hash and CAS endpoint
-func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (xet.Hash, *Token, error) {
+// ResolveDownload resolves a download URL to its corresponding file hash and a
+// CAS TokenProvider. The provider pre-populates the first token from the
+// response headers so no extra round-trip is needed on first use.
+func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (xet.Hash, client.AuthProvider, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
@@ -41,8 +44,9 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 	return ResolveResponse(ctx, httpClient, resp)
 }
 
-// ResolveXETReadToken resolves a Hugging Face repo reference to an XET read token for downloading
-func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (xet.Hash, *Token, error) {
+// ResolveResponse extracts the file hash and a CAS TokenProvider from an
+// already-executed HTTP response that contains XET link headers.
+func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (xet.Hash, client.AuthProvider, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		return xet.Hash{}, nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
@@ -79,12 +83,13 @@ func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Re
 		return xet.Hash{}, nil, fmt.Errorf("parse X-Xet-Hash: %w", err)
 	}
 
-	tokenResp, err := fetchXETAuthToken(ctx, httpClient, authURL, "")
+	initial, err := fetchXETAuthToken(ctx, httpClient, authURL, "")
 	if err != nil {
 		return xet.Hash{}, nil, fmt.Errorf("fetch xet auth token: %w", err)
 	}
 
-	return fileHash, tokenResp, nil
+	provider := newTokenProviderFromURL(httpClient, authURL, initial)
+	return fileHash, provider, nil
 }
 
 func normalizeRepoType(repoType string) string {
@@ -142,7 +147,7 @@ type tokenResp struct {
 	Exp    int64  `json:"exp"`
 }
 
-func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL string, token string) (*Token, error) {
+func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL string, token string) (*tokenData, error) {
 	// Avoid caching issues by adding a timestamp query parameter
 	tokenURL += "?" + fmt.Sprint(time.Now().Unix())
 
@@ -183,7 +188,7 @@ func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL st
 		return nil, fmt.Errorf("decode auth response: %w", err)
 	}
 
-	return &Token{
+	return &tokenData{
 		BaseURL: respData.CASURL,
 		Token:   respData.Token,
 		Exp:     time.Unix(respData.Exp, 0),

@@ -11,6 +11,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	xetcas "github.com/wzshiming/xet/cas"
+	"github.com/wzshiming/xet/client"
 )
 
 const (
@@ -30,13 +31,13 @@ func baseName(p string) string {
 	return p
 }
 
-func ExecuteUpload(ctx context.Context, filename, baseURL, token, namespace string, concurrency int, out io.Writer) (err error) {
+func ExecuteUpload(ctx context.Context, filename string, provider client.AuthProvider, namespace string, concurrency int, out io.Writer) (err error) {
 	if _, err := fmt.Fprintf(out, "%s Uploading file\n", filename); err != nil {
 		return err
 	}
 
 	progressSummary := newProgressSummary()
-	fileHash, err := xetcas.Upload(ctx, filename, baseURL, token, namespace, concurrency, func(name string, current, total int64) {
+	fileHash, err := xetcas.Upload(ctx, filename, provider, namespace, concurrency, func(name string, current, total int64) {
 		progressSummary.Update(baseName(name), current, total)
 		progressSummary.Output(out)
 	})
@@ -54,9 +55,9 @@ func ExecuteUpload(ctx context.Context, filename, baseURL, token, namespace stri
 	return nil
 }
 
-func ExecuteDownload(ctx context.Context, fileHash xet.Hash, outputFile, baseURL, token, namespace string, concurrency int, resume bool, out io.Writer) (err error) {
+func ExecuteDownload(ctx context.Context, fileHash xet.Hash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, out io.Writer) (err error) {
 	progressSummary := newProgressSummary()
-	err = xetcas.Download(ctx, fileHash, outputFile, baseURL, token, namespace, concurrency, resume, func(name string, current, total int64) {
+	err = xetcas.Download(ctx, fileHash, outputFile, provider, namespace, concurrency, resume, func(name string, current, total int64) {
 		progressSummary.Update(baseName(name), current, total)
 		progressSummary.Output(out)
 	})

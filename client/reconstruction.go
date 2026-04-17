@@ -14,7 +14,11 @@ import (
 
 // GetReconstructionV1 retrieves reconstruction information for a file
 func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV1, error) {
-	url := fmt.Sprintf("%s/v1/reconstructions/%s", c.baseURL, fileHash.String())
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/reconstructions/%s", baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -23,8 +27,10 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, hea
 
 	maps.Copy(req.Header, header)
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)
@@ -47,7 +53,11 @@ func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, hea
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
 func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV2, error) {
-	url := fmt.Sprintf("%s/v2/reconstructions/%s", c.baseURL, fileHash.String())
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v2/reconstructions/%s", baseURL, fileHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -56,8 +66,10 @@ func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, hea
 
 	maps.Copy(req.Header, header)
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)
@@ -88,8 +100,13 @@ func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Ha
 		}, nil
 	}
 
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+
 	var urlStr strings.Builder
-	urlStr.WriteString(c.baseURL + "/reconstructions?")
+	urlStr.WriteString(baseURL + "/reconstructions?")
 	for i, h := range fileHashes {
 		if i > 0 {
 			urlStr.WriteString("&")
@@ -101,8 +118,10 @@ func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Ha
 	if err != nil {
 		return nil, fmt.Errorf("create batch reconstruction request: %w", err)
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)

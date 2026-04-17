@@ -39,12 +39,8 @@ func NewCommand() *cobra.Command {
 				Revision: hfRevision,
 			}
 
-			hfInfo, err := hf.ResolveXETWriteToken(cmd.Context(), nil, target, hfToken)
-			if err != nil {
-				return fmt.Errorf("resolve Hugging Face upload target: %w", err)
-			}
-
-			return common.ExecuteUpload(cmd.Context(), args[0], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, os.Stderr)
+			provider := hf.NewWriteTokenProvider(nil, target, hfToken)
+			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr)
 		},
 	}
 

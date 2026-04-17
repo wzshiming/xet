@@ -30,7 +30,11 @@ type batchChunkDedupResult struct {
 
 // UploadShard uploads a serialized shard to the server
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	url := fmt.Sprintf("%s/shards", c.baseURL)
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/shards", baseURL)
 
 	reader, encodeErr := shardObj.Encode(false)
 	if encodeErr != nil {
@@ -51,8 +55,10 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 
 	req.ContentLength = contentLength
 	req.Header.Set("Content-Type", "application/octet-stream")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)
@@ -77,15 +83,21 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 // returns all chunk locations indexed by that shard, enabling local O(1) lookups
 // for any chunk that shares the same shard (xet-core style local dedup).
 func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.Hash) (map[xet.Hash]*upload.DeduplicationResult, error) {
-	url := fmt.Sprintf("%s/v1/chunks/%s/%s", c.baseURL, c.namespace, chunkHash.String())
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/chunks/%s/%s", baseURL, c.namespace, chunkHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -150,14 +162,20 @@ func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.Hash) (
 		return nil, fmt.Errorf("marshal batch chunk query: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1/chunks/%s:query", c.baseURL, c.namespace)
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/chunks/%s:query", baseURL, c.namespace)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create batch request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.httpClient.Do(req)

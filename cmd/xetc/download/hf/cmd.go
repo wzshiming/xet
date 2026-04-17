@@ -34,6 +34,11 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("--token is required")
 			}
 
+			fileHash, err := xet.ParseHash(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid file hash: %w", err)
+			}
+
 			target := hf.Target{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
@@ -41,17 +46,8 @@ func NewCommand() *cobra.Command {
 				Revision: hfRevision,
 			}
 
-			fileHash, err := xet.ParseHash(args[0])
-			if err != nil {
-				return fmt.Errorf("invalid file hash: %w", err)
-			}
-
-			hfInfo, err := hf.ResolveXETReadToken(cmd.Context(), nil, target, hfToken)
-			if err != nil {
-				return fmt.Errorf("resolve Hugging Face download target: %w", err)
-			}
-
-			return common.ExecuteDownload(cmd.Context(), fileHash, args[1], hfInfo.BaseURL, hfInfo.Token, namespace, concurrency, resume, os.Stderr)
+			provider := hf.NewReadTokenProvider(nil, target, hfToken)
+			return common.ExecuteDownload(cmd.Context(), fileHash, args[1], provider, namespace, concurrency, resume, os.Stderr)
 		},
 	}
 

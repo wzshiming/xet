@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -28,7 +29,8 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			return common.ExecuteDownload(cmd.Context(), hash, args[0], baseURL, token, namespace, concurrency, resume, os.Stderr)
+			provider := client.StaticAuthProvider(baseURL, token)
+			return common.ExecuteDownload(cmd.Context(), hash, args[0], provider, namespace, concurrency, resume, os.Stderr)
 		},
 	}
 

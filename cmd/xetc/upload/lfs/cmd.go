@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 	"github.com/wzshiming/xet/lfs"
 )
@@ -72,7 +73,9 @@ func NewCommand() *cobra.Command {
 
 			casToken := batchResult.Upload.Header["X-Xet-Access-Token"]
 
-			if err := common.ExecuteUpload(cmd.Context(), args[0], casURL, casToken, namespace, concurrency, os.Stderr); err != nil {
+			provider := client.StaticAuthProvider(casURL, casToken)
+
+			if err := common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr); err != nil {
 				return err
 			}
 

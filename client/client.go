@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,11 +11,37 @@ import (
 	"github.com/wzshiming/xet/progress"
 )
 
+// AuthProvider provides dynamic base URL and access token values.
+type AuthProvider interface {
+	BaseURL(context.Context) (string, error)
+	Token(context.Context) (string, error)
+}
+
+type authProviderFuncs struct {
+	baseURL func(ctx context.Context) (string, error)
+	token   func(ctx context.Context) (string, error)
+}
+
+func (p *authProviderFuncs) BaseURL(ctx context.Context) (string, error) {
+	if p == nil || p.baseURL == nil {
+		return "", nil
+	}
+	return p.baseURL(ctx)
+}
+
+func (p *authProviderFuncs) Token(ctx context.Context) (string, error) {
+	if p == nil || p.token == nil {
+		return "", nil
+	}
+	return p.token(ctx)
+}
+
 // Client represents an HTTP client for the XET protocol
 type Client struct {
 	baseURL      string
-	httpClient   *http.Client
 	token        string
+	authProvider AuthProvider
+	httpClient   *http.Client
 	namespace    string
 	concurrency  int
 	retries      int
@@ -37,10 +64,18 @@ func WithHTTPClient(httpClient *http.Client) Options {
 	}
 }
 
-// WithToken sets the authentication token for the client, which will be included in the Authorization header of API requests.
+// WithToken sets a static authentication token for the client. The token is
+// included verbatim in the Authorization header of every request.
 func WithToken(token string) Options {
 	return func(c *Client) {
 		c.token = token
+	}
+}
+
+// WithAuthProvider sets a dynamic provider for both base URL and token.
+func WithAuthProvider(provider AuthProvider) Options {
+	return func(c *Client) {
+		c.authProvider = provider
 	}
 }
 
@@ -89,6 +124,36 @@ func NewClient(opts ...Options) *Client {
 	}
 
 	return c
+}
+
+// getToken calls the configured tokenFunc and returns the bearer token string.
+// If no tokenFunc is set it returns an empty string.
+func (c *Client) getToken(ctx context.Context) (string, error) {
+	if c.authProvider != nil {
+		token, err := c.authProvider.Token(ctx)
+		if err != nil {
+			return "", err
+		}
+		if token != "" {
+			return token, nil
+		}
+	}
+	return c.token, nil
+}
+
+// getBaseURL calls the configured baseURLFunc and returns the request base URL.
+// If no baseURLFunc is set it returns the static baseURL configured on client.
+func (c *Client) getBaseURL(ctx context.Context) (string, error) {
+	if c.authProvider != nil {
+		baseURL, err := c.authProvider.BaseURL(ctx)
+		if err != nil {
+			return "", err
+		}
+		if baseURL != "" {
+			return baseURL, nil
+		}
+	}
+	return c.baseURL, nil
 }
 
 var errNotFound = fmt.Errorf("404 not found")

@@ -29,7 +29,7 @@ func TestResolveHuggingFace(t *testing.T) {
 	}))
 	defer resolveSrv.Close()
 
-	hash, token, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
+	hash, provider, err := ResolveDownload(context.Background(), nil, resolveSrv.URL)
 	if err != nil {
 		t.Fatalf("Resolve returned error: %v", err)
 	}
@@ -37,11 +37,19 @@ func TestResolveHuggingFace(t *testing.T) {
 	if got := hash.String(); got != sampleHash {
 		t.Fatalf("unexpected hash: %s", got)
 	}
-	if token.BaseURL != "https://override.cas" {
-		t.Fatalf("unexpected baseURL: %s", token.BaseURL)
+	baseURL, err := provider.BaseURL(context.Background())
+	if err != nil {
+		t.Fatalf("BaseURL returned error: %v", err)
 	}
-	if token.Token != "token-123" {
-		t.Fatalf("unexpected token: %s", token.Token)
+	if baseURL != "https://override.cas" {
+		t.Fatalf("unexpected baseURL: %s", baseURL)
+	}
+	token, err := provider.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token returned error: %v", err)
+	}
+	if token != "token-123" {
+		t.Fatalf("unexpected token: %s", token)
 	}
 }
 
@@ -76,16 +84,21 @@ func TestResolveUploadWithExplicitTarget(t *testing.T) {
 
 	target := Target{Endpoint: tokenSrv.URL, RepoType: "dataset", RepoID: "org/repo", Revision: "main"}
 
-	info, err := ResolveXETWriteToken(context.Background(), nil, target, "hf-token")
+	provider := NewWriteTokenProvider(nil, target, "hf-token")
+	baseURL, err := provider.BaseURL(context.Background())
 	if err != nil {
 		t.Fatalf("ResolveUpload returned error: %v", err)
 	}
 
-	if info.BaseURL != "https://cas-upload.example.com" {
-		t.Fatalf("unexpected baseURL: %s", info.BaseURL)
+	if baseURL != "https://cas-upload.example.com" {
+		t.Fatalf("unexpected baseURL: %s", baseURL)
 	}
-	if info.Token != "cas-write-token" {
-		t.Fatalf("unexpected token: %s", info.Token)
+	token, err := provider.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token returned error: %v", err)
+	}
+	if token != "cas-write-token" {
+		t.Fatalf("unexpected token: %s", token)
 	}
 }
 
@@ -107,16 +120,21 @@ func TestResolveUploadWithExplicitOverrides(t *testing.T) {
 		Revision: "custom-rev",
 	}
 
-	info, err := ResolveXETWriteToken(context.Background(), nil, target, "hf-token")
+	provider := NewWriteTokenProvider(nil, target, "hf-token")
+	token, err := provider.Token(context.Background())
 	if err != nil {
 		t.Fatalf("ResolveUpload returned error: %v", err)
 	}
 
-	if info.Token != "cas-write-token" {
-		t.Fatalf("unexpected token: %s", info.Token)
+	if token != "cas-write-token" {
+		t.Fatalf("unexpected token: %s", token)
 	}
-	if info.BaseURL != "https://cas-upload.example.com" {
-		t.Fatalf("unexpected baseURL: %s", info.BaseURL)
+	baseURL, err := provider.BaseURL(context.Background())
+	if err != nil {
+		t.Fatalf("BaseURL returned error: %v", err)
+	}
+	if baseURL != "https://cas-upload.example.com" {
+		t.Fatalf("unexpected baseURL: %s", baseURL)
 	}
 }
 
@@ -139,15 +157,20 @@ func TestResolveReadWithExplicitTarget(t *testing.T) {
 
 	target := Target{Endpoint: tokenSrv.URL, RepoID: "org/repo"}
 
-	info, err := ResolveXETReadToken(context.Background(), nil, target, "hf-token")
+	provider := NewReadTokenProvider(nil, target, "hf-token")
+	baseURL, err := provider.BaseURL(context.Background())
 	if err != nil {
 		t.Fatalf("ResolveRead returned error: %v", err)
 	}
 
-	if info.BaseURL != "https://cas-download.example.com" {
-		t.Fatalf("unexpected baseURL: %s", info.BaseURL)
+	if baseURL != "https://cas-download.example.com" {
+		t.Fatalf("unexpected baseURL: %s", baseURL)
 	}
-	if info.Token != "cas-read-token" {
-		t.Fatalf("unexpected token: %s", info.Token)
+	token, err := provider.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token returned error: %v", err)
+	}
+	if token != "cas-read-token" {
+		t.Fatalf("unexpected token: %s", token)
 	}
 }

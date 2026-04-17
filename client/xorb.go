@@ -17,15 +17,21 @@ import (
 
 // HasXorb checks whether a xorb already exists on the server.
 func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, c.namespace, xorbHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
 		return false, fmt.Errorf("create request: %w", err)
 	}
 
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return false, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)
@@ -64,7 +70,11 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 		return nil, fmt.Errorf("seek to start offset: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", c.baseURL, c.namespace, xorbHash.String())
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, c.namespace, xorbHash.String())
 
 	makeBody := func() (io.ReadCloser, error) {
 		if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
@@ -86,8 +96,10 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 	req.GetBody = makeBody
 	req.ContentLength = contentLength - startOffset
 	req.Header.Set("Content-Type", "application/octet-stream")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token, err := c.getToken(ctx); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)
