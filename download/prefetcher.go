@@ -316,41 +316,13 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 }
 
 func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader, closer io.Closer) (int, error) {
-	type streamTarget struct {
-		entry *prefetchEntry
-		cache *chunkCache
-		pipeW *io.PipeWriter
-	}
-
 	defer closer.Close()
 
-	targets := make([]streamTarget, len(entries))
 	for i, entry := range entries {
-		pipeR, pipeW := io.Pipe()
-		dec := xorb.NewDecoder(pipeR, false)
-		cache, err := newChunkCache(dec, p.store)
-		if err != nil {
-			for j := range i {
-				targets[j].pipeW.CloseWithError(err)
-				targets[j].cache.Done()
-			}
-			pipeW.CloseWithError(err)
-			pipeR.CloseWithError(err)
-			return 0, err
-		}
-		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
-
-		p.publishEntry(entry, cache)
-	}
-
-	for i := range targets {
 		part, err := mr.NextPart()
 		if err != nil {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
-			}
-			for j := i; j < len(targets); j++ {
-				targets[j].pipeW.CloseWithError(err)
 			}
 			return i, err
 		}
@@ -359,33 +331,28 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 		if p.progressFunc != nil {
 			partReader = &progressReader{
 				r:            part,
-				name:         targets[i].entry.task.key.String(),
-				total:        targets[i].entry.task.key.Size(),
+				name:         entry.task.key.String(),
+				total:        entry.task.key.Size(),
 				progressFunc: p.progressFunc,
 			}
 		}
 
-		_, copyErr := io.Copy(targets[i].pipeW, partReader)
-		part.Close()
-		if copyErr != nil {
-			targets[i].pipeW.CloseWithError(copyErr)
-			for j := i + 1; j < len(targets); j++ {
-				targets[j].pipeW.CloseWithError(copyErr)
-			}
-			return i, copyErr
-		}
-		targets[i].pipeW.Close()
-
-		err = targets[i].cache.LoadAll()
+		dec := xorb.NewDecoder(partReader, false)
+		cache, err := newChunkCache(dec, p.store)
 		if err != nil {
-			for j := i + 1; j < len(targets); j++ {
-				targets[j].cache.Done()
-			}
-			return i + 1, err
+			part.Close()
+			return i, err
+		}
+
+		p.publishEntry(entry, cache)
+		err = cache.LoadAll()
+		if err != nil {
+			part.Close()
+			return i, err
 		}
 	}
 
-	return len(targets), nil
+	return len(entries), nil
 }
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
