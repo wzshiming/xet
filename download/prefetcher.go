@@ -25,6 +25,10 @@ func (k fetchKey) String() string {
 	return fmt.Sprintf("%s:%d-%d", k.Hash, k.Start, k.End)
 }
 
+func (k fetchKey) Size() int64 {
+	return k.End - k.Start
+}
+
 type fetchTask struct {
 	key fetchKey
 	url string
@@ -52,6 +56,23 @@ type prefetcher struct {
 	progressFunc progress.ProgressFunc
 
 	store *chunkStore
+}
+
+type progressReader struct {
+	r            io.Reader
+	name         string
+	current      int64
+	total        int64
+	progressFunc progress.ProgressFunc
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 && r.progressFunc != nil {
+		r.current += int64(n)
+		r.progressFunc(r.name, r.current, r.total)
+	}
+	return n, err
 }
 
 func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) (*prefetcher, error) {
@@ -244,8 +265,8 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 			header := http.Header{
 				"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
 			}
-			var rc io.ReadCloser
-			rc, err = p.client.DownloadXorb(p.ctx, entry.task.url, header)
+
+			rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
 			if err != nil {
 				if attempt < maxAttempts {
 					continue
@@ -253,10 +274,20 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 				break
 			}
 
-			dec := xorb.NewDecoder(rc, false)
+			var reader io.Reader = rc
+			if p.progressFunc != nil {
+				reader = &progressReader{
+					r:            rc,
+					name:         entry.task.key.String(),
+					total:        entry.task.key.Size(),
+					progressFunc: p.progressFunc,
+				}
+			}
+
+			dec := xorb.NewDecoder(reader, false)
 			cache, err = newChunkCache(dec, p.store)
 			if err != nil {
-				dec.Close()
+				rc.Close()
 				if attempt < maxAttempts {
 					continue
 				}
@@ -266,13 +297,14 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 			p.publishEntry(entry, cache)
 			err = cache.LoadAll()
 			if err != nil {
-				dec.Close()
+				rc.Close()
 				if attempt < maxAttempts {
 					continue
 				}
 				break
 			}
-			p.markEntryDone(entry)
+
+			rc.Close()
 			break
 		}
 
@@ -290,6 +322,8 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 		pipeW *io.PipeWriter
 	}
 
+	defer closer.Close()
+
 	targets := make([]streamTarget, len(entries))
 	for i, entry := range entries {
 		pipeR, pipeW := io.Pipe()
@@ -302,7 +336,6 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			}
 			pipeW.CloseWithError(err)
 			pipeR.CloseWithError(err)
-			closer.Close()
 			return 0, err
 		}
 		targets[i] = streamTarget{entry: entry, cache: cache, pipeW: pipeW}
@@ -310,7 +343,6 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 		p.publishEntry(entry, cache)
 	}
 
-	defer closer.Close()
 	for i := range targets {
 		part, err := mr.NextPart()
 		if err != nil {
@@ -323,7 +355,17 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			return i, err
 		}
 
-		_, copyErr := io.Copy(targets[i].pipeW, part)
+		var partReader io.Reader = part
+		if p.progressFunc != nil {
+			partReader = &progressReader{
+				r:            part,
+				name:         targets[i].entry.task.key.String(),
+				total:        targets[i].entry.task.key.Size(),
+				progressFunc: p.progressFunc,
+			}
+		}
+
+		_, copyErr := io.Copy(targets[i].pipeW, partReader)
 		part.Close()
 		if copyErr != nil {
 			targets[i].pipeW.CloseWithError(copyErr)
@@ -341,8 +383,6 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 			}
 			return i + 1, err
 		}
-
-		p.markEntryDone(targets[i].entry)
 	}
 
 	return len(targets), nil
@@ -364,13 +404,6 @@ func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
 	entry.once.Do(func() {
 		close(entry.ready)
 	})
-}
-
-func (p *prefetcher) markEntryDone(entry *prefetchEntry) {
-	if p.progressFunc != nil {
-		size := entry.task.key.End - entry.task.key.Start
-		p.progressFunc(entry.task.key.String(), size, size)
-	}
 }
 
 // Close releases all resources held by the prefetcher: it closes every cached

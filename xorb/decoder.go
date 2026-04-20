@@ -32,14 +32,6 @@ func NewDecoder(r io.Reader, withFooter bool) *Decoder {
 	}
 }
 
-// Close releases any resources held by the Decoder, in particular the Closer set via SetCloser.
-func (d *Decoder) Close() error {
-	if closer, ok := d.r.(io.Closer); ok {
-		closer.Close()
-	}
-	return nil
-}
-
 // Decode reads and returns the next chunk's uncompressed data.
 // Returns io.EOF when all chunks have been consumed.
 func (d *Decoder) Read(p []byte) (int, error) {

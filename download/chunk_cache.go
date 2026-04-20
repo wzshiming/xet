@@ -171,6 +171,5 @@ func (c *chunkCache) LoadAll() error {
 func (c *chunkCache) Done() {
 	if !c.done {
 		c.done = true
-		c.dec.Close()
 	}
 }
