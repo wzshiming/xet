@@ -1,12 +1,12 @@
 package download
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"sync"
 
 	"github.com/wzshiming/xet/internal/pool"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // chunkRef records the position of one decoded chunk in the backing temp file.
@@ -20,11 +20,11 @@ type chunkRef struct {
 // position referenced by multiple reconstruction terms) can be re-read without a
 // second download, while keeping memory usage low.
 type chunkCache struct {
-	dec   *xorb.Decoder
+	dec   io.Reader
 	store *chunkStore
 	index []chunkRef
 	done  bool // decoder exhausted or closed
-	mut   sync.Mutex
+	mut   sync.RWMutex
 }
 
 type chunkStore struct {
@@ -90,48 +90,47 @@ func (s *chunkStore) Close() error {
 	return nil
 }
 
-func newChunkCache(dec *xorb.Decoder, store *chunkStore) (*chunkCache, error) {
+func newChunkCache(dec io.Reader, store *chunkStore) (*chunkCache, error) {
 	return &chunkCache{dec: dec, store: store}, nil
 }
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
 // Already-decoded chunks are served from the backing temp file.
-func (c *chunkCache) Chunk(idx uint32) ([]byte, error) {
-	c.mut.Lock()
-	defer c.mut.Unlock()
-	if int(idx) < len(c.index) {
-		ref := c.index[idx]
-		data := make([]byte, ref.length)
-		n, err := c.store.readAt(data, ref.offset)
-		if err != nil {
-			return nil, err
-		}
-		if int64(n) != int64(ref.length) {
-			return nil, io.ErrUnexpectedEOF
-		}
-		return data, nil
-	}
-	for uint32(len(c.index)) <= idx {
-		err := c.load()
-		if err != nil {
-			return nil, err
-		}
-	}
-	ref := c.index[idx]
-	data := make([]byte, ref.length)
-	n, err := c.store.readAt(data, ref.offset)
+func (c *chunkCache) Chunk(idx uint32, buf []byte) (int64, error) {
+	err := c.LoadTo(idx)
 	if err != nil {
-		return nil, err
+		return 0, fmt.Errorf("load chunk %d: %w", idx, err)
 	}
-	if int64(n) != int64(ref.length) {
-		return nil, io.ErrUnexpectedEOF
+
+	n, err := c.chunk(idx, buf)
+	if err != nil {
+		return 0, fmt.Errorf("get chunk %d: %w", idx, err)
 	}
-	return data, nil
+	return n, nil
 }
 
-func (c *chunkCache) load() error {
+func (c *chunkCache) chunk(idx uint32, buf []byte) (int64, error) {
+	c.mut.RLock()
+	defer c.mut.RUnlock()
+
+	ref := c.index[idx]
+	if len(buf) < int(ref.length) {
+		return 0, fmt.Errorf("buffer too small for chunk: need %d bytes", ref.length)
+	}
+
+	n, err := c.store.readAt(buf[:ref.length], ref.offset)
+	if err != nil {
+		return 0, fmt.Errorf("read at offset %d: %w", ref.offset, err)
+	}
+	if int64(n) != int64(ref.length) {
+		return 0, fmt.Errorf("short read: expected %d bytes, got %d", ref.length, n)
+	}
+	return n, nil
+}
+
+func (c *chunkCache) load() (int, error) {
 	if c.done {
-		return io.EOF
+		return 0, io.EOF
 	}
 
 	tmp := pool.GetChunkBuf()
@@ -141,24 +140,43 @@ func (c *chunkCache) load() error {
 	if err != nil {
 		if err == io.EOF {
 			c.Done()
-			return io.EOF
+			return 0, io.EOF
 		}
-		return err
+		return 0, err
 	}
+
 	offset, err := c.store.append(tmp[:n])
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("append chunk: %w", err)
 	}
+
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
 	c.index = append(c.index, chunkRef{offset: offset, length: int32(n)})
-	return nil
+	return len(c.index), nil
+}
+
+// LoadTo decodes and caches chunks up to the specified index.
+func (c *chunkCache) LoadTo(idx uint32) error {
+	for {
+		curr, err := c.load()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if curr > int(idx) {
+			return nil
+		}
+	}
 }
 
 // LoadAll decodes and caches all chunks.
 func (c *chunkCache) LoadAll() error {
 	for {
-		c.mut.Lock()
-		err := c.load()
-		c.mut.Unlock()
+		_, err := c.load()
 		if err != nil {
 			if err == io.EOF {
 				return nil

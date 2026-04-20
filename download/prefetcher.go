@@ -285,7 +285,7 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 			}
 
 			dec := xorb.NewDecoder(reader, false)
-			cache, err = newChunkCache(dec, p.store)
+			cache, err = newChunkCache(newMutexReader(dec), p.store)
 			if err != nil {
 				rc.Close()
 				if attempt < maxAttempts {
@@ -294,6 +294,15 @@ func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
 				break
 			}
 
+			err = cache.LoadTo(0)
+			if err != nil {
+				cache.Done()
+				rc.Close()
+				if attempt < maxAttempts && shouldRetryXorbLoadError(err) {
+					continue
+				}
+				break
+			}
 			p.publishEntry(entry, cache)
 			err = cache.LoadAll()
 			if err != nil {
@@ -338,12 +347,18 @@ func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader
 		}
 
 		dec := xorb.NewDecoder(partReader, false)
-		cache, err := newChunkCache(dec, p.store)
+		cache, err := newChunkCache(newMutexReader(dec), p.store)
 		if err != nil {
 			part.Close()
 			return i, err
 		}
 
+		err = cache.LoadTo(0)
+		if err != nil {
+			cache.Done()
+			part.Close()
+			return i, err
+		}
 		p.publishEntry(entry, cache)
 		err = cache.LoadAll()
 		if err != nil {
@@ -361,9 +376,6 @@ func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
 	entry.once.Do(func() {
 		close(entry.ready)
 	})
-	if p.progressFunc != nil {
-		p.progressFunc(entry.task.key.String(), 0, entry.task.key.End-entry.task.key.Start)
-	}
 }
 
 func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
@@ -412,4 +424,19 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
+}
+
+type mutexReader struct {
+	r   io.Reader
+	mut sync.Mutex
+}
+
+func newMutexReader(r io.Reader) io.Reader {
+	return &mutexReader{r: r}
+}
+
+func (mr *mutexReader) Read(p []byte) (int, error) {
+	mr.mut.Lock()
+	defer mr.mut.Unlock()
+	return mr.r.Read(p)
 }

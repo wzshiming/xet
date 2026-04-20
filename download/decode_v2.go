@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/wzshiming/xet/internal/pool"
 )
 
 // ReaderV2 implements io.Reader for V2 reconstruction
@@ -58,6 +60,9 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		return 0, r.err
 	}
 
+	buf := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(buf)
+
 	for n < len(p) {
 		// Check if we're done with all terms
 		if r.termIdx >= len(r.reconstruction.Terms) {
@@ -84,7 +89,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		}
 
 		// Get chunk on demand by index
-		data, chunkErr := r.currentCache.Chunk(r.chunkIdx)
+		size, chunkErr := r.currentCache.Chunk(r.chunkIdx, buf[:])
 		if chunkErr != nil {
 			r.err = chunkErr
 			r.cleanup()
@@ -94,10 +99,12 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 			return 0, chunkErr
 		}
 
+		data := buf[:size]
+
 		// Apply skip for the first chunk of the first term
 		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
-			if r.skipBytes >= int64(len(data)) {
-				r.skipBytes -= int64(len(data))
+			if r.skipBytes >= size {
+				r.skipBytes -= size
 				r.chunkIdx++
 				r.chunkOffset = 0
 				continue
