@@ -2,13 +2,10 @@ package download
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/wzshiming/xet/progress"
@@ -135,43 +132,22 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		desiredWorkers = 1
 	}
 
-	jobs := make(chan []*prefetchEntry)
+	jobs := make(chan *prefetchEntry)
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
-			for entries := range jobs {
-				p.runJob(entries)
+			for entry := range jobs {
+				p.runJob(entry)
 			}
 		}()
 	}
 	go func() {
 		defer close(jobs)
-		remaining := len(items)
-		groupByURL(items, func(entries []*prefetchEntry) {
-			for len(entries) > 0 {
-				size := max(remaining/concurrency, 1)
-				n := min(size, len(entries))
-				jobs <- entries[:n]
-				entries = entries[n:]
-				remaining -= n
-			}
-		})
+		for _, item := range items {
+			jobs <- item
+		}
 	}()
 
 	return p, nil
-}
-
-func groupByURL(entries []*prefetchEntry, fn func([]*prefetchEntry)) {
-	if len(entries) == 0 {
-		return
-	}
-	start := 0
-	for i := 1; i < len(entries); i++ {
-		if entries[i].task.url != entries[start].task.url {
-			fn(entries[start:i])
-			start = i
-		}
-	}
-	fn(entries[start:])
 }
 
 func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
@@ -199,175 +175,75 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 	})
 }
 
-func (p *prefetcher) runJob(entries []*prefetchEntry) {
-	if len(entries) == 0 {
-		return
-	}
-	if len(entries) > 1 {
-		// Try multipart download first, with retries
-		maxAttempts := max(p.retries+1, 1)
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			ranges := make([]string, len(entries))
-			for i, entry := range entries {
-				ranges[i] = fmt.Sprintf("%d-%d", entry.task.key.Start, entry.task.key.End)
-			}
-			header := http.Header{
-				"Range": {
-					fmt.Sprintf("bytes=%s", strings.Join(ranges, ",")),
-				},
-			}
-			mr, closer, err := p.client.DownloadXorbsMultipart(p.ctx, entries[0].task.url, header)
-			if err != nil {
-				if attempt < maxAttempts && shouldRetryXorbLoadError(err) {
-					continue
-				}
-				// Fall back to single-range retrieval
-				p.runSingleRangeEntries(entries)
-				return
-			}
+func (p *prefetcher) runJob(entry *prefetchEntry) {
+	var cache *chunkCache
+	var err error
+	maxAttempts := max(p.retries+1, 1)
 
-			n, err := p.runStreamJob(entries, mr, closer)
-			if err == nil {
-				return
-			}
-
-			entries = entries[n:]
-
-			if len(entries) == 1 {
-				p.runSingleRangeEntries(entries)
-				return
-			}
-
-			// Stream failed; fall back to single-range if this was the last attempt
-			if attempt == maxAttempts || !shouldRetryXorbLoadError(err) {
-				p.failEntries(entries, err)
-				return
-			}
-		}
-		return
-	}
-
-	p.runSingleRangeEntries(entries)
-}
-
-func (p *prefetcher) runSingleRangeEntries(entries []*prefetchEntry) {
-	for _, entry := range entries {
-		var cache *chunkCache
-		var err error
-		maxAttempts := max(p.retries+1, 1)
-
-		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			if p.ctx.Err() != nil {
-				err = p.ctx.Err()
-				break
-			}
-
-			header := http.Header{
-				"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
-			}
-
-			rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
-			if err != nil {
-				if attempt < maxAttempts {
-					continue
-				}
-				break
-			}
-
-			var reader io.Reader = rc
-			if p.progressFunc != nil {
-				reader = &progressReader{
-					r:            rc,
-					name:         entry.task.key.String(),
-					total:        entry.task.key.Size(),
-					progressFunc: p.progressFunc,
-				}
-			}
-
-			dec := xorb.NewDecoder(reader, false)
-			cache, err = newChunkCache(newMutexReader(dec), p.store)
-			if err != nil {
-				rc.Close()
-				if attempt < maxAttempts {
-					continue
-				}
-				break
-			}
-
-			err = cache.LoadTo(0)
-			if err != nil {
-				cache.Done()
-				rc.Close()
-				if attempt < maxAttempts && shouldRetryXorbLoadError(err) {
-					continue
-				}
-				break
-			}
-			p.publishEntry(entry, cache)
-			err = cache.LoadAll()
-			if err != nil {
-				rc.Close()
-				if attempt < maxAttempts {
-					continue
-				}
-				break
-			}
-
-			rc.Close()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if p.ctx.Err() != nil {
+			err = p.ctx.Err()
 			break
 		}
 
-		if err != nil {
-			p.failEntry(entry, err)
-			continue
+		header := http.Header{
+			"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
 		}
-	}
-}
 
-func (p *prefetcher) runStreamJob(entries []*prefetchEntry, mr *multipart.Reader, closer io.Closer) (int, error) {
-	defer closer.Close()
-
-	for i, entry := range entries {
-		part, err := mr.NextPart()
+		rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
 		if err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
+			if attempt < maxAttempts {
+				continue
 			}
-			return i, err
+			break
 		}
 
-		var partReader io.Reader = part
+		var reader io.Reader = rc
 		if p.progressFunc != nil {
-			partReader = &progressReader{
-				r:            part,
+			reader = &progressReader{
+				r:            rc,
 				name:         entry.task.key.String(),
 				total:        entry.task.key.Size(),
 				progressFunc: p.progressFunc,
 			}
 		}
 
-		dec := xorb.NewDecoder(partReader, false)
-		cache, err := newChunkCache(newMutexReader(dec), p.store)
+		dec := xorb.NewDecoder(reader, false)
+		cache, err = newChunkCache(newMutexReader(dec), p.store)
 		if err != nil {
-			part.Close()
-			return i, err
+			rc.Close()
+			if attempt < maxAttempts {
+				continue
+			}
+			break
 		}
 
 		err = cache.LoadTo(0)
 		if err != nil {
 			cache.Done()
-			part.Close()
-			return i, err
+			rc.Close()
+			if attempt < maxAttempts {
+				continue
+			}
+			break
 		}
 		p.publishEntry(entry, cache)
 		err = cache.LoadAll()
 		if err != nil {
-			part.Close()
-			return i, err
+			rc.Close()
+			if attempt < maxAttempts {
+				continue
+			}
+			break
 		}
+
+		rc.Close()
+		break
 	}
 
-	return len(entries), nil
+	if err != nil {
+		p.failEntry(entry, err)
+	}
 }
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
@@ -397,19 +273,6 @@ func (p *prefetcher) Close() {
 
 	if p.store != nil {
 		p.store.Close()
-	}
-}
-
-func shouldRetryXorbLoadError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
-}
-
-func (p *prefetcher) failEntries(entries []*prefetchEntry, err error) {
-	for _, entry := range entries {
-		p.failEntry(entry, err)
 	}
 }
 
