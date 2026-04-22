@@ -129,7 +129,8 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Heade
 	}
 	maps.Copy(req.Header, header)
 
-	resp, err := c.doWithNetworkRetry(req)
+	// Use the getHttpClient for retry with resume with range requests.
+	resp, err := c.getHttpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

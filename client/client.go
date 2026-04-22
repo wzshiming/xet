@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -38,14 +39,15 @@ func (p *authProviderFuncs) Token(ctx context.Context) (string, error) {
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL      string
-	token        string
-	authProvider AuthProvider
-	httpClient   *http.Client
-	namespace    string
-	concurrency  int
-	retries      int
-	progressFunc progress.ProgressFunc
+	baseURL       string
+	token         string
+	authProvider  AuthProvider
+	httpClient    *http.Client
+	getHttpClient *http.Client
+	namespace     string
+	concurrency   int
+	retries       int
+	progressFunc  progress.ProgressFunc
 }
 
 type Options func(*Client)
@@ -121,6 +123,28 @@ func NewClient(opts ...Options) *Client {
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+
+	if c.httpClient.Transport == nil {
+		c.httpClient.Transport = http.DefaultTransport
+	}
+
+	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
+		transport.DisableKeepAlives = true
+		transport.ForceAttemptHTTP2 = false
+	}
+
+	c.getHttpClient = &http.Client{
+		CheckRedirect: c.httpClient.CheckRedirect,
+		Jar:           c.httpClient.Jar,
+		Timeout:       c.httpClient.Timeout,
+		Transport: httpseek.NewMustReaderTransport(c.httpClient.Transport,
+			func(r *http.Request, retry int, err error) error {
+				if retry >= c.retryAttempts() {
+					return fmt.Errorf("max retries reached: %w", err)
+				}
+				return nil
+			}),
 	}
 
 	return c

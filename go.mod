@@ -6,6 +6,7 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/spf13/cobra v1.10.2
+	github.com/wzshiming/httpseek v0.6.0
 	github.com/zeebo/blake3 v0.2.4
 )
 
