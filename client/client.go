@@ -126,7 +126,7 @@ func NewClient(opts ...Options) *Client {
 	}
 
 	if c.httpClient.Transport == nil {
-		c.httpClient.Transport = http.DefaultTransport
+		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
 
 	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
