@@ -136,6 +136,9 @@ func (c *chunkCache) load() (int, error) {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
 
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
 	n, err := c.dec.Read(tmp[:])
 	if err != nil {
 		if err == io.EOF {
@@ -149,9 +152,6 @@ func (c *chunkCache) load() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("append chunk: %w", err)
 	}
-
-	c.mut.Lock()
-	defer c.mut.Unlock()
 
 	c.index = append(c.index, chunkRef{offset: offset, length: int32(n)})
 	return len(c.index), nil

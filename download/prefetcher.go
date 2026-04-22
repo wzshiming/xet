@@ -209,7 +209,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		}
 
 		dec := xorb.NewDecoder(reader, false)
-		cache, err = newChunkCache(newMutexReader(dec), p.store)
+		cache, err = newChunkCache(dec, p.store)
 		if err != nil {
 			rc.Close()
 			if attempt < maxAttempts {
@@ -287,19 +287,4 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
-}
-
-type mutexReader struct {
-	r   io.Reader
-	mut sync.Mutex
-}
-
-func newMutexReader(r io.Reader) io.Reader {
-	return &mutexReader{r: r}
-}
-
-func (mr *mutexReader) Read(p []byte) (int, error) {
-	mr.mut.Lock()
-	defer mr.mut.Unlock()
-	return mr.r.Read(p)
 }
