@@ -25,7 +25,10 @@ func Upload(ctx context.Context, filename string, provider client.AuthProvider, 
 		client.WithConcurrency(concurrency),
 	}
 
-	cli := client.NewClient(opts...)
+	cli, err := client.NewClient(opts...)
+	if err != nil {
+		return xet.Hash{}, fmt.Errorf("create client: %w", err)
+	}
 
 	return cli.UploadFile(ctx, f)
 }

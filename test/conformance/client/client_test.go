@@ -240,7 +240,11 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeProxy = NewRecordingProxy(nativeSrv)
 
 				// Upload with native client
-				nativeClient := client.NewClient(client.WithBaseURL(nativeHttpSrv.URL))
+				nativeClient, err := client.NewClient(client.WithBaseURL(nativeHttpSrv.URL))
+				if err != nil {
+					t.Fatalf("create native client: %v", err)
+				}
+				defer nativeClient.Evict(0)
 
 				nativeFile := filepath.Join(tempDir, "native-upload.bin")
 				if err := os.WriteFile(nativeFile, tt.data, 0644); err != nil {
@@ -298,7 +302,11 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				proxy = NewRecordingProxy(srv)
 
 				// First upload file using native client
-				nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+				nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+				if err != nil {
+					t.Fatalf("create native client: %v", err)
+				}
+				defer nativeClient.Evict(0)
 
 				tempDir := t.TempDir()
 				uploadFile := filepath.Join(tempDir, "upload.bin")
@@ -461,7 +469,11 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	nativeSrv = server.NewHandler(server.WithStorage(nativeStor))
 	nativeProxy = NewRecordingProxy(nativeSrv)
 
-	nativeClient := client.NewClient(client.WithBaseURL(nativeHTTP.URL))
+	nativeClient, err := client.NewClient(client.WithBaseURL(nativeHTTP.URL))
+	if err != nil {
+		t.Fatalf("create native client: %v", err)
+	}
+	defer nativeClient.Evict(0)
 
 	seedReader, err := os.Open(nativeSeedFile)
 	if err != nil {
@@ -1249,7 +1261,11 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
 	srv = server.NewHandler(server.WithStorage(stor))
-	nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	if err != nil {
+		t.Fatalf("create native client: %v", err)
+	}
+	defer nativeClient.Evict(0)
 
 	datasets := []struct {
 		name string
@@ -1428,7 +1444,12 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		proxy = NewRecordingProxy(innerSrv)
 
 		// Upload two small files.
-		innerClient := client.NewClient(client.WithBaseURL(proxiedSrv.URL))
+		innerClient, err := client.NewClient(client.WithBaseURL(proxiedSrv.URL))
+		if err != nil {
+			t.Fatalf("create native client: %v", err)
+		}
+		defer nativeClient.Evict(0)
+
 		data1 := []byte("batch endpoint check – file one")
 		data2 := []byte("batch endpoint check – file two")
 
@@ -1511,7 +1532,11 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		cmpSrv = server.NewHandler(server.WithStorage(cmpStor))
 		cmpProxy = NewRecordingProxy(cmpSrv)
 
-		cmpClient := client.NewClient(client.WithBaseURL(cmpHTTP.URL))
+		cmpClient, err := client.NewClient(client.WithBaseURL(cmpHTTP.URL))
+		if err != nil {
+			t.Fatalf("create native client: %v", err)
+		}
+		defer nativeClient.Evict(0)
 
 		// Upload three files — one tiny, two larger — to exercise multiple xorbs.
 		cmpDatasets := [][]byte{
@@ -1559,7 +1584,12 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		// ── native batch download ────────────────────────────────────────────────
 		// Use a fresh client (empty cache) so reconstruction is not served from disk.
 		cmpProxy.ClearRequests()
-		freshClient := client.NewClient(client.WithBaseURL(cmpHTTP.URL))
+		freshClient, err := client.NewClient(client.WithBaseURL(cmpHTTP.URL))
+		if err != nil {
+			t.Fatalf("create native client: %v", err)
+		}
+		defer nativeClient.Evict(0)
+
 		readers, _, err := freshClient.DownloadFiles(context.Background(), cmpHashes)
 		if err != nil {
 			t.Fatalf("native DownloadFiles failed: %v", err)

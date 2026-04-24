@@ -89,7 +89,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			if err != nil {
+				t.Fatalf("create native client: %v", err)
+			}
 
 			t.Run("upload_with_xetgo", func(t *testing.T) {
 				// Create temp directory and write test file
@@ -231,7 +234,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			if err != nil {
+				t.Fatalf("create native client: %v", err)
+			}
 
 			t.Run("upload", func(t *testing.T) {
 				// Write test file to upload
@@ -366,7 +372,10 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 	}
 
 	srv = server.NewHandler(server.WithStorage(stor))
-	nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	if err != nil {
+		t.Fatalf("create native client: %v", err)
+	}
 
 	data := utils.MakeRandData(2 * 1024 * 1024)
 	uploadFile := filepath.Join(t.TempDir(), "batch-dedup.bin")
@@ -487,7 +496,10 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 	}
 
 	srv = server.NewHandler(server.WithStorage(stor))
-	nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	if err != nil {
+		t.Fatalf("create native client: %v", err)
+	}
 
 	// Upload three files of different types so the batch spans multiple xorbs.
 	datasets := [][]byte{
@@ -793,7 +805,11 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		// Native client downloads all files via DownloadFiles (batch endpoint).
-		nativeClient := client.NewClient(client.WithBaseURL(httpSrv.URL))
+		nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+		if err != nil {
+			t.Fatalf("create native client: %v", err)
+		}
+
 		readers, sizes, err := nativeClient.DownloadFiles(context.Background(), hashes)
 		if err != nil {
 			t.Fatalf("native DownloadFiles failed: %v", err)

@@ -27,8 +27,10 @@ func (k fetchKey) Size() int64 {
 }
 
 type fetchTask struct {
-	key fetchKey
-	url string
+	key        fetchKey
+	url        string
+	chunkStart uint32
+	chunkEnd   uint32
 }
 
 type selectedFetch struct {
@@ -49,10 +51,8 @@ type prefetcher struct {
 	ctx          context.Context
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
-	retries      int
 	progressFunc progress.ProgressFunc
-
-	store *chunkStore
+	diskCache    *DiskCache
 }
 
 type progressReader struct {
@@ -72,7 +72,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, opts *options) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, dc *DiskCache, opts *options) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -94,36 +94,38 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		items = append(items, item)
 	}
 	concurrency := opts.concurrency
-	retries := opts.retries
-
 	if len(items) == 0 {
 		return &prefetcher{
 			ctx:     ctx,
 			client:  client,
 			entries: entries,
-			retries: retries,
 		}, nil
 	}
 
 	orderEntry(items, termOrder)
 
-	store, err := newChunkStore()
-	if err != nil {
-		return nil, err
-	}
-
 	p := &prefetcher{
 		ctx:          ctx,
 		client:       client,
 		entries:      entries,
-		retries:      retries,
-		store:        store,
 		progressFunc: opts.progressFunc,
+		diskCache:    dc,
 	}
 
 	if opts.progressFunc != nil {
 		for _, item := range items {
 			opts.progressFunc(item.task.key.String(), 0, item.task.key.End-item.task.key.Start)
+		}
+		for _, item := range items {
+			cc, err := p.diskCache.get(item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+			if err != nil {
+				return nil, fmt.Errorf("check disk cache for %s: %w", item.task.key.String(), err)
+			}
+			if cc != nil {
+				size := item.task.key.Size()
+				p.progressFunc(item.task.key.String(), size, size)
+				p.publishEntry(item, cc)
+			}
 		}
 	}
 
@@ -143,6 +145,9 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	go func() {
 		defer close(jobs)
 		for _, item := range items {
+			if item.cache != nil {
+				continue
+			}
 			jobs <- item
 		}
 	}()
@@ -178,71 +183,47 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 func (p *prefetcher) runJob(entry *prefetchEntry) {
 	var cache *chunkCache
 	var err error
-	maxAttempts := max(p.retries+1, 1)
 
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if p.ctx.Err() != nil {
-			err = p.ctx.Err()
-			break
-		}
-
-		header := http.Header{
-			"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
-		}
-
-		rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
-		if err != nil {
-			if attempt < maxAttempts {
-				continue
-			}
-			break
-		}
-
-		var reader io.Reader = rc
-		if p.progressFunc != nil {
-			reader = &progressReader{
-				r:            rc,
-				name:         entry.task.key.String(),
-				total:        entry.task.key.Size(),
-				progressFunc: p.progressFunc,
-			}
-		}
-
-		dec := xorb.NewDecoder(reader, false)
-		cache, err = newChunkCache(dec, p.store)
-		if err != nil {
-			rc.Close()
-			if attempt < maxAttempts {
-				continue
-			}
-			break
-		}
-
-		err = cache.LoadTo(0)
-		if err != nil {
-			cache.Done()
-			rc.Close()
-			if attempt < maxAttempts {
-				continue
-			}
-			break
-		}
-		p.publishEntry(entry, cache)
-		err = cache.LoadAll()
-		if err != nil {
-			rc.Close()
-			if attempt < maxAttempts {
-				continue
-			}
-			break
-		}
-
-		rc.Close()
-		break
+	header := http.Header{
+		"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
 	}
 
+	rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
 	if err != nil {
 		p.failEntry(entry, err)
+		return
+	}
+	defer rc.Close()
+
+	var reader io.Reader = rc
+	if p.progressFunc != nil {
+		reader = &progressReader{
+			r:            rc,
+			name:         entry.task.key.String(),
+			total:        entry.task.key.Size(),
+			progressFunc: p.progressFunc,
+		}
+	}
+
+	dec := xorb.NewDecoder(reader, false)
+	cache, err = newChunkCache(dec, p.diskCache, entry.task.key.Hash, entry.task.chunkStart, entry.task.chunkEnd, entry.task.key.Start, entry.task.key.End)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+
+	err = cache.LoadTo(0)
+	if err != nil {
+		cache.Done()
+		p.failEntry(entry, err)
+		return
+	}
+	p.publishEntry(entry, cache)
+	err = cache.LoadAll()
+	if err != nil {
+		cache.Done()
+		p.failEntry(entry, err)
+		return
 	}
 }
 
@@ -261,21 +242,17 @@ func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
 	})
 }
 
-// Close releases all resources held by the prefetcher: it closes every cached
-// entry and drops the prefetcher's own reference to the shared chunkStore so
-// that the backing temp file is deleted once all consumers are done with it.
+// Close releases all resources held by the prefetcher and compacts the disk cache
+// by merging any adjacent cache files written during this session.
 func (p *prefetcher) Close() {
 	for _, entry := range p.entries {
 		if entry.cache != nil {
 			entry.cache.Done()
 		}
 	}
-
-	if p.store != nil {
-		p.store.Close()
-	}
 }
 
+// Get returns the chunk cache for the specified fetch key, blocking until the corresponding fetch task is complete. An error is returned if the fetch failed or if the key was not found. The caller should call Done() on the returned chunk cache when finished to release any resources. Note that the chunk cache may be shared across multiple overlapping fetch tasks, so callers should not assume exclusive access to the underlying data.
 func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 	entry, ok := p.entries[key]
 	if !ok {
@@ -287,4 +264,14 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
+}
+
+// Compact merges adjacent cache files in the disk cache to reduce fragmentation and improve future read performance.
+func (p *prefetcher) Compact() error {
+	return p.diskCache.Compact()
+}
+
+// Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes. If maxBytes <= 0 the call is a no-op.
+func (p *prefetcher) Evict(maxBytes int64) error {
+	return p.diskCache.Evict(maxBytes)
 }

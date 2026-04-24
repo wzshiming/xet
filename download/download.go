@@ -9,7 +9,6 @@ type Option func(*options)
 
 type options struct {
 	concurrency  int
-	retries      int
 	progressFunc progress.ProgressFunc
 }
 
@@ -17,17 +16,6 @@ type options struct {
 func WithConcurrency(concurrency int) Option {
 	return func(o *options) {
 		o.concurrency = concurrency
-	}
-}
-
-// WithRetries configures how many times xorb range prefetch should retry when
-// stream reads fail with transient truncation errors (for example unexpected EOF).
-func WithRetries(retries int) Option {
-	return func(o *options) {
-		if retries < 0 {
-			retries = 0
-		}
-		o.retries = retries
 	}
 }
 

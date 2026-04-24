@@ -21,12 +21,15 @@ func Download(ctx context.Context, fileHash xet.Hash, outputFile string, provide
 		}
 	}
 
-	cli := client.NewClient(
+	cli, err := client.NewClient(
 		client.WithAuthProvider(provider),
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(progressFunc),
 		client.WithConcurrency(concurrency),
 	)
+	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
 
 	var header http.Header
 	if resumeOffset > 0 {

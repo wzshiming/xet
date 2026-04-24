@@ -30,7 +30,7 @@ type ReaderV1 struct {
 }
 
 // NewReaderV1 creates a new V1 reconstruction reader
-func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, opts ...Option) (io.Reader, error) {
+func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, diskCache *DiskCache, opts ...Option) (io.Reader, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -41,7 +41,7 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, diskCache, options)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -200,8 +200,10 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 			chunkEnd:   fetchInfo.Range.End,
 		}
 		tasks = append(tasks, fetchTask{
-			key: key,
-			url: fetchInfo.URL,
+			key:        key,
+			url:        fetchInfo.URL,
+			chunkStart: fetchInfo.Range.Start,
+			chunkEnd:   fetchInfo.Range.End,
 		})
 	}
 	return selected, tasks, nil

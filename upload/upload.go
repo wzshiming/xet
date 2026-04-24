@@ -105,6 +105,7 @@ type xorbGroup struct {
 }
 
 type options struct {
+	cacheDir     string
 	concurrency  int
 	enableSHA256 bool
 	progressFunc progress.ProgressFunc
@@ -133,6 +134,13 @@ func WithEnableSHA256(enabled bool) Option {
 func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
+	}
+}
+
+// WithCacheDir sets the directory to use for temporary cache files during upload.
+func WithCacheDir(cacheDir string) Option {
+	return func(o *options) {
+		o.cacheDir = cacheDir
 	}
 }
 
@@ -259,8 +267,12 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		xorbs = append(xorbs, group)
 	}
 
+	if options.cacheDir == "" {
+		options.cacheDir = os.TempDir()
+	}
+
 	// Step 4: Upload xorbs
-	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency, options.progressFunc); err != nil {
+	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency, options.cacheDir, options.progressFunc); err != nil {
 		return nil, fmt.Errorf("upload xorbs: %w", err)
 	}
 
@@ -389,7 +401,7 @@ type preparedXorb struct {
 	chunkHashes []xet.Hash
 }
 
-func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int, progressFunc progress.ProgressFunc) error {
+func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int, cacheDir string, progressFunc progress.ProgressFunc) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -424,7 +436,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					return
 				}
 
-				tmpFile, err := os.CreateTemp("", "xet-upload-xorb-*")
+				tmpFile, err := os.CreateTemp(cacheDir, "xet-upload-xorb-*")
 				if err != nil {
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("create temp file: %w", err)

@@ -9,126 +9,87 @@ import (
 	"github.com/wzshiming/xet/internal/pool"
 )
 
-// chunkRef records the position of one decoded chunk in the backing temp file.
+// chunkRef records the location of one decoded chunk within the backing file.
 type chunkRef struct {
-	offset int64
-	length int32
+	offset  int64
+	size    int32
+	fileIdx int // index into chunkCache.files; 0 means chunkCache.file
 }
 
 // chunkCache wraps a Decoder with lazy per-chunk decoding backed by a temp file.
-// Decoded chunks are written to disk so that dedup'd xorb chunks (the same chunk
-// position referenced by multiple reconstruction terms) can be re-read without a
-// second download, while keeping memory usage low.
+// Decoded chunks are written to disk immediately; only offset+size metadata is
+// kept in memory, so large xorbs do not inflate the process heap.
 type chunkCache struct {
-	dec   io.Reader
-	store *chunkStore
-	index []chunkRef
-	done  bool // decoder exhausted or closed
-	mut   sync.RWMutex
+	dec        io.Reader
+	metas      []chunkRef
+	writePos   int64 // next write offset in file
+	done       bool
+	mut        sync.Mutex
+	diskCache  *DiskCache
+	hash       string
+	chunkStart uint32
+	chunkEnd   uint32
+	bytesStart int64
+	bytesEnd   int64
+	file       *os.File   // primary backing file (write path / single-file read path)
+	files      []*os.File // additional files for multi-file read path (fileIdx > 0)
 }
 
-type chunkStore struct {
-	file        *os.File
-	writeOffset int64
-	mut         sync.RWMutex
-}
-
-func newChunkStore() (*chunkStore, error) {
-	f, err := os.CreateTemp("", "xorb-chunks-*")
+func newChunkCache(dec io.Reader, dc *DiskCache, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*chunkCache, error) {
+	tmp, err := os.CreateTemp("", "xet-chunk-*")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create chunk temp file: %w", err)
 	}
-	return &chunkStore{file: f}, nil
-}
-
-func (s *chunkStore) append(data []byte) (int64, error) {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	if s.file == nil {
-		return 0, os.ErrClosed
-	}
-	n, err := s.file.WriteAt(data, s.writeOffset)
-	if err != nil {
-		return 0, err
-	}
-	if n != len(data) {
-		return 0, io.ErrShortWrite
-	}
-	writeOffset := s.writeOffset
-	s.writeOffset += int64(n)
-	return writeOffset, nil
-}
-
-func (s *chunkStore) readAt(buf []byte, offset int64) (int64, error) {
-	s.mut.RLock()
-	defer s.mut.RUnlock()
-	if s.file == nil {
-		return 0, os.ErrClosed
-	}
-
-	var n int
-	for n != len(buf) {
-		sn, err := s.file.ReadAt(buf[n:], offset+int64(n))
-		n += sn
-		if err != nil {
-			return int64(n), err
-		}
-	}
-	return int64(n), nil
-}
-
-func (s *chunkStore) Close() error {
-	s.mut.Lock()
-	defer s.mut.Unlock()
-	if s.file == nil {
-		return nil
-	}
-	name := s.file.Name()
-	s.file.Close()
-	os.Remove(name)
-	s.file = nil
-	return nil
-}
-
-func newChunkCache(dec io.Reader, store *chunkStore) (*chunkCache, error) {
-	return &chunkCache{dec: dec, store: store}, nil
+	return &chunkCache{
+		dec:        dec,
+		diskCache:  dc,
+		hash:       hash,
+		chunkStart: chunkStart,
+		chunkEnd:   chunkEnd,
+		bytesStart: bytesStart,
+		bytesEnd:   bytesEnd,
+		file:       tmp,
+	}, nil
 }
 
 // Chunk returns the decoded chunk at idx, decoding forward as needed.
-// Already-decoded chunks are served from the backing temp file.
+// Already-decoded chunks are served from the backing file.
 func (c *chunkCache) Chunk(idx uint32, buf []byte) (int64, error) {
-	err := c.LoadTo(idx)
-	if err != nil {
+	if err := c.loadTo(idx); err != nil {
 		return 0, fmt.Errorf("load chunk %d: %w", idx, err)
 	}
 
-	n, err := c.chunk(idx, buf)
-	if err != nil {
-		return 0, fmt.Errorf("get chunk %d: %w", idx, err)
+	c.mut.Lock()
+	if int(idx) >= len(c.metas) {
+		total := len(c.metas)
+		c.mut.Unlock()
+		return 0, fmt.Errorf("chunk %d out of range (total: %d)", idx, total)
 	}
-	return n, nil
+	m := c.metas[idx]
+	var f *os.File
+	if m.fileIdx == 0 {
+		f = c.file
+	} else if m.fileIdx-1 < len(c.files) {
+		f = c.files[m.fileIdx-1]
+	}
+	c.mut.Unlock()
+
+	if f == nil {
+		return 0, fmt.Errorf("chunk %d: file closed", idx)
+	}
+	if int(m.size) > len(buf) {
+		return 0, fmt.Errorf("buffer too small for chunk: need %d bytes", m.size)
+	}
+	n, err := f.ReadAt(buf[:m.size], m.offset)
+	return int64(n), err
 }
 
-func (c *chunkCache) chunk(idx uint32, buf []byte) (int64, error) {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
-
-	ref := c.index[idx]
-	if len(buf) < int(ref.length) {
-		return 0, fmt.Errorf("buffer too small for chunk: need %d bytes", ref.length)
-	}
-
-	n, err := c.store.readAt(buf[:ref.length], ref.offset)
-	if err != nil {
-		return 0, fmt.Errorf("read at offset %d: %w", ref.offset, err)
-	}
-	if int64(n) != int64(ref.length) {
-		return 0, fmt.Errorf("short read: expected %d bytes, got %d", ref.length, n)
-	}
-	return n, nil
-}
-
+// load decodes the next chunk and writes it to the backing file.
+// The mutex is held for the full decode+write to serialise concurrent callers.
 func (c *chunkCache) load() (int, error) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
 	if c.done {
 		return 0, io.EOF
 	}
@@ -136,46 +97,36 @@ func (c *chunkCache) load() (int, error) {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
 
-	c.mut.Lock()
-	defer c.mut.Unlock()
-
 	n, err := c.dec.Read(tmp[:])
 	if err != nil {
 		if err == io.EOF {
-			c.Done()
+			c.done = true
 			return 0, io.EOF
 		}
 		return 0, err
 	}
 
-	offset, err := c.store.append(tmp[:n])
-	if err != nil {
-		return 0, fmt.Errorf("append chunk: %w", err)
+	if _, werr := c.file.WriteAt(tmp[:n], c.writePos); werr != nil {
+		return 0, fmt.Errorf("write chunk to file: %w", werr)
 	}
-
-	c.index = append(c.index, chunkRef{offset: offset, length: int32(n)})
-	return len(c.index), nil
+	c.metas = append(c.metas, chunkRef{offset: c.writePos, size: int32(n)})
+	c.writePos += int64(n)
+	return len(c.metas), nil
 }
 
-// LoadTo decodes and caches chunks up to the specified index.
-func (c *chunkCache) LoadTo(idx uint32) error {
+// loadTo decodes and caches chunks until index idx is available or the decoder
+// is exhausted.
+func (c *chunkCache) loadTo(idx uint32) error {
 	for {
-		curr, err := c.load()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		if curr > int(idx) {
+		c.mut.Lock()
+		curr := len(c.metas)
+		done := c.done
+		c.mut.Unlock()
+
+		if curr > int(idx) || done {
 			return nil
 		}
-	}
-}
 
-// LoadAll decodes and caches all chunks.
-func (c *chunkCache) LoadAll() error {
-	for {
 		_, err := c.load()
 		if err != nil {
 			if err == io.EOF {
@@ -186,8 +137,42 @@ func (c *chunkCache) LoadAll() error {
 	}
 }
 
-func (c *chunkCache) Done() {
-	if !c.done {
-		c.done = true
+// LoadTo decodes and caches chunks up to the specified index.
+func (c *chunkCache) LoadTo(idx uint32) error {
+	return c.loadTo(idx)
+}
+
+// LoadAll decodes and caches all remaining chunks, then persists to the disk cache.
+// The write is skipped if the number of loaded chunks does not match the expected
+// range (e.g. when the decoder was interrupted early by a Done() call).
+func (c *chunkCache) LoadAll() error {
+	for {
+		_, err := c.load()
+		if err != nil {
+			if err == io.EOF {
+				c.mut.Lock()
+				metas := c.metas
+				file := c.file
+				c.mut.Unlock()
+
+				c.diskCache.put(c.hash, c.chunkStart, c.chunkEnd, c.bytesStart, c.bytesEnd, metas, file)
+				return nil
+			}
+			return err
+		}
 	}
+}
+
+// Done marks the decoder as exhausted and releases the backing file(s).
+func (c *chunkCache) Done() {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+	c.done = true
+	if c.file != nil {
+		c.file.Close()
+	}
+	for _, f := range c.files {
+		f.Close()
+	}
+	c.files = nil
 }

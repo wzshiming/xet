@@ -33,12 +33,11 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.diskCache, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
@@ -58,12 +57,11 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	// Create a reader that reconstructs the file on-demand
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithRetries(c.retries),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.diskCache, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
@@ -106,12 +104,11 @@ func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io
 		sizes[i] = download.ExpectedLengthV1(singleResp)
 		opts := []download.Option{
 			download.WithConcurrency(c.concurrency),
-			download.WithRetries(c.retries),
 		}
 		if c.progressFunc != nil {
 			opts = append(opts, download.WithProgressFunc(c.progressFunc))
 		}
-		reader, err := download.NewReaderV1(ctx, c, singleResp, opts...)
+		reader, err := download.NewReaderV1(ctx, c, singleResp, c.diskCache, opts...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

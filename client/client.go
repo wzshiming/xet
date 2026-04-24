@@ -9,6 +9,7 @@ import (
 	"net/url"
 
 	"github.com/wzshiming/httpseek"
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -48,6 +49,8 @@ type Client struct {
 	concurrency   int
 	retries       int
 	progressFunc  progress.ProgressFunc
+	cacheDir      string
+	diskCache     *download.DiskCache
 }
 
 type Options func(*Client)
@@ -113,8 +116,15 @@ func WithRetries(retries int) Options {
 	}
 }
 
+// WithCacheDir enables the persistent disk chunk cache at the given directory. Downloaded and decoded xorb ranges are stored as individual files so that subsequent downloads (across processes and sessions) can skip re-fetching already-seen ranges. The cache enforces a default 10 GiB capacity limit with random eviction, matching the behaviour of xet-core's DiskCache.
+func WithCacheDir(cacheDir string) Options {
+	return func(c *Client) {
+		c.cacheDir = cacheDir
+	}
+}
+
 // NewClient creates a new API client
-func NewClient(opts ...Options) *Client {
+func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
 		httpClient:  &http.Client{},
 		namespace:   "default",
@@ -124,6 +134,12 @@ func NewClient(opts ...Options) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+
+	dc, err := download.NewDiskCache(c.cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialize disk cache: %w", err)
+	}
+	c.diskCache = dc
 
 	if c.httpClient.Transport == nil {
 		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
@@ -147,7 +163,20 @@ func NewClient(opts ...Options) *Client {
 			}),
 	}
 
-	return c
+	return c, nil
+}
+
+// Evict evicts entries from the disk cache until the total size is under the specified limit. This can be used to proactively manage disk usage, but note that the cache also automatically evicts entries when adding new data if the total size exceeds the default 10 GiB limit.
+func (c *Client) Evict(maxBytes int64) error {
+	err := c.diskCache.Evict(maxBytes)
+	if err != nil {
+		return fmt.Errorf("evict disk cache: %w", err)
+	}
+	err = c.diskCache.Compact()
+	if err != nil {
+		return fmt.Errorf("compact disk cache: %w", err)
+	}
+	return nil
 }
 
 // getToken calls the configured tokenFunc and returns the bearer token string.

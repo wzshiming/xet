@@ -54,7 +54,10 @@ func TestGetReconstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	client, err := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	reconstruction, err := client.GetReconstructionV1(context.Background(), testHash, nil)
 	if err != nil {
@@ -100,10 +103,13 @@ func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(
+	c, err := NewClient(
 		WithBaseURL(server.URL),
 		WithRetries(2),
 	)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	if _, err := c.GetReconstructionV1(context.Background(), testHash, nil); err != nil {
 		t.Fatalf("GetReconstructionV1 failed: %v", err)
@@ -123,10 +129,13 @@ func TestGetReconstructionError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(WithBaseURL(server.URL))
+	client, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	hash := xet.Hash{}
-	_, err := client.GetReconstructionV1(context.Background(), hash, nil)
+	_, err = client.GetReconstructionV1(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
 	}
@@ -151,7 +160,10 @@ func TestGetReconstructionRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(WithBaseURL(server.URL))
+	client, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	hash := xet.Hash{}
 	reconstruction, err := client.GetReconstructionV1(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
@@ -208,7 +220,10 @@ func TestGetReconstructionV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	c, err := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	reconstruction, err := c.GetReconstructionV2(context.Background(), testHash, nil)
 	if err != nil {
@@ -238,10 +253,13 @@ func TestGetReconstructionV2Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(WithBaseURL(server.URL))
+	c, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 
 	hash := xet.Hash{}
-	_, err := c.GetReconstructionV2(context.Background(), hash, nil)
+	_, err = c.GetReconstructionV2(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
 	}
@@ -266,8 +284,10 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c := NewClient(WithBaseURL(server.URL))
-
+	c, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
 	hash := xet.Hash{}
 	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
 	if err != nil {
