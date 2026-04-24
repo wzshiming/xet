@@ -128,12 +128,18 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Download using native client to verify
-				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
+				nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
+				nativeFile, err := os.Create(nativeDownloadFile)
+				if err != nil {
+					t.Fatalf("Failed to create native download file: %v", err)
+				}
+				err = nativeClient.DownloadFile(context.Background(), fileHash, nativeFile)
+				nativeFile.Close()
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}
 
-				downloadedData, err := io.ReadAll(reader)
+				downloadedData, err := os.ReadFile(nativeDownloadFile)
 				if err != nil {
 					t.Fatalf("Failed to read downloaded data: %v", err)
 				}
@@ -301,12 +307,18 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				// Download using native client
-				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
+				downloadFile := filepath.Join(tempDir, "download.bin")
+				dlFile, err := os.Create(downloadFile)
+				if err != nil {
+					t.Fatalf("Failed to create download file: %v", err)
+				}
+				err = nativeClient.DownloadFile(context.Background(), fileHash, dlFile)
+				dlFile.Close()
 				if err != nil {
 					t.Fatalf("Failed to download file: %v", err)
 				}
 
-				downloadedData, err := io.ReadAll(reader)
+				downloadedData, err := os.ReadFile(downloadFile)
 				if err != nil {
 					t.Fatalf("Failed to read downloaded data: %v", err)
 				}
@@ -315,12 +327,6 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				if !bytes.Equal(downloadedData, tt.data) {
 					t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
 						len(downloadedData), len(tt.data))
-				}
-
-				// Write downloaded data to file for verification
-				downloadFile := filepath.Join(tempDir, "download.bin")
-				if err := os.WriteFile(downloadFile, downloadedData, 0644); err != nil {
-					t.Fatalf("Failed to write downloaded file: %v", err)
 				}
 
 				// Verify using xet-go that the downloaded file has the correct hash

@@ -10,27 +10,47 @@ import (
 	"github.com/wzshiming/xet/download"
 )
 
-// DownloadFile downloads and reconstructs a file from its hash, automatically falling back to V1 if V2 is not supported
-func (c *Client) DownloadFile(ctx context.Context, fileHash xet.Hash, header http.Header) (io.Reader, int64, error) {
-	r, size, err := c.DownloadFileV2(ctx, fileHash, header)
+// DownloadFile downloads and reconstructs a file from its hash into w, automatically falling back to V1 if V2 is not supported.
+// It seeks w to determine the current size for resume support.
+func (c *Client) DownloadFile(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
+	err := c.DownloadFileV2(ctx, fileHash, w)
 	if err != nil {
 		if err == errNotFound {
-			return c.DownloadFileV1(ctx, fileHash, header)
+			return c.DownloadFileV1(ctx, fileHash, w)
 		}
-		return nil, 0, err
+		return err
 	}
-	return r, size, nil
+	return nil
 }
 
-// DownloadFileV1 downloads and reconstructs a file from its hash
-func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header http.Header) (io.Reader, int64, error) {
-	// Step 1: Query reconstruction
-	reconstructionResp, err := c.GetReconstructionV1(ctx, fileHash, header)
+// DownloadFileV1 downloads and reconstructs a file from its hash into w.
+// It seeks w to determine the current size for resume support.
+func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
+	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
-		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
+		resumeOffset = 0
 	}
 
-	// Create a reader that reconstructs the file on-demand
+	var header http.Header
+	if resumeOffset > 0 {
+		header = http.Header{
+			"Range": []string{fmt.Sprintf("bytes=%d-", resumeOffset)},
+		}
+	}
+
+	reconstructionResp, err := c.GetReconstructionV1(ctx, fileHash, header)
+	if err != nil {
+		if resumeOffset > 0 {
+			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
+				resumeOffset = 0
+				reconstructionResp, err = c.GetReconstructionV1(ctx, fileHash, nil)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("query reconstruction: %w", err)
+		}
+	}
+
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 	}
@@ -39,22 +59,48 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, header h
 	}
 	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.diskCache, opts...)
 	if err != nil {
-		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
+		return fmt.Errorf("initialize reader v1: %w", err)
 	}
 
 	expectedLength := download.ExpectedLengthV1(reconstructionResp)
-
-	return reader, expectedLength, nil
+	n, err := io.Copy(w, reader)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if n != expectedLength {
+		return fmt.Errorf("downloaded file size mismatch: expected %d bytes, got %d bytes", expectedLength, n)
+	}
+	return nil
 }
 
-// DownloadFileV2 downloads and reconstructs a file from its hash using the V2 API
-func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header http.Header) (io.Reader, int64, error) {
-	reconstructionResp, err := c.GetReconstructionV2(ctx, fileHash, header)
+// DownloadFileV2 downloads and reconstructs a file from its hash into w using the V2 API.
+// It seeks w to determine the current size for resume support.
+func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
+	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
-		return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
+		resumeOffset = 0
 	}
 
-	// Create a reader that reconstructs the file on-demand
+	var header http.Header
+	if resumeOffset > 0 {
+		header = http.Header{
+			"Range": []string{fmt.Sprintf("bytes=%d-", resumeOffset)},
+		}
+	}
+
+	reconstructionResp, err := c.GetReconstructionV2(ctx, fileHash, header)
+	if err != nil {
+		if resumeOffset > 0 {
+			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
+				resumeOffset = 0
+				reconstructionResp, err = c.GetReconstructionV2(ctx, fileHash, nil)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("query reconstruction v2: %w", err)
+		}
+	}
+
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 	}
@@ -63,12 +109,18 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, header h
 	}
 	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.diskCache, opts...)
 	if err != nil {
-		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
+		return fmt.Errorf("initialize reader v2: %w", err)
 	}
 
 	expectedLength := download.ExpectedLengthV2(reconstructionResp)
-
-	return reader, expectedLength, nil
+	n, err := io.Copy(w, reader)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if n != expectedLength {
+		return fmt.Errorf("downloaded file size mismatch: expected %d bytes, got %d bytes", expectedLength, n)
+	}
+	return nil
 }
 
 // DownloadFiles downloads multiple files using a single batch reconstruction request.

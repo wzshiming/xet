@@ -345,12 +345,18 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 				// Download with native client
 				proxy.ClearRequests()
-				reader, _, err := nativeClient.DownloadFile(context.Background(), fileHash, nil)
+				nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
+				nativeFile, err := os.Create(nativeDownloadFile)
+				if err != nil {
+					t.Fatalf("Failed to create native download file: %v", err)
+				}
+				err = nativeClient.DownloadFile(context.Background(), fileHash, nativeFile)
+				nativeFile.Close()
 				if err != nil {
 					t.Fatalf("Failed to download file with native client: %v", err)
 				}
 
-				nativeDownloadedData, err := io.ReadAll(reader)
+				nativeDownloadedData, err := os.ReadFile(nativeDownloadFile)
 				if err != nil {
 					t.Fatalf("Failed to read downloaded data: %v", err)
 				}
@@ -1388,10 +1394,22 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		}
 
 		for i, tc := range datasets {
-			seqReader, seqSize, err := nativeClient.DownloadFile(context.Background(), hashes[i], nil)
+			seqFile, err := os.CreateTemp("", "seq-*.bin")
+			if err != nil {
+				t.Fatalf("sequential DownloadFile %d (%s) create temp: %v", i, tc.name, err)
+			}
+			seqFileName := seqFile.Name()
+			defer os.Remove(seqFileName)
+			err = nativeClient.DownloadFile(context.Background(), hashes[i], seqFile)
+			seqFile.Close()
 			if err != nil {
 				t.Fatalf("sequential DownloadFile %d (%s) failed: %v", i, tc.name, err)
 			}
+			seqData, err := os.ReadFile(seqFileName)
+			if err != nil {
+				t.Fatalf("sequential DownloadFile %d (%s) read: %v", i, tc.name, err)
+			}
+			seqSize := int64(len(seqData))
 			if batchSizes[i] != seqSize {
 				t.Errorf("file %d (%s) size: batch=%d sequential=%d",
 					i, tc.name, batchSizes[i], seqSize)
@@ -1399,11 +1417,6 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 			batchData, err := io.ReadAll(batchReaders[i])
 			if err != nil {
 				t.Errorf("read batch file %d (%s): %v", i, tc.name, err)
-				continue
-			}
-			seqData, err := io.ReadAll(seqReader)
-			if err != nil {
-				t.Errorf("read sequential file %d (%s): %v", i, tc.name, err)
 				continue
 			}
 			if !bytes.Equal(batchData, seqData) {
