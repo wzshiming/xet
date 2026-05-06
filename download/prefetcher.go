@@ -188,7 +188,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
 	}
 
-	rc, err := p.client.DownloadXorb(p.ctx, entry.task.url, header)
+	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
 	if err != nil {
 		p.failEntry(entry, err)
 		return

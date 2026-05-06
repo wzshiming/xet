@@ -120,9 +120,22 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 	return &uploadResp, nil
 }
 
+// DownloadXorb fetches the raw xorb bytes for the given hash directly
+// from the upstream CAS server, including the Authorization header.
+// The caller must close the returned ReadCloser.
+func (c *Client) DownloadXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadCloser, error) {
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	xorbURL := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String())
+
+	return c.DownloadXorbWithURL(ctx, xorbURL, nil)
+}
+
 // DownloadXorb downloads a xorb from a URL and returns a streaming Decoder.
 // The caller must call Decoder.Close() when done to release the underlying HTTP connection.
-func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -140,21 +153,12 @@ func (c *Client) DownloadXorb(ctx context.Context, url string, header http.Heade
 		return nil, err
 	}
 
-	var body io.Reader = resp.Body
-
-	// resp.Body is owned by the Decoder; it will be closed via SetCloser.
-	return struct {
-		io.Reader
-		io.Closer
-	}{
-		Reader: body,
-		Closer: resp.Body,
-	}, nil
+	return resp.Body, nil
 }
 
 // DownloadXorbsMultipart sends one multi-range request and returns the multipart reader.
 // Caller must close the returned closer.
-func (c *Client) DownloadXorbsMultipart(ctx context.Context, url string, header http.Header) (*multipart.Reader, io.Closer, error) {
+func (c *Client) DownloadXorbsMultipartWithURL(ctx context.Context, url string, header http.Header) (*multipart.Reader, io.Closer, error) {
 	if len(header) == 0 {
 		return nil, nil, fmt.Errorf("empty ranges")
 	}
@@ -217,4 +221,35 @@ func parseMediaType(contentType string) (mediaType string, params map[string]str
 		}
 	}
 	return
+}
+
+// FetchXorbRangeWithURL issues a GET to rawURL forwarding the provided headers (typically
+// a Range header) and returns the raw *http.Response so the caller can proxy the
+// status code and response headers (e.g. Content-Range) verbatim.
+// The plain httpClient is used so the response is not modified by MustReaderTransport.
+// The caller must close the response body.
+func (c *Client) FetchXorbRangeWithURL(ctx context.Context, rawURL string, header http.Header) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	maps.Copy(req.Header, header)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch xorb range: %w", err)
+	}
+	return resp, nil
+}
+
+// FetchXorbRange fetches a raw xorb byte range from the upstream CAS
+// server endpoint, adding the client's authentication headers. Useful as a
+// fallback when no CDN URL is known for a given xorb hash.
+func (c *Client) FetchXorbRange(ctx context.Context, namespace string, xorbHash xet.Hash, header http.Header) (*http.Response, error) {
+	baseURL, err := c.getBaseURL(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get base URL: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String())
+
+	return c.FetchXorbRangeWithURL(ctx, url, header)
 }
