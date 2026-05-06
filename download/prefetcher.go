@@ -93,7 +93,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries[task.key] = item
 		items = append(items, item)
 	}
-	concurrency := opts.concurrency
+
 	if len(items) == 0 {
 		return &prefetcher{
 			ctx:     ctx,
@@ -112,29 +112,51 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		diskCache:    dc,
 	}
 
-	if opts.progressFunc != nil {
-		for _, item := range items {
-			opts.progressFunc(item.task.key.String(), 0, item.task.key.End-item.task.key.Start)
-		}
-		for _, item := range items {
-			cc, err := p.diskCache.get(item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
-			if err != nil {
-				return nil, fmt.Errorf("check disk cache for %s: %w", item.task.key.String(), err)
-			}
-			if cc != nil {
-				size := item.task.key.Size()
-				p.progressFunc(item.task.key.String(), size, size)
-				p.publishEntry(item, cc)
-			}
-		}
+	if err := p.start(items, opts.concurrency); err != nil {
+		return nil, err
 	}
 
-	desiredWorkers := concurrency
+	return p, nil
+}
+
+func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
+	newItems := make([]*prefetchEntry, 0, len(items))
+	for _, item := range items {
+		cc, err := p.diskCache.get(item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+		if err != nil {
+			return fmt.Errorf("check disk cache for %s: %w", item.task.key.String(), err)
+		}
+		if cc != nil {
+			if p.progressFunc != nil {
+				size := item.task.key.Size()
+				p.progressFunc(item.task.key.String(), size, size)
+			}
+			p.publishEntry(item, cc)
+		} else {
+			if p.progressFunc != nil {
+				size := item.task.key.Size()
+				p.progressFunc(item.task.key.String(), 0, size)
+			}
+			newItems = append(newItems, item)
+		}
+	}
+	if len(newItems) == 0 {
+		return nil
+	}
+
 	if desiredWorkers <= 0 {
 		desiredWorkers = 1
 	}
+	desiredWorkers = min(desiredWorkers, len(newItems))
 
 	jobs := make(chan *prefetchEntry)
+	go func() {
+		defer close(jobs)
+		for _, item := range newItems {
+			jobs <- item
+		}
+	}()
+
 	for i := 0; i < desiredWorkers; i++ {
 		go func() {
 			for entry := range jobs {
@@ -142,17 +164,8 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 			}
 		}()
 	}
-	go func() {
-		defer close(jobs)
-		for _, item := range items {
-			if item.cache != nil {
-				continue
-			}
-			jobs <- item
-		}
-	}()
 
-	return p, nil
+	return nil
 }
 
 func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
