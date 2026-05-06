@@ -163,11 +163,18 @@ func (dc *DiskCache) get(hash string, chunkStart, chunkEnd uint32) (*chunkCache,
 
 		f, err := os.Open(c.path)
 		if err != nil {
+			for _, seg := range segments {
+				seg.file.Close()
+			}
 			return nil, err
 		}
 
 		metas, err := readCacheFileMetas(f, c.start, needStart, needEnd)
 		if err != nil {
+			f.Close()
+			for _, seg := range segments {
+				seg.file.Close()
+			}
 			os.Remove(c.path) //nolint:errcheck
 			return nil, fmt.Errorf("read cache file metas: %w", err)
 		}
@@ -208,24 +215,21 @@ func (dc *DiskCache) get(hash string, chunkStart, chunkEnd uint32) (*chunkCache,
 	}, nil
 }
 
-// readCacheFileMetas opens a cache file and returns metas for [chunkStart, chunkEnd)
-// along with the open file handle (caller must close). Returns nil,nil on error.
+// readCacheFileMetas reads metas for [chunkStart, chunkEnd) from an already-open
+// cache file. The caller is responsible for closing f in all cases.
 func readCacheFileMetas(f *os.File, offset, chunkStart, chunkEnd uint32) ([]chunkRef, error) {
 	var numOffsets uint32
 	if err := binary.Read(f, binary.LittleEndian, &numOffsets); err != nil {
-		f.Close()
 		return nil, err
 	}
 	offsets := make([]uint32, numOffsets)
 	if err := binary.Read(f, binary.LittleEndian, &offsets); err != nil {
-		f.Close()
 		return nil, err
 	}
 
 	idxStart := int(chunkStart - offset)
 	idxEnd := int(chunkEnd - offset)
 	if idxEnd >= int(numOffsets) || idxStart < 0 || idxStart > idxEnd {
-		f.Close()
 		return nil, fmt.Errorf("invalid chunk range")
 	}
 
@@ -440,16 +444,23 @@ func mergeAdjacentFiles(cacheDir, hash string) error {
 
 			f, err := os.Open(e.path)
 			if err != nil {
+				for _, s := range segs {
+					s.f.Close()
+				}
 				return err
 			}
 
 			metas, err := readCacheFileMetas(f, e.chunkStart, needStart, needEnd)
 			if err != nil {
 				f.Close()
+				for _, s := range segs {
+					s.f.Close()
+				}
 				os.Remove(e.path) //nolint:errcheck
 				return fmt.Errorf("read cache file metas: %w", err)
 			}
 			if metas == nil {
+				f.Close()
 				ok = false
 				break
 			}
