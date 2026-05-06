@@ -40,6 +40,7 @@ func newChunkCache(dec io.Reader, dc *DiskCache, hash string, chunkStart, chunkE
 	if err != nil {
 		return nil, fmt.Errorf("create chunk temp file: %w", err)
 	}
+	dc.addRef(hash)
 	return &chunkCache{
 		dec:        dec,
 		diskCache:  dc,
@@ -166,7 +167,6 @@ func (c *chunkCache) LoadAll() error {
 // Done marks the decoder as exhausted and releases the backing file(s).
 func (c *chunkCache) Done() {
 	c.mut.Lock()
-	defer c.mut.Unlock()
 	c.done = true
 	if c.file != nil {
 		c.file.Close()
@@ -175,4 +175,12 @@ func (c *chunkCache) Done() {
 		f.Close()
 	}
 	c.files = nil
+	dc := c.diskCache
+	hash := c.hash
+	c.diskCache = nil
+	c.mut.Unlock()
+
+	if dc != nil {
+		dc.decRef(hash)
+	}
 }

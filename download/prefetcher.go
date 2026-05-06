@@ -279,11 +279,6 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 	return entry.cache, nil
 }
 
-// Compact merges adjacent cache files in the disk cache to reduce fragmentation and improve future read performance.
-func (p *prefetcher) Compact() error {
-	return p.diskCache.Compact()
-}
-
 // Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes. If maxBytes <= 0 the call is a no-op.
 func (p *prefetcher) Evict(maxBytes int64) error {
 	return p.diskCache.Evict(maxBytes)

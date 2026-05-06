@@ -37,6 +37,7 @@ type DiskCache struct {
 	cacheDir    string
 	mut         sync.Mutex
 	dirtyHashes map[string]struct{} // hashes with newly written cache files
+	activeRefs  map[string]int      // number of active write-path chunkCaches per hash
 }
 
 // NewDiskCache creates a diskCache rooted at cacheDir.
@@ -217,29 +218,40 @@ func (dc *DiskCache) get(hash string, chunkStart, chunkEnd uint32) (*chunkCache,
 
 // readCacheFileMetas reads metas for [chunkStart, chunkEnd) from an already-open
 // cache file. The caller is responsible for closing f in all cases.
+// It uses ReadAt to fetch only the needed offset sub-range, avoiding a full
+// read of potentially large offset arrays.
 func readCacheFileMetas(f *os.File, offset, chunkStart, chunkEnd uint32) ([]chunkRef, error) {
-	var numOffsets uint32
-	if err := binary.Read(f, binary.LittleEndian, &numOffsets); err != nil {
+	// Read only the count (4 bytes at the very start of the file).
+	var countBuf [4]byte
+	if _, err := f.ReadAt(countBuf[:], 0); err != nil {
 		return nil, err
 	}
-	offsets := make([]uint32, numOffsets)
-	if err := binary.Read(f, binary.LittleEndian, &offsets); err != nil {
-		return nil, err
-	}
+	numOffsets := binary.LittleEndian.Uint32(countBuf[:])
 
+	if chunkStart < offset || chunkEnd < chunkStart {
+		return nil, fmt.Errorf("invalid chunk range")
+	}
 	idxStart := int(chunkStart - offset)
 	idxEnd := int(chunkEnd - offset)
-	if idxEnd >= int(numOffsets) || idxStart < 0 || idxStart > idxEnd {
+	if idxEnd >= int(numOffsets) || idxStart > idxEnd {
 		return nil, fmt.Errorf("invalid chunk range")
 	}
 
-	headerBytes := int64(4 + 4*int(numOffsets))
+	// Read only the offsets we need: [idxStart, idxEnd] inclusive (numChunks+1 values).
 	numChunks := int(chunkEnd - chunkStart)
+	rawBuf := make([]byte, (numChunks+1)*4)
+	if _, err := f.ReadAt(rawBuf, int64(4+idxStart*4)); err != nil {
+		return nil, err
+	}
+
+	headerBytes := int64(4 + 4*int(numOffsets))
 	metas := make([]chunkRef, numChunks)
 	for i := range numChunks {
+		start := binary.LittleEndian.Uint32(rawBuf[i*4:])
+		end := binary.LittleEndian.Uint32(rawBuf[(i+1)*4:])
 		metas[i] = chunkRef{
-			offset: headerBytes + int64(offsets[idxStart+i]),
-			size:   int32(offsets[idxStart+i+1] - offsets[idxStart+i]),
+			offset: headerBytes + int64(start),
+			size:   int32(end - start),
 		}
 	}
 	return metas, nil
@@ -263,10 +275,6 @@ func (dc *DiskCache) put(hash string, chunkStart, chunkEnd uint32, bytesStart, b
 	}
 
 	path := entryPath(dc.cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
-	if _, err := os.Stat(path); err == nil {
-		return // already present
-	}
-
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
@@ -294,6 +302,11 @@ func (dc *DiskCache) put(hash string, chunkStart, chunkEnd uint32, bytesStart, b
 	chunkBuf := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(chunkBuf)
 	for _, m := range metas {
+		if int(m.size) > len(chunkBuf) {
+			tmp.Close()
+			os.Remove(tmpName) //nolint:errcheck
+			return
+		}
 		buf := chunkBuf[:m.size]
 		if _, err := file.ReadAt(buf, m.offset); err != nil {
 			tmp.Close()
@@ -324,20 +337,37 @@ func (dc *DiskCache) put(hash string, chunkStart, chunkEnd uint32, bytesStart, b
 	dc.mut.Unlock()
 }
 
-// Compact merges adjacent cached files for all hashes written since the last
-// Compact call. Call this once all downloads for a session are complete.
-func (dc *DiskCache) Compact() error {
+// addRef increments the active reference count for hash. Called when a write-path
+// chunkCache is created so we know when all writers for a hash have finished.
+func (dc *DiskCache) addRef(hash string) {
 	dc.mut.Lock()
-	hashes := dc.dirtyHashes
-	dc.dirtyHashes = nil
-	dc.mut.Unlock()
-
-	for hash := range hashes {
-		if err := mergeAdjacentFiles(dc.cacheDir, hash); err != nil {
-			return err
-		}
+	if dc.activeRefs == nil {
+		dc.activeRefs = make(map[string]int)
 	}
-	return nil
+	dc.activeRefs[hash]++
+	dc.mut.Unlock()
+}
+
+// decRef decrements the active reference count for hash. When it reaches zero
+// and the hash has been marked dirty by put(), mergeAdjacentFiles is called
+// automatically to compact the newly written cache files.
+func (dc *DiskCache) decRef(hash string) {
+	dc.mut.Lock()
+	refs := dc.activeRefs[hash] - 1
+	if refs > 0 {
+		dc.activeRefs[hash] = refs
+		dc.mut.Unlock()
+		return
+	}
+	delete(dc.activeRefs, hash)
+	_, dirty := dc.dirtyHashes[hash]
+	if dirty {
+		delete(dc.dirtyHashes, hash)
+	}
+	dc.mut.Unlock()
+	if dirty {
+		mergeAdjacentFiles(dc.cacheDir, hash) //nolint:errcheck
+	}
 }
 
 // mergeAdjacentFiles scans all cached files for hash, sorts them, finds every
@@ -471,10 +501,12 @@ func mergeAdjacentFiles(cacheDir, hash string) error {
 			for _, s := range segs {
 				s.f.Close()
 			}
-			return fmt.Errorf("merge %s [%d,%d): gap or read error", hash, runStart, runEnd)
+			// Gap or partial coverage is not fatal — skip this run.
+			i = j
+			continue
 		}
 
-		// Build the merged header+data buffer.
+		// Build the merged header: compute offsets from meta sizes (no file reads needed).
 		totalChunks := 0
 		for _, s := range segs {
 			totalChunks += len(s.metas)
@@ -488,51 +520,54 @@ func mergeAdjacentFiles(cacheDir, hash string) error {
 		for k, m := range allMetas {
 			offsets[k+1] = offsets[k] + uint32(m.size)
 		}
-		totalData := int(offsets[numOffsets-1])
 		headerSize := 4 + 4*int(numOffsets)
-		buf := make([]byte, headerSize+totalData)
-		binary.LittleEndian.PutUint32(buf[0:], numOffsets)
+		header := make([]byte, headerSize)
+		binary.LittleEndian.PutUint32(header[0:], numOffsets)
 		for k, o := range offsets {
-			binary.LittleEndian.PutUint32(buf[4+4*k:], o)
+			binary.LittleEndian.PutUint32(header[4+4*k:], o)
 		}
 
-		pos := headerSize
-		writeOk := true
-		for _, s := range segs {
-			for _, m := range s.metas {
-				if _, err := s.f.ReadAt(buf[pos:pos+int(m.size)], m.offset); err != nil {
-					writeOk = false
+		// Write the merged file atomically: stream chunks to avoid loading all data into memory.
+		mergedPath := entryPath(cacheDir, hash, runStart, runEnd, runBytesStart, runBytesEnd)
+		dir := filepath.Dir(mergedPath)
+		tmp, err := os.CreateTemp(dir, ".tmp-*")
+		if err != nil {
+			for _, s := range segs {
+				s.f.Close()
+			}
+			return fmt.Errorf("merge %s [%d,%d): create temp: %w", hash, runStart, runEnd, err)
+		}
+		tmpName := tmp.Name()
+		var writeErr error
+		if _, writeErr = tmp.Write(header); writeErr == nil {
+			chunkBuf := pool.GetChunkBuf()
+			for _, s := range segs {
+				for _, m := range s.metas {
+					if int(m.size) < 0 || int(m.size) > len(chunkBuf) {
+						writeErr = fmt.Errorf("chunk size %d out of range", m.size)
+						break
+					}
+					buf := chunkBuf[:m.size]
+					if _, writeErr = s.f.ReadAt(buf, m.offset); writeErr != nil {
+						break
+					}
+					if _, writeErr = tmp.Write(buf); writeErr != nil {
+						break
+					}
+				}
+				if writeErr != nil {
 					break
 				}
-				pos += int(m.size)
 			}
-			if !writeOk {
-				break
-			}
+			pool.PutChunkBuf(chunkBuf)
 		}
 		for _, s := range segs {
 			s.f.Close()
 		}
-
-		if !writeOk {
-			return fmt.Errorf("merge %s [%d,%d): read chunk data failed", hash, runStart, runEnd)
-		}
-
-		// Write the merged file atomically.
-		mergedPath := entryPath(cacheDir, hash, runStart, runEnd, runBytesStart, runBytesEnd)
-		dir := filepath.Dir(mergedPath)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("merge %s [%d,%d): mkdir: %w", hash, runStart, runEnd, err)
-		}
-		tmp, err := os.CreateTemp(dir, ".tmp-*")
-		if err != nil {
-			return fmt.Errorf("merge %s [%d,%d): create temp: %w", hash, runStart, runEnd, err)
-		}
-		tmpName := tmp.Name()
-		if _, err := tmp.Write(buf); err != nil {
+		if writeErr != nil {
 			tmp.Close()
 			os.Remove(tmpName) //nolint:errcheck
-			return fmt.Errorf("merge %s [%d,%d): write: %w", hash, runStart, runEnd, err)
+			return fmt.Errorf("merge %s [%d,%d): write: %w", hash, runStart, runEnd, writeErr)
 		}
 		if err := tmp.Close(); err != nil {
 			os.Remove(tmpName) //nolint:errcheck

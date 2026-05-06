@@ -172,10 +172,6 @@ func (c *Client) Evict(maxBytes int64) error {
 	if err != nil {
 		return fmt.Errorf("evict disk cache: %w", err)
 	}
-	err = c.diskCache.Compact()
-	if err != nil {
-		return fmt.Errorf("compact disk cache: %w", err)
-	}
 	return nil
 }
 
