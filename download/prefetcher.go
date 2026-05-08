@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
@@ -279,7 +280,8 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 	return entry.cache, nil
 }
 
-// Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes. If maxBytes <= 0 the call is a no-op.
-func (p *prefetcher) Evict(maxBytes int64) error {
-	return p.diskCache.Evict(maxBytes)
+// Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes.
+// If before is provided, only cache entries older than before are eligible.
+func (p *prefetcher) Evict(maxBytes int64, before time.Time) error {
+	return p.diskCache.Evict(maxBytes, before)
 }

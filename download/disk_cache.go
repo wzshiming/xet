@@ -590,40 +590,15 @@ func mergeAdjacentFiles(cacheDir, hash string) error {
 
 // Evict removes the least-recently-used hash directories until the total cache
 // size is at or below maxBytes. A hash directory's recency is the newest mtime
-// among its cache files.
-func (dc *DiskCache) Evict(maxBytes int64) error {
+// among its cache files. If before is provided, only hash directories whose
+// newest cache-file mtime is strictly before before are eligible for removal.
+func (dc *DiskCache) Evict(maxBytes int64, before time.Time) error {
 	if maxBytes < 0 {
 		return nil
 	}
 
-	if maxBytes == 0 {
-		// Clear everything.
-		topDirs, err := os.ReadDir(dc.cacheDir)
-		if err != nil {
-			return fmt.Errorf("read cache dir: %w", err)
-		}
-		for _, top := range topDirs {
-			if !top.IsDir() {
-				continue
-			}
-			topPath := filepath.Join(dc.cacheDir, top.Name())
-			subDirs, err := os.ReadDir(topPath)
-			if err != nil {
-				return fmt.Errorf("read cache subdir: %w", err)
-			}
-			for _, sub := range subDirs {
-				if !sub.IsDir() {
-					continue
-				}
-				hashDir := filepath.Join(topPath, sub.Name())
-				os.RemoveAll(hashDir) //nolint:errcheck
-			}
-			os.Remove(topPath) //nolint:errcheck
-		}
-		return nil
-	}
-
 	type hashEntry struct {
+		hash       string
 		hashDir    string
 		lastUpdate time.Time
 		size       int64
@@ -675,12 +650,44 @@ func (dc *DiskCache) Evict(maxBytes int64) error {
 				continue
 			}
 			entries = append(entries, hashEntry{
+				hash:       top.Name() + sub.Name(),
 				hashDir:    hashDir,
 				lastUpdate: newest,
 				size:       dirSize,
 			})
 			totalSize += dirSize
 		}
+	}
+
+	// Snapshot active refs to avoid holding the lock during disk I/O.
+	dc.mut.Lock()
+	activeRefs := make(map[string]int, len(dc.activeRefs))
+	for k, v := range dc.activeRefs {
+		activeRefs[k] = v
+	}
+	dc.mut.Unlock()
+
+	canEvict := func(e hashEntry) bool {
+		if activeRefs[e.hash] > 0 {
+			return false
+		}
+		if !before.IsZero() && !e.lastUpdate.Before(before) {
+			return false
+		}
+		return true
+	}
+
+	if maxBytes == 0 {
+		for _, e := range entries {
+			if !canEvict(e) {
+				continue
+			}
+			if err := os.RemoveAll(e.hashDir); err == nil {
+				// Remove empty prefix dir if possible.
+				os.Remove(filepath.Dir(e.hashDir)) //nolint:errcheck
+			}
+		}
+		return nil
 	}
 
 	if totalSize <= maxBytes {
@@ -695,6 +702,9 @@ func (dc *DiskCache) Evict(maxBytes int64) error {
 	for _, e := range entries {
 		if totalSize <= maxBytes {
 			break
+		}
+		if !canEvict(e) {
+			continue
 		}
 		if err := os.RemoveAll(e.hashDir); err == nil {
 			totalSize -= e.size

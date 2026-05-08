@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet/download"
@@ -166,9 +167,10 @@ func NewClient(opts ...Options) (*Client, error) {
 	return c, nil
 }
 
-// Evict evicts entries from the disk cache until the total size is under the specified limit. This can be used to proactively manage disk usage, but note that the cache also automatically evicts entries when adding new data if the total size exceeds the default 10 GiB limit.
-func (c *Client) Evict(maxBytes int64) error {
-	err := c.diskCache.Evict(maxBytes)
+// Evict evicts entries from the disk cache until the total size is under the specified limit.
+// If before is provided, only cache entries older than before are eligible.
+func (c *Client) Evict(maxBytes int64, before time.Time) error {
+	err := c.diskCache.Evict(maxBytes, before)
 	if err != nil {
 		return fmt.Errorf("evict disk cache: %w", err)
 	}
