@@ -17,7 +17,13 @@ import (
 
 // HasXorb checks whether a xorb already exists on the server.
 func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
-	baseURL, err := c.getBaseURL(ctx)
+	return c.HasXorbWithAuthProvider(ctx, nil, xorbHash)
+}
+
+// HasXorbWithAuthProvider checks whether a xorb already exists on the server
+// with a per-call auth provider.
+func (c *Client) HasXorbWithAuthProvider(ctx context.Context, provider AuthProvider, xorbHash xet.Hash) (bool, error) {
+	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return false, fmt.Errorf("get base URL: %w", err)
 	}
@@ -28,7 +34,7 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
 		return false, fmt.Errorf("create request: %w", err)
 	}
 
-	if token, err := c.getToken(ctx); err != nil {
+	if token, err := c.getToken(ctx, provider); err != nil {
 		return false, fmt.Errorf("get token: %w", err)
 	} else if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -57,6 +63,12 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.Hash) (bool, error) {
 // UploadXorb serializes and uploads a xorb to the server
 // This is a high-level method that handles serialization and upload of a Xorb object.
 func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
+	return c.UploadXorbWithAuthProvider(ctx, nil, xorbHash, reader)
+}
+
+// UploadXorbWithAuthProvider serializes and uploads a xorb to the server with
+// a per-call auth provider.
+func (c *Client) UploadXorbWithAuthProvider(ctx context.Context, provider AuthProvider, xorbHash xet.Hash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
 	startOffset, err := reader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, fmt.Errorf("seek current: %w", err)
@@ -70,7 +82,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 		return nil, fmt.Errorf("seek to start offset: %w", err)
 	}
 
-	baseURL, err := c.getBaseURL(ctx)
+	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -96,7 +108,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 	req.GetBody = makeBody
 	req.ContentLength = contentLength - startOffset
 	req.Header.Set("Content-Type", "application/octet-stream")
-	if token, err := c.getToken(ctx); err != nil {
+	if token, err := c.getToken(ctx, provider); err != nil {
 		return nil, fmt.Errorf("get token: %w", err)
 	} else if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -124,13 +136,26 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.Hash, reader io.Re
 // from the upstream CAS server, including the Authorization header.
 // The caller must close the returned ReadCloser.
 func (c *Client) DownloadXorb(ctx context.Context, namespace string, xorbHash xet.Hash) (io.ReadCloser, error) {
-	baseURL, err := c.getBaseURL(ctx)
+	return c.DownloadXorbWithAuthProvider(ctx, nil, namespace, xorbHash)
+}
+
+// DownloadXorbWithAuthProvider fetches the raw xorb bytes with a per-call auth
+// provider.
+func (c *Client) DownloadXorbWithAuthProvider(ctx context.Context, provider AuthProvider, namespace string, xorbHash xet.Hash) (io.ReadCloser, error) {
+	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
 	xorbURL := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String())
 
-	return c.DownloadXorbWithURL(ctx, xorbURL, nil)
+	header := http.Header{}
+	if token, err := c.getToken(ctx, provider); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		header.Set("Authorization", "Bearer "+token)
+	}
+
+	return c.DownloadXorbWithURL(ctx, xorbURL, header)
 }
 
 // DownloadXorb downloads a xorb from a URL and returns a streaming Decoder.
@@ -245,11 +270,26 @@ func (c *Client) FetchXorbRangeWithURL(ctx context.Context, rawURL string, heade
 // server endpoint, adding the client's authentication headers. Useful as a
 // fallback when no CDN URL is known for a given xorb hash.
 func (c *Client) FetchXorbRange(ctx context.Context, namespace string, xorbHash xet.Hash, header http.Header) (*http.Response, error) {
-	baseURL, err := c.getBaseURL(ctx)
+	return c.FetchXorbRangeWithAuthProvider(ctx, nil, namespace, xorbHash, header)
+}
+
+// FetchXorbRangeWithAuthProvider fetches a raw xorb byte range with a per-call
+// auth provider.
+func (c *Client) FetchXorbRangeWithAuthProvider(ctx context.Context, provider AuthProvider, namespace string, xorbHash xet.Hash, header http.Header) (*http.Response, error) {
+	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
 	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String())
+
+	if token, err := c.getToken(ctx, provider); err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	} else if token != "" {
+		if header == nil {
+			header = make(http.Header)
+		}
+		header.Set("Authorization", "Bearer "+token)
+	}
 
 	return c.FetchXorbRangeWithURL(ctx, url, header)
 }

@@ -19,7 +19,6 @@ func Upload(ctx context.Context, filename string, provider client.AuthProvider, 
 	defer f.Close()
 
 	opts := []client.Options{
-		client.WithAuthProvider(provider),
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(progressFunc),
 		client.WithConcurrency(concurrency),
@@ -30,5 +29,5 @@ func Upload(ctx context.Context, filename string, provider client.AuthProvider, 
 		return xet.Hash{}, fmt.Errorf("create client: %w", err)
 	}
 
-	return cli.UploadFile(ctx, f)
+	return cli.UploadFileWithAuthProvider(ctx, provider, f)
 }

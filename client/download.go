@@ -13,10 +13,16 @@ import (
 // DownloadFile downloads and reconstructs a file from its hash into w, automatically falling back to V1 if V2 is not supported.
 // It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFile(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
-	err := c.DownloadFileV2(ctx, fileHash, w)
+	return c.DownloadFileWithAuthProvider(ctx, nil, fileHash, w)
+}
+
+// DownloadFileWithAuthProvider downloads and reconstructs a file using a
+// per-call auth provider.
+func (c *Client) DownloadFileWithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.Hash, w io.WriteSeeker) error {
+	err := c.DownloadFileV2WithAuthProvider(ctx, provider, fileHash, w)
 	if err != nil {
 		if err == errNotFound {
-			return c.DownloadFileV1(ctx, fileHash, w)
+			return c.DownloadFileV1WithAuthProvider(ctx, provider, fileHash, w)
 		}
 		return err
 	}
@@ -26,6 +32,12 @@ func (c *Client) DownloadFile(ctx context.Context, fileHash xet.Hash, w io.Write
 // DownloadFileV1 downloads and reconstructs a file from its hash into w.
 // It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
+	return c.DownloadFileV1WithAuthProvider(ctx, nil, fileHash, w)
+}
+
+// DownloadFileV1WithAuthProvider downloads and reconstructs a file from its
+// hash into w using a per-call auth provider.
+func (c *Client) DownloadFileV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.Hash, w io.WriteSeeker) error {
 	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
 		resumeOffset = 0
@@ -38,12 +50,12 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, w io.Wri
 		}
 	}
 
-	reconstructionResp, err := c.GetReconstructionV1(ctx, fileHash, header)
+	reconstructionResp, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
-				reconstructionResp, err = c.GetReconstructionV1(ctx, fileHash, nil)
+				reconstructionResp, err = c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, nil)
 			}
 		}
 		if err != nil {
@@ -76,6 +88,12 @@ func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.Hash, w io.Wri
 // DownloadFileV2 downloads and reconstructs a file from its hash into w using the V2 API.
 // It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, w io.WriteSeeker) error {
+	return c.DownloadFileV2WithAuthProvider(ctx, nil, fileHash, w)
+}
+
+// DownloadFileV2WithAuthProvider downloads and reconstructs a file from its
+// hash into w using the V2 API and a per-call auth provider.
+func (c *Client) DownloadFileV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.Hash, w io.WriteSeeker) error {
 	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
 		resumeOffset = 0
@@ -88,12 +106,12 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, w io.Wri
 		}
 	}
 
-	reconstructionResp, err := c.GetReconstructionV2(ctx, fileHash, header)
+	reconstructionResp, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
-				reconstructionResp, err = c.GetReconstructionV2(ctx, fileHash, nil)
+				reconstructionResp, err = c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, nil)
 			}
 		}
 		if err != nil {
@@ -128,11 +146,17 @@ func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.Hash, w io.Wri
 // It returns a reader and size per file in the same order as fileHashes.
 // Individual errors are embedded per-entry; a nil reader means that file was not found.
 func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.Hash) ([]io.Reader, []int64, error) {
+	return c.DownloadFilesWithAuthProvider(ctx, nil, fileHashes)
+}
+
+// DownloadFilesWithAuthProvider downloads multiple files using a single batch
+// reconstruction request and a per-call auth provider.
+func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.Hash) ([]io.Reader, []int64, error) {
 	if len(fileHashes) == 0 {
 		return nil, nil, nil
 	}
 
-	batchResp, err := c.GetBatchReconstruction(ctx, fileHashes)
+	batchResp, err := c.GetBatchReconstructionWithAuthProvider(ctx, provider, fileHashes)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get batch reconstruction: %w", err)
 	}

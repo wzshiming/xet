@@ -20,30 +20,10 @@ type AuthProvider interface {
 	Token(context.Context) (string, error)
 }
 
-type authProviderFuncs struct {
-	baseURL func(ctx context.Context) (string, error)
-	token   func(ctx context.Context) (string, error)
-}
-
-func (p *authProviderFuncs) BaseURL(ctx context.Context) (string, error) {
-	if p == nil || p.baseURL == nil {
-		return "", nil
-	}
-	return p.baseURL(ctx)
-}
-
-func (p *authProviderFuncs) Token(ctx context.Context) (string, error) {
-	if p == nil || p.token == nil {
-		return "", nil
-	}
-	return p.token(ctx)
-}
-
 // Client represents an HTTP client for the XET protocol
 type Client struct {
 	baseURL       string
 	token         string
-	authProvider  AuthProvider
 	httpClient    *http.Client
 	getHttpClient *http.Client
 	namespace     string
@@ -75,13 +55,6 @@ func WithHTTPClient(httpClient *http.Client) Options {
 func WithToken(token string) Options {
 	return func(c *Client) {
 		c.token = token
-	}
-}
-
-// WithAuthProvider sets a dynamic provider for both base URL and token.
-func WithAuthProvider(provider AuthProvider) Options {
-	return func(c *Client) {
-		c.authProvider = provider
 	}
 }
 
@@ -179,9 +152,9 @@ func (c *Client) Evict(maxBytes int64, before time.Time) error {
 
 // getToken calls the configured tokenFunc and returns the bearer token string.
 // If no tokenFunc is set it returns an empty string.
-func (c *Client) getToken(ctx context.Context) (string, error) {
-	if c.authProvider != nil {
-		token, err := c.authProvider.Token(ctx)
+func (c *Client) getToken(ctx context.Context, provider AuthProvider) (string, error) {
+	if provider != nil {
+		token, err := provider.Token(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -194,9 +167,9 @@ func (c *Client) getToken(ctx context.Context) (string, error) {
 
 // getBaseURL calls the configured baseURLFunc and returns the request base URL.
 // If no baseURLFunc is set it returns the static baseURL configured on client.
-func (c *Client) getBaseURL(ctx context.Context) (string, error) {
-	if c.authProvider != nil {
-		baseURL, err := c.authProvider.BaseURL(ctx)
+func (c *Client) getBaseURL(ctx context.Context, provider AuthProvider) (string, error) {
+	if provider != nil {
+		baseURL, err := provider.BaseURL(ctx)
 		if err != nil {
 			return "", err
 		}

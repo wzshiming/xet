@@ -13,7 +13,6 @@ import (
 // Download downloads a file from CAS and saves it to the specified output path. If resume is true and the output file already exists, it will attempt to resume the download from where it left off.
 func Download(ctx context.Context, fileHash xet.Hash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, progressFunc progress.ProgressFunc) (err error) {
 	cli, err := client.NewClient(
-		client.WithAuthProvider(provider),
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(progressFunc),
 		client.WithConcurrency(concurrency),
@@ -36,5 +35,5 @@ func Download(ctx context.Context, fileHash xet.Hash, outputFile string, provide
 	}
 	defer file.Close()
 
-	return cli.DownloadFile(ctx, fileHash, file)
+	return cli.DownloadFileWithAuthProvider(ctx, provider, fileHash, file)
 }
