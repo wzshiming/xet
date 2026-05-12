@@ -154,9 +154,15 @@ func (c *chunkCache) LoadAll() error {
 				c.mut.Lock()
 				metas := c.metas
 				file := c.file
+				dc := c.diskCache
+				hash := c.hash
+				chunkStart := c.chunkStart
+				chunkEnd := c.chunkEnd
+				bytesStart := c.bytesStart
+				bytesEnd := c.bytesEnd
 				c.mut.Unlock()
 
-				c.diskCache.put(c.hash, c.chunkStart, c.chunkEnd, c.bytesStart, c.bytesEnd, metas, file)
+				dc.put(hash, chunkStart, chunkEnd, bytesStart, bytesEnd, metas, file)
 				return nil
 			}
 			return err
