@@ -589,7 +589,9 @@ func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord
 	// requests alone is not treated as a conformance failure.
 	xetgoXorbDownloadCount := len(xetgoByType["GET:/v1/xorbs/default/{hash}"])
 	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}"])
-	if xetgoXorbDownloadCount == 0 || nativeXorbDownloadCount == 0 {
+	if xetgoXorbDownloadCount == 0 && nativeXorbDownloadCount == 0 {
+		t.Logf("Skip strict xorb download-count check: both clients served xorb data from cache")
+	} else if xetgoXorbDownloadCount == 0 || nativeXorbDownloadCount == 0 {
 		t.Logf("Skip strict xorb download-count check due to cache hit: xet-go=%d native=%d", xetgoXorbDownloadCount, nativeXorbDownloadCount)
 	}
 
@@ -1232,7 +1234,9 @@ func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestR
 	// on one side is acceptable.
 	xetgoXorbReqs := xetgoByType["GET:/v1/xorbs/default/{hash}"]
 	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}"]
-	if len(xetgoXorbReqs) == 0 || len(nativeXorbReqs) == 0 {
+	if len(xetgoXorbReqs) == 0 && len(nativeXorbReqs) == 0 {
+		t.Logf("Skip strict batch xorb download-count check: both clients served xorb data from cache")
+	} else if len(xetgoXorbReqs) == 0 || len(nativeXorbReqs) == 0 {
 		t.Logf("Skip strict batch xorb download-count check due to cache hit: xet-go=%d native=%d", len(xetgoXorbReqs), len(nativeXorbReqs))
 	}
 

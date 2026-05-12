@@ -162,7 +162,11 @@ func (c *chunkCache) LoadAll() error {
 				bytesEnd := c.bytesEnd
 				c.mut.Unlock()
 
-				dc.put(hash, chunkStart, chunkEnd, bytesStart, bytesEnd, metas, file)
+				// Done() may run concurrently and clear diskCache before prefetch
+				// persistence reaches EOF; in that case we skip cache writeback.
+				if dc != nil {
+					dc.put(hash, chunkStart, chunkEnd, bytesStart, bytesEnd, metas, file)
+				}
 				return nil
 			}
 			return err
