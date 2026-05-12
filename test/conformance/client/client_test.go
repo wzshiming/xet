@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	xetgo "github.com/wzshiming/xet-go"
@@ -244,7 +245,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("create native client: %v", err)
 				}
-				defer nativeClient.Evict(0)
+				defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 				nativeFile := filepath.Join(tempDir, "native-upload.bin")
 				if err := os.WriteFile(nativeFile, tt.data, 0644); err != nil {
@@ -306,7 +307,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("create native client: %v", err)
 				}
-				defer nativeClient.Evict(0)
+				defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 				tempDir := t.TempDir()
 				uploadFile := filepath.Join(tempDir, "upload.bin")
@@ -479,7 +480,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
 	}
-	defer nativeClient.Evict(0)
+	defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 	seedReader, err := os.Open(nativeSeedFile)
 	if err != nil {
@@ -1271,7 +1272,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
 	}
-	defer nativeClient.Evict(0)
+	defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 	datasets := []struct {
 		name string
@@ -1461,7 +1462,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
 		}
-		defer nativeClient.Evict(0)
+		defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 		data1 := []byte("batch endpoint check – file one")
 		data2 := []byte("batch endpoint check – file two")
@@ -1549,7 +1550,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
 		}
-		defer nativeClient.Evict(0)
+		defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 		// Upload three files — one tiny, two larger — to exercise multiple xorbs.
 		cmpDatasets := [][]byte{
@@ -1601,7 +1602,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
 		}
-		defer nativeClient.Evict(0)
+		defer nativeClient.Evict(0, time.Now().Add(5*time.Minute))
 
 		readers, _, err := freshClient.DownloadFiles(context.Background(), cmpHashes)
 		if err != nil {
