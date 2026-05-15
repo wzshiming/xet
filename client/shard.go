@@ -132,7 +132,7 @@ func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider A
 	}
 
 	shardObj := shard.NewShard()
-	if err := shardObj.Decode(resp.Body, false); err != nil {
+	if err := shardObj.Decode(resp.Body, true); err != nil {
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 
