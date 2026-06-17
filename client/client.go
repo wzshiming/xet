@@ -121,7 +121,6 @@ func NewClient(opts ...Options) (*Client, error) {
 
 	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
 		transport.DisableKeepAlives = true
-		transport.ForceAttemptHTTP2 = false
 	}
 
 	c.getHttpClient = &http.Client{
