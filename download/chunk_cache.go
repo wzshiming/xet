@@ -31,7 +31,8 @@ type chunkCache struct {
 	chunkEnd   uint32
 	bytesStart int64
 	bytesEnd   int64
-	file       *os.File   // primary backing file (write path / single-file read path)
+	file       *os.File // primary backing file (write path / single-file read path)
+	deleteFile bool
 	files      []*os.File // additional files for multi-file read path (fileIdx > 0)
 }
 
@@ -50,6 +51,7 @@ func newChunkCache(dec io.Reader, dc *DiskCache, hash string, chunkStart, chunkE
 		bytesStart: bytesStart,
 		bytesEnd:   bytesEnd,
 		file:       tmp,
+		deleteFile: true,
 	}, nil
 }
 
@@ -176,6 +178,10 @@ func (c *chunkCache) Done() {
 	c.done = true
 	if c.file != nil {
 		c.file.Close()
+		if c.deleteFile {
+			os.Remove(c.file.Name())
+		}
+		c.file = nil
 	}
 	for _, f := range c.files {
 		f.Close()
