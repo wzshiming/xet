@@ -170,7 +170,7 @@ func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header htt
 	// Use the getHttpClient for retry with resume with range requests.
 	resp, err := c.getHttpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch xorb: %w", err)
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -196,7 +196,7 @@ func (c *Client) DownloadXorbsMultipartWithURL(ctx context.Context, url string, 
 
 	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("fetch xorbs: %w", err)
 	}
 
 	if err := reqError(req, resp); err != nil {
