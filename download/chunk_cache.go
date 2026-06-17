@@ -164,7 +164,9 @@ func (c *chunkCache) LoadAll() error {
 				bytesEnd := c.bytesEnd
 				c.mut.Unlock()
 
-				dc.put(hash, chunkStart, chunkEnd, bytesStart, bytesEnd, metas, file)
+				if dc != nil {
+					dc.put(hash, chunkStart, chunkEnd, bytesStart, bytesEnd, metas, file)
+				}
 				return nil
 			}
 			return err
