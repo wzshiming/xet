@@ -89,7 +89,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			nativeClient, err := client.NewClient(
+				client.WithBaseURL(httpSrv.URL),
+				client.WithCacheDir(t.TempDir()),
+			)
 			if err != nil {
 				t.Fatalf("create native client: %v", err)
 			}
@@ -240,7 +243,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 			srv = server.NewHandler(server.WithStorage(stor))
 
 			// Create native client
-			nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+			nativeClient, err := client.NewClient(
+				client.WithBaseURL(httpSrv.URL),
+				client.WithCacheDir(t.TempDir()),
+			)
 			if err != nil {
 				t.Fatalf("create native client: %v", err)
 			}
@@ -378,7 +384,10 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 	}
 
 	srv = server.NewHandler(server.WithStorage(stor))
-	nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	nativeClient, err := client.NewClient(
+		client.WithBaseURL(httpSrv.URL),
+		client.WithCacheDir(t.TempDir()),
+	)
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
 	}
@@ -502,7 +511,10 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 	}
 
 	srv = server.NewHandler(server.WithStorage(stor))
-	nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+	nativeClient, err := client.NewClient(
+		client.WithBaseURL(httpSrv.URL),
+		client.WithCacheDir(t.TempDir()),
+	)
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
 	}
@@ -811,7 +823,10 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		// Native client downloads all files via DownloadFiles (batch endpoint).
-		nativeClient, err := client.NewClient(client.WithBaseURL(httpSrv.URL))
+		nativeClient, err := client.NewClient(
+			client.WithBaseURL(httpSrv.URL),
+			client.WithCacheDir(t.TempDir()),
+		)
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
 		}

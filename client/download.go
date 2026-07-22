@@ -69,7 +69,7 @@ func (c *Client) DownloadFileV1WithAuthProvider(ctx context.Context, provider Au
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.diskCache, opts...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.cacheDir, opts...)
 	if err != nil {
 		return fmt.Errorf("initialize reader v1: %w", err)
 	}
@@ -125,7 +125,7 @@ func (c *Client) DownloadFileV2WithAuthProvider(ctx context.Context, provider Au
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.diskCache, opts...)
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.cacheDir, opts...)
 	if err != nil {
 		return fmt.Errorf("initialize reader v2: %w", err)
 	}
@@ -184,7 +184,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		if c.progressFunc != nil {
 			opts = append(opts, download.WithProgressFunc(c.progressFunc))
 		}
-		reader, err := download.NewReaderV1(ctx, c, singleResp, c.diskCache, opts...)
+		reader, err := download.NewReaderV1(ctx, c, singleResp, c.cacheDir, opts...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

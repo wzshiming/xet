@@ -30,7 +30,7 @@ type ReaderV2 struct {
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, diskCache *DiskCache, opts ...Option) (io.Reader, error) {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, cacheDir string, opts ...Option) (io.Reader, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -41,7 +41,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, diskCache, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cacheDir, options)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}

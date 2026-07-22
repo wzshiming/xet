@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
@@ -53,7 +52,7 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	diskCache    *DiskCache
+	cacheDir     string
 }
 
 type progressReader struct {
@@ -73,7 +72,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, dc *DiskCache, opts *options) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cacheDir string, opts *options) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -110,7 +109,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		client:       client,
 		entries:      entries,
 		progressFunc: opts.progressFunc,
-		diskCache:    dc,
+		cacheDir:     cacheDir,
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -123,9 +122,9 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	newItems := make([]*prefetchEntry, 0, len(items))
 	for _, item := range items {
-		cc, err := p.diskCache.get(item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+		cc, err := openCachedRange(p.cacheDir, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
 		if err != nil {
-			return fmt.Errorf("check disk cache for %s: %w", item.task.key.String(), err)
+			return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
 		}
 		if cc != nil {
 			if p.progressFunc != nil {
@@ -220,7 +219,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}
 
 	dec := xorb.NewDecoder(reader, false)
-	cache, err = newChunkCache(dec, p.diskCache, entry.task.key.Hash, entry.task.chunkStart, entry.task.chunkEnd, entry.task.key.Start, entry.task.key.End)
+	cache, err = newChunkCache(dec, p.cacheDir, entry.task.key.Hash, entry.task.chunkStart, entry.task.chunkEnd, entry.task.key.Start, entry.task.key.End)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
@@ -278,10 +277,4 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
-}
-
-// Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes.
-// If before is provided, only cache entries older than before are eligible.
-func (p *prefetcher) Evict(maxBytes int64, before time.Time) error {
-	return p.diskCache.Evict(maxBytes, before)
 }
