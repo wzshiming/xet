@@ -1,6 +1,6 @@
 module github.com/wzshiming/xet/test/conformance
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/wzshiming/xet v0.0.0
@@ -13,6 +13,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/wzshiming/httpseek v0.6.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )
 
 replace github.com/wzshiming/xet => ../..

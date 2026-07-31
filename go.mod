@@ -1,6 +1,6 @@
 module github.com/wzshiming/xet
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/gorilla/mux v1.8.1
@@ -8,6 +8,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/wzshiming/httpseek v0.6.1
 	github.com/zeebo/blake3 v0.2.4
+	golang.org/x/sys v0.47.0
 )
 
 require (

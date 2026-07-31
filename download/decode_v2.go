@@ -30,7 +30,7 @@ type ReaderV2 struct {
 }
 
 // NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, diskCache *DiskCache, opts ...Option) (io.Reader, error) {
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, cacheDir string, opts ...Option) (io.Reader, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -41,7 +41,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, diskCache, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cacheDir, options)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -132,21 +132,17 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// cleanup closes the prefetcher (which releases all caches and the shared temp file).
+// cleanup closes the prefetcher, which owns and releases all caches.
 func (r *ReaderV2) cleanup() {
 	if r.prefetcher != nil {
 		r.prefetcher.Close()
 	}
 	r.prefetcher = nil
-	if r.currentCache != nil {
-		r.currentCache.Done()
-	}
 	r.currentCache = nil
 	r.currentTerm = nil
 }
 
-// finishCurrentTerm decrements the use count for the current fetchKey and
-// closes the cache when no more terms reference it.
+// finishCurrentTerm advances to the next reconstruction term.
 func (r *ReaderV2) finishCurrentTerm() {
 	if r.currentTerm == nil {
 		return

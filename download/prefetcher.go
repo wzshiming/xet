@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"sync"
-	"time"
 
+	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -53,7 +53,7 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	diskCache    *DiskCache
+	cacheDir     string
 }
 
 type progressReader struct {
@@ -73,7 +73,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, dc *DiskCache, opts *options) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cacheDir string, opts *options) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -110,7 +110,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		client:       client,
 		entries:      entries,
 		progressFunc: opts.progressFunc,
-		diskCache:    dc,
+		cacheDir:     cacheDir,
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -123,21 +123,16 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	newItems := make([]*prefetchEntry, 0, len(items))
 	for _, item := range items {
-		cc, err := p.diskCache.get(item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+		cc, err := openCachedRange(p.cacheDir, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
 		if err != nil {
-			return fmt.Errorf("check disk cache for %s: %w", item.task.key.String(), err)
+			return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
 		}
+		size := item.task.key.Size()
 		if cc != nil {
-			if p.progressFunc != nil {
-				size := item.task.key.Size()
-				p.progressFunc(item.task.key.String(), size, size)
-			}
+			p.reportProgress(item.task.key, size, size)
 			p.publishEntry(item, cc)
 		} else {
-			if p.progressFunc != nil {
-				size := item.task.key.Size()
-				p.progressFunc(item.task.key.String(), 0, size)
-			}
+			p.reportProgress(item.task.key, 0, size)
 			newItems = append(newItems, item)
 		}
 	}
@@ -197,9 +192,34 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 func (p *prefetcher) runJob(entry *prefetchEntry) {
 	var cache *chunkCache
 	var err error
+	key := entry.task.key
+
+	lockFile, err := lockChunkCache(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			flock.Unlock(lockFile) //nolint:errcheck
+			lockFile.Close()
+		}
+	}()
+
+	// Another process may have populated the cache while this worker waited.
+	cache, err = openCachedRange(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	if cache != nil {
+		p.publishEntry(entry, cache)
+		return
+	}
 
 	header := http.Header{
-		"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
+		"Range": {fmt.Sprintf("bytes=%d-%d", key.Start, key.End)},
 	}
 
 	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
@@ -220,11 +240,12 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}
 
 	dec := xorb.NewDecoder(reader, false)
-	cache, err = newChunkCache(dec, p.diskCache, entry.task.key.Hash, entry.task.chunkStart, entry.task.chunkEnd, entry.task.key.Start, entry.task.key.End)
+	cache, err = newLockedChunkCache(dec, p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
 	}
+	releaseLock = false // cache.Done owns the lock from this point.
 
 	err = cache.LoadTo(0)
 	if err != nil {
@@ -242,22 +263,28 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 }
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
-	entry.cache = cache
-	entry.err = nil
-	entry.once.Do(func() {
-		close(entry.ready)
-	})
+	p.completeEntry(entry, cache, nil)
 }
 
 func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
+	p.completeEntry(entry, nil, err)
+}
+
+func (p *prefetcher) completeEntry(entry *prefetchEntry, cache *chunkCache, err error) {
+	entry.cache = cache
 	entry.err = err
 	entry.once.Do(func() {
 		close(entry.ready)
 	})
 }
 
-// Close releases all resources held by the prefetcher and compacts the disk cache
-// by merging any adjacent cache files written during this session.
+func (p *prefetcher) reportProgress(key fetchKey, current, total int64) {
+	if p.progressFunc != nil {
+		p.progressFunc(key.String(), current, total)
+	}
+}
+
+// Close releases all caches owned by the prefetcher.
 func (p *prefetcher) Close() {
 	for _, entry := range p.entries {
 		if entry.cache != nil {
@@ -266,7 +293,8 @@ func (p *prefetcher) Close() {
 	}
 }
 
-// Get returns the chunk cache for the specified fetch key, blocking until the corresponding fetch task is complete. An error is returned if the fetch failed or if the key was not found. The caller should call Done() on the returned chunk cache when finished to release any resources. Note that the chunk cache may be shared across multiple overlapping fetch tasks, so callers should not assume exclusive access to the underlying data.
+// Get returns the cache for key, blocking until the fetch task has published its
+// first chunk. The prefetcher retains ownership of the returned cache.
 func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 	entry, ok := p.entries[key]
 	if !ok {
@@ -278,10 +306,4 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
-}
-
-// Evict removes least-recently-used cache files from the disk cache until the total size is at or below maxBytes.
-// If before is provided, only cache entries older than before are eligible.
-func (p *prefetcher) Evict(maxBytes int64, before time.Time) error {
-	return p.diskCache.Evict(maxBytes, before)
 }

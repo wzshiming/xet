@@ -7,10 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/wzshiming/httpseek"
-	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -31,7 +29,6 @@ type Client struct {
 	retries       int
 	progressFunc  progress.ProgressFunc
 	cacheDir      string
-	diskCache     *download.DiskCache
 }
 
 type Options func(*Client)
@@ -90,7 +87,7 @@ func WithRetries(retries int) Options {
 	}
 }
 
-// WithCacheDir enables the persistent disk chunk cache at the given directory. Downloaded and decoded xorb ranges are stored as individual files so that subsequent downloads (across processes and sessions) can skip re-fetching already-seen ranges. The cache enforces a default 10 GiB capacity limit with random eviction, matching the behaviour of xet-core's DiskCache.
+// WithCacheDir enables the persistent disk chunk cache at the given directory.
 func WithCacheDir(cacheDir string) Options {
 	return func(c *Client) {
 		c.cacheDir = cacheDir
@@ -108,12 +105,6 @@ func NewClient(opts ...Options) (*Client, error) {
 	for _, opt := range opts {
 		opt(c)
 	}
-
-	dc, err := download.NewDiskCache(c.cacheDir)
-	if err != nil {
-		return nil, fmt.Errorf("initialize disk cache: %w", err)
-	}
-	c.diskCache = dc
 
 	if c.httpClient.Transport == nil {
 		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
@@ -137,16 +128,6 @@ func NewClient(opts ...Options) (*Client, error) {
 	}
 
 	return c, nil
-}
-
-// Evict evicts entries from the disk cache until the total size is under the specified limit.
-// If before is provided, only cache entries older than before are eligible.
-func (c *Client) Evict(maxBytes int64, before time.Time) error {
-	err := c.diskCache.Evict(maxBytes, before)
-	if err != nil {
-		return fmt.Errorf("evict disk cache: %w", err)
-	}
-	return nil
 }
 
 // getToken calls the configured tokenFunc and returns the bearer token string.
