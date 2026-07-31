@@ -37,10 +37,17 @@ xetd -addr :8080 -storage /var/lib/xet \
 
 When a file is cold, upstream Xet `Link` and hash headers are removed and the
 mirror provides HTTP service only, even if the upstream supports Xet. The
-mirror captures that same HTTP body and converts it to its own Xet data.
+upstream half of the fill prefers the Xet client when reconstruction metadata
+is available and falls back to the ordinary HTTP client otherwise. In both
+cases the bytes are streamed immediately to the cold downstream as HTTP while
+being captured and converted into the mirror's own Xet data.
 Only after the full file and its local shard/xorbs have
 been atomically committed does the mirror return its own reconstruction and auth
 links. The completed mapping is persisted below `<storage>/mirror/index.json`.
+The HTTP metadata needed by Hugging Face clients is persisted alongside it in
+`<storage>/mirror/metadata.json`, so completed resolve HEAD requests no longer
+depend on the upstream. After promotion, the mirror can therefore serve HEAD,
+ordinary/range HTTP GET, and Xet reconstruction entirely from local storage.
 Incomplete bodies are stored below `<storage>/mirror/files/` using the SHA-256
 of the canonical request path as the filename. An interrupted fill keeps that
 stable file, allowing the next fill to continue instead of starting with a new

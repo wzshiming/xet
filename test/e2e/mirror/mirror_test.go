@@ -183,7 +183,7 @@ func runHFCLIClients(ctx context.Context, t *testing.T, endpoint string, want []
 			if tc.disableXet {
 				disable = "1"
 			}
-			cmd.Env = append(os.Environ(), "HF_ENDPOINT="+endpoint, "HF_HOME="+home, "HF_HUB_CACHE="+filepath.Join(home, "hub"), "HF_HUB_DISABLE_XET="+disable, "HF_HUB_DISABLE_TELEMETRY=1", "NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1")
+			cmd.Env = append(withoutProxyEnv(os.Environ()), "HF_ENDPOINT="+endpoint, "HF_HOME="+home, "HF_HUB_CACHE="+filepath.Join(home, "hub"), "HF_HUB_DISABLE_XET="+disable, "HF_HUB_DISABLE_TELEMETRY=1", "NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1")
 			output, err := cmd.CombinedOutput()
 			results <- cliResult{name: tc.name, path: filepath.Join(localDir, "model.bin"), output: output, err: err}
 		}()
@@ -207,6 +207,19 @@ func runHFCLIClients(ctx context.Context, t *testing.T, endpoint string, want []
 			t.Fatalf("hf download (%s) content mismatch", result.name)
 		}
 	}
+}
+
+func withoutProxyEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, value := range env {
+		name, _, _ := strings.Cut(value, "=")
+		switch strings.ToLower(name) {
+		case "all_proxy", "http_proxy", "https_proxy":
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func assertDownload(t *testing.T, name string, got struct {

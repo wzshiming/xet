@@ -54,6 +54,124 @@ func TestCachedResolveUsesLocalLinks(t *testing.T) {
 	}
 }
 
+func TestPromotedCacheServesHeadAndGetWithoutUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	root := t.TempDir()
+	store, err := storage.NewFileStorage(storage.WithBasePath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheDir := filepath.Join(root, "mirror")
+	h, err := NewHandler(Options{Upstream: upstream.URL, CacheDir: cacheDir, Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/owner/repo/resolve/main/offline.bin"
+	want := []byte(strings.Repeat("durable xet mirror cache\n", 1000))
+	raw := filepath.Join(t.TempDir(), "offline.bin")
+	if err := os.WriteFile(raw, want, 0644); err != nil {
+		t.Fatal(err)
+	}
+	metadata := http.Header{}
+	metadata.Set("Content-Type", "application/octet-stream")
+	metadata.Set("ETag", `"origin-etag"`)
+	metadata.Set("X-Repo-Commit", "0123456789abcdef0123456789abcdef01234567")
+	h.rememberMetadata(path, metadata)
+	if err := h.convertFile(context.Background(), path, raw); err != nil {
+		t.Fatal(err)
+	}
+	upstream.Close()
+
+	// Recreate the handler to prove that both the index and resolve metadata
+	// survive a process restart and no request needs the origin.
+	restarted, err := NewHandler(Options{Upstream: upstream.URL, CacheDir: cacheDir, Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(restarted)
+	defer server.Close()
+
+	head, err := http.Head(server.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != http.StatusOK || head.Header.Get("X-Cache-Status") != "HIT" {
+		t.Fatalf("offline HEAD status=%d cache=%q", head.StatusCode, head.Header.Get("X-Cache-Status"))
+	}
+	if head.Header.Get("ETag") != `"origin-etag"` || head.Header.Get("X-Repo-Commit") == "" {
+		t.Fatalf("offline HEAD lost metadata: %v", head.Header)
+	}
+	if !strings.Contains(head.Header.Get("Link"), server.URL+"/v1/reconstructions/") {
+		t.Fatalf("offline HEAD did not advertise local Xet: %s", head.Header.Get("Link"))
+	}
+
+	get, err := http.Get(server.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, readErr := io.ReadAll(get.Body)
+	get.Body.Close()
+	if readErr != nil || !bytes.Equal(got, want) {
+		t.Fatalf("offline GET failed: bytes=%d err=%v", len(got), readErr)
+	}
+}
+
+func TestColdResolveFollowsRedirectInsideMirror(t *testing.T) {
+	want := []byte(strings.Repeat("redirected origin body\n", 1000))
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(want)))
+		_, _ = w.Write(want)
+	}))
+	defer cdn.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, cdn.URL+"/objects/file.bin", http.StatusFound)
+	}))
+	defer origin.Close()
+	root := t.TempDir()
+	store, err := storage.NewFileStorage(storage.WithBasePath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHandler(Options{Upstream: origin.URL, CacheDir: filepath.Join(root, "mirror"), Storage: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirrorServer := httptest.NewServer(h)
+	defer mirrorServer.Close()
+	path := "/owner/repo/resolve/main/redirect.bin"
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return fmt.Errorf("mirror leaked a redirect")
+	}}
+	resp, err := client.Get(mirrorServer.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("cold redirected GET failed: bytes=%d err=%v", len(got), err)
+	}
+	if resp.Request.URL.Host != strings.TrimPrefix(mirrorServer.URL, "http://") {
+		t.Fatalf("client left mirror: %s", resp.Request.URL)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		h.mu.RLock()
+		cached := h.index[path] != ""
+		h.mu.RUnlock()
+		if cached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("redirected body was not promoted under the resolve path")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestCacheFileUsesStableSHA256NameAndSurvivesInterruption(t *testing.T) {
 	upstream := httptest.NewServer(http.NotFoundHandler())
 	defer upstream.Close()
@@ -254,7 +372,10 @@ func testXetUpstream(t *testing.T) {
 		switch r.URL.Path {
 		case "/repo/resolve/main/file.bin":
 			w.Header().Set("Link", "<"+originURL+"/v1/reconstructions/"+originHash.String()+">; rel=\"xet-reconstruction-info\", <"+originURL+"/auth>; rel=\"xet-auth\"")
-			_, _ = w.Write(content) // ordinary upstream HTTP response during a miss
+			// Deliberately return different HTTP bytes. A cold mirror with Xet
+			// metadata must reconstruct from the origin CAS, while still exposing
+			// those reconstructed bytes to its downstream as ordinary HTTP.
+			_, _ = w.Write([]byte("HTTP fallback must not be selected"))
 		case "/auth":
 			_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": originURL, "accessToken": "", "exp": time.Now().Add(time.Hour).Unix()})
 		default:

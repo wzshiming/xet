@@ -19,7 +19,9 @@ import (
 	"sync"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/hf"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
@@ -29,18 +31,26 @@ import (
 // the background. A resolve request is switched to the local CAS only after
 // the complete file has been downloaded, converted, and committed.
 type Handler struct {
-	proxy       *httputil.ReverseProxy
-	store       storage.Storage
-	cacheDir    string
-	indexPath   string
-	concurrency int
-	hfToken     string
-	localToken  string
-	upstream    *url.URL
-	mu          sync.RWMutex
-	index       map[string]string
-	inflight    map[string]struct{}
+	proxy        *httputil.ReverseProxy
+	store        storage.Storage
+	cacheDir     string
+	indexPath    string
+	metadataPath string
+	concurrency  int
+	hfToken      string
+	localToken   string
+	upstream     *url.URL
+	mu           sync.RWMutex
+	index        map[string]string
+	metadata     map[string]http.Header
+	inflight     map[string]struct{}
 }
+
+type cacheKeyContextKey struct{}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 type Options struct {
 	Upstream    string
@@ -72,9 +82,19 @@ func NewHandler(opts Options) (*Handler, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("invalid upstream %q", opts.Upstream)
 	}
-	h := &Handler{store: opts.Storage, cacheDir: opts.CacheDir, indexPath: filepath.Join(opts.CacheDir, "index.json"), concurrency: opts.Concurrency, hfToken: opts.HFToken, localToken: opts.LocalToken, upstream: u, index: map[string]string{}, inflight: map[string]struct{}{}}
+	h := &Handler{store: opts.Storage, cacheDir: opts.CacheDir, indexPath: filepath.Join(opts.CacheDir, "index.json"), metadataPath: filepath.Join(opts.CacheDir, "metadata.json"), concurrency: opts.Concurrency, hfToken: opts.HFToken, localToken: opts.LocalToken, upstream: u, index: map[string]string{}, metadata: map[string]http.Header{}, inflight: map[string]struct{}{}}
 	_ = h.loadIndex()
+	_ = h.loadMetadata()
 	p := httputil.NewSingleHostReverseProxy(u)
+	// Resolve endpoints commonly redirect to a CDN. Follow those redirects in
+	// the mirror so a cold client never leaves the mirror and the final HTTP
+	// body can populate the transient cache.
+	redirectClient := &http.Client{Transport: http.DefaultTransport}
+	p.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		out := r.Clone(r.Context())
+		out.RequestURI = ""
+		return redirectClient.Do(out)
+	})
 	originalDirector := p.Director
 	p.Director = func(r *http.Request) {
 		originalHost := r.Host
@@ -106,23 +126,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": base, "accessToken": h.localToken, "exp": int64(4102444800)})
 		return
 	}
-	if r.Method == http.MethodGet {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		h.mu.RLock()
 		localHash := h.index[cacheKey(r.URL)]
 		h.mu.RUnlock()
 		if localHash != "" {
-			h.serveFile(w, r, localHash)
+			if r.Method == http.MethodHead {
+				h.serveMetadata(w, r, localHash)
+			} else {
+				h.serveFile(w, r, localHash)
+			}
 			return
 		}
-		if r.Header.Get("Range") == "" && h.tryServeResumedHTTP(w, r) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "" && h.tryServeResumedHTTP(w, r) {
 			return
 		}
 	}
-	h.proxy.ServeHTTP(w, r)
+	ctx := context.WithValue(r.Context(), cacheKeyContextKey{}, cacheKey(r.URL))
+	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (h *Handler) modifyResponse(resp *http.Response) error {
-	key := cacheKey(resp.Request.URL)
+	key, _ := resp.Request.Context().Value(cacheKeyContextKey{}).(string)
+	if key == "" {
+		key = cacheKey(resp.Request.URL)
+	}
 	h.mu.RLock()
 	localHash := h.index[key]
 	h.mu.RUnlock()
@@ -134,30 +162,123 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		return nil
 	}
 	links := parseLinks(resp.Header.Values("Link"))
-	reconstruction, auth := links["xet-reconstruction-info"], links["xet-auth"]
-	if reconstruction != "" && auth != "" && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		resp.Header.Set("X-Cache-Status", "MISS")
-		// Until the local conversion is committed, expose this response as plain
-		// HTTP only and capture a GET body exactly like a non-Xet upstream. Never
-		// leak or privately download the upstream Xet representation during fill.
-		resp.Header.Del("Link")
-		resp.Header.Del("X-Xet-Hash")
-		if resp.Request.Method == http.MethodGet && resp.StatusCode == http.StatusOK && resp.Request.Header.Get("Range") == "" {
-			if body, ok := h.startHTTPBodyCache(key, resp.Body); ok {
-				resp.Body = body
-			}
+	if resp.Request.Method == http.MethodGet && resp.StatusCode == http.StatusOK && resp.Request.Header.Get("Range") == "" && links["xet-reconstruction-info"] != "" && links["xet-auth"] != "" {
+		// Prefer the origin's Xet representation for the upstream half of a cold
+		// fill. The reconstructed bytes still leave this handler as plain HTTP.
+		if body, size, err := h.openUpstreamXet(resp); err == nil {
+			_ = resp.Body.Close()
+			resp.Body = body
+			resp.ContentLength = size
+			resp.Header.Set("Content-Length", strconv.FormatInt(size, 10))
+			resp.Header.Set("X-Mirror-Upstream", "xet")
 		}
-	} else if resp.Request.Method == http.MethodGet && resp.StatusCode == http.StatusOK && resp.Request.Header.Get("Range") == "" {
-		// Non-Xet upstreams (for example ModelScope) have no reconstruction
-		// links. Tee the bytes to a temporary file while ReverseProxy streams
-		// them downstream. Conversion begins only after EOF, and no Xet Link is
-		// advertised until the local shard and xorbs are fully committed.
+	}
+	// A cold mirror is an ordinary HTTP intermediary. Do not expose an
+	// upstream Xet identity which the mirror cannot serve yet.
+	if links["xet-reconstruction-info"] != "" || links["xet-auth"] != "" {
+		resp.Header.Del("Link")
+	}
+	resp.Header.Del("X-Xet-Hash")
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+		resp.Header.Set("X-Cache-Status", "MISS")
+	}
+	if resp.Request.Method == http.MethodGet && resp.StatusCode == http.StatusOK && resp.Request.Header.Get("Range") == "" {
+		// Tee the ordinary HTTP bytes to the transient cache. Conversion begins
+		// only after EOF, regardless of whether the origin itself supports Xet.
+		h.rememberMetadata(key, resp.Header)
 		if body, ok := h.startHTTPBodyCache(key, resp.Body); ok {
 			resp.Body = body
 			resp.Header.Set("X-Cache-Status", "MISS")
 		}
 	}
 	return nil
+}
+
+func (h *Handler) openUpstreamXet(resp *http.Response) (io.ReadCloser, int64, error) {
+	provider, fileHash, err := h.resolveUpstreamXet(resp)
+	if err != nil {
+		return nil, 0, err
+	}
+	baseURL, err := provider.BaseURL(resp.Request.Context())
+	if err != nil {
+		return nil, 0, err
+	}
+	token, err := provider.Token(resp.Request.Context())
+	if err != nil {
+		return nil, 0, err
+	}
+	cli, err := client.NewClient(client.WithBaseURL(baseURL), client.WithToken(token), client.WithConcurrency(h.concurrency), client.WithCacheDir(h.cacheDir))
+	if err != nil {
+		return nil, 0, err
+	}
+	if reconstruction, err := cli.GetReconstructionV2(resp.Request.Context(), fileHash, nil); err == nil {
+		reader, err := download.NewReaderV2(resp.Request.Context(), cli, reconstruction, h.cacheDir, download.WithConcurrency(h.concurrency))
+		if err == nil {
+			return io.NopCloser(reader), download.ExpectedLengthV2(reconstruction), nil
+		}
+	}
+	reconstruction, err := cli.GetReconstructionV1(resp.Request.Context(), fileHash, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	reader, err := download.NewReaderV1(resp.Request.Context(), cli, reconstruction, h.cacheDir, download.WithConcurrency(h.concurrency))
+	if err != nil {
+		return nil, 0, err
+	}
+	return io.NopCloser(reader), download.ExpectedLengthV1(reconstruction), nil
+}
+
+func (h *Handler) resolveUpstreamXet(resp *http.Response) (client.AuthProvider, xet.Hash, error) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		out := r.Clone(r.Context())
+		if h.hfToken != "" && out.Header.Get("Authorization") == "" {
+			out.Header.Set("Authorization", "Bearer "+h.hfToken)
+		}
+		return http.DefaultTransport.RoundTrip(out)
+	})
+	httpClient := &http.Client{Transport: transport}
+	fileHash, provider, err := hf.ResolveResponse(resp.Request.Context(), httpClient, resp)
+	return provider, fileHash, err
+}
+
+// serveMetadata makes a promoted resolve entry independent of the origin.
+// Hugging Face metadata captured during the fill is replayed, while the Xet
+// identity and content length are always derived from the committed local CAS.
+func (h *Handler) serveMetadata(w http.ResponseWriter, r *http.Request, hashString string) {
+	fileHash, err := xet.ParseHash(hashString)
+	if err != nil {
+		http.Error(w, "invalid cached hash", http.StatusInternalServerError)
+		return
+	}
+	sh, err := h.store.GetShardByFileHash(r.Context(), fileHash)
+	h.mu.RLock()
+	metadata := h.metadata[cacheKey(r.URL)].Clone()
+	h.mu.RUnlock()
+	for name, values := range metadata {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	base := forwardedBaseURL(r)
+	w.Header().Set("Link", fmt.Sprintf("<%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\", <%s/api/xet-auth>; rel=\"xet-auth\"", base, hashString, base))
+	w.Header().Set("X-Xet-Hash", hashString)
+	w.Header().Set("X-Cache-Status", "HIT")
+	w.Header().Set("Accept-Ranges", "bytes")
+	if err == nil {
+		w.Header().Set("Content-Length", strconv.FormatInt(fileSize(sh, fileHash), 10))
+	}
+}
+
+func (h *Handler) rememberMetadata(key string, header http.Header) {
+	keep := http.Header{}
+	for _, name := range []string{"Cache-Control", "Content-Disposition", "Content-Type", "ETag", "Last-Modified", "X-Linked-Etag", "X-Repo-Commit"} {
+		if values := header.Values(name); len(values) != 0 {
+			keep[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+		}
+	}
+	h.mu.Lock()
+	h.metadata[key] = keep
+	h.mu.Unlock()
 }
 
 // serveFile reconstructs an ordinary HTTP response directly from the local
@@ -494,6 +615,18 @@ func (h *Handler) loadIndex() error {
 	}
 	return json.Unmarshal(b, &h.index)
 }
+
+func (h *Handler) loadMetadata() error {
+	b, err := os.ReadFile(h.metadataPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, &h.metadata)
+}
+
 func (h *Handler) saveIndexLocked() error {
 	b, err := json.MarshalIndent(h.index, "", "  ")
 	if err != nil {
@@ -503,7 +636,18 @@ func (h *Handler) saveIndexLocked() error {
 	if err = os.WriteFile(tmp, b, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, h.indexPath)
+	if err := os.Rename(tmp, h.indexPath); err != nil {
+		return err
+	}
+	metadata, err := json.MarshalIndent(h.metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+	metadataTmp := h.metadataPath + ".tmp"
+	if err := os.WriteFile(metadataTmp, metadata, 0644); err != nil {
+		return err
+	}
+	return os.Rename(metadataTmp, h.metadataPath)
 }
 
 func forwardedBaseURL(r *http.Request) string {
