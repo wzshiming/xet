@@ -28,9 +28,12 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 
 	for {
 		n, err := io.ReadFull(r, headerBuf[:])
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		if err == io.EOF {
 			// Chunk-only format: structural validation passed.
 			return nil
+		}
+		if err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("failed to read chunk header: %w", err)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to read chunk header: %w", err)
@@ -47,6 +50,12 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 		compressedSize := uint32(headerBuf[1]) | uint32(headerBuf[2])<<8 | uint32(headerBuf[3])<<16
 		ct := compressionType(headerBuf[4])
 		uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
+		if compressedSize > uint32(len(tmp)) {
+			return fmt.Errorf("invalid compressed chunk size: %d exceeds maximum %d", compressedSize, len(tmp))
+		}
+		if uncompressedSize > xet.MaxChunkSize {
+			return fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
+		}
 
 		if _, err := io.ReadFull(r, tmp[:compressedSize]); err != nil {
 			return fmt.Errorf("failed to read compressed chunk data: %w", err)
@@ -95,11 +104,19 @@ func validateWithFooter(
 	}
 
 	numChunks := binary.LittleEndian.Uint32(fixedBuf[40:44])
+	if numChunks > xet.MaxChunksPerXorb {
+		return fmt.Errorf("invalid footer: chunk count %d exceeds maximum %d", numChunks, xet.MaxChunksPerXorb)
+	}
 
 	// Remaining: chunk hashes (32*N) + boundary section (12 + 8*N) + trailer (28) + length field (4)
 	// = 40*N + 44 bytes.
 	remainingSize := int(numChunks)*40 + 44
-	remaining := buf[:remainingSize]
+	remaining := buf
+	if remainingSize > len(remaining) {
+		remaining = make([]byte, remainingSize)
+	} else {
+		remaining = remaining[:remainingSize]
+	}
 	if _, err := io.ReadFull(r, remaining); err != nil {
 		return fmt.Errorf("invalid footer: failed to read remaining footer data: %w", err)
 	}

@@ -92,6 +92,14 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	compressedSize := uint32(headerBuf[1]) | uint32(headerBuf[2])<<8 | uint32(headerBuf[3])<<16
 	ct := compressionType(headerBuf[4])
 	uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
+	if compressedSize > uint32(len(p)) {
+		d.err = fmt.Errorf("input buffer too small for compressed chunk: need %d bytes, have %d", compressedSize, len(p))
+		return 0, d.err
+	}
+	if uncompressedSize > xet.MaxChunkSize {
+		d.err = fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
+		return 0, d.err
+	}
 
 	if _, err := io.ReadFull(d.r, p[:compressedSize]); err != nil {
 		d.err = fmt.Errorf("failed to read chunk data: %w", err)
@@ -110,13 +118,12 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	d.chunkHashes = append(d.chunkHashes, h)
 	d.chunkSizes = append(d.chunkSizes, uint64(uncompressedSize))
 
-	copied := copy(p, uncompressed)
-	if copied < len(uncompressed) {
+	if len(uncompressed) > len(p) {
 		d.err = fmt.Errorf("output buffer too small: need %d bytes", len(uncompressed))
-		return copied, d.err
+		return 0, d.err
 	}
 
-	return copied, nil
+	return copy(p, uncompressed), nil
 }
 
 // SummoryHash returns the overall xorb hash.
