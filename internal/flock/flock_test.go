@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -258,7 +259,9 @@ func TestLockConcurrent(t *testing.T) {
 	const goroutines = 10
 	const iterations = 5
 
-	var counter int64
+	var counter atomic.Int64
+	var active atomic.Int32
+	var overlaps atomic.Int32
 	var wg sync.WaitGroup
 
 	for i := 0; i < goroutines; i++ {
@@ -276,7 +279,11 @@ func TestLockConcurrent(t *testing.T) {
 					f.Close()
 					return
 				}
-				counter++
+				if active.Add(1) != 1 {
+					overlaps.Add(1)
+				}
+				counter.Add(1)
+				active.Add(-1)
 				if err := Unlock(f); err != nil {
 					t.Errorf("Unlock failed: %v", err)
 					f.Close()
@@ -289,8 +296,11 @@ func TestLockConcurrent(t *testing.T) {
 	wg.Wait()
 
 	expected := int64(goroutines * iterations)
-	if counter != expected {
-		t.Fatalf("expected counter=%d, got=%d", expected, counter)
+	if got := counter.Load(); got != expected {
+		t.Fatalf("expected counter=%d, got=%d", expected, got)
+	}
+	if got := overlaps.Load(); got != 0 {
+		t.Fatalf("lock allowed %d overlapping critical sections", got)
 	}
 }
 

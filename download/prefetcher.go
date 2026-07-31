@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -126,17 +127,12 @@ func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 		if err != nil {
 			return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
 		}
+		size := item.task.key.Size()
 		if cc != nil {
-			if p.progressFunc != nil {
-				size := item.task.key.Size()
-				p.progressFunc(item.task.key.String(), size, size)
-			}
+			p.reportProgress(item.task.key, size, size)
 			p.publishEntry(item, cc)
 		} else {
-			if p.progressFunc != nil {
-				size := item.task.key.Size()
-				p.progressFunc(item.task.key.String(), 0, size)
-			}
+			p.reportProgress(item.task.key, 0, size)
 			newItems = append(newItems, item)
 		}
 	}
@@ -196,9 +192,34 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 func (p *prefetcher) runJob(entry *prefetchEntry) {
 	var cache *chunkCache
 	var err error
+	key := entry.task.key
+
+	lockFile, err := lockChunkCache(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			flock.Unlock(lockFile) //nolint:errcheck
+			lockFile.Close()
+		}
+	}()
+
+	// Another process may have populated the cache while this worker waited.
+	cache, err = openCachedRange(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	if cache != nil {
+		p.publishEntry(entry, cache)
+		return
+	}
 
 	header := http.Header{
-		"Range": {fmt.Sprintf("bytes=%d-%d", entry.task.key.Start, entry.task.key.End)},
+		"Range": {fmt.Sprintf("bytes=%d-%d", key.Start, key.End)},
 	}
 
 	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
@@ -219,11 +240,12 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}
 
 	dec := xorb.NewDecoder(reader, false)
-	cache, err = newChunkCache(dec, p.cacheDir, entry.task.key.Hash, entry.task.chunkStart, entry.task.chunkEnd, entry.task.key.Start, entry.task.key.End)
+	cache, err = newLockedChunkCache(dec, p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
 	}
+	releaseLock = false // cache.Done owns the lock from this point.
 
 	err = cache.LoadTo(0)
 	if err != nil {
@@ -241,22 +263,28 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 }
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
-	entry.cache = cache
-	entry.err = nil
-	entry.once.Do(func() {
-		close(entry.ready)
-	})
+	p.completeEntry(entry, cache, nil)
 }
 
 func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
+	p.completeEntry(entry, nil, err)
+}
+
+func (p *prefetcher) completeEntry(entry *prefetchEntry, cache *chunkCache, err error) {
+	entry.cache = cache
 	entry.err = err
 	entry.once.Do(func() {
 		close(entry.ready)
 	})
 }
 
-// Close releases all resources held by the prefetcher and compacts the disk cache
-// by merging any adjacent cache files written during this session.
+func (p *prefetcher) reportProgress(key fetchKey, current, total int64) {
+	if p.progressFunc != nil {
+		p.progressFunc(key.String(), current, total)
+	}
+}
+
+// Close releases all caches owned by the prefetcher.
 func (p *prefetcher) Close() {
 	for _, entry := range p.entries {
 		if entry.cache != nil {
@@ -265,7 +293,8 @@ func (p *prefetcher) Close() {
 	}
 }
 
-// Get returns the chunk cache for the specified fetch key, blocking until the corresponding fetch task is complete. An error is returned if the fetch failed or if the key was not found. The caller should call Done() on the returned chunk cache when finished to release any resources. Note that the chunk cache may be shared across multiple overlapping fetch tasks, so callers should not assume exclusive access to the underlying data.
+// Get returns the cache for key, blocking until the fetch task has published its
+// first chunk. The prefetcher retains ownership of the returned cache.
 func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 	entry, ok := p.entries[key]
 	if !ok {

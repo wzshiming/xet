@@ -132,21 +132,17 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// cleanup closes the prefetcher (which releases all caches and the shared temp file).
+// cleanup closes the prefetcher, which owns and releases all caches.
 func (r *ReaderV2) cleanup() {
 	if r.prefetcher != nil {
 		r.prefetcher.Close()
 	}
 	r.prefetcher = nil
-	if r.currentCache != nil {
-		r.currentCache.Done()
-	}
 	r.currentCache = nil
 	r.currentTerm = nil
 }
 
-// finishCurrentTerm decrements the use count for the current fetchKey and
-// closes the cache when no more terms reference it.
+// finishCurrentTerm advances to the next reconstruction term.
 func (r *ReaderV2) finishCurrentTerm() {
 	if r.currentTerm == nil {
 		return

@@ -22,14 +22,42 @@ type chunkRef struct {
 	fileIdx int // index into chunkCache.files; 0 means chunkCache.file
 }
 
+type cacheRange struct {
+	cacheDir             string
+	hash                 string
+	chunkStart, chunkEnd uint32
+	bytesStart, bytesEnd int64
+}
+
+func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (cacheRange, error) {
+	if len(hash) < 2 || chunkEnd < chunkStart || bytesEnd < bytesStart {
+		return cacheRange{}, fmt.Errorf("invalid cache range for hash %q", hash)
+	}
+	return cacheRange{
+		cacheDir: defaultCacheDir(cacheDir),
+		hash:     hash, chunkStart: chunkStart, chunkEnd: chunkEnd,
+		bytesStart: bytesStart, bytesEnd: bytesEnd,
+	}, nil
+}
+
+func (r cacheRange) dir() string {
+	return filepath.Join(r.cacheDir, r.hash[:2], r.hash[2:])
+}
+
+func (r cacheRange) basePath() string {
+	return filepath.Join(r.dir(), cacheFileBaseName(r.chunkStart, r.chunkEnd, r.bytesStart, r.bytesEnd))
+}
+
+func (r cacheRange) partialPath() string { return r.basePath() + ".partial" }
+
 // chunkCache is the single cache for decoded xorb chunk ranges.
 //
 // Each entry is stored as a single file at:
 //
-//	cacheDir/<hash[:2]>/<hash[2:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>
+//	cacheDir/<hash[:2]>/<hash[2:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>_<fileSize>
 //
-// where bytesStart and bytesEnd indicate the range of bytes in the original
-// file that this cache entry covers.
+// where bytesStart and bytesEnd identify the source xorb byte range and
+// fileSize is the exact size of the completed cache file.
 //
 // File format (all integers little-endian):
 //
@@ -40,40 +68,40 @@ type chunkRef struct {
 //	[offset[N]   uint32]           // = total data length
 //	[data bytes ...]               // decoded chunks concatenated
 //
-// A per-cache-entry file lock (flock) coordinates concurrent writers so
-// that only one process/goroutine downloads while others wait and then
-// reuse the completed cache file.
-// When reading, the file size is verified against the expected header size;
-// incomplete writes (smaller than expected) are treated as cache misses
-// and the file is removed.
+// The .partial file is also the stable flock target. Once complete, the final
+// size-bearing name is hard-linked to the same inode, so data is written once
+// and readers only consider published final names.
 type chunkCache struct {
-	dec      io.Reader
-	metas    []chunkRef
-	writePos int64 // next write offset in file
-	done     bool
-	readonly bool // true for read-only cache from openCachedRange
-	mut      sync.Mutex
-	file     *os.File   // backing file
-	files    []*os.File // additional files for multi-file read path (fileIdx > 0)
-	lockFile *os.File   // file lock handle, non-nil for write path
+	dec            io.Reader
+	metas          []chunkRef
+	writePos       int64 // next write offset in file
+	done           bool
+	readonly       bool // true for read-only cache from openCachedRange
+	mut            sync.Mutex
+	file           *os.File   // backing file
+	files          []*os.File // additional files for multi-file read path (fileIdx > 0)
+	lockFile       *os.File   // same handle as file while the write lock is held
+	partialPath    string
+	finalBasePath  string
+	expectedChunks uint32
+	published      bool
 }
 
-// cacheFileName returns the base filename for a cache entry.
-func cacheFileName(start, end uint32, bytesStart, bytesEnd int64) string {
+// cacheFileBaseName returns the stable portion of a cache entry name.
+func cacheFileBaseName(start, end uint32, bytesStart, bytesEnd int64) string {
 	return fmt.Sprintf("%d-%d_%d-%d", start, end, bytesStart, bytesEnd)
 }
 
-// cacheFilePath returns the full path for a cache entry.
-func cacheFilePath(cacheDir, hash string, start, end uint32, bytesStart, bytesEnd int64) string {
-	return filepath.Join(cacheDir, hash[:2], hash[2:], cacheFileName(start, end, bytesStart, bytesEnd))
+func cacheFileBasePath(cacheDir, hash string, start, end uint32, bytesStart, bytesEnd int64) string {
+	return filepath.Join(cacheDir, hash[:2], hash[2:], cacheFileBaseName(start, end, bytesStart, bytesEnd))
 }
 
 // parseCacheFileName parses a filename of the form
-// "<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>" and returns the components.
+// "<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>_<fileSize>" and returns the components.
 // Returns ok=false if parsing fails.
-func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64, ok bool) {
-	parts := strings.SplitN(name, "_", 2)
-	if len(parts) != 2 {
+func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, bytesEnd, fileSize int64, ok bool) {
+	parts := strings.Split(name, "_")
+	if len(parts) != 3 {
 		return
 	}
 	chunkParts := strings.SplitN(parts[0], "-", 2)
@@ -100,51 +128,69 @@ func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, b
 	if err != nil || be < 0 {
 		return
 	}
-	return uint32(cs), uint32(ce), bs, be, true
+	size, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || size <= 0 || ce < cs || be < bs {
+		return
+	}
+	return uint32(cs), uint32(ce), bs, be, size, true
 }
 
 // newChunkCache creates a chunkCache that decodes chunks from dec and writes
-// them to a cache file. A per-cache-entry file lock (flock) coordinates
-// concurrent writers: the first caller acquires the lock and downloads;
-// subsequent callers block on the lock, then find the completed cache file
-// and use it.
+// them to a cache file. Concurrent callers wait on the entry lock and reuse a
+// completed file published by the first caller.
 //
 // The caller must call Done() to release the file lock.
 func newChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*chunkCache, error) {
-	dir := filepath.Join(cacheDir, hash[:2], hash[2:])
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	lockFile, err := lockChunkCache(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := openCachedRange(cacheDir, hash, chunkStart, chunkEnd)
+	if err != nil || cache != nil {
+		flock.Unlock(lockFile) //nolint:errcheck
+		lockFile.Close()
+		return cache, err
+	}
+	cache, err = newLockedChunkCache(dec, cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd, lockFile)
+	if err != nil {
+		flock.Unlock(lockFile) //nolint:errcheck
+		lockFile.Close()
+	}
+	return cache, err
+}
+
+func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*os.File, error) {
+	r, err := newCacheRange(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(r.dir(), 0o755); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 
-	finalPath := cacheFilePath(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
-
-	// Open (or create) the cache file and acquire an exclusive file lock.
-	// If another process/goroutine is already writing, the lock will block
-	// until it finishes. After acquiring the lock, check whether the file
-	// is complete by verifying its size.
-	f, err := os.OpenFile(finalPath, os.O_RDWR|os.O_CREATE, 0o644)
+	lockFile, err := os.OpenFile(r.partialPath(), os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("create cache file: %w", err)
+		return nil, fmt.Errorf("create partial cache file: %w", err)
 	}
-
-	err = flock.Lock(f)
-	if err != nil {
-		f.Close()
+	if err := flock.Lock(lockFile); err != nil {
+		lockFile.Close()
 		return nil, fmt.Errorf("lock cache file: %w", err)
 	}
+	return lockFile, nil
+}
 
-	// Check if the file is already complete (another writer finished while
-	// we were waiting for the lock).
-	expectedSize := expectedCacheFileSize(chunkStart, chunkEnd)
-	if fi, _ := f.Stat(); fi != nil && fi.Size() >= expectedSize {
-		flock.Unlock(f)
-		f.Close()
-		return openCachedRange(cacheDir, hash, chunkStart, chunkEnd)
+func newLockedChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64, lockFile *os.File) (*chunkCache, error) {
+	r, err := newCacheRange(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	if err != nil {
+		return nil, err
 	}
 
-	// Truncate and start fresh — the previous writer (if any) crashed before
-	// completing.
-	f.Truncate(0) //nolint:errcheck
+	// The locked partial file is the backing data file. Reuse its inode so all
+	// current and future contenders synchronize on the same flock target.
+	f := lockFile
+	if err := f.Truncate(0); err != nil {
+		return nil, fmt.Errorf("truncate partial cache file: %w", err)
+	}
 
 	// Write a placeholder header. The actual numOffsets is known from the
 	// chunk range, so we can write the correct header size upfront.
@@ -154,32 +200,26 @@ func newChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunkEnd ui
 	header := make([]byte, headerSize)
 	binary.LittleEndian.PutUint32(header[0:], numOffsets)
 	// offsets[0] = 0, the rest will be filled in during LoadAll.
-	if _, err := f.Write(header); err != nil {
-		f.Close()
-		os.Remove(finalPath) //nolint:errcheck
+	if _, err := f.WriteAt(header, 0); err != nil {
 		return nil, fmt.Errorf("write header: %w", err)
 	}
 
 	return &chunkCache{
-		dec:      dec,
-		file:     f,
-		writePos: int64(headerSize), // data starts after the header
-		lockFile: f,
+		dec:            dec,
+		file:           f,
+		writePos:       int64(headerSize), // data starts after the header
+		lockFile:       lockFile,
+		partialPath:    r.partialPath(),
+		finalBasePath:  r.basePath(),
+		expectedChunks: numChunks,
 	}, nil
 }
 
-// expectedCacheFileSize returns the expected file size (in bytes) for a
-// complete cache file covering [chunkStart, chunkEnd). This is used to
-// detect incomplete writes: if the actual file is smaller, the write
-// was interrupted and the file should be discarded.
-func expectedCacheFileSize(chunkStart, chunkEnd uint32) int64 {
-	numChunks := chunkEnd - chunkStart
-	numOffsets := numChunks + 1
-	headerSize := int64(4 + 4*int(numOffsets))
-	// The data size is unknown at this point, so we only check that the
-	// header (at minimum) is fully written. A complete file will always
-	// be larger than the header alone.
-	return headerSize
+func defaultCacheDir(cacheDir string) string {
+	if cacheDir == "" {
+		return filepath.Join(os.TempDir(), "xet-cache")
+	}
+	return cacheDir
 }
 
 // openCachedRange opens one or more cache files that together cover
@@ -189,6 +229,7 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 	if len(hash) < 2 {
 		return nil, nil
 	}
+	cacheDir = defaultCacheDir(cacheDir)
 	hashDir := filepath.Join(cacheDir, hash[:2], hash[2:])
 	files, err := os.ReadDir(hashDir)
 	if err != nil {
@@ -201,13 +242,14 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 	type candidate struct {
 		path       string
 		start, end uint32
+		size       int64
 	}
 	var candidates []candidate
 	for _, de := range files {
 		if de.IsDir() || strings.HasPrefix(de.Name(), ".") {
 			continue
 		}
-		cs, ce, _, _, ok := parseCacheFileName(de.Name())
+		cs, ce, _, _, size, ok := parseCacheFileName(de.Name())
 		if !ok {
 			continue
 		}
@@ -218,6 +260,7 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 			path:  filepath.Join(hashDir, de.Name()),
 			start: cs,
 			end:   ce,
+			size:  size,
 		})
 	}
 
@@ -234,6 +277,11 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 		file  *os.File
 	}
 	var segments []fileSegment
+	closeSegments := func() {
+		for _, seg := range segments {
+			seg.file.Close()
+		}
+	}
 	covered := chunkStart
 
 	for _, c := range candidates {
@@ -243,36 +291,32 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 		if c.start > covered {
 			break
 		}
+		if c.end <= covered {
+			continue
+		}
 
 		needStart := covered
 		needEnd := min(c.end, chunkEnd)
 
 		f, err := os.Open(c.path)
 		if err != nil {
-			for _, seg := range segments {
-				seg.file.Close()
-			}
+			closeSegments()
 			return nil, err
 		}
 
-		// Verify the file is complete by checking its size against the
-		// expected header size. Incomplete files (from a crashed writer)
-		// are treated as cache misses and cleaned up.
-		if fi, _ := f.Stat(); fi != nil && fi.Size() < expectedCacheFileSize(c.start, c.end) {
+		// The final size is part of the published filename. A mismatch means
+		// the entry is incomplete or corrupted.
+		if fi, statErr := f.Stat(); statErr != nil || fi.Size() != c.size {
 			f.Close()
-			for _, seg := range segments {
-				seg.file.Close()
-			}
+			closeSegments()
 			os.Remove(c.path) //nolint:errcheck
 			return nil, nil
 		}
 
-		metas, err := readCacheFileMetas(f, c.start, needStart, needEnd)
+		metas, err := readCacheFileMetas(f, c.start, c.end, needStart, needEnd, c.size)
 		if err != nil {
 			f.Close()
-			for _, seg := range segments {
-				seg.file.Close()
-			}
+			closeSegments()
 			// Remove corrupted cache file so it doesn't cause repeated errors.
 			os.Remove(c.path) //nolint:errcheck
 			return nil, nil
@@ -282,9 +326,7 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 	}
 
 	if covered < chunkEnd {
-		for _, seg := range segments {
-			seg.file.Close()
-		}
+		closeSegments()
 		return nil, nil
 	}
 
@@ -305,7 +347,6 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 	}
 	return &chunkCache{
 		metas:    allMetas,
-		done:     true,
 		readonly: true,
 		file:     segments[0].file,
 		files:    extraFiles,
@@ -314,18 +355,21 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 
 // readCacheFileMetas reads metas for [chunkStart, chunkEnd) from an already-open
 // cache file. The caller is responsible for closing f in all cases.
-func readCacheFileMetas(f *os.File, offset, chunkStart, chunkEnd uint32) ([]chunkRef, error) {
+func readCacheFileMetas(f *os.File, fileStart, fileEnd, chunkStart, chunkEnd uint32, fileSize int64) ([]chunkRef, error) {
 	var countBuf [4]byte
 	if _, err := f.ReadAt(countBuf[:], 0); err != nil {
 		return nil, err
 	}
 	numOffsets := binary.LittleEndian.Uint32(countBuf[:])
+	if fileEnd < fileStart || numOffsets != fileEnd-fileStart+1 {
+		return nil, fmt.Errorf("invalid cache offset count")
+	}
 
-	if chunkStart < offset || chunkEnd < chunkStart {
+	if chunkStart < fileStart || chunkEnd < chunkStart {
 		return nil, fmt.Errorf("invalid chunk range")
 	}
-	idxStart := int(chunkStart - offset)
-	idxEnd := int(chunkEnd - offset)
+	idxStart := int(chunkStart - fileStart)
+	idxEnd := int(chunkEnd - fileStart)
 	if idxEnd >= int(numOffsets) || idxStart > idxEnd {
 		return nil, fmt.Errorf("invalid chunk range")
 	}
@@ -337,10 +381,17 @@ func readCacheFileMetas(f *os.File, offset, chunkStart, chunkEnd uint32) ([]chun
 	}
 
 	headerBytes := int64(4 + 4*int(numOffsets))
+	dataBytes := fileSize - headerBytes
+	if dataBytes < 0 {
+		return nil, fmt.Errorf("cache file is smaller than its header")
+	}
 	metas := make([]chunkRef, numChunks)
 	for i := range numChunks {
 		start := binary.LittleEndian.Uint32(rawBuf[i*4:])
 		end := binary.LittleEndian.Uint32(rawBuf[(i+1)*4:])
+		if end < start || int64(end) > dataBytes {
+			return nil, fmt.Errorf("invalid cache offsets")
+		}
 		metas[i] = chunkRef{
 			offset: headerBytes + int64(start),
 			size:   int32(end - start),
@@ -445,8 +496,7 @@ func (c *chunkCache) LoadAll() error {
 		_, err := c.load()
 		if err != nil {
 			if err == io.EOF {
-				c.finalize()
-				return nil
+				return c.finalize()
 			}
 			return err
 		}
@@ -455,15 +505,21 @@ func (c *chunkCache) LoadAll() error {
 
 // finalize patches the offset table in the header with the actual chunk sizes,
 // then syncs the file to disk. No-op for read-only caches.
-func (c *chunkCache) finalize() {
+func (c *chunkCache) finalize() error {
 	c.mut.Lock()
+	defer c.mut.Unlock()
 	metas := c.metas
 	file := c.file
 	readonly := c.readonly
-	c.mut.Unlock()
 
-	if file == nil || len(metas) == 0 || readonly {
-		return
+	if readonly {
+		return nil
+	}
+	if file == nil {
+		return fmt.Errorf("cache file is closed")
+	}
+	if uint32(len(metas)) != c.expectedChunks {
+		return fmt.Errorf("decoded %d chunks, expected %d", len(metas), c.expectedChunks)
 	}
 
 	// Compute sequential offsets and write them into the pre-allocated header.
@@ -479,9 +535,27 @@ func (c *chunkCache) finalize() {
 		binary.LittleEndian.PutUint32(header[4+4*i:], o)
 	}
 	if _, err := file.WriteAt(header, 0); err != nil {
-		return
+		return fmt.Errorf("write cache header: %w", err)
 	}
-	file.Sync() //nolint:errcheck
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync cache file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat cache file: %w", err)
+	}
+	finalPath := fmt.Sprintf("%s_%d", c.finalBasePath, info.Size())
+	if err := os.Link(c.partialPath, finalPath); err != nil {
+		return fmt.Errorf("publish cache file: %w", err)
+	}
+	c.published = true
+	if c.lockFile != nil {
+		if err := flock.Unlock(c.lockFile); err != nil {
+			return fmt.Errorf("unlock cache file: %w", err)
+		}
+		c.lockFile = nil
+	}
+	return nil
 }
 
 // Done marks the decoder as exhausted and releases the backing file(s).
@@ -489,9 +563,16 @@ func (c *chunkCache) finalize() {
 func (c *chunkCache) Done() {
 	c.mut.Lock()
 	c.done = true
+	if c.lockFile != nil {
+		flock.Unlock(c.lockFile) //nolint:errcheck
+		c.lockFile = nil
+	}
 	if c.file != nil {
 		c.file.Close()
 		c.file = nil
+	}
+	if !c.readonly && !c.published {
+		os.Remove(c.partialPath) //nolint:errcheck
 	}
 	for _, f := range c.files {
 		f.Close()
