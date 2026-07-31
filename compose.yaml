@@ -1,0 +1,11 @@
+services:
+  xetd:
+    build: .
+    ports:
+      - "8080:8080"
+    command:
+      - --mirror-upstream=https://hf.m.daocloud.io
+      - --addr=:8080
+    #   - --storage=/data/
+    # volumes:
+    #   - ./data/:/data/

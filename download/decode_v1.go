@@ -110,7 +110,10 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 				r.chunkOffset = 0
 				continue
 			}
-			data = data[r.skipBytes:]
+			// Keep chunkOffset relative to the complete chunk. Slicing data here
+			// makes a short caller buffer lose the skipped offset on the next
+			// Read and duplicates bytes in streamed HTTP range responses.
+			r.chunkOffset = int(r.skipBytes)
 			r.skipBytes = 0
 		}
 
