@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/gorilla/handlers"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
 )
@@ -39,13 +40,18 @@ func main() {
 		fmt.Println("⚠️  WARNING: Authentication is disabled. Anyone can access this server.")
 	}
 
+	var next http.Handler
+
 	// Create server
-	srv := server.NewHandler(
+	next = server.NewHandler(
 		server.WithStorage(storage),
 		server.WithAuthFunc(authFn),
+		server.WithNext(next),
 	)
 
-	err = http.ListenAndServe(*addr, srv)
+	next = handlers.CombinedLoggingHandler(os.Stdout, next)
+
+	err = http.ListenAndServe(*addr, next)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
