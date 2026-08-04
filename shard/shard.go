@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"encoding/hex"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -40,20 +41,30 @@ type FileDataSequenceEntry struct {
 	ChunkIndexEnd    uint32 // Exclusive
 }
 
-// SHA256Hash is the xet-core wire format for a SHA-256 digest.
-// Each 8-byte segment of the raw digest is stored in reversed byte order.
+// SHA256Hash is a SHA-256 digest in standard byte order. The shard codec is
+// responsible for converting it to and from xet-core's wire representation.
 type SHA256Hash [32]byte
 
-// NewSHA256Hash converts a raw SHA-256 digest to the xet-core wire format.
+// NewSHA256Hash converts a raw SHA-256 digest to the Shard API type.
 func NewSHA256Hash(raw [32]byte) SHA256Hash {
-	var h SHA256Hash
-	for segment := range len(raw) / 8 {
+	return SHA256Hash(raw)
+}
+
+// transformSHA256ByteOrder converts between standard digest byte order and
+// the xet-core wire representation. The transformation is its own inverse.
+func transformSHA256ByteOrder(hash SHA256Hash) SHA256Hash {
+	var transformed SHA256Hash
+	for segment := range len(hash) / 8 {
 		start := segment * 8
 		for offset := range 8 {
-			h[start+offset] = raw[start+7-offset]
+			transformed[start+offset] = hash[start+7-offset]
 		}
 	}
-	return h
+	return transformed
+}
+
+func (h SHA256Hash) String() string {
+	return hex.EncodeToString(h[:])
 }
 
 // FileMetadataExt contains optional metadata (SHA-256 hash)

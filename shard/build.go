@@ -39,7 +39,7 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 			Entries:      make([]FileDataSequenceEntry, 0),
 			Verification: make([]xet.VerificationHash, 0),
 		}
-		if file.SHA256 != ([32]byte{}) && len(file.ChunkIndices) != 0 {
+		if file.SHA256 != ([32]byte{}) {
 			fileBlock.MetadataExt = &FileMetadataExt{
 				SHA256Hash: NewSHA256Hash(file.SHA256),
 			}
