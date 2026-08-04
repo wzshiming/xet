@@ -27,8 +27,8 @@ Result (XET string):
 */
 func TestInternalNodeHash(t *testing.T) {
 	// Create two child nodes with specified hashes and sizes
-	child1Hash, _ := ParseHash("c28f58387a60d4aa200c311cda7c7f77f686614864f5869eadebf765d0a14a69")
-	child2Hash, _ := ParseHash("6e4e3263e073ce2c0e78cc770c361e2778db3b054b98ab65e277fc084fa70f22")
+	child1Hash, _ := parseHash("c28f58387a60d4aa200c311cda7c7f77f686614864f5869eadebf765d0a14a69")
+	child2Hash, _ := parseHash("6e4e3263e073ce2c0e78cc770c361e2778db3b054b98ab65e277fc084fa70f22")
 
 	child1 := node{
 		hash: child1Hash,
@@ -47,7 +47,7 @@ func TestInternalNodeHash(t *testing.T) {
 	// Compute the root hash (which will merge these two nodes)
 	root := tree.ComputeRoot()
 
-	expectedRoot, _ := ParseHash("be64c7003ccd3cf4357364750e04c9592b3c36705dee76a71590c011766b6c14")
+	expectedRoot, _ := parseHash("be64c7003ccd3cf4357364750e04c9592b3c36705dee76a71590c011766b6c14")
 
 	if root != expectedRoot {
 		t.Errorf("Internal node hash does not match expected value. Got %s, want %s", root.String(), expectedRoot.String())
@@ -78,21 +78,21 @@ func TestVerificationHash(t *testing.T) {
 
 	// Compute verification hash
 
-	verificationHash := ComputeVerificationHash([]Hash{chunk1, chunk2})
+	verificationHash := ComputeVerificationHash([]ChunkHash{ChunkHash(chunk1), ChunkHash(chunk2)})
 
-	expectedHash, _ := ParseHash("eb06a8ad81d588ac05d1d9a079232d9c1e7d0b07232fa58091caa7bf333a2768")
+	expectedHash, _ := ParseVerificationHash("eb06a8ad81d588ac05d1d9a079232d9c1e7d0b07232fa58091caa7bf333a2768")
 
 	if verificationHash != expectedHash {
 		t.Errorf("Verification hash does not match expected value. Got %s, want %s", verificationHash.String(), expectedHash.String())
 	}
 }
 
-func decodeRawHash(hexStr string) (Hash, error) {
+func decodeRawHash(hexStr string) (hash, error) {
 	bytes, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return Hash{}, err
+		return hash{}, err
 	}
-	var hash Hash
+	var hash hash
 	copy(hash[:], bytes)
 	return hash, nil
 }

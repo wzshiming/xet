@@ -55,7 +55,7 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.AuthPro
 	return nil
 }
 
-func ExecuteDownload(ctx context.Context, fileHash xet.Hash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, out io.Writer) (err error) {
+func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, out io.Writer) (err error) {
 	progressSummary := newProgressSummary()
 	err = xetcas.Download(ctx, fileHash, outputFile, provider, namespace, concurrency, resume, func(name string, current, total int64) {
 		progressSummary.Update(baseName(name), current, total)

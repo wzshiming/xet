@@ -122,10 +122,10 @@ func getReferenceChunks(t *testing.T, data []byte) []chunkEntry {
 // getNativeFileHash computes the file hash using the native Go implementation.
 func getNativeFileHash(t *testing.T, chunks []chunkEntry) string {
 	t.Helper()
-	hashes := make([]xet.Hash, len(chunks))
+	hashes := make([]xet.ChunkHash, len(chunks))
 	sizes := make([]uint64, len(chunks))
 	for i, c := range chunks {
-		h, err := xet.ParseHash(c.hash)
+		h, err := xet.ParseChunkHash(c.hash)
 		if err != nil {
 			t.Fatalf("parse hash: %v", err)
 		}

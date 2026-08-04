@@ -18,7 +18,7 @@ import (
 // ResolveDownload resolves a download URL to its corresponding file hash and a
 // CAS TokenProvider. The provider pre-populates the first token from the
 // response headers so no extra round-trip is needed on first use.
-func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (xet.Hash, client.AuthProvider, error) {
+func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (xet.FileHash, client.AuthProvider, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
@@ -30,12 +30,12 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, resolveURL, nil)
 	if err != nil {
-		return xet.Hash{}, nil, fmt.Errorf("create resolve request: %w", err)
+		return xet.FileHash{}, nil, fmt.Errorf("create resolve request: %w", err)
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return xet.Hash{}, nil, fmt.Errorf("resolve request: %w", err)
+		return xet.FileHash{}, nil, fmt.Errorf("resolve request: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -46,46 +46,46 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 
 // ResolveResponse extracts the file hash and a CAS TokenProvider from an
 // already-executed HTTP response that contains XET link headers.
-func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (xet.Hash, client.AuthProvider, error) {
+func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (xet.FileHash, client.AuthProvider, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return xet.Hash{}, nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
+		return xet.FileHash{}, nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
 
 	linkMap := parseLinkHeaders(resp.Header.Values("Link"))
 	reconURLStr := linkMap["xet-reconstruction-info"]
 	if reconURLStr == "" {
-		return xet.Hash{}, nil, fmt.Errorf("missing xet-reconstruction-info link")
+		return xet.FileHash{}, nil, fmt.Errorf("missing xet-reconstruction-info link")
 	}
 
 	authURL := linkMap["xet-auth"]
 	if authURL == "" {
-		return xet.Hash{}, nil, fmt.Errorf("missing xet-auth link")
+		return xet.FileHash{}, nil, fmt.Errorf("missing xet-auth link")
 	}
 
 	reconURL, err := url.Parse(reconURLStr)
 	if err != nil {
-		return xet.Hash{}, nil, fmt.Errorf("parse reconstruction link: %w", err)
+		return xet.FileHash{}, nil, fmt.Errorf("parse reconstruction link: %w", err)
 	}
 	if reconURL.Scheme == "" || reconURL.Host == "" {
-		return xet.Hash{}, nil, fmt.Errorf("invalid reconstruction link: %s", reconURLStr)
+		return xet.FileHash{}, nil, fmt.Errorf("invalid reconstruction link: %s", reconURLStr)
 	}
 
 	hashStr := path.Base(reconURL.Path)
 	if hashStr == "" {
 		hashStr := resp.Header.Get("X-Xet-Hash")
 		if hashStr == "" {
-			return xet.Hash{}, nil, fmt.Errorf("missing X-Xet-Hash header in resolve response")
+			return xet.FileHash{}, nil, fmt.Errorf("missing X-Xet-Hash header in resolve response")
 		}
 	}
 
-	fileHash, err := xet.ParseHash(hashStr)
+	fileHash, err := xet.ParseFileHash(hashStr)
 	if err != nil {
-		return xet.Hash{}, nil, fmt.Errorf("parse X-Xet-Hash: %w", err)
+		return xet.FileHash{}, nil, fmt.Errorf("parse X-Xet-Hash: %w", err)
 	}
 
 	initial, err := fetchXETAuthToken(ctx, httpClient, authURL, "")
 	if err != nil {
-		return xet.Hash{}, nil, fmt.Errorf("fetch xet auth token: %w", err)
+		return xet.FileHash{}, nil, fmt.Errorf("fetch xet auth token: %w", err)
 	}
 
 	provider := newTokenProviderFromURL(httpClient, authURL, initial)

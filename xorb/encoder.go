@@ -17,7 +17,7 @@ type Encoder struct {
 	withFooter bool
 
 	// Accumulated per-chunk metadata
-	chunkHashes     []xet.Hash
+	chunkHashes     []xet.ChunkHash
 	chunkSizes      []uint64
 	chunkOffsets    []uint64 // cumulative packed byte end-positions (footer only)
 	unpackedOffsets []uint64 // cumulative unpacked byte end-positions (footer only)
@@ -26,7 +26,7 @@ type Encoder struct {
 	unpackedPos uint64
 
 	finalized bool
-	xorbHash  *xet.Hash
+	xorbHash  *xet.XorbHash
 	err       error
 }
 
@@ -110,7 +110,7 @@ func (e *Encoder) Close() error {
 }
 
 // SummoryHash returns the overall xorb hash computed from all encoded chunks.
-func (e *Encoder) SummoryHash() xet.Hash {
+func (e *Encoder) SummoryHash() xet.XorbHash {
 	if e.xorbHash == nil {
 		hash := xet.ComputeXorbHash(e.chunkHashes, e.chunkSizes)
 		e.xorbHash = &hash

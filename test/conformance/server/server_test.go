@@ -125,7 +125,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Logf("xet-go uploaded file with hash %s", xetgoHash)
 
 				// Parse the hash for download
-				fileHash, err := xet.ParseHash(xetgoHash)
+				fileHash, err := xet.ParseFileHash(xetgoHash)
 				if err != nil {
 					t.Fatalf("Failed to parse hash from xet-go: %v", err)
 				}
@@ -411,7 +411,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("close upload file: %v", err)
 	}
 
-	if fileHash == (xet.Hash{}) {
+	if fileHash == (xet.FileHash{}) {
 		t.Fatalf("expected a valid file hash, got empty hash")
 	}
 
@@ -420,8 +420,8 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("get shard by file hash: %v", err)
 	}
 
-	var targetChunk xet.Hash
-	var expectedXorb xet.Hash
+	var targetChunk xet.ChunkHash
+	var expectedXorb xet.XorbHash
 	var expectedIndex uint32
 	found := false
 	for _, cas := range shardObj.CASInfos {
@@ -525,7 +525,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		utils.MakeRandData(2 * 1024 * 1024),
 		utils.MakeRepeatData(2 * 1024 * 1024),
 	}
-	hashes := make([]xet.Hash, len(datasets))
+	hashes := make([]xet.FileHash, len(datasets))
 	for i, data := range datasets {
 		hash, err := nativeClient.UploadFile(context.Background(), bytes.NewReader(data))
 		if err != nil {
@@ -633,7 +633,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 
 	t.Run("unknown_files_skipped", func(t *testing.T) {
 		// Mix a known hash with a fabricated non-existent hash.
-		var unknownHash xet.Hash
+		var unknownHash xet.FileHash
 		for i := range unknownHash {
 			unknownHash[i] = 0xcd
 		}

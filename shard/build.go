@@ -8,17 +8,17 @@ import (
 
 // FileInfo contains per-file information needed to build a Shard.
 type FileInfo struct {
-	Hash         xet.Hash
+	Hash         xet.FileHash
 	SHA256       [32]byte // zero value means not available
 	ChunkIndices []int    // indices into the chunks slice passed to BuildShard
 }
 
 // ChunkInfo contains the per-chunk information needed to build a Shard.
 type ChunkInfo struct {
-	Hash       xet.Hash
+	Hash       xet.ChunkHash
 	Size       uint32
 	IsNew      bool
-	XorbHash   xet.Hash
+	XorbHash   xet.XorbHash
 	ChunkIndex uint32
 }
 
@@ -28,7 +28,7 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 
 	// Build file blocks.
 	for _, file := range files {
-		fileChunkHashes := make([]xet.Hash, len(file.ChunkIndices))
+		fileChunkHashes := make([]xet.ChunkHash, len(file.ChunkIndices))
 		for i, idx := range file.ChunkIndices {
 			fileChunkHashes[i] = chunks[idx].Hash
 		}
@@ -37,7 +37,7 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 			FileHash:     file.Hash,
 			Flags:        FileWithVerification,
 			Entries:      make([]FileDataSequenceEntry, 0),
-			Verification: make([]xet.Hash, 0),
+			Verification: make([]xet.VerificationHash, 0),
 		}
 		if file.SHA256 != ([32]byte{}) && len(file.ChunkIndices) != 0 {
 			fileBlock.MetadataExt = &FileMetadataExt{
@@ -48,7 +48,7 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 
 		// Group consecutive chunks by xorb into terms.
 		type term struct {
-			xorbHash   xet.Hash
+			xorbHash   xet.XorbHash
 			startIndex uint32
 			endIndex   uint32 // exclusive, tracks next expected chunk index
 			bytes      uint32
@@ -96,8 +96,8 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 	}
 
 	// Build CAS blocks.
-	casBlocks := make(map[xet.Hash]*CASBlock)
-	seen := make(map[xet.Hash]bool)
+	casBlocks := make(map[xet.XorbHash]*CASBlock)
+	seen := make(map[xet.ChunkHash]bool)
 	for _, chunk := range chunks {
 		if !chunk.IsNew || seen[chunk.Hash] {
 			continue

@@ -10,7 +10,7 @@ import (
 )
 
 func TestValidateRejectsTruncatedChunkHeader(t *testing.T) {
-	err := Validate(bytes.NewReader([]byte{0, 1, 2}), xet.Hash{})
+	err := Validate(bytes.NewReader([]byte{0, 1, 2}), xet.XorbHash{})
 	if err == nil || !strings.Contains(err.Error(), "unexpected EOF") {
 		t.Fatalf("Validate() error = %v, want unexpected EOF", err)
 	}
@@ -36,7 +36,7 @@ func TestValidateRejectsOversizedChunkLengths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := Validate(bytes.NewReader(tt.header[:]), xet.Hash{})
+			err := Validate(bytes.NewReader(tt.header[:]), xet.XorbHash{})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("Validate() error = %v, want %q", err, tt.want)
 			}
@@ -64,7 +64,7 @@ func TestValidateRejectsFooterChunkCountAboveProtocolLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := Validate(&data, xet.Hash{})
+	err := Validate(&data, xet.XorbHash{})
 	if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("Validate() error = %v, want chunk-count limit error", err)
 	}

@@ -13,13 +13,13 @@ import (
 )
 
 // GetReconstructionV1 retrieves reconstruction information for a file
-func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV1, error) {
+func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
 	return c.GetReconstructionV1WithAuthProvider(ctx, nil, fileHash, header)
 }
 
 // GetReconstructionV1WithAuthProvider retrieves reconstruction information for
 // a file with a per-call auth provider.
-func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV1, error) {
+func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
 	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
@@ -58,13 +58,13 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 }
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
-func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV2, error) {
+func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
 	return c.GetReconstructionV2WithAuthProvider(ctx, nil, fileHash, header)
 }
 
 // GetReconstructionV2WithAuthProvider retrieves V2 reconstruction information
 // for a file with a per-call auth provider.
-func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.Hash, header http.Header) (*download.ReconstructionResponseV2, error) {
+func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
 	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
@@ -104,13 +104,13 @@ func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provid
 
 // GetBatchReconstruction retrieves reconstruction information for multiple files in a single request.
 // It calls GET /reconstructions?file_id=<hex>&file_id=<hex>&... and returns the aggregated response.
-func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Hash) (*download.BatchReconstructionResponse, error) {
+func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.FileHash) (*download.BatchReconstructionResponse, error) {
 	return c.GetBatchReconstructionWithAuthProvider(ctx, nil, fileHashes)
 }
 
 // GetBatchReconstructionWithAuthProvider retrieves reconstruction information
 // for multiple files in a single request with a per-call auth provider.
-func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.Hash) (*download.BatchReconstructionResponse, error) {
+func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.FileHash) (*download.BatchReconstructionResponse, error) {
 	if len(fileHashes) == 0 {
 		return &download.BatchReconstructionResponse{
 			Files:     make(map[string][]download.Term),

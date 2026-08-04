@@ -64,7 +64,7 @@ func (s *Shard) Decode(r io.Reader, withFooter bool) error {
 		}
 
 		if fb.Flags&FileWithVerification != 0 {
-			fb.Verification = make([]xet.Hash, numEntries)
+			fb.Verification = make([]xet.VerificationHash, numEntries)
 			for i := range numEntries {
 				if _, err := io.ReadFull(r, buf[:]); err != nil {
 					return fmt.Errorf("failed to read verification entry %d: %w", i, err)

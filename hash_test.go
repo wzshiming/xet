@@ -19,7 +19,7 @@ func TestComputeChunkHash(t *testing.T) {
 	data := []byte("Hello World!")
 	hash := ComputeChunkHash(data)
 
-	expected, _ := ParseHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
+	expected, _ := ParseChunkHash("d8d408e608fb9ca213b9909a65d86d725f2de4d8d540324be8a363e7a6e228cb")
 
 	if hash != expected {
 		t.Errorf("Chunk hash does not match expected value. Got %s, want %s", hash, expected)
@@ -41,7 +41,7 @@ Expected XET string:
 	07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918
 */
 func TestHashString(t *testing.T) {
-	hash := Hash{
+	hash := hash{
 		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
 		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,

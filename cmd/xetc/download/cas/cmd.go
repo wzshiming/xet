@@ -24,7 +24,7 @@ func NewCommand() *cobra.Command {
 		Short: "Download a file using the native CAS API",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			hash, err := xet.ParseHash(args[1])
+			hash, err := xet.ParseFileHash(args[1])
 			if err != nil {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}

@@ -15,12 +15,12 @@ import (
 // are accumulated for hash verification against the footer.
 // For chunk-only format (no footer), only structural validity is checked.
 // Returns nil if the stream is valid, or a descriptive error otherwise.
-func Validate(r io.Reader, xorbHash xet.Hash) error {
+func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
 
 	var headerBuf [8]byte
-	var chunkHashes []xet.Hash
+	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
 	var uncompressedBuf []byte
 	var packedEndOffset uint64   // cumulative compressed bytes (header + data) per chunk
@@ -77,8 +77,8 @@ func Validate(r io.Reader, xorbHash xet.Hash) error {
 // headerBuf contains the first 8 bytes already read (XETBLOB identifier + version byte).
 func validateWithFooter(
 	r io.Reader, buf []byte, headerBuf [8]byte,
-	xorbHash xet.Hash,
-	chunkHashes []xet.Hash,
+	xorbHash xet.XorbHash,
+	chunkHashes []xet.ChunkHash,
 ) error {
 	// Validate main header version.
 	if headerBuf[7] != 1 {
@@ -91,7 +91,7 @@ func validateWithFooter(
 		return fmt.Errorf("invalid footer: failed to read xorb hash and hash section header: %w", err)
 	}
 
-	footerHash := *(*xet.Hash)(fixedBuf[:32])
+	footerHash := *(*xet.XorbHash)(fixedBuf[:32])
 	if footerHash != xorbHash {
 		return fmt.Errorf("xorb hash mismatch: footer claims %x, computed %x", footerHash, xorbHash)
 	}
@@ -134,7 +134,7 @@ func validateWithFooter(
 
 	// Parse per-chunk hashes from the hash section (first 32*N bytes of remaining).
 	for i, v := range chunkHashes {
-		if v != *(*xet.Hash)(remaining[i*32:]) {
+		if v != *(*xet.ChunkHash)(remaining[i*32:]) {
 			return fmt.Errorf("chunk %d hash mismatch: footer claims %x, computed %x", i, remaining[i*32:i*32+32], v)
 		}
 	}

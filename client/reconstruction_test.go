@@ -14,7 +14,7 @@ import (
 
 func TestGetReconstruction(t *testing.T) {
 	// Create a test hash
-	testHash := xet.Hash([32]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2})
+	testHash := xet.FileHash([32]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2})
 	expectedPath := "/v1/reconstructions/" + testHash.String()
 
 	// Create test server
@@ -76,7 +76,7 @@ func TestGetReconstruction(t *testing.T) {
 }
 
 func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
-	testHash := xet.Hash([32]byte{0x11})
+	testHash := xet.FileHash([32]byte{0x11})
 	var calls int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,7 +134,7 @@ func TestGetReconstructionError(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	hash := xet.Hash{}
+	hash := xet.FileHash{}
 	_, err = client.GetReconstructionV1(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
@@ -165,7 +165,7 @@ func TestGetReconstructionRange(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	hash := xet.Hash{}
+	hash := xet.FileHash{}
 	reconstruction, err := client.GetReconstructionV1(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
 	if err != nil {
 		t.Fatalf("GetReconstructionRange failed: %v", err)
@@ -177,7 +177,7 @@ func TestGetReconstructionRange(t *testing.T) {
 }
 
 func TestGetReconstructionV2(t *testing.T) {
-	testHash := xet.Hash([32]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2})
+	testHash := xet.FileHash([32]byte{0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0xa7, 0xb8, 0xc9, 0xd0, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0xa9, 0xb0, 0xc1, 0xd2, 0xe3, 0xf4, 0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xf0, 0xa1, 0xb2})
 	expectedPath := "/v2/reconstructions/" + testHash.String()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +258,7 @@ func TestGetReconstructionV2Error(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	hash := xet.Hash{}
+	hash := xet.FileHash{}
 	_, err = c.GetReconstructionV2(context.Background(), hash, nil)
 	if err == nil {
 		t.Fatal("Expected error for 404 response")
@@ -288,7 +288,7 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	hash := xet.Hash{}
+	hash := xet.FileHash{}
 	reconstruction, err := c.GetReconstructionV2(context.Background(), hash, http.Header{"Range": []string{"bytes=1000-2000"}})
 	if err != nil {
 		t.Fatalf("GetReconstructionRangeV2 failed: %v", err)

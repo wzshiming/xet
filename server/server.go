@@ -102,7 +102,7 @@ func (s *Handler) handleHasXorb(w http.ResponseWriter, r *http.Request) {
 	namespace := vars["namespace"]
 	xorbHashStr := vars["xorb_hash"]
 
-	xorbHash, err := xet.ParseHash(xorbHashStr)
+	xorbHash, err := xet.ParseXorbHash(xorbHashStr)
 	if err != nil {
 		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
 		return
@@ -168,7 +168,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	vars := mux.Vars(r)
 	fileHashStr := vars["file_hash"]
 
-	fileHash, err := xet.ParseHash(fileHashStr)
+	fileHash, err := xet.ParseFileHash(fileHashStr)
 	if err != nil {
 		http.Error(w, "Invalid file hash", http.StatusBadRequest)
 		return
@@ -209,9 +209,9 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	fileHashes := make([]xet.Hash, 0, len(fileIDStrs))
+	fileHashes := make([]xet.FileHash, 0, len(fileIDStrs))
 	for _, idStr := range fileIDStrs {
-		h, err := xet.ParseHash(idStr)
+		h, err := xet.ParseFileHash(idStr)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("invalid file_id %q: %v", idStr, err), http.StatusBadRequest)
 			return
@@ -252,7 +252,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	vars := mux.Vars(r)
 	fileHashStr := vars["file_hash"]
 
-	fileHash, err := xet.ParseHash(fileHashStr)
+	fileHash, err := xet.ParseFileHash(fileHashStr)
 	if err != nil {
 		http.Error(w, "Invalid file hash", http.StatusBadRequest)
 		return
@@ -295,7 +295,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	xorbHashStr := vars["xorb_hash"]
 
 	// Parse xorb hash
-	xorbHash, err := xet.ParseHash(xorbHashStr)
+	xorbHash, err := xet.ParseXorbHash(xorbHashStr)
 	if err != nil {
 		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
 		return
@@ -329,7 +329,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	xorbHashStr := vars["xorb_hash"]
 
 	// Parse xorb hash
-	xorbHash, err := xet.ParseHash(xorbHashStr)
+	xorbHash, err := xet.ParseXorbHash(xorbHashStr)
 	if err != nil {
 		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
 		return
@@ -411,7 +411,7 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	chunkHashStr := vars["chunk_hash"]
 
 	// Parse chunk hash
-	chunkHash, err := xet.ParseHash(chunkHashStr)
+	chunkHash, err := xet.ParseChunkHash(chunkHashStr)
 	if err != nil {
 		http.Error(w, "Invalid chunk hash", http.StatusBadRequest)
 		return
@@ -454,7 +454,7 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 	for _, chunkHashStr := range reqBody.ChunkHashes {
 		res := batchChunkDedupResult{ChunkHash: chunkHashStr, Found: false}
 
-		chunkHash, err := xet.ParseHash(chunkHashStr)
+		chunkHash, err := xet.ParseChunkHash(chunkHashStr)
 		if err != nil {
 			results = append(results, res)
 			continue
@@ -482,7 +482,7 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(batchChunkDedupQueryResponse{Results: results})
 }
 
-func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.Hash) (xet.Hash, uint32, bool) {
+func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.ChunkHash) (xet.XorbHash, uint32, bool) {
 	for _, casBlock := range shardObj.CASInfos {
 		for i, casChunk := range casBlock.Chunks {
 			if casChunk.ChunkHash == chunkHash {
@@ -491,5 +491,5 @@ func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.Hash) (xet.Ha
 		}
 	}
 
-	return xet.Hash{}, 0, false
+	return xet.XorbHash{}, 0, false
 }

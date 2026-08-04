@@ -122,12 +122,12 @@ func TestSerializeWithFileBlock(t *testing.T) {
 	s := NewShard()
 
 	// Create a file block
-	fileHash := xet.Hash{}
+	fileHash := xet.FileHash{}
 	for i := range fileHash {
 		fileHash[i] = byte(i)
 	}
 
-	casHash := xet.Hash{}
+	casHash := xet.XorbHash{}
 	for i := range casHash {
 		casHash[i] = byte(i + 32)
 	}
@@ -199,24 +199,24 @@ func TestSerializeWithFileBlock(t *testing.T) {
 func TestSerializeWithVerification(t *testing.T) {
 	s := NewShard()
 
-	verifHash := xet.Hash{}
+	verifHash := xet.VerificationHash{}
 	for i := range verifHash {
 		verifHash[i] = byte(i * 2)
 	}
 
 	fb := FileBlock{
-		FileHash: xet.Hash{},
+		FileHash: xet.FileHash{},
 		Flags:    FileWithVerification,
 		Entries: []FileDataSequenceEntry{
 			{
-				CASHash:          xet.Hash{},
+				CASHash:          xet.XorbHash{},
 				CASFlags:         0,
 				UnpackedSegBytes: 512,
 				ChunkIndexStart:  0,
 				ChunkIndexEnd:    3,
 			},
 		},
-		Verification: []xet.Hash{verifHash},
+		Verification: []xet.VerificationHash{verifHash},
 	}
 
 	s.AddFile(fb)
@@ -266,11 +266,11 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 	}
 
 	fb := FileBlock{
-		FileHash: xet.Hash{},
+		FileHash: xet.FileHash{},
 		Flags:    FileWithMetadataExt,
 		Entries: []FileDataSequenceEntry{
 			{
-				CASHash:          xet.Hash{},
+				CASHash:          xet.XorbHash{},
 				CASFlags:         0,
 				UnpackedSegBytes: 256,
 				ChunkIndexStart:  0,
@@ -323,17 +323,17 @@ func TestSerializeWithMetadataExt(t *testing.T) {
 func TestSerializeWithCASBlock(t *testing.T) {
 	s := NewShard()
 
-	casHash := xet.Hash{}
+	casHash := xet.XorbHash{}
 	for i := range casHash {
 		casHash[i] = byte(i + 64)
 	}
 
-	chunkHash1 := xet.Hash{}
+	chunkHash1 := xet.ChunkHash{}
 	for i := range chunkHash1 {
 		chunkHash1[i] = byte(i)
 	}
 
-	chunkHash2 := xet.Hash{}
+	chunkHash2 := xet.ChunkHash{}
 	for i := range chunkHash2 {
 		chunkHash2[i] = byte(i + 32)
 	}
@@ -433,11 +433,11 @@ func TestSerializeWithFooter(t *testing.T) {
 
 	// Add some data
 	fb := FileBlock{
-		FileHash: xet.Hash{},
+		FileHash: xet.FileHash{},
 		Flags:    0,
 		Entries: []FileDataSequenceEntry{
 			{
-				CASHash:          xet.Hash{},
+				CASHash:          xet.XorbHash{},
 				CASFlags:         0,
 				UnpackedSegBytes: 100,
 				ChunkIndexStart:  0,
@@ -508,7 +508,7 @@ func TestSerializeComplexShard(t *testing.T) {
 
 	// Add multiple file blocks
 	for i := range 3 {
-		fileHash := xet.Hash{}
+		fileHash := xet.FileHash{}
 		for j := range fileHash {
 			fileHash[j] = byte(i*32 + j)
 		}
@@ -518,7 +518,7 @@ func TestSerializeComplexShard(t *testing.T) {
 			Flags:    0,
 			Entries: []FileDataSequenceEntry{
 				{
-					CASHash:          xet.Hash{},
+					CASHash:          xet.XorbHash{},
 					CASFlags:         0,
 					UnpackedSegBytes: uint32(100 * (i + 1)),
 					ChunkIndexStart:  uint32(i * 5),
@@ -531,7 +531,7 @@ func TestSerializeComplexShard(t *testing.T) {
 
 	// Add multiple CAS blocks
 	for i := range 2 {
-		casHash := xet.Hash{}
+		casHash := xet.XorbHash{}
 		for j := range casHash {
 			casHash[j] = byte(i*64 + j)
 		}
@@ -543,7 +543,7 @@ func TestSerializeComplexShard(t *testing.T) {
 			NumBytesOnDisk: uint32(500 * (i + 1)),
 			Chunks: []CASChunkSequenceEntry{
 				{
-					ChunkHash:        xet.Hash{},
+					ChunkHash:        xet.ChunkHash{},
 					ByteRangeStart:   0,
 					UnpackedSegBytes: uint32(200 * (i + 1)),
 					Flags:            0,

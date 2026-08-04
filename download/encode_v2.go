@@ -12,7 +12,7 @@ import (
 // BuildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
 // The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
 // into multi-range fetch entries for more efficient downloading.
-func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.Hash, rangeHeader string) (*ReconstructionResponseV2, error) {
+func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV2, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -108,7 +108,7 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 	// For now, we create one XorbMultiRangeFetch per xorb with all ranges
 	// A more sophisticated implementation could group consecutive/nearby ranges
 	for xorbHashStr, ranges := range xorbFetchRanges {
-		xorbHash, _ := xet.ParseHash(xorbHashStr)
+		xorbHash, _ := xet.ParseXorbHash(xorbHashStr)
 		xorbURL := storage.GetXorbURL(namespace, xorbHash)
 
 		var descriptors []XorbRangeDescriptor
