@@ -175,7 +175,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	}
 
 	// Get shard for this file
-	shard, err := s.storage.GetShardByFileHash(r.Context(), fileHash)
+	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -225,7 +225,7 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 	}
 
 	for _, fileHash := range fileHashes {
-		sh, err := s.storage.GetShardByFileHash(r.Context(), fileHash)
+		sh, err := s.storage.GetShard(r.Context(), fileHash)
 		if err != nil {
 			// Skip files not found; caller can check which hashes are absent.
 			continue
@@ -259,7 +259,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Get shard for this file
-	shard, err := s.storage.GetShardByFileHash(r.Context(), fileHash)
+	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
