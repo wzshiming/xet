@@ -3,6 +3,7 @@ module github.com/wzshiming/xet
 go 1.25.0
 
 require (
+	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 	github.com/gorilla/mux v1.8.1
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/spf13/cobra v1.10.2

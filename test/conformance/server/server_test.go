@@ -415,7 +415,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("expected a valid file hash, got empty hash")
 	}
 
-	shardObj, err := stor.GetShardByFileHash(context.Background(), fileHash)
+	shardObj, err := stor.GetShard(context.Background(), fileHash)
 	if err != nil {
 		t.Fatalf("get shard by file hash: %v", err)
 	}
