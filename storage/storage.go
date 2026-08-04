@@ -51,7 +51,7 @@ type Storage interface {
 type FileStorage struct {
 	basePath    string
 	baseURL     string
-	mut         sync.RWMutex
+	mut         sync.Mutex
 	shardIndex  *lru.Cache // bounded file hash -> shard cache
 	chunkIndex  *lru.Cache // bounded chunk hash -> file hash cache
 	sha256Index *lru.Cache // bounded SHA-256 -> file hash cache
@@ -369,16 +369,16 @@ func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.F
 
 // GetShard retrieves a shard by file hash
 func (fs *FileStorage) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error) {
-	fs.mut.RLock()
-	defer fs.mut.RUnlock()
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
 
 	return fs.getShard(fileHash)
 }
 
 func (fs *FileStorage) getShardBySHA256(ctx context.Context, _ string, digest [32]byte) (*shard.Shard, error) {
-	fs.mut.RLock()
+	fs.mut.Lock()
 	value, exists := fs.sha256Index.Get(digest)
-	fs.mut.RUnlock()
+	fs.mut.Unlock()
 	if exists {
 		return fs.GetShard(ctx, value.(xet.FileHash))
 	}
@@ -411,9 +411,9 @@ func (fs *FileStorage) GetReconstructedFile(ctx context.Context, namespace strin
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
 func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
-	fs.mut.RLock()
+	fs.mut.Lock()
 	value, exists := fs.chunkIndex.Get(chunkHash)
-	fs.mut.RUnlock()
+	fs.mut.Unlock()
 	if exists {
 		return fs.GetShard(ctx, value.(xet.FileHash))
 	}
@@ -430,9 +430,9 @@ func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string
 	if err != nil {
 		return nil, fmt.Errorf("invalid chunk index: %w", err)
 	}
-	fs.mut.RLock()
+	fs.mut.Lock()
 	fs.chunkIndex.Add(chunkHash, fileHash)
-	fs.mut.RUnlock()
+	fs.mut.Unlock()
 	return fs.GetShard(ctx, fileHash)
 }
 
