@@ -17,11 +17,11 @@ type Decoder struct {
 	r          io.Reader
 	withFooter bool
 
-	chunkHashes []xet.Hash
+	chunkHashes []xet.ChunkHash
 	chunkSizes  []uint64
 
 	done     bool
-	xorbHash *xet.Hash
+	xorbHash *xet.XorbHash
 	err      error
 }
 
@@ -129,7 +129,7 @@ func (d *Decoder) Read(p []byte) (int, error) {
 // SummoryHash returns the overall xorb hash.
 // When withFooter is true, the hash is taken directly from the footer after Decode returns io.EOF.
 // Otherwise it is computed from all decoded chunks.
-func (d *Decoder) SummoryHash() xet.Hash {
+func (d *Decoder) SummoryHash() xet.XorbHash {
 	if d.xorbHash == nil {
 		hash := xet.ComputeXorbHash(d.chunkHashes, d.chunkSizes)
 		d.xorbHash = &hash

@@ -800,13 +800,13 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	}
 
 	// Collect all chunk hashes from both clients by deserializing xorbs
-	xetgoChunkHashes := make(map[xet.Hash]bool)
-	nativeChunkHashes := make(map[xet.Hash]bool)
+	xetgoChunkHashes := make(map[xet.ChunkHash]bool)
+	nativeChunkHashes := make(map[xet.ChunkHash]bool)
 
 	// Also collect ordered chunk sequences per xorb for detailed comparison
 	type xorbInfo struct {
 		hash        string
-		chunkHashes []xet.Hash
+		chunkHashes []xet.ChunkHash
 		chunkSizes  []int // uncompressed chunk sizes
 	}
 	var xetgoXorbs []xorbInfo
@@ -856,14 +856,14 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	// STRICT: Both clients must upload the same set of chunk hashes
 	// (same chunking algorithm should produce same chunks)
-	xetgoOnly := []xet.Hash{}
+	xetgoOnly := []xet.ChunkHash{}
 	for hash := range xetgoChunkHashes {
 		if !nativeChunkHashes[hash] {
 			xetgoOnly = append(xetgoOnly, hash)
 		}
 	}
 
-	nativeOnly := []xet.Hash{}
+	nativeOnly := []xet.ChunkHash{}
 	for hash := range nativeChunkHashes {
 		if !xetgoChunkHashes[hash] {
 			nativeOnly = append(nativeOnly, hash)
@@ -1204,7 +1204,7 @@ func equalByteRanges(a, b []byteRange) bool {
 // native client for a multi-file batch download.
 // It asserts that the native client uses the batch /reconstructions endpoint and that
 // both clients cover the same byte ranges when downloading xorb data.
-func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHashes []xet.Hash) {
+func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHashes []xet.FileHash) {
 	t.Helper()
 
 	xetgoByType := groupRequestsByType(xetgoReqs)
@@ -1320,7 +1320,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	}
 
 	// Upload all files once; sub-tests below reuse the same server state.
-	hashes := make([]xet.Hash, len(datasets))
+	hashes := make([]xet.FileHash, len(datasets))
 	for i, tc := range datasets {
 		hash, err := nativeClient.UploadFile(context.Background(), bytes.NewReader(tc.data))
 		if err != nil {
@@ -1488,7 +1488,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		proxy.ClearRequests()
 
 		// Batch-download both files and capture the resulting requests.
-		readers, _, err := innerClient.DownloadFiles(context.Background(), []xet.Hash{h1, h2})
+		readers, _, err := innerClient.DownloadFiles(context.Background(), []xet.FileHash{h1, h2})
 		if err != nil {
 			t.Fatalf("DownloadFiles failed: %v", err)
 		}
@@ -1569,7 +1569,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 			utils.MakeRandData(1024 * 1024),
 			utils.MakeRepeatData(1024 * 1024),
 		}
-		cmpHashes := make([]xet.Hash, len(cmpDatasets))
+		cmpHashes := make([]xet.FileHash, len(cmpDatasets))
 		for i, data := range cmpDatasets {
 			hash, err := cmpClient.UploadFile(context.Background(), bytes.NewReader(data))
 			if err != nil {

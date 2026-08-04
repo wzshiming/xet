@@ -25,7 +25,7 @@ func newTree() *merkleTree {
 }
 
 // AddLeaf adds a leaf (chunk hash and size) to the tree
-func (t *merkleTree) AddLeaf(hash Hash, size uint64) {
+func (t *merkleTree) AddLeaf(hash hash, size uint64) {
 	t.node = append(t.node, node{
 		hash: hash,
 		size: size,
@@ -33,10 +33,10 @@ func (t *merkleTree) AddLeaf(hash Hash, size uint64) {
 }
 
 // ComputeRoot computes the Merkle tree root hash
-func (t *merkleTree) ComputeRoot() Hash {
+func (t *merkleTree) ComputeRoot() hash {
 	if len(t.node) == 0 {
 		// Return ZERO_HASH (32 zero bytes)
-		return Hash{}
+		return hash{}
 	}
 
 	// Build initial list of entries
@@ -72,7 +72,7 @@ func (t *merkleTree) ComputeRoot() Hash {
 
 // node represents a node in the Merkle tree
 type node struct {
-	hash Hash
+	hash hash
 	size uint64
 }
 
@@ -130,29 +130,29 @@ func mergeNodes(nodes []node) node {
 }
 
 // ComputeXorbHash computes the xorb hash from chunk hashes and sizes
-func ComputeXorbHash(chunkHashes []Hash, chunkSizes []uint64) Hash {
+func ComputeXorbHash(chunkHashes []ChunkHash, chunkSizes []uint64) XorbHash {
 	if len(chunkHashes) != len(chunkSizes) {
 		panic("chunk hashes and sizes length mismatch")
 	}
 
 	tree := newTree()
 	for i := range chunkHashes {
-		tree.AddLeaf(chunkHashes[i], chunkSizes[i])
+		tree.AddLeaf(hash(chunkHashes[i]), chunkSizes[i])
 	}
 
-	return tree.ComputeRoot()
+	return XorbHash(tree.ComputeRoot())
 }
 
 // ComputeFileHash computes the file hash from chunk hashes and sizes
 // This is the same as xorb hash but with an additional keyed hash step
-func ComputeFileHash(chunkHashes []Hash, chunkSizes []uint64) Hash {
+func ComputeFileHash(chunkHashes []ChunkHash, chunkSizes []uint64) FileHash {
 	// First compute the Merkle root (same as xorb hash)
 	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
-	if xorbHash == (Hash{}) {
+	if xorbHash == (XorbHash{}) {
 		// If xorb hash is ZERO_HASH, return ZERO_HASH for file hash as well
-		return Hash{}
+		return FileHash{}
 	}
 
 	// Then apply the final keyed hash with ZERO_KEY
-	return computeFileHash(xorbHash[:])
+	return FileHash(computeFileHash(xorbHash[:]))
 }

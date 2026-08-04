@@ -11,7 +11,7 @@ import (
 )
 
 // Download downloads a file from CAS and saves it to the specified output path. If resume is true and the output file already exists, it will attempt to resume the download from where it left off.
-func Download(ctx context.Context, fileHash xet.Hash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, progressFunc progress.ProgressFunc) (err error) {
+func Download(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, resume bool, progressFunc progress.ProgressFunc) (err error) {
 	cli, err := client.NewClient(
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(progressFunc),

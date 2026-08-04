@@ -24,17 +24,17 @@ const (
 
 // FileBlock represents a file reconstruction block
 type FileBlock struct {
-	FileHash     xet.Hash
+	FileHash     xet.FileHash
 	Flags        FileFlags
 	Entries      []FileDataSequenceEntry
-	Verification []xet.Hash       // Present if FileWithVerification flag set
-	MetadataExt  *FileMetadataExt // Present if FileWithMetadataExt flag set
+	Verification []xet.VerificationHash // Present if FileWithVerification flag set
+	MetadataExt  *FileMetadataExt       // Present if FileWithMetadataExt flag set
 }
 
 // FileDataSequenceEntry describes a term in the file reconstruction
 type FileDataSequenceEntry struct {
-	CASHash          xet.Hash // xorb hash
-	CASFlags         uint32   // Reserved, must be 0
+	CASHash          xet.XorbHash
+	CASFlags         uint32 // Reserved, must be 0
 	UnpackedSegBytes uint32
 	ChunkIndexStart  uint32
 	ChunkIndexEnd    uint32 // Exclusive
@@ -63,7 +63,7 @@ type FileMetadataExt struct {
 
 // CASBlock represents a xorb and its chunks
 type CASBlock struct {
-	CASHash        xet.Hash
+	CASHash        xet.XorbHash
 	CASFlags       uint32 // Reserved, must be 0
 	Chunks         []CASChunkSequenceEntry
 	NumBytesInCAS  uint32 // Total uncompressed bytes
@@ -72,7 +72,7 @@ type CASBlock struct {
 
 // CASChunkSequenceEntry describes a chunk in a xorb
 type CASChunkSequenceEntry struct {
-	ChunkHash        xet.Hash
+	ChunkHash        xet.ChunkHash
 	ByteRangeStart   uint32 // Cumulative byte offset within uncompressed xorb
 	UnpackedSegBytes uint32
 	Flags            ChunkFlags

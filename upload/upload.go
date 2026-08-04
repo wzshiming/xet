@@ -22,9 +22,9 @@ import (
 
 // DeduplicationResult represents the result of deduplication for a chunk.
 type DeduplicationResult struct {
-	ChunkHash  xet.Hash
+	ChunkHash  xet.ChunkHash
 	IsNew      bool
-	XorbHash   xet.Hash
+	XorbHash   xet.XorbHash
 	ChunkIndex uint32
 }
 
@@ -93,14 +93,14 @@ func (l *lazyChunkSeeker) Read(p []byte) (int, error) {
 
 // chunkInfo contains information about a chunk within a file.
 type chunkInfo struct {
-	Hash  xet.Hash
+	Hash  xet.ChunkHash
 	Chunk Chunk
 }
 
 // xorbGroup represents a group of chunks to be packed into a single xorb.
 type xorbGroup struct {
 	Chunks      []Chunk
-	ChunkHashes []xet.Hash
+	ChunkHashes []xet.ChunkHash
 	StartIndex  int
 }
 
@@ -145,17 +145,17 @@ func WithCacheDir(cacheDir string) Option {
 }
 
 // UploadFile chunks, deduplicates, and uploads a single file using the provided client adapter.
-func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...Option) (xet.Hash, error) {
+func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...Option) (xet.FileHash, error) {
 	hashes, err := UploadFiles(ctx, client, []io.ReadSeeker{readSeeker}, opts...)
 	if err != nil {
-		return xet.Hash{}, err
+		return xet.FileHash{}, err
 	}
 	return hashes[0], nil
 }
 
 // UploadFiles chunks, deduplicates, and uploads multiple files using the
 // provided client adapter. It returns the computed file hashes.
-func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.ReadSeeker, opts ...Option) ([]xet.Hash, error) {
+func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.ReadSeeker, opts ...Option) ([]xet.FileHash, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -165,10 +165,10 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 
 	// Step 1: Chunk all files
 	var allChunks []chunkInfo
-	fileHashes := make([]xet.Hash, len(readSeekers))
+	fileHashes := make([]xet.FileHash, len(readSeekers))
 	fileInfos := make([]shard.FileInfo, len(readSeekers))
-	fileChunkHashes := make([][]xet.Hash, len(readSeekers))
-	chunkIndex := make(map[xet.Hash]int)
+	fileChunkHashes := make([][]xet.ChunkHash, len(readSeekers))
+	chunkIndex := make(map[xet.ChunkHash]int)
 
 	for index, readSeeker := range readSeekers {
 		sr := newSyncReadSeeker(readSeeker)
@@ -180,7 +180,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 			reader = io.TeeReader(reader, sha256Hasher)
 		}
 
-		var chunkHashes []xet.Hash
+		var chunkHashes []xet.ChunkHash
 		var chunkSizes []uint64
 
 		err := xet.ChunkData(reader, func(offset int64, chunk []byte) error {
@@ -223,7 +223,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	}
 
 	// Step 2: Deduplicate unique chunks
-	uniqueHashes := make([]xet.Hash, len(allChunks))
+	uniqueHashes := make([]xet.ChunkHash, len(allChunks))
 	for i, chunk := range allChunks {
 		uniqueHashes[i] = chunk.Hash
 	}
@@ -257,7 +257,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		}
 		group := &xorbGroup{
 			Chunks:      make([]Chunk, 0, len(indices)),
-			ChunkHashes: make([]xet.Hash, 0, len(indices)),
+			ChunkHashes: make([]xet.ChunkHash, 0, len(indices)),
 			StartIndex:  indices[0],
 		}
 		for _, idx := range indices {
@@ -297,7 +297,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	return fileHashes, nil
 }
 
-func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, probes []xet.Hash) error {
+func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, probes []xet.ChunkHash) error {
 	m, err := client.QueryDedupShards(ctx, probes)
 	if err != nil {
 		return fmt.Errorf("query dedup shards: %w", err)
@@ -307,7 +307,7 @@ func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 	return nil
 }
 
-func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []xet.Hash, globalDedupProbeChunkHashes []xet.Hash, concurrency int) (map[xet.Hash]*DeduplicationResult, error) {
+func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []xet.ChunkHash, globalDedupProbeChunkHashes []xet.ChunkHash, concurrency int) (map[xet.ChunkHash]*DeduplicationResult, error) {
 	if len(chunkHashes) == 0 {
 		return nil, nil
 	}
@@ -320,7 +320,7 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []
 		concurrency = 1
 	}
 
-	cache := make(map[xet.Hash]*DeduplicationResult, len(chunkHashes))
+	cache := make(map[xet.ChunkHash]*DeduplicationResult, len(chunkHashes))
 
 	if err := queryShards(ctx, client, cache, globalDedupProbeChunkHashes); err != nil {
 		return nil, fmt.Errorf("query shards: %w", err)
@@ -339,14 +339,14 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []
 	return cache, nil
 }
 
-func selectChunkHashesForGlobalDedupAcrossFiles(fileChunkHashes [][]xet.Hash) []xet.Hash {
+func selectChunkHashesForGlobalDedupAcrossFiles(fileChunkHashes [][]xet.ChunkHash) []xet.ChunkHash {
 	var totalChunks int
 	for _, chunkHashes := range fileChunkHashes {
 		totalChunks += len(chunkHashes)
 	}
 
-	probes := make([]xet.Hash, 0, totalChunks)
-	seen := make(map[xet.Hash]struct{}, totalChunks)
+	probes := make([]xet.ChunkHash, 0, totalChunks)
+	seen := make(map[xet.ChunkHash]struct{}, totalChunks)
 	for _, chunkHashes := range fileChunkHashes {
 		for _, chunkHash := range selectChunkHashesForGlobalDedup(chunkHashes) {
 			if _, ok := seen[chunkHash]; ok {
@@ -360,13 +360,13 @@ func selectChunkHashesForGlobalDedupAcrossFiles(fileChunkHashes [][]xet.Hash) []
 	return probes
 }
 
-func selectChunkHashesForGlobalDedup(chunkHashes []xet.Hash) []xet.Hash {
+func selectChunkHashesForGlobalDedup(chunkHashes []xet.ChunkHash) []xet.ChunkHash {
 	if len(chunkHashes) == 0 {
 		return nil
 	}
 
 	const minSpacingBetweenGlobalDedupQueries = 256
-	probes := make([]xet.Hash, 0, len(chunkHashes)/minSpacingBetweenGlobalDedupQueries+1)
+	probes := make([]xet.ChunkHash, 0, len(chunkHashes)/minSpacingBetweenGlobalDedupQueries+1)
 	lastProbeIndex := -minSpacingBetweenGlobalDedupQueries
 	for i, chunkHash := range chunkHashes {
 		if i == 0 {
@@ -387,7 +387,7 @@ func selectChunkHashesForGlobalDedup(chunkHashes []xet.Hash) []xet.Hash {
 	return probes
 }
 
-func isChunkHashGlobalDedupEligible(chunkHash xet.Hash) bool {
+func isChunkHashGlobalDedupEligible(chunkHash xet.ChunkHash) bool {
 	const dedupModulus uint64 = 1024
 	value := binary.LittleEndian.Uint64(chunkHash[24:32])
 	return value%dedupModulus == 0
@@ -395,13 +395,13 @@ func isChunkHashGlobalDedupEligible(chunkHash xet.Hash) bool {
 
 // uploadXorbs serializes and uploads all xorbs.
 type preparedXorb struct {
-	hash        xet.Hash
+	hash        xet.XorbHash
 	path        string
 	size        int64
-	chunkHashes []xet.Hash
+	chunkHashes []xet.ChunkHash
 }
 
-func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*DeduplicationResult, groups []*xorbGroup, concurrency int, cacheDir string, progressFunc progress.ProgressFunc) error {
+func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, groups []*xorbGroup, concurrency int, cacheDir string, progressFunc progress.ProgressFunc) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -527,7 +527,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.Hash]*
 					hash:        xorbHash,
 					path:        tmpPath,
 					size:        size,
-					chunkHashes: append([]xet.Hash(nil), group.ChunkHashes...),
+					chunkHashes: append([]xet.ChunkHash(nil), group.ChunkHashes...),
 				})
 				preparedMu.Unlock()
 			}

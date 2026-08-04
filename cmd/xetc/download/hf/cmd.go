@@ -34,7 +34,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("--token is required")
 			}
 
-			fileHash, err := xet.ParseHash(args[0])
+			fileHash, err := xet.ParseFileHash(args[0])
 			if err != nil {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
