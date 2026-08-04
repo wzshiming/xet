@@ -200,7 +200,8 @@ func (r *shardReader) buildFileBlock(fb FileBlock) {
 	// FileMetadataExt (48 bytes) if flag set
 	if fb.Flags&FileWithMetadataExt != 0 {
 		if fb.MetadataExt != nil {
-			r.buffer = append(r.buffer, fb.MetadataExt.SHA256Hash[:]...)
+			wireHash := transformSHA256ByteOrder(fb.MetadataExt.SHA256Hash)
+			r.buffer = append(r.buffer, wireHash[:]...)
 			r.buffer = append(r.buffer, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 16 bytes reserved
 		}
 	}

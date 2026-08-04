@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,8 +89,33 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
+	s.root.HandleFunc("/xet-bridge/{sha256}", s.handleXetBridge).Methods(http.MethodGet, http.MethodHead)
 
 	s.root.NotFoundHandler = s.next
+}
+
+// handleXetBridge reconstructs a complete file addressed by its SHA-256 digest.
+func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
+	sh256Hash := mux.Vars(r)["sha256"]
+	digestBytes, err := hex.DecodeString(sh256Hash)
+	if err != nil || len(digestBytes) != sha256.Size {
+		http.Error(w, "Invalid SHA-256 digest", http.StatusBadRequest)
+		return
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], digestBytes)
+
+	content, err := s.storage.GetReconstructedFile(r.Context(), "default", digest)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	defer content.Close()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, sh256Hash))
+	http.ServeContent(w, r, sh256Hash, time.Time{}, content)
 }
 
 // handleHasXorb handles HEAD /v1/xorbs/{namespace}/{xorb_hash}

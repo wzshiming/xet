@@ -79,7 +79,9 @@ func (s *Shard) Decode(r io.Reader, withFooter bool) error {
 				return fmt.Errorf("failed to read metadata ext: %w", err)
 			}
 			fb.MetadataExt = &FileMetadataExt{}
-			copy(fb.MetadataExt.SHA256Hash[:], buf[:32])
+			var wireHash SHA256Hash
+			copy(wireHash[:], buf[:32])
+			fb.MetadataExt.SHA256Hash = transformSHA256ByteOrder(wireHash)
 			// buf[32:48] reserved
 		}
 

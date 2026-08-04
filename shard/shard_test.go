@@ -58,6 +58,31 @@ func TestNewShard(t *testing.T) {
 	}
 }
 
+func TestSHA256ByteOrderIsConfinedToCodec(t *testing.T) {
+	var raw [32]byte
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+
+	inMemory := NewSHA256Hash(raw)
+	if inMemory != SHA256Hash(raw) {
+		t.Fatal("in-memory SHA-256 must use standard byte order")
+	}
+
+	wire := transformSHA256ByteOrder(inMemory)
+	for segment := range 4 {
+		for offset := range 8 {
+			want := raw[segment*8+7-offset]
+			if wire[segment*8+offset] != want {
+				t.Fatalf("wire byte %d = %d, want %d", segment*8+offset, wire[segment*8+offset], want)
+			}
+		}
+	}
+	if decoded := transformSHA256ByteOrder(wire); decoded != inMemory {
+		t.Fatal("decoding wire SHA-256 did not restore standard byte order")
+	}
+}
+
 // TestSerializeEmptyShard tests serializing an empty shard
 func TestSerializeEmptyShard(t *testing.T) {
 	s := NewShard()
