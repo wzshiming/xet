@@ -40,7 +40,7 @@ func (c *Client) UploadShardWithAuthProvider(ctx context.Context, provider AuthP
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/shards", baseURL)
+	url := fmt.Sprintf("%s/v1/shards", baseURL)
 
 	reader, encodeErr := shardObj.Encode(false)
 	if encodeErr != nil {

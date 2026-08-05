@@ -140,6 +140,18 @@ func (r *shardReader) buildFooterBuffer() {
 	f.FileInfoOffset = r.fileInfoOffset
 	f.CASInfoOffset = r.casInfoOffset
 	f.FooterOffset = r.footerOffset
+	// This encoder does not write lookup tables. Their empty ranges must still
+	// start at the footer; xet-core uses FileLookupOffset as the end of the CAS
+	// section when it falls back to scanning chunk entries.
+	if f.FileLookupNumEntries == 0 {
+		f.FileLookupOffset = r.footerOffset
+	}
+	if f.CASLookupNumEntries == 0 {
+		f.CASLookupOffset = r.footerOffset
+	}
+	if f.ChunkLookupNumEntries == 0 {
+		f.ChunkLookupOffset = r.footerOffset
+	}
 	r.buffer = r.buffer[:0]
 	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.Version)
 	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, f.FileInfoOffset)

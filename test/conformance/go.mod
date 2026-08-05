@@ -2,10 +2,9 @@ module github.com/wzshiming/xet/test/conformance
 
 go 1.25.0
 
-require (
-	github.com/wzshiming/xet v0.0.0
-	github.com/wzshiming/xet-go v0.0.4
-)
+replace github.com/wzshiming/xet => ../..
+
+require github.com/wzshiming/xet v0.0.0
 
 require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
@@ -16,5 +15,3 @@ require (
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
-
-replace github.com/wzshiming/xet => ../..

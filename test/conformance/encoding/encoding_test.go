@@ -2,12 +2,14 @@ package encoding_test
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"testing"
 
 	"github.com/wzshiming/xet"
-	xetgo "github.com/wzshiming/xet-go"
+	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/utils"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // chunkEntry holds the hash and size for a single chunk.
@@ -69,9 +71,19 @@ func TestConformance(t *testing.T) {
 				}
 			})
 
-			if len(tt.data) == 0 {
-				return
-			}
+			t.Run("chunk_hash", func(t *testing.T) {
+				reference, err := rustref.HashChunk(tt.data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if native := xet.ComputeChunkHash(tt.data).String(); native != reference {
+					t.Errorf("chunk hash mismatch: native=%s reference=%s", native, reference)
+				}
+			})
+
+			t.Run("aggregate_hashes", func(t *testing.T) {
+				compareAggregateHashes(t, nativeChunks)
+			})
 
 			t.Run("file", func(t *testing.T) {
 				nativeHash := getNativeFileHash(t, nativeChunks)
@@ -81,6 +93,43 @@ func TestConformance(t *testing.T) {
 						nativeHash, refHash)
 				}
 			})
+		})
+	}
+}
+
+func TestXorbConformance(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "Hello World", data: []byte("Hello World!")},
+		{name: "1MB", data: utils.MakeRandData(1024 * 1024)},
+		{name: "1MB repeating", data: utils.MakeRepeatData(1024 * 1024)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := getNativeChunks(t, tt.data)
+			for _, withFooter := range []bool{false, true} {
+				name := "without_footer"
+				if withFooter {
+					name = "with_footer"
+				}
+				t.Run(name, func(t *testing.T) {
+					nativeXorb := encodeNativeXorb(t, tt.data, withFooter)
+					rustChunks, err := rustref.DecodeXorb(nativeXorb, withFooter)
+					if err != nil {
+						t.Fatalf("Rust decoding Go xorb: %v", err)
+					}
+					compareChunkEntries(t, expected, fromRustChunks(rustChunks))
+
+					rustXorb, err := rustref.EncodeXorb(tt.data, withFooter, "auto")
+					if err != nil {
+						t.Fatalf("Rust encoding xorb: %v", err)
+					}
+					compareChunkEntries(t, expected, decodeNativeXorb(t, rustXorb, withFooter))
+				})
+			}
 		})
 	}
 }
@@ -100,15 +149,11 @@ func getNativeChunks(t *testing.T, data []byte) []chunkEntry {
 	return chunks
 }
 
-// getReferenceChunks splits data using the xet-go (Rust) reference implementation
+// getReferenceChunks splits data using the xet-core (Rust) reference implementation
 // and returns the hash and size of each chunk.
 func getReferenceChunks(t *testing.T, data []byte) []chunkEntry {
 	t.Helper()
-	// xetgo.ChunkData does not accept empty input; empty data produces no chunks.
-	if len(data) == 0 {
-		return nil
-	}
-	raw, err := xetgo.ChunkData(data)
+	raw, err := rustref.ChunkData(data)
 	if err != nil {
 		t.Fatalf("reference ChunkData: %v", err)
 	}
@@ -119,23 +164,59 @@ func getReferenceChunks(t *testing.T, data []byte) []chunkEntry {
 	return chunks
 }
 
-// getNativeFileHash computes the file hash using the native Go implementation.
-func getNativeFileHash(t *testing.T, chunks []chunkEntry) string {
+func compareAggregateHashes(t *testing.T, chunks []chunkEntry) {
+	t.Helper()
+	hashes, sizes := nativeHashList(t, chunks)
+	referenceChunks := make([]rustref.ChunkInfo, len(chunks))
+	for i, chunk := range chunks {
+		referenceChunks[i] = rustref.ChunkInfo{Hash: chunk.hash, Size: chunk.size}
+	}
+
+	tests := []struct {
+		name      string
+		native    string
+		reference func([]rustref.ChunkInfo) (string, error)
+	}{
+		{name: "xorb", native: xet.ComputeXorbHash(hashes, sizes).String(), reference: rustref.ComputeXorbHash},
+		{name: "file", native: xet.ComputeFileHash(hashes, sizes).String(), reference: rustref.ComputeFileHash},
+		{name: "range", native: xet.ComputeVerificationHash(hashes).String(), reference: rustref.ComputeRangeHash},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reference, err := test.reference(referenceChunks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.native != reference {
+				t.Errorf("%s hash mismatch: native=%s reference=%s", test.name, test.native, reference)
+			}
+		})
+	}
+}
+
+func nativeHashList(t *testing.T, chunks []chunkEntry) ([]xet.ChunkHash, []uint64) {
 	t.Helper()
 	hashes := make([]xet.ChunkHash, len(chunks))
 	sizes := make([]uint64, len(chunks))
-	for i, c := range chunks {
-		h, err := xet.ParseChunkHash(c.hash)
+	for i, chunk := range chunks {
+		hash, err := xet.ParseChunkHash(chunk.hash)
 		if err != nil {
 			t.Fatalf("parse hash: %v", err)
 		}
-		hashes[i] = h
-		sizes[i] = c.size
+		hashes[i] = hash
+		sizes[i] = chunk.size
 	}
+	return hashes, sizes
+}
+
+// getNativeFileHash computes the file hash using the native Go implementation.
+func getNativeFileHash(t *testing.T, chunks []chunkEntry) string {
+	t.Helper()
+	hashes, sizes := nativeHashList(t, chunks)
 	return xet.ComputeFileHash(hashes, sizes).String()
 }
 
-// getReferenceFileHash computes the file hash using the xet-go (Rust) reference
+// getReferenceFileHash computes the file hash using the xet-core (Rust) reference
 // implementation by writing the data to a temporary file and calling HashFiles.
 func getReferenceFileHash(t *testing.T, data []byte) string {
 	t.Helper()
@@ -150,7 +231,7 @@ func getReferenceFileHash(t *testing.T, data []byte) string {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close temp file: %v", err)
 	}
-	results, err := xetgo.HashFiles([]string{f.Name()})
+	results, err := rustref.HashFiles([]string{f.Name()})
 	if err != nil {
 		t.Fatalf("reference HashFiles: %v", err)
 	}
@@ -158,4 +239,59 @@ func getReferenceFileHash(t *testing.T, data []byte) string {
 		t.Fatal("reference HashFiles returned no results")
 	}
 	return results[0].Hash
+}
+
+func encodeNativeXorb(t *testing.T, data []byte, withFooter bool) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	encoder := xorb.NewEncoder(&output, withFooter)
+	if err := xet.ChunkData(bytes.NewReader(data), func(_ int64, chunk []byte) error {
+		_, err := encoder.Write(chunk)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func decodeNativeXorb(t *testing.T, data []byte, withFooter bool) []chunkEntry {
+	t.Helper()
+	decoder := xorb.NewDecoder(bytes.NewReader(data), withFooter)
+	buffer := make([]byte, xet.MaxChunkSize)
+	var chunks []chunkEntry
+	for {
+		n, err := decoder.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		chunk := buffer[:n]
+		chunks = append(chunks, chunkEntry{hash: xet.ComputeChunkHash(chunk).String(), size: uint64(n)})
+	}
+	return chunks
+}
+
+func fromRustChunks(chunks []rustref.ChunkInfo) []chunkEntry {
+	result := make([]chunkEntry, len(chunks))
+	for i, chunk := range chunks {
+		result[i] = chunkEntry{hash: chunk.Hash, size: chunk.Size}
+	}
+	return result
+}
+
+func compareChunkEntries(t *testing.T, expected, actual []chunkEntry) {
+	t.Helper()
+	if len(expected) != len(actual) {
+		t.Fatalf("chunk count mismatch: expected=%d actual=%d", len(expected), len(actual))
+	}
+	for i := range expected {
+		if expected[i] != actual[i] {
+			t.Errorf("chunk[%d] mismatch: expected=%+v actual=%+v", i, expected[i], actual[i])
+		}
+	}
 }
