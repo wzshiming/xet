@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"time"
 
@@ -95,6 +96,20 @@ type ChunkFlags uint32
 const (
 	ChunkGlobalDedupEligible ChunkFlags = 1 << 31 // Chunk is eligible for global deduplication
 )
+
+// IsChunkGlobalDedupEligible reports whether a chunk may be used for a global
+// deduplication query under draft-05. A chunk is eligible when it is the first
+// chunk of a file, its shard entry carries the eligibility flag, or its hash
+// suffix satisfies the protocol sampling rule.
+func IsChunkGlobalDedupEligible(chunkHash xet.ChunkHash, isFirstChunk bool, flags ChunkFlags) bool {
+	if isFirstChunk || flags&ChunkGlobalDedupEligible != 0 {
+		return true
+	}
+
+	const dedupModulus uint64 = 1024
+	value := binary.LittleEndian.Uint64(chunkHash[24:32])
+	return value%dedupModulus == 0
+}
 
 // Footer represents the 200-byte shard footer
 type Footer struct {

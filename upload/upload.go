@@ -3,7 +3,6 @@ package upload
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"hash"
 	"io"
@@ -247,7 +246,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		newChunkSizes[i] = chunk.Chunk.Size
 	}
 
-	groupIndices := xorb.GroupChunkIndicesBySize(newChunkSizes, xet.MaxXorbSerializedSize)
+	groupIndices := xorb.GroupChunkIndicesBySize(newChunkSizes, xet.MaxXorbSize)
 
 	// Reconstruct xorbGroups from the grouping indices
 	var xorbs []*xorbGroup
@@ -379,18 +378,12 @@ func selectChunkHashesForGlobalDedup(chunkHashes []xet.ChunkHash) []xet.ChunkHas
 			continue
 		}
 
-		if isChunkHashGlobalDedupEligible(chunkHash) {
+		if shard.IsChunkGlobalDedupEligible(chunkHash, false, 0) {
 			probes = append(probes, chunkHash)
 			lastProbeIndex = i
 		}
 	}
 	return probes
-}
-
-func isChunkHashGlobalDedupEligible(chunkHash xet.ChunkHash) bool {
-	const dedupModulus uint64 = 1024
-	value := binary.LittleEndian.Uint64(chunkHash[24:32])
-	return value%dedupModulus == 0
 }
 
 // uploadXorbs serializes and uploads all xorbs.

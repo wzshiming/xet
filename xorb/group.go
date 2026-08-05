@@ -1,9 +1,12 @@
 package xorb
 
+import "github.com/wzshiming/xet"
+
 // GroupChunkIndicesBySize performs size-based grouping of chunks.
-// It groups chunk indices into groups targeting the specified size limit.
+// It groups chunk indices by their uncompressed sizes, targeting the specified
+// raw payload limit and the protocol's maximum chunk count.
 // A new group is started before adding a chunk that would cause the total
-// to reach or exceed targetSize.
+// to exceed targetSize.
 //
 // This function implements the core grouping logic extracted from upload.go.
 // It's independent of specific chunk types to allow reuse across different packages.
@@ -21,9 +24,10 @@ func GroupChunkIndicesBySize(chunkSizes []uint32, targetSize uint64) [][]int {
 	for i, size := range chunkSizes {
 		chunkSize := uint64(size)
 
-		// Finalize the current group before adding a chunk that would reach or
-		// exceed the target size, matching the xet-go reference implementation.
-		if len(currentGroup) > 0 && currentSize+chunkSize >= targetSize {
+		// MAX_XORB_SIZE applies to the sum of uncompressed chunk bytes. A xorb
+		// may contain exactly targetSize bytes, but never more than the size or
+		// chunk-count limit.
+		if len(currentGroup) > 0 && (currentSize+chunkSize > targetSize || len(currentGroup) >= xet.MaxChunksPerXorb) {
 			groups = append(groups, currentGroup)
 			currentGroup = nil
 			currentSize = 0

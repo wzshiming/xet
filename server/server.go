@@ -371,6 +371,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	defer xorbReader.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, xorbHash.String()))
 	http.ServeContent(w, r, xorbHashStr, time.Time{}, xorbReader)
 }
 

@@ -3,6 +3,7 @@ package xorb
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"strings"
 	"testing"
 
@@ -68,4 +69,84 @@ func TestValidateRejectsFooterChunkCountAboveProtocolLimit(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("Validate() error = %v, want chunk-count limit error", err)
 	}
+}
+
+func TestFooterUniquenessNonceDoesNotChangeXorbHash(t *testing.T) {
+	nonce := [4]byte{1, 2, 3, 4}
+	chunks := [][]byte{[]byte("first chunk"), []byte("second chunk")}
+
+	withoutNonce, hashWithoutNonce := encodeXorbForTest(t, [4]byte{}, chunks...)
+	withNonce, hashWithNonce := encodeXorbForTest(t, nonce, chunks...)
+
+	if bytes.Equal(withoutNonce, withNonce) {
+		t.Fatal("serialized xorbs should differ when the uniqueness nonce differs")
+	}
+	if hashWithoutNonce != hashWithNonce {
+		t.Fatalf("xorb hash changed with nonce: %s != %s", hashWithoutNonce, hashWithNonce)
+	}
+	if got := withNonce[len(withNonce)-20 : len(withNonce)-16]; !bytes.Equal(got, nonce[:]) {
+		t.Fatalf("serialized nonce = %x, want %x", got, nonce)
+	}
+	if err := Validate(bytes.NewReader(withNonce), hashWithNonce); err != nil {
+		t.Fatalf("Validate() rejected uniqueness nonce: %v", err)
+	}
+
+	decoder := NewDecoder(bytes.NewReader(withNonce), true)
+	decoded, err := io.ReadAll(decoder)
+	if err != nil {
+		t.Fatalf("Decoder rejected uniqueness nonce: %v", err)
+	}
+	if want := bytes.Join(chunks, nil); !bytes.Equal(decoded, want) {
+		t.Fatalf("decoded data = %q, want %q", decoded, want)
+	}
+	if got := decoder.SummoryHash(); got != hashWithNonce {
+		t.Fatalf("decoded xorb hash = %s, want %s", got, hashWithNonce)
+	}
+}
+
+func TestValidateRejectsNonZeroReservedFooterBuffer(t *testing.T) {
+	data, xorbHash := encodeXorbForTest(t, [4]byte{1}, []byte("chunk"))
+	data[len(data)-16] = 1 // First reserved byte after nonce; final 4 bytes are footer length.
+
+	err := Validate(bytes.NewReader(data), xorbHash)
+	if err == nil || !strings.Contains(err.Error(), "reserved footer buffer") {
+		t.Fatalf("Validate() error = %v, want reserved-footer error", err)
+	}
+}
+
+func TestEncoderEnforcesDraft05XorbLimits(t *testing.T) {
+	t.Run("raw payload", func(t *testing.T) {
+		encoder := NewEncoder(io.Discard, false)
+		encoder.unpackedPos = xet.MaxXorbSize
+		if _, err := encoder.Write([]byte{1}); err == nil || !strings.Contains(err.Error(), "raw payload") {
+			t.Fatalf("Encoder.Write() error = %v, want raw-payload limit error", err)
+		}
+	})
+
+	t.Run("chunk count", func(t *testing.T) {
+		encoder := NewEncoder(io.Discard, false)
+		encoder.chunkHashes = make([]xet.ChunkHash, xet.MaxChunksPerXorb)
+		if _, err := encoder.Write([]byte{1}); err == nil || !strings.Contains(err.Error(), "chunk count") {
+			t.Fatalf("Encoder.Write() error = %v, want chunk-count limit error", err)
+		}
+	})
+}
+
+func encodeXorbForTest(t *testing.T, nonce [4]byte, chunks ...[]byte) ([]byte, xet.XorbHash) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	encoder := NewEncoder(&buf, true)
+	if err := encoder.SetUniquenessNonce(nonce); err != nil {
+		t.Fatalf("Encoder.SetUniquenessNonce() failed: %v", err)
+	}
+	for _, chunk := range chunks {
+		if _, err := encoder.Write(chunk); err != nil {
+			t.Fatalf("Encoder.Write() failed: %v", err)
+		}
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatalf("Encoder.Close() failed: %v", err)
+	}
+	return buf.Bytes(), encoder.SummoryHash()
 }

@@ -3,8 +3,9 @@
 Go implementation of the XET content-addressable storage protocol for large-file transfer with chunk-level deduplication.
 
 This project tracks:
+
 - [huggingface/xet-core](https://github.com/huggingface/xet-core) (reference behavior in production)
-- [XET Protocol Draft](https://datatracker.ietf.org/doc/draft-denis-xet/03/) (public protocol baseline)
+- [XET Protocol Draft](https://datatracker.ietf.org/doc/draft-denis-xet/05/) (public protocol baseline)
 
 The Rust implementation in xet-core is currently ahead of the draft in several areas, so this repository prioritizes compatibility with real xet-core behavior where needed.
 

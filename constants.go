@@ -14,9 +14,9 @@ const (
 	MaxChildren         = 9
 
 	// Xorb parameters
-	MaxChunksPerXorb      = 8192
-	MaxXorbSerializedSize = 64 * 1024 * 1024 // 64 MiB
-	TargetChunksPerXorb   = 1024
+	MaxChunksPerXorb    = 8192
+	MaxXorbSize         = 64 * 1024 * 1024 // 64 MiB maximum uncompressed chunk payload
+	TargetChunksPerXorb = 1024
 )
 
 // Hash sizes

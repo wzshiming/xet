@@ -9,6 +9,65 @@ import (
 	"github.com/wzshiming/xet"
 )
 
+func TestIsChunkGlobalDedupEligible(t *testing.T) {
+	var nonModulusHash xet.ChunkHash
+	binary.LittleEndian.PutUint64(nonModulusHash[24:], 1)
+	var modulusHash xet.ChunkHash
+	binary.LittleEndian.PutUint64(modulusHash[24:], 1024)
+
+	tests := []struct {
+		name  string
+		hash  xet.ChunkHash
+		first bool
+		flags ChunkFlags
+		want  bool
+	}{
+		{name: "first file chunk", hash: nonModulusHash, first: true, want: true},
+		{name: "explicit flag", hash: nonModulusHash, flags: ChunkGlobalDedupEligible, want: true},
+		{name: "hash sampling", hash: modulusHash, want: true},
+		{name: "not eligible", hash: nonModulusHash, want: false},
+		{name: "reserved flag", hash: nonModulusHash, flags: 1, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsChunkGlobalDedupEligible(tt.hash, tt.first, tt.flags); got != tt.want {
+				t.Fatalf("IsChunkGlobalDedupEligible() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildShardMarksGlobalDedupEligibleChunks(t *testing.T) {
+	var firstHash, ordinaryHash, sampledHash xet.ChunkHash
+	binary.LittleEndian.PutUint64(firstHash[24:], 1)
+	binary.LittleEndian.PutUint64(ordinaryHash[24:], 2)
+	binary.LittleEndian.PutUint64(sampledHash[24:], 1024)
+	var xorbHash xet.XorbHash
+	xorbHash[0] = 1
+
+	chunks := []ChunkInfo{
+		{Hash: firstHash, Size: 10, IsNew: true, XorbHash: xorbHash, ChunkIndex: 0},
+		{Hash: ordinaryHash, Size: 20, IsNew: true, XorbHash: xorbHash, ChunkIndex: 1},
+		{Hash: sampledHash, Size: 30, IsNew: true, XorbHash: xorbHash, ChunkIndex: 2},
+	}
+	sh := BuildShard([]FileInfo{{ChunkIndices: []int{0, 1, 2}}}, chunks)
+	if len(sh.CASInfos) != 1 || len(sh.CASInfos[0].Chunks) != 3 {
+		t.Fatalf("unexpected CAS layout: %+v", sh.CASInfos)
+	}
+
+	entries := sh.CASInfos[0].Chunks
+	if entries[0].Flags&ChunkGlobalDedupEligible == 0 {
+		t.Error("first file chunk is missing GLOBAL_DEDUP_ELIGIBLE")
+	}
+	if entries[1].Flags != 0 {
+		t.Errorf("ordinary chunk flags = %#x, want 0", entries[1].Flags)
+	}
+	if entries[2].Flags&ChunkGlobalDedupEligible == 0 {
+		t.Error("hash-sampled chunk is missing GLOBAL_DEDUP_ELIGIBLE")
+	}
+}
+
 // TestNewShard tests that a new shard encodes with the correct default header values.
 func TestNewShard(t *testing.T) {
 	s := NewShard()

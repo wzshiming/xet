@@ -143,15 +143,16 @@ func ComputeXorbHash(chunkHashes []ChunkHash, chunkSizes []uint64) XorbHash {
 	return XorbHash(tree.ComputeRoot())
 }
 
-// ComputeFileHash computes the file hash from chunk hashes and sizes
-// This is the same as xorb hash but with an additional keyed hash step
+// ComputeFileHash computes the file hash from chunk hashes and sizes. Non-empty
+// files apply an additional keyed hash step to the Merkle root; an empty file
+// is represented directly by ZERO_HASH.
 func ComputeFileHash(chunkHashes []ChunkHash, chunkSizes []uint64) FileHash {
-	// First compute the Merkle root (same as xorb hash)
-	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
-	if xorbHash == (XorbHash{}) {
-		// If xorb hash is ZERO_HASH, return ZERO_HASH for file hash as well
+	if len(chunkHashes) == 0 {
 		return FileHash{}
 	}
+
+	// First compute the Merkle root (same as xorb hash)
+	xorbHash := ComputeXorbHash(chunkHashes, chunkSizes)
 
 	// Then apply the final keyed hash with ZERO_KEY
 	return FileHash(computeFileHash(xorbHash[:]))
