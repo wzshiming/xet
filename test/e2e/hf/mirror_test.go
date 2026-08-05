@@ -10,7 +10,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,7 +28,9 @@ import (
 
 // mirrorEnv holds a complete mirror setup: upstream, mirror server and storage.
 type mirrorEnv struct {
-	upstreamRequests atomic.Int32
+	upstreamRequests       atomic.Int32
+	xetAuthRequests        atomic.Int32
+	reconstructionRequests atomic.Int32
 
 	upstreamServer *httptest.Server
 	mirrorServer   *httptest.Server
@@ -97,7 +103,17 @@ func newHTTPMirrorEnv(t *testing.T, data []byte, etag string) *mirrorEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env.mirrorServer = httptest.NewServer(env.mirrorHandler)
+	env.mirrorServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/.xet-mirror/auth":
+			env.xetAuthRequests.Add(1)
+		case r.URL.Path == "/reconstructions",
+			strings.HasPrefix(r.URL.Path, "/v1/reconstructions/"),
+			strings.HasPrefix(r.URL.Path, "/v2/reconstructions/"):
+			env.reconstructionRequests.Add(1)
+		}
+		env.mirrorHandler.ServeHTTP(w, r)
+	}))
 	return env
 }
 
@@ -436,7 +452,100 @@ func TestHFMirror_XETClientSeesLocalURLsOnly(t *testing.T) {
 	}
 }
 
+// TestHFMirror_HFCLICompatibility exercises the mirror through Hugging Face's
+// official hf CLI and its bundled hf-xet client. The first download populates
+// the mirror; the second uses a fresh client cache and must be served through
+// the mirror's local XET endpoints without contacting the upstream.
+func TestHFMirror_HFCLICompatibility(t *testing.T) {
+	hfPath, err := exec.LookPath("hf")
+	if err != nil {
+		if os.Getenv("XET_HF_CLI_REQUIRED") == "1" {
+			t.Fatal("hf CLI is required but was not found in PATH")
+		}
+		t.Skip("hf CLI is not installed")
+	}
+
+	data := bytes.Repeat([]byte("official-hf-cli-mirror-compatibility-"), 8192)
+	env := newHTTPMirrorEnv(t, data, `"hf-cli-v1"`)
+	defer env.close()
+
+	const (
+		repoID   = "org/repo"
+		filename = "model.bin"
+	)
+	resolveURL := env.resolveURL("/" + repoID + "/resolve/main/" + filename)
+
+	firstDir := t.TempDir()
+	runHFDownload(t, hfPath, env.mirrorServer.URL, repoID, filename, firstDir)
+	assertFileContents(t, filepath.Join(firstDir, filename), data)
+	waitForCached(t, resolveURL)
+
+	upstreamAfterCache := env.upstreamRequests.Load()
+	authBefore := env.xetAuthRequests.Load()
+	reconstructionBefore := env.reconstructionRequests.Load()
+
+	// Use a separate HF_HOME and destination so the CLI cannot reuse its own
+	// file or XET caches from the first download.
+	secondDir := t.TempDir()
+	runHFDownload(t, hfPath, env.mirrorServer.URL, repoID, filename, secondDir)
+	assertFileContents(t, filepath.Join(secondDir, filename), data)
+
+	if got := env.upstreamRequests.Load(); got != upstreamAfterCache {
+		t.Fatalf("cached hf download contacted upstream: requests = %d, want %d", got, upstreamAfterCache)
+	}
+	if env.xetAuthRequests.Load() <= authBefore {
+		t.Fatal("cached hf download did not use the mirror's xet-auth endpoint")
+	}
+	if env.reconstructionRequests.Load() <= reconstructionBefore {
+		t.Fatal("cached hf download did not use the mirror's XET reconstruction endpoint")
+	}
+}
+
 // --- Helpers ---
+
+func runHFDownload(t *testing.T, hfPath, endpoint, repoID, filename, destination string) {
+	t.Helper()
+	hfHome := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, hfPath, "download", repoID, filename, "--local-dir", destination, "--quiet")
+	cmd.Env = append(os.Environ(),
+		"HF_ENDPOINT="+endpoint,
+		"HF_HOME="+hfHome,
+		"HF_HUB_CACHE="+filepath.Join(hfHome, "hub"),
+		"HF_XET_CACHE="+filepath.Join(hfHome, "xet"),
+		"HF_HUB_DISABLE_IMPLICIT_TOKEN=1",
+		"HF_HUB_DISABLE_PROGRESS_BARS=1",
+		"HF_HUB_DISABLE_TELEMETRY=1",
+		"HF_HUB_DISABLE_UPDATE_CHECK=1",
+		"HF_HUB_DISABLE_XET=0",
+		"HF_HUB_OFFLINE=0",
+		"HF_TOKEN=",
+		"NO_COLOR=1",
+		"ALL_PROXY=",
+		"HTTPS_PROXY=",
+		"HTTP_PROXY=",
+		"NO_PROXY=127.0.0.1,localhost",
+		"all_proxy=",
+		"https_proxy=",
+		"http_proxy=",
+		"no_proxy=127.0.0.1,localhost",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hf download failed: %v\n%s", err, output)
+	}
+}
+
+func assertFileContents(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read downloaded file %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("downloaded file %s: got %d bytes, want %d", path, len(got), len(want))
+	}
+}
 
 // restrictedTransport is an http.RoundTripper that only allows requests to
 // a single host, failing on any other destination.

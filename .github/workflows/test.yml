@@ -54,3 +54,31 @@ jobs:
     - name: Run conformance tests
       working-directory: test/conformance
       run: go test ./...
+
+  hf-mirror-compatibility:
+    name: HF Mirror Compatibility
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        version: "0.11.32"
+
+    - name: Install hf CLI
+      run: |
+        uv tool install "hf==1.26.0"
+        echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
+
+    - name: Run hf mirror compatibility test
+      env:
+        XET_HF_CLI_REQUIRED: "1"
+      run: go test -v ./test/e2e/hf -run '^TestHFMirror_HFCLICompatibility$'
