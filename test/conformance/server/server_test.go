@@ -12,18 +12,18 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/utils"
 )
 
 // TestServerUploadDownloadConformance tests that files uploaded through the native
-// Go client can be verified with the xet-go reference implementation, that files
-// can be uploaded using the xet-go client, and that files can be downloaded using
-// both the native client and the xet-go client.
+// Go client can be verified with the xet-core reference implementation, that files
+// can be uploaded using the xet-core client, and that files can be downloaded using
+// both the native client and the xet-core client.
 func TestServerUploadDownloadConformance(t *testing.T) {
 	tests := []struct {
 		name string
@@ -97,7 +97,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				t.Fatalf("create native client: %v", err)
 			}
 
-			t.Run("upload_with_xetgo", func(t *testing.T) {
+			t.Run("upload_with_rustref", func(t *testing.T) {
 				// Create temp directory and write test file
 				tempDir := t.TempDir()
 				uploadFile := filepath.Join(tempDir, "upload.bin")
@@ -105,8 +105,8 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to write upload file: %v", err)
 				}
 
-				// Upload using xet-go client
-				uploadResults, err := xetgo.UploadFiles(
+				// Upload using xet-core client
+				uploadResults, err := rustref.UploadFiles(
 					[]string{uploadFile},
 					httpSrv.URL,
 					nil,   // token
@@ -114,20 +114,20 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					false, // skipSHA256
 				)
 				if err != nil {
-					t.Fatalf("Failed to upload file with xet-go: %v", err)
+					t.Fatalf("Failed to upload file with xet-core: %v", err)
 				}
 
 				if len(uploadResults) != 1 {
 					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
 				}
 
-				xetgoHash := uploadResults[0].Hash
-				t.Logf("xet-go uploaded file with hash %s", xetgoHash)
+				rustrefHash := uploadResults[0].Hash
+				t.Logf("xet-core uploaded file with hash %s", rustrefHash)
 
 				// Parse the hash for download
-				fileHash, err := xet.ParseFileHash(xetgoHash)
+				fileHash, err := xet.ParseFileHash(rustrefHash)
 				if err != nil {
-					t.Fatalf("Failed to parse hash from xet-go: %v", err)
+					t.Fatalf("Failed to parse hash from xet-core: %v", err)
 				}
 
 				// Download using native client to verify
@@ -153,10 +153,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 						len(downloadedData), len(tt.data))
 				}
 
-				t.Logf("Successfully uploaded with xet-go and downloaded with native client")
+				t.Logf("Successfully uploaded with xet-core and downloaded with native client")
 			})
 
-			t.Run("download_with_xetgo", func(t *testing.T) {
+			t.Run("download_with_rustref", func(t *testing.T) {
 				// First upload the file using native client
 				tempDir := t.TempDir()
 				uploadFile := filepath.Join(tempDir, "upload.bin")
@@ -175,9 +175,9 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
-				// Download using xet-go client
-				downloadFile := filepath.Join(tempDir, "download-xetgo.bin")
-				downloadReq := []xetgo.DownloadRequest{
+				// Download using xet-core client
+				downloadFile := filepath.Join(tempDir, "download-rustref.bin")
+				downloadReq := []rustref.DownloadRequest{
 					{
 						DestinationPath: downloadFile,
 						Hash:            fileHash.String(),
@@ -185,10 +185,10 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					},
 				}
 
-				// Use xet-go to download from our server
-				downloaded, err := xetgo.DownloadFiles(downloadReq, httpSrv.URL, nil)
+				// Use xet-core to download from our server
+				downloaded, err := rustref.DownloadFiles(downloadReq, httpSrv.URL, nil)
 				if err != nil {
-					t.Fatalf("Failed to download file with xet-go: %v", err)
+					t.Fatalf("Failed to download file with xet-core: %v", err)
 				}
 
 				if len(downloaded) != 1 {
@@ -202,11 +202,11 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 				}
 
 				if !bytes.Equal(downloadedData, tt.data) {
-					t.Errorf("Downloaded data (xet-go) does not match original (got %d bytes, want %d bytes)",
+					t.Errorf("Downloaded data (xet-core) does not match original (got %d bytes, want %d bytes)",
 						len(downloadedData), len(tt.data))
 				}
 
-				t.Logf("Successfully downloaded file using xet-go client with hash %s", fileHash.String())
+				t.Logf("Successfully downloaded file using xet-core client with hash %s", fileHash.String())
 			})
 		})
 
@@ -271,14 +271,14 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
-				// Verify the file hash using xet-go reference implementation
-				refResults, err := xetgo.HashFiles([]string{testFile})
+				// Verify the file hash using xet-core reference implementation
+				refResults, err := rustref.HashFiles([]string{testFile})
 				if err != nil {
-					t.Fatalf("Failed to hash file with xet-go: %v", err)
+					t.Fatalf("Failed to hash file with xet-core: %v", err)
 				}
 
 				if len(refResults) == 0 {
-					t.Fatal("xet-go returned no results")
+					t.Fatal("xet-core returned no results")
 				}
 
 				// Compare hashes
@@ -335,14 +335,14 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 						len(downloadedData), len(tt.data))
 				}
 
-				// Verify using xet-go that the downloaded file has the correct hash
-				refResults, err := xetgo.HashFiles([]string{downloadFile})
+				// Verify using xet-core that the downloaded file has the correct hash
+				refResults, err := rustref.HashFiles([]string{downloadFile})
 				if err != nil {
-					t.Fatalf("Failed to hash downloaded file with xet-go: %v", err)
+					t.Fatalf("Failed to hash downloaded file with xet-core: %v", err)
 				}
 
 				if len(refResults) == 0 {
-					t.Fatal("xet-go returned no results for downloaded file")
+					t.Fatal("xet-core returned no results for downloaded file")
 				}
 
 				expectedHash := fileHash.String()
@@ -484,7 +484,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 // TestServerBatchGetReconstructionConformance tests the batch reconstruction endpoint
 // GET /reconstructions?file_id=<h1>&file_id=<h2>...
 // Verifies the response structure, correct content, partial-unknown handling, and
-// that the xet-go reference client can download multiple files using this endpoint.
+// that the xet-core reference client can download multiple files using this endpoint.
 func TestServerBatchGetReconstructionConformance(t *testing.T) {
 	storageDir := t.TempDir()
 
@@ -666,23 +666,23 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 	})
 
-	t.Run("xetgo_downloads_multiple_files", func(t *testing.T) {
-		// xet-go downloads multiple files in a single DownloadFiles call,
+	t.Run("rustref_downloads_multiple_files", func(t *testing.T) {
+		// xet-core downloads multiple files in a single DownloadFiles call,
 		// which exercises our batch reconstruction endpoint.
 		tempDir := t.TempDir()
-		fileNames := []string{"xetgo-0.bin", "xetgo-1.bin", "xetgo-2.bin"}
-		downloadReqs := make([]xetgo.DownloadRequest, len(datasets))
+		fileNames := []string{"rustref-0.bin", "rustref-1.bin", "rustref-2.bin"}
+		downloadReqs := make([]rustref.DownloadRequest, len(datasets))
 		for i, h := range hashes {
-			downloadReqs[i] = xetgo.DownloadRequest{
+			downloadReqs[i] = rustref.DownloadRequest{
 				DestinationPath: filepath.Join(tempDir, fileNames[i]),
 				Hash:            h.String(),
 				FileSize:        int64(len(datasets[i])),
 			}
 		}
 
-		downloaded, err := xetgo.DownloadFiles(downloadReqs, httpSrv.URL, nil)
+		downloaded, err := rustref.DownloadFiles(downloadReqs, httpSrv.URL, nil)
 		if err != nil {
-			t.Fatalf("xet-go DownloadFiles failed: %v", err)
+			t.Fatalf("xet-core DownloadFiles failed: %v", err)
 		}
 		if len(downloaded) != len(datasets) {
 			t.Fatalf("expected %d downloaded results, got %d", len(datasets), len(downloaded))
@@ -699,7 +699,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 					i, len(got), len(data))
 			}
 		}
-		t.Logf("✓ xet-go successfully downloaded %d files via batch endpoint", len(datasets))
+		t.Logf("✓ xet-core successfully downloaded %d files via batch endpoint", len(datasets))
 	})
 
 	// Verify that the native client's DownloadFiles also reconstructs content correctly.
@@ -804,22 +804,22 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		t.Logf("✓ Batch response terms match individual V1 responses for %d files", len(hashes))
 	})
 
-	// Verify that xet-go and the native client reconstruct identical content when
+	// Verify that xet-core and the native client reconstruct identical content when
 	// downloading the same files and that both get correct data.
-	t.Run("xetgo_and_native_reconstruct_same_content", func(t *testing.T) {
+	t.Run("rustref_and_native_reconstruct_same_content", func(t *testing.T) {
 		tempDir := t.TempDir()
 
-		// xet-go downloads all files.
-		xetgoReqs := make([]xetgo.DownloadRequest, len(datasets))
+		// xet-core downloads all files.
+		rustrefReqs := make([]rustref.DownloadRequest, len(datasets))
 		for i, h := range hashes {
-			xetgoReqs[i] = xetgo.DownloadRequest{
-				DestinationPath: filepath.Join(tempDir, "xetgo-"+h.String()+".bin"),
+			rustrefReqs[i] = rustref.DownloadRequest{
+				DestinationPath: filepath.Join(tempDir, "rustref-"+h.String()+".bin"),
 				Hash:            h.String(),
 				FileSize:        int64(len(datasets[i])),
 			}
 		}
-		if _, err := xetgo.DownloadFiles(xetgoReqs, httpSrv.URL, nil); err != nil {
-			t.Fatalf("xet-go DownloadFiles failed: %v", err)
+		if _, err := rustref.DownloadFiles(rustrefReqs, httpSrv.URL, nil); err != nil {
+			t.Fatalf("xet-core DownloadFiles failed: %v", err)
 		}
 
 		// Native client downloads all files via DownloadFiles (batch endpoint).
@@ -837,13 +837,13 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		for i, data := range datasets {
-			// xet-go content check.
-			xetgoGot, err := os.ReadFile(xetgoReqs[i].DestinationPath)
+			// xet-core content check.
+			rustrefGot, err := os.ReadFile(rustrefReqs[i].DestinationPath)
 			if err != nil {
-				t.Errorf("read xet-go file %d: %v", i, err)
-			} else if !bytes.Equal(xetgoGot, data) {
-				t.Errorf("xet-go file %d content mismatch: got %d bytes want %d bytes",
-					i, len(xetgoGot), len(data))
+				t.Errorf("read xet-core file %d: %v", i, err)
+			} else if !bytes.Equal(rustrefGot, data) {
+				t.Errorf("xet-core file %d content mismatch: got %d bytes want %d bytes",
+					i, len(rustrefGot), len(data))
 			}
 
 			// Native content check.
@@ -864,11 +864,11 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 					i, len(nativeGot), len(data))
 			}
 
-			// xet-go and native must agree on content.
-			if err == nil && !bytes.Equal(xetgoGot, nativeGot) {
-				t.Errorf("file %d: xet-go and native content differ", i)
+			// xet-core and native must agree on content.
+			if err == nil && !bytes.Equal(rustrefGot, nativeGot) {
+				t.Errorf("file %d: xet-core and native content differ", i)
 			}
 		}
-		t.Logf("✓ xet-go and native both reconstructed correct content for %d files", len(datasets))
+		t.Logf("✓ xet-core and native both reconstructed correct content for %d files", len(datasets))
 	})
 }

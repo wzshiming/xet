@@ -584,6 +584,17 @@ func TestSerializeWithFooter(t *testing.T) {
 	if s2.Footer.ShardKeyExpiry != 1234567900 {
 		t.Errorf("expected key expiry 1234567900, got %d", s2.Footer.ShardKeyExpiry)
 	}
+
+	if s2.Footer.FileLookupOffset != s2.Footer.FooterOffset ||
+		s2.Footer.CASLookupOffset != s2.Footer.FooterOffset ||
+		s2.Footer.ChunkLookupOffset != s2.Footer.FooterOffset {
+		t.Errorf("empty lookup tables must start at footer offset %d: file=%d CAS=%d chunk=%d",
+			s2.Footer.FooterOffset,
+			s2.Footer.FileLookupOffset,
+			s2.Footer.CASLookupOffset,
+			s2.Footer.ChunkLookupOffset,
+		)
+	}
 }
 
 // TestSerializeComplexShard tests serializing a complex shard with multiple blocks

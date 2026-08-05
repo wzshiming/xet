@@ -16,11 +16,11 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
-	xetgo "github.com/wzshiming/xet-go"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/utils"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -31,7 +31,7 @@ type RequestRecord struct {
 	Path       string
 	Headers    http.Header
 	Body       []byte
-	ClientType string // "xet-go" or "native"
+	ClientType string // "xet-core" or "native"
 	RequestID  string // Unique identifier for matching corresponding requests
 }
 
@@ -70,8 +70,8 @@ func (p *RecordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Determine client type from User-Agent or custom header
 	clientType := "unknown"
 	if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
-		if strings.Contains(userAgent, "xet-go") {
-			clientType = "xet-go"
+		if strings.Contains(userAgent, "xet-core") {
+			clientType = "xet-core"
 		} else {
 			clientType = "native"
 		}
@@ -114,7 +114,7 @@ func (p *RecordingProxy) ClearRequests() {
 	p.requests = make([]RequestRecord, 0)
 }
 
-// TestClientUploadDownloadRequestConformance tests that xet-go and native clients
+// TestClientUploadDownloadRequestConformance tests that xet-core and native clients
 // generate compatible HTTP requests for upload and download operations
 func TestClientUploadDownloadRequestConformance(t *testing.T) {
 	tests := []struct {
@@ -159,59 +159,59 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Run("upload_conformance", func(t *testing.T) {
 				// Create separate temp directories for each client's storage
-				xetgoStorageDir := t.TempDir()
+				rustrefStorageDir := t.TempDir()
 				nativeStorageDir := t.TempDir()
 
-				// Setup server for xet-go
-				var xetgoStor storage.Storage
-				var xetgoSrv *server.Handler
-				var xetgoProxy *RecordingProxy
-				var xetgoHttpSrv *httptest.Server
+				// Setup server for xet-core
+				var rustrefStor storage.Storage
+				var rustrefSrv *server.Handler
+				var rustrefProxy *RecordingProxy
+				var rustrefHttpSrv *httptest.Server
 
-				xetgoHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if xetgoProxy != nil {
-						xetgoProxy.ServeHTTP(w, r)
+				rustrefHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if rustrefProxy != nil {
+						rustrefProxy.ServeHTTP(w, r)
 					} else {
 						http.Error(w, "server not initialized", http.StatusInternalServerError)
 					}
 				}))
-				defer xetgoHttpSrv.Close()
+				defer rustrefHttpSrv.Close()
 
 				var err error
-				xetgoStor, err = storage.NewFileStorage(
-					storage.WithBasePath(xetgoStorageDir),
-					storage.WithBaseURL(xetgoHttpSrv.URL),
+				rustrefStor, err = storage.NewFileStorage(
+					storage.WithBasePath(rustrefStorageDir),
+					storage.WithBaseURL(rustrefHttpSrv.URL),
 				)
 				if err != nil {
-					t.Fatalf("Failed to create xet-go storage: %v", err)
+					t.Fatalf("Failed to create xet-core storage: %v", err)
 				}
 
-				xetgoSrv = server.NewHandler(server.WithStorage(xetgoStor))
-				xetgoProxy = NewRecordingProxy(xetgoSrv)
+				rustrefSrv = server.NewHandler(server.WithStorage(rustrefStor))
+				rustrefProxy = NewRecordingProxy(rustrefSrv)
 
-				// Upload with xet-go
+				// Upload with xet-core
 				tempDir := t.TempDir()
-				xetgoFile := filepath.Join(tempDir, "xetgo-upload.bin")
-				if err := os.WriteFile(xetgoFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write xet-go upload file: %v", err)
+				rustrefFile := filepath.Join(tempDir, "rustref-upload.bin")
+				if err := os.WriteFile(rustrefFile, tt.data, 0644); err != nil {
+					t.Fatalf("Failed to write xet-core upload file: %v", err)
 				}
 
-				uploadResults, err := xetgo.UploadFiles(
-					[]string{xetgoFile},
-					xetgoHttpSrv.URL,
+				uploadResults, err := rustref.UploadFiles(
+					[]string{rustrefFile},
+					rustrefHttpSrv.URL,
 					nil,   // token
 					nil,   // sha256s (computed automatically)
 					false, // skipSHA256
 				)
 				if err != nil {
-					t.Fatalf("Failed to upload file with xet-go: %v", err)
+					t.Fatalf("Failed to upload file with xet-core: %v", err)
 				}
 
 				if len(uploadResults) != 1 {
 					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
 				}
 
-				xetgoRequests := xetgoProxy.GetRequests()
+				rustrefRequests := rustrefProxy.GetRequests()
 
 				// Setup server for native client
 				var nativeStor storage.Storage
@@ -271,7 +271,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeRequests := nativeProxy.GetRequests()
 
 				// Compare requests
-				compareUploadRequests(t, xetgoRequests, nativeRequests, uploadResults[0].Hash, fileHash.String())
+				compareUploadRequests(t, rustrefRequests, nativeRequests, uploadResults[0].Hash, fileHash.String())
 			})
 
 			t.Run("download_conformance", func(t *testing.T) {
@@ -329,23 +329,23 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 					t.Fatalf("Failed to upload file: %v", err)
 				}
 
-				// Download with xet-go
+				// Download with xet-core
 				proxy.ClearRequests()
-				xetgoDownloadFile := filepath.Join(tempDir, "xetgo-download.bin")
-				downloadReq := []xetgo.DownloadRequest{
+				rustrefDownloadFile := filepath.Join(tempDir, "rustref-download.bin")
+				downloadReq := []rustref.DownloadRequest{
 					{
-						DestinationPath: xetgoDownloadFile,
+						DestinationPath: rustrefDownloadFile,
 						Hash:            fileHash.String(),
 						FileSize:        int64(len(tt.data)),
 					},
 				}
 
-				_, err = xetgo.DownloadFiles(downloadReq, httpSrv.URL, nil)
+				_, err = rustref.DownloadFiles(downloadReq, httpSrv.URL, nil)
 				if err != nil {
-					t.Fatalf("Failed to download file with xet-go: %v", err)
+					t.Fatalf("Failed to download file with xet-core: %v", err)
 				}
 
-				xetgoRequests := proxy.GetRequests()
+				rustrefRequests := proxy.GetRequests()
 
 				// Download with native client
 				proxy.ClearRequests()
@@ -368,13 +368,13 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				nativeRequests := proxy.GetRequests()
 
 				// Verify downloaded content matches
-				xetgoDownloadedData, err := os.ReadFile(xetgoDownloadFile)
+				rustrefDownloadedData, err := os.ReadFile(rustrefDownloadFile)
 				if err != nil {
-					t.Fatalf("Failed to read xet-go downloaded file: %v", err)
+					t.Fatalf("Failed to read xet-core downloaded file: %v", err)
 				}
 
-				if !bytes.Equal(xetgoDownloadedData, tt.data) {
-					t.Errorf("xet-go downloaded data mismatch: got %d bytes, want %d bytes", len(xetgoDownloadedData), len(tt.data))
+				if !bytes.Equal(rustrefDownloadedData, tt.data) {
+					t.Errorf("xet-core downloaded data mismatch: got %d bytes, want %d bytes", len(rustrefDownloadedData), len(tt.data))
 				}
 
 				if !bytes.Equal(nativeDownloadedData, tt.data) {
@@ -382,7 +382,7 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 				}
 
 				// Compare download requests
-				compareDownloadRequests(t, xetgoRequests, nativeRequests, fileHash.String())
+				compareDownloadRequests(t, rustrefRequests, nativeRequests, fileHash.String())
 			})
 		})
 	}
@@ -394,16 +394,16 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	targetData = append(targetData, utils.MakeRandData(4*1024*1024)...)
 
 	tempDir := t.TempDir()
-	xetgoSeedFile := filepath.Join(tempDir, "xetgo-seed.bin")
-	xetgoTargetFile := filepath.Join(tempDir, "xetgo-target.bin")
+	rustrefSeedFile := filepath.Join(tempDir, "rustref-seed.bin")
+	rustrefTargetFile := filepath.Join(tempDir, "rustref-target.bin")
 	nativeSeedFile := filepath.Join(tempDir, "native-seed.bin")
 	nativeTargetFile := filepath.Join(tempDir, "native-target.bin")
 
-	if err := os.WriteFile(xetgoSeedFile, seedData, 0644); err != nil {
-		t.Fatalf("write xet-go seed file: %v", err)
+	if err := os.WriteFile(rustrefSeedFile, seedData, 0644); err != nil {
+		t.Fatalf("write xet-core seed file: %v", err)
 	}
-	if err := os.WriteFile(xetgoTargetFile, targetData, 0644); err != nil {
-		t.Fatalf("write xet-go target file: %v", err)
+	if err := os.WriteFile(rustrefTargetFile, targetData, 0644); err != nil {
+		t.Fatalf("write xet-core target file: %v", err)
 	}
 	if err := os.WriteFile(nativeSeedFile, seedData, 0644); err != nil {
 		t.Fatalf("write native seed file: %v", err)
@@ -412,46 +412,46 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 		t.Fatalf("write native target file: %v", err)
 	}
 
-	// xet-go backend
-	xetgoStorageDir := t.TempDir()
-	var xetgoStor storage.Storage
-	var xetgoSrv *server.Handler
-	var xetgoProxy *RecordingProxy
-	var xetgoHTTP *httptest.Server
+	// xet-core backend
+	rustrefStorageDir := t.TempDir()
+	var rustrefStor storage.Storage
+	var rustrefSrv *server.Handler
+	var rustrefProxy *RecordingProxy
+	var rustrefHTTP *httptest.Server
 
-	xetgoHTTP = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if xetgoProxy != nil {
-			xetgoProxy.ServeHTTP(w, r)
+	rustrefHTTP = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rustrefProxy != nil {
+			rustrefProxy.ServeHTTP(w, r)
 			return
 		}
 		http.Error(w, "server not initialized", http.StatusInternalServerError)
 	}))
-	defer xetgoHTTP.Close()
+	defer rustrefHTTP.Close()
 
 	var err error
-	xetgoStor, err = storage.NewFileStorage(
-		storage.WithBasePath(xetgoStorageDir),
-		storage.WithBaseURL(xetgoHTTP.URL),
+	rustrefStor, err = storage.NewFileStorage(
+		storage.WithBasePath(rustrefStorageDir),
+		storage.WithBaseURL(rustrefHTTP.URL),
 	)
 	if err != nil {
-		t.Fatalf("create xet-go storage: %v", err)
+		t.Fatalf("create xet-core storage: %v", err)
 	}
-	xetgoSrv = server.NewHandler(server.WithStorage(xetgoStor))
-	xetgoProxy = NewRecordingProxy(xetgoSrv)
+	rustrefSrv = server.NewHandler(server.WithStorage(rustrefStor))
+	rustrefProxy = NewRecordingProxy(rustrefSrv)
 
-	if _, err := xetgo.UploadFiles([]string{xetgoSeedFile}, xetgoHTTP.URL, nil, nil, false); err != nil {
-		t.Fatalf("seed upload with xet-go failed: %v", err)
+	if _, err := rustref.UploadFiles([]string{rustrefSeedFile}, rustrefHTTP.URL, nil, nil, false); err != nil {
+		t.Fatalf("seed upload with xet-core failed: %v", err)
 	}
-	xetgoProxy.ClearRequests()
+	rustrefProxy.ClearRequests()
 
-	xetgoResults, err := xetgo.UploadFiles([]string{xetgoTargetFile}, xetgoHTTP.URL, nil, nil, false)
+	rustrefResults, err := rustref.UploadFiles([]string{rustrefTargetFile}, rustrefHTTP.URL, nil, nil, false)
 	if err != nil {
-		t.Fatalf("target upload with xet-go failed: %v", err)
+		t.Fatalf("target upload with xet-core failed: %v", err)
 	}
-	if len(xetgoResults) != 1 {
-		t.Fatalf("expected one xet-go result, got %d", len(xetgoResults))
+	if len(rustrefResults) != 1 {
+		t.Fatalf("expected one xet-core result, got %d", len(rustrefResults))
 	}
-	xetgoRequests := xetgoProxy.GetRequests()
+	rustrefRequests := rustrefProxy.GetRequests()
 
 	// native backend
 	nativeStorageDir := t.TempDir()
@@ -514,26 +514,26 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	}
 	nativeRequests := nativeProxy.GetRequests()
 
-	compareUploadRequests(t, xetgoRequests, nativeRequests, xetgoResults[0].Hash, nativeHash.String())
+	compareUploadRequests(t, rustrefRequests, nativeRequests, rustrefResults[0].Hash, nativeHash.String())
 }
 
-// compareUploadRequests compares HTTP requests from xet-go and native clients for uploads
-func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, xetgoHash, nativeHash string) {
+// compareUploadRequests compares HTTP requests from xet-core and native clients for uploads
+func compareUploadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, rustrefHash, nativeHash string) {
 	t.Helper()
 
 	// STRICT: Verify that file hashes match
-	if xetgoHash != nativeHash {
-		t.Errorf("File hash mismatch: xet-go=%s native=%s", xetgoHash, nativeHash)
+	if rustrefHash != nativeHash {
+		t.Errorf("File hash mismatch: xet-core=%s native=%s", rustrefHash, nativeHash)
 		return
 	}
 
 	// Group requests by type
-	xetgoByType := groupRequestsByType(xetgoReqs)
+	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
 	// STRICT: All non-dedup request type counts must match after canonicalizing
 	// v1/v2 variants. Dedup probes are validated semantically below.
-	assertCanonicalTypeCountEquality(t, xetgoByType, nativeByType, map[string]bool{
+	assertCanonicalTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
 		"GET:/v{version}/chunks/default/{hash}": true,
 		"POST:/v{version}/chunks/default:query": true,
 		"HEAD:/v{version}/xorbs/default/{hash}": true,
@@ -541,86 +541,92 @@ func compareUploadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, 
 	})
 
 	// STRICT: Both must upload exactly one shard
-	xetgoShardCount := len(xetgoByType["POST:/shards"]) + len(xetgoByType["POST:/v1/shards"])
-	nativeShardCount := len(nativeByType["POST:/shards"]) + len(nativeByType["POST:/v1/shards"])
-	if xetgoShardCount != 1 {
-		t.Errorf("xet-go uploaded %d shards, expected exactly 1", xetgoShardCount)
+	rustrefShardCount := len(rustrefByType["POST:/shards"]) + len(rustrefByType["POST:/v1/shards"]) + len(rustrefByType["POST:/v2/shards"])
+	nativeShardCount := len(nativeByType["POST:/shards"]) + len(nativeByType["POST:/v1/shards"]) + len(nativeByType["POST:/v2/shards"])
+	if rustrefShardCount != 1 {
+		t.Errorf("xet-core uploaded %d shards, expected exactly 1", rustrefShardCount)
 	}
 	if nativeShardCount != 1 {
 		t.Errorf("native client uploaded %d shards, expected exactly 1", nativeShardCount)
 	}
 
 	// STRICT: Dedup chunk queries must target the same chunk hash set.
-	compareChunkDedupQueries(t, xetgoReqs, nativeReqs)
+	compareChunkDedupQueries(t, rustrefReqs, nativeReqs)
 
 	// Compare xorb uploads - validate chunk content
-	xetgoXorbReqs := xetgoByType["POST:/v1/xorbs/default/{hash}"]
+	rustrefXorbReqs := rustrefByType["POST:/v1/xorbs/default/{hash}"]
 	nativeXorbReqs := nativeByType["POST:/v1/xorbs/default/{hash}"]
-	if len(xetgoXorbReqs) > 0 && len(nativeXorbReqs) > 0 {
-		compareXorbRequests(t, xetgoXorbReqs, nativeXorbReqs)
+	if len(rustrefXorbReqs) > 0 && len(nativeXorbReqs) > 0 {
+		compareXorbRequests(t, rustrefXorbReqs, nativeXorbReqs)
 	} else {
-		t.Logf("Skip strict xorb upload body comparison: xet-go posts=%d native posts=%d", len(xetgoXorbReqs), len(nativeXorbReqs))
+		t.Logf("Skip strict xorb upload body comparison: xet-core posts=%d native posts=%d", len(rustrefXorbReqs), len(nativeXorbReqs))
 	}
 
 	// STRICT: Compare shard content
-	xetgoShardReqs := append(xetgoByType["POST:/shards"], xetgoByType["POST:/v1/shards"]...)
-	nativeShardReqs := append(nativeByType["POST:/shards"], nativeByType["POST:/v1/shards"]...)
-	if len(xetgoXorbReqs) == len(nativeXorbReqs) {
-		compareShardRequests(t, xetgoShardReqs, nativeShardReqs)
+	rustrefShardReqs := appendShardRequests(rustrefByType)
+	nativeShardReqs := appendShardRequests(nativeByType)
+	if len(rustrefXorbReqs) == len(nativeXorbReqs) {
+		compareShardRequests(t, rustrefShardReqs, nativeShardReqs)
 	} else {
-		t.Logf("Skip strict shard CAS comparison because xorb upload counts differ: xet-go=%d native=%d", len(xetgoXorbReqs), len(nativeXorbReqs))
+		t.Logf("Skip strict shard CAS comparison because xorb upload counts differ: xet-core=%d native=%d", len(rustrefXorbReqs), len(nativeXorbReqs))
 	}
 }
 
-// compareDownloadRequests compares HTTP requests from xet-go and native clients for downloads
-func compareDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHash string) {
+func appendShardRequests(byType map[string][]RequestRecord) []RequestRecord {
+	requests := append([]RequestRecord(nil), byType["POST:/shards"]...)
+	requests = append(requests, byType["POST:/v1/shards"]...)
+	return append(requests, byType["POST:/v2/shards"]...)
+}
+
+// compareDownloadRequests compares HTTP requests from xet-core and native clients for downloads
+func compareDownloadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, fileHash string) {
 	t.Helper()
 
 	// Group requests by type
-	xetgoByType := groupRequestsByType(xetgoReqs)
+	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
 	// STRICT: Both must query reconstruction (v1 or v2)
-	xetgoReconCount := len(xetgoByType["GET:/v1/reconstructions/{hash}"]) + len(xetgoByType["GET:/v2/reconstructions/{hash}"])
+	rustrefReconCount := len(rustrefByType["GET:/v1/reconstructions/{hash}"]) + len(rustrefByType["GET:/v2/reconstructions/{hash}"])
 	nativeReconCount := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
-	if xetgoReconCount == 0 {
-		t.Errorf("xet-go did not query reconstruction")
+	if rustrefReconCount == 0 {
+		t.Errorf("xet-core did not query reconstruction")
 	}
 	if nativeReconCount == 0 {
 		t.Errorf("native client did not query reconstruction")
 	}
 
 	// STRICT: Both must download xorb data
-	xetgoXorbDownloadCount := len(xetgoByType["GET:/v1/xorbs/default/{hash}"])
+	rustrefXorbDownloadCount := len(rustrefByType["GET:/v1/xorbs/default/{hash}"])
 	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}"])
-	if xetgoXorbDownloadCount == 0 && nativeXorbDownloadCount > 0 {
-		t.Errorf("xet-go did not download any xorb data")
+	if rustrefXorbDownloadCount == 0 && nativeXorbDownloadCount > 0 {
+		t.Errorf("xet-core did not download any xorb data")
 	}
-	if nativeXorbDownloadCount == 0 && xetgoXorbDownloadCount > 0 {
+	if nativeXorbDownloadCount == 0 && rustrefXorbDownloadCount > 0 {
 		t.Errorf("native client did not download any xorb data")
 	}
 
 	// STRICT: Compare reconstruction query paths (must use same file hash)
-	compareReconstructionPaths(t, xetgoReqs, nativeReqs, fileHash)
+	compareReconstructionPaths(t, rustrefReqs, nativeReqs, fileHash)
 
 	// STRICT: Compare xorb download Range headers
-	xetgoXorbReqs := xetgoByType["GET:/v1/xorbs/default/{hash}"]
+	rustrefXorbReqs := rustrefByType["GET:/v1/xorbs/default/{hash}"]
 	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}"]
-	compareXorbDownloadRanges(t, xetgoXorbReqs, nativeXorbReqs)
+	compareXorbDownloadRanges(t, rustrefXorbReqs, nativeXorbReqs)
 
 	// STRICT: Except for xorb data (validated by precise range coverage), all
 	// request types must match exactly after canonicalizing v1/v2 variants.
-	assertCanonicalTypeCountEquality(t, xetgoByType, nativeByType, map[string]bool{
+	assertCanonicalTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
 		"GET:/v{version}/reconstructions/{hash}": true,
 		"GET:/v1/xorbs/default/{hash}":           true,
 	})
 
 	// Get request types for logging after strict checks.
-	xetgoTypes := getSortedKeys(xetgoByType)
+	rustrefTypes := getSortedKeys(rustrefByType)
 	nativeTypes := getSortedKeys(nativeByType)
 
 	t.Logf("✓ Download conformance check passed for file %s", fileHash)
-	t.Logf("  xet-go request types: %v", xetgoTypes)
+	t.Logf("  xet-core request types: %v", rustrefTypes)
 	t.Logf("  native request types: %v", nativeTypes)
 }
 
@@ -640,18 +646,18 @@ func canonicalizeRequestType(reqType string) string {
 
 // assertCanonicalTypeCountEquality enforces exact equality of request-type counts
 // after canonicalizing API versions.
-func assertCanonicalTypeCountEquality(t *testing.T, xetgoByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
+func assertCanonicalTypeCountEquality(t *testing.T, rustrefByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
 	t.Helper()
 
-	xetgoCounts := make(map[string]int)
+	rustrefCounts := make(map[string]int)
 	nativeCounts := make(map[string]int)
 
-	for reqType, reqs := range xetgoByType {
+	for reqType, reqs := range rustrefByType {
 		canonical := canonicalizeRequestType(reqType)
 		if skipTypes != nil && (skipTypes[reqType] || skipTypes[canonical]) {
 			continue
 		}
-		xetgoCounts[canonical] += len(reqs)
+		rustrefCounts[canonical] += len(reqs)
 	}
 
 	for reqType, reqs := range nativeByType {
@@ -662,16 +668,16 @@ func assertCanonicalTypeCountEquality(t *testing.T, xetgoByType, nativeByType ma
 		nativeCounts[canonical] += len(reqs)
 	}
 
-	for key, xCount := range xetgoCounts {
+	for key, xCount := range rustrefCounts {
 		nCount := nativeCounts[key]
 		if xCount != nCount {
-			t.Errorf("Request type count mismatch for %s: xet-go=%d native=%d", key, xCount, nCount)
+			t.Errorf("Request type count mismatch for %s: xet-core=%d native=%d", key, xCount, nCount)
 		}
 	}
 	for key, nCount := range nativeCounts {
-		xCount := xetgoCounts[key]
+		xCount := rustrefCounts[key]
 		if xCount != nCount {
-			t.Errorf("Request type count mismatch for %s: xet-go=%d native=%d", key, xCount, nCount)
+			t.Errorf("Request type count mismatch for %s: xet-core=%d native=%d", key, xCount, nCount)
 		}
 	}
 }
@@ -679,21 +685,21 @@ func assertCanonicalTypeCountEquality(t *testing.T, xetgoByType, nativeByType ma
 // compareChunkDedupQueries validates dedup probes semantically. Clients may choose
 // different probing strategies, but every probed chunk hash must belong to that
 // client's uploaded chunk set.
-func compareChunkDedupQueries(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+func compareChunkDedupQueries(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
-	xetgoChunks := make(map[string]bool)
+	rustrefChunks := make(map[string]bool)
 	nativeChunks := make(map[string]bool)
-	xetgoUploaded := extractUploadedChunkHashes(t, xetgoReqs)
+	rustrefUploaded := extractUploadedChunkHashes(t, rustrefReqs)
 	nativeUploaded := extractUploadedChunkHashes(t, nativeReqs)
 
-	for _, req := range xetgoReqs {
+	for _, req := range rustrefReqs {
 		if req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/v1/chunks/") {
 			continue
 		}
 		parts := strings.Split(strings.TrimPrefix(req.Path, "/v1/chunks/"), "/")
 		if len(parts) > 0 && len(parts[0]) == 64 && isHexString(parts[0]) {
-			xetgoChunks[parts[0]] = true
+			rustrefChunks[parts[0]] = true
 		}
 	}
 
@@ -707,9 +713,9 @@ func compareChunkDedupQueries(t *testing.T, xetgoReqs, nativeReqs []RequestRecor
 		}
 	}
 
-	for h := range xetgoChunks {
-		if !xetgoUploaded[h] {
-			t.Errorf("xet-go queried dedup chunk %s that is not in xet-go uploaded chunks", h)
+	for h := range rustrefChunks {
+		if !rustrefUploaded[h] {
+			t.Errorf("xet-core queried dedup chunk %s that is not in xet-core uploaded chunks", h)
 		}
 	}
 	for h := range nativeChunks {
@@ -791,16 +797,16 @@ func getSortedKeys(m map[string][]RequestRecord) []string {
 }
 
 // compareXorbRequests compares xorb upload requests by deserializing and comparing chunk content
-func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+func compareXorbRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
 	// STRICT: Both clients must upload the same number of xorbs
-	if len(xetgoReqs) != len(nativeReqs) {
-		t.Errorf("Xorb upload count mismatch: xet-go=%d native=%d", len(xetgoReqs), len(nativeReqs))
+	if len(rustrefReqs) != len(nativeReqs) {
+		t.Errorf("Xorb upload count mismatch: xet-core=%d native=%d", len(rustrefReqs), len(nativeReqs))
 	}
 
 	// Collect all chunk hashes from both clients by deserializing xorbs
-	xetgoChunkHashes := make(map[xet.ChunkHash]bool)
+	rustrefChunkHashes := make(map[xet.ChunkHash]bool)
 	nativeChunkHashes := make(map[xet.ChunkHash]bool)
 
 	// Also collect ordered chunk sequences per xorb for detailed comparison
@@ -809,10 +815,10 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 		chunkHashes []xet.ChunkHash
 		chunkSizes  []int // uncompressed chunk sizes
 	}
-	var xetgoXorbs []xorbInfo
+	var rustrefXorbs []xorbInfo
 	var nativeXorbs []xorbInfo
 
-	for _, req := range xetgoReqs {
+	for _, req := range rustrefReqs {
 		info := xorbInfo{hash: req.Path}
 		dec := xorb.NewDecoder(bytes.NewReader(req.Body), false)
 		var buf [xet.MaxChunkSize]byte
@@ -822,15 +828,15 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 				break
 			}
 			if err != nil {
-				t.Errorf("Failed to deserialize xet-go xorb: %v", err)
+				t.Errorf("Failed to deserialize xet-core xorb: %v", err)
 				break
 			}
 			h := xet.ComputeChunkHash(buf[:n])
-			xetgoChunkHashes[h] = true
+			rustrefChunkHashes[h] = true
 			info.chunkHashes = append(info.chunkHashes, h)
 			info.chunkSizes = append(info.chunkSizes, n)
 		}
-		xetgoXorbs = append(xetgoXorbs, info)
+		rustrefXorbs = append(rustrefXorbs, info)
 	}
 
 	for _, req := range nativeReqs {
@@ -856,55 +862,55 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 
 	// STRICT: Both clients must upload the same set of chunk hashes
 	// (same chunking algorithm should produce same chunks)
-	xetgoOnly := []xet.ChunkHash{}
-	for hash := range xetgoChunkHashes {
+	rustrefOnly := []xet.ChunkHash{}
+	for hash := range rustrefChunkHashes {
 		if !nativeChunkHashes[hash] {
-			xetgoOnly = append(xetgoOnly, hash)
+			rustrefOnly = append(rustrefOnly, hash)
 		}
 	}
 
 	nativeOnly := []xet.ChunkHash{}
 	for hash := range nativeChunkHashes {
-		if !xetgoChunkHashes[hash] {
+		if !rustrefChunkHashes[hash] {
 			nativeOnly = append(nativeOnly, hash)
 		}
 	}
 
-	if len(xetgoOnly) > 0 {
-		t.Errorf("xet-go uploaded %d chunks that native did not: %v", len(xetgoOnly), xetgoOnly)
+	if len(rustrefOnly) > 0 {
+		t.Errorf("xet-core uploaded %d chunks that native did not: %v", len(rustrefOnly), rustrefOnly)
 	}
 	if len(nativeOnly) > 0 {
-		t.Errorf("native uploaded %d chunks that xet-go did not: %v", len(nativeOnly), nativeOnly)
+		t.Errorf("native uploaded %d chunks that xet-core did not: %v", len(nativeOnly), nativeOnly)
 	}
 
 	// STRICT: Compare chunk ordering within corresponding xorbs.
 	// Sort both slices by path (which contains the xorb hash) so that the
-	// positional comparison is stable even when xet-go uploads xorbs
+	// positional comparison is stable even when xet-core uploads xorbs
 	// concurrently and the server records them in a different arrival order.
-	sort.Slice(xetgoXorbs, func(i, j int) bool { return xetgoXorbs[i].hash < xetgoXorbs[j].hash })
+	sort.Slice(rustrefXorbs, func(i, j int) bool { return rustrefXorbs[i].hash < rustrefXorbs[j].hash })
 	sort.Slice(nativeXorbs, func(i, j int) bool { return nativeXorbs[i].hash < nativeXorbs[j].hash })
-	if len(xetgoXorbs) == len(nativeXorbs) {
-		for i := range xetgoXorbs {
-			if len(xetgoXorbs[i].chunkHashes) != len(nativeXorbs[i].chunkHashes) {
-				t.Errorf("Xorb %d chunk count mismatch: xet-go=%d native=%d",
-					i, len(xetgoXorbs[i].chunkHashes), len(nativeXorbs[i].chunkHashes))
+	if len(rustrefXorbs) == len(nativeXorbs) {
+		for i := range rustrefXorbs {
+			if len(rustrefXorbs[i].chunkHashes) != len(nativeXorbs[i].chunkHashes) {
+				t.Errorf("Xorb %d chunk count mismatch: xet-core=%d native=%d",
+					i, len(rustrefXorbs[i].chunkHashes), len(nativeXorbs[i].chunkHashes))
 				continue
 			}
-			for j := range xetgoXorbs[i].chunkHashes {
-				if xetgoXorbs[i].chunkHashes[j] != nativeXorbs[i].chunkHashes[j] {
-					t.Errorf("Xorb %d chunk %d hash mismatch: xet-go=%s native=%s",
-						i, j, xetgoXorbs[i].chunkHashes[j], nativeXorbs[i].chunkHashes[j])
+			for j := range rustrefXorbs[i].chunkHashes {
+				if rustrefXorbs[i].chunkHashes[j] != nativeXorbs[i].chunkHashes[j] {
+					t.Errorf("Xorb %d chunk %d hash mismatch: xet-core=%s native=%s",
+						i, j, rustrefXorbs[i].chunkHashes[j], nativeXorbs[i].chunkHashes[j])
 				}
 			}
 			// STRICT: Compare chunk sizes
-			if len(xetgoXorbs[i].chunkSizes) != len(nativeXorbs[i].chunkSizes) {
-				t.Errorf("Xorb %d chunk size count mismatch: xet-go=%d native=%d",
-					i, len(xetgoXorbs[i].chunkSizes), len(nativeXorbs[i].chunkSizes))
+			if len(rustrefXorbs[i].chunkSizes) != len(nativeXorbs[i].chunkSizes) {
+				t.Errorf("Xorb %d chunk size count mismatch: xet-core=%d native=%d",
+					i, len(rustrefXorbs[i].chunkSizes), len(nativeXorbs[i].chunkSizes))
 			} else {
-				for j := range xetgoXorbs[i].chunkSizes {
-					if xetgoXorbs[i].chunkSizes[j] != nativeXorbs[i].chunkSizes[j] {
-						t.Errorf("Xorb %d chunk %d size mismatch: xet-go=%d native=%d",
-							i, j, xetgoXorbs[i].chunkSizes[j], nativeXorbs[i].chunkSizes[j])
+				for j := range rustrefXorbs[i].chunkSizes {
+					if rustrefXorbs[i].chunkSizes[j] != nativeXorbs[i].chunkSizes[j] {
+						t.Errorf("Xorb %d chunk %d size mismatch: xet-core=%d native=%d",
+							i, j, rustrefXorbs[i].chunkSizes[j], nativeXorbs[i].chunkSizes[j])
 					}
 				}
 			}
@@ -912,23 +918,23 @@ func compareXorbRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	}
 
 	// Log success
-	if len(xetgoOnly) == 0 && len(nativeOnly) == 0 {
-		t.Logf("✓ Both clients uploaded identical chunk sets (%d chunks)", len(xetgoChunkHashes))
+	if len(rustrefOnly) == 0 && len(nativeOnly) == 0 {
+		t.Logf("✓ Both clients uploaded identical chunk sets (%d chunks)", len(rustrefChunkHashes))
 	}
 }
 
 // compareShardRequests compares shard upload bodies between clients
-func compareShardRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+func compareShardRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
-	if len(xetgoReqs) == 0 || len(nativeReqs) == 0 {
+	if len(rustrefReqs) == 0 || len(nativeReqs) == 0 {
 		return // already reported by count checks
 	}
 
 	// Deserialize both shards
-	xetgoShard := &shard.Shard{}
-	if err := xetgoShard.Decode(bytes.NewReader(xetgoReqs[0].Body), false); err != nil {
-		t.Errorf("Failed to deserialize xet-go shard: %v", err)
+	rustrefShard := &shard.Shard{}
+	if err := rustrefShard.Decode(bytes.NewReader(rustrefReqs[0].Body), false); err != nil {
+		t.Errorf("Failed to deserialize xet-core shard: %v", err)
 		return
 	}
 
@@ -939,119 +945,119 @@ func compareShardRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
 	}
 
 	// STRICT: Both shards must have the same number of files
-	if len(xetgoShard.Files) != len(nativeShard.Files) {
-		t.Errorf("Shard file count mismatch: xet-go=%d native=%d",
-			len(xetgoShard.Files), len(nativeShard.Files))
+	if len(rustrefShard.Files) != len(nativeShard.Files) {
+		t.Errorf("Shard file count mismatch: xet-core=%d native=%d",
+			len(rustrefShard.Files), len(nativeShard.Files))
 		return
 	}
 
 	// STRICT: Compare file blocks
-	for i := range xetgoShard.Files {
-		xetgoFile := xetgoShard.Files[i]
+	for i := range rustrefShard.Files {
+		rustrefFile := rustrefShard.Files[i]
 		nativeFile := nativeShard.Files[i]
 
 		// STRICT: File hashes must match
-		if xetgoFile.FileHash != nativeFile.FileHash {
-			t.Errorf("Shard file %d hash mismatch: xet-go=%s native=%s",
-				i, xetgoFile.FileHash, nativeFile.FileHash)
+		if rustrefFile.FileHash != nativeFile.FileHash {
+			t.Errorf("Shard file %d hash mismatch: xet-core=%s native=%s",
+				i, rustrefFile.FileHash, nativeFile.FileHash)
 			continue
 		}
 
 		// STRICT: Same number of reconstruction entries
-		if len(xetgoFile.Entries) != len(nativeFile.Entries) {
-			t.Errorf("Shard file %d entry count mismatch: xet-go=%d native=%d",
-				i, len(xetgoFile.Entries), len(nativeFile.Entries))
+		if len(rustrefFile.Entries) != len(nativeFile.Entries) {
+			t.Errorf("Shard file %d entry count mismatch: xet-core=%d native=%d",
+				i, len(rustrefFile.Entries), len(nativeFile.Entries))
 			continue
 		}
 
 		// STRICT: Compare reconstruction entries
-		for j := range xetgoFile.Entries {
-			xetgoEntry := xetgoFile.Entries[j]
+		for j := range rustrefFile.Entries {
+			rustrefEntry := rustrefFile.Entries[j]
 			nativeEntry := nativeFile.Entries[j]
 
-			if xetgoEntry.CASHash != nativeEntry.CASHash {
-				t.Errorf("Shard file %d entry %d CASHash mismatch: xet-go=%s native=%s",
-					i, j, xetgoEntry.CASHash, nativeEntry.CASHash)
+			if rustrefEntry.CASHash != nativeEntry.CASHash {
+				t.Errorf("Shard file %d entry %d CASHash mismatch: xet-core=%s native=%s",
+					i, j, rustrefEntry.CASHash, nativeEntry.CASHash)
 			}
-			if xetgoEntry.ChunkIndexStart != nativeEntry.ChunkIndexStart {
-				t.Errorf("Shard file %d entry %d ChunkIndexStart mismatch: xet-go=%d native=%d",
-					i, j, xetgoEntry.ChunkIndexStart, nativeEntry.ChunkIndexStart)
+			if rustrefEntry.ChunkIndexStart != nativeEntry.ChunkIndexStart {
+				t.Errorf("Shard file %d entry %d ChunkIndexStart mismatch: xet-core=%d native=%d",
+					i, j, rustrefEntry.ChunkIndexStart, nativeEntry.ChunkIndexStart)
 			}
-			if xetgoEntry.ChunkIndexEnd != nativeEntry.ChunkIndexEnd {
-				t.Errorf("Shard file %d entry %d ChunkIndexEnd mismatch: xet-go=%d native=%d",
-					i, j, xetgoEntry.ChunkIndexEnd, nativeEntry.ChunkIndexEnd)
+			if rustrefEntry.ChunkIndexEnd != nativeEntry.ChunkIndexEnd {
+				t.Errorf("Shard file %d entry %d ChunkIndexEnd mismatch: xet-core=%d native=%d",
+					i, j, rustrefEntry.ChunkIndexEnd, nativeEntry.ChunkIndexEnd)
 			}
-			if xetgoEntry.UnpackedSegBytes != nativeEntry.UnpackedSegBytes {
-				t.Errorf("Shard file %d entry %d UnpackedSegBytes mismatch: xet-go=%d native=%d",
-					i, j, xetgoEntry.UnpackedSegBytes, nativeEntry.UnpackedSegBytes)
+			if rustrefEntry.UnpackedSegBytes != nativeEntry.UnpackedSegBytes {
+				t.Errorf("Shard file %d entry %d UnpackedSegBytes mismatch: xet-core=%d native=%d",
+					i, j, rustrefEntry.UnpackedSegBytes, nativeEntry.UnpackedSegBytes)
 			}
 		}
 	}
 
 	// STRICT: Both shards must have the same number of CAS blocks
-	if len(xetgoShard.CASInfos) != len(nativeShard.CASInfos) {
-		t.Errorf("Shard CAS block count mismatch: xet-go=%d native=%d",
-			len(xetgoShard.CASInfos), len(nativeShard.CASInfos))
+	if len(rustrefShard.CASInfos) != len(nativeShard.CASInfos) {
+		t.Errorf("Shard CAS block count mismatch: xet-core=%d native=%d",
+			len(rustrefShard.CASInfos), len(nativeShard.CASInfos))
 		return
 	}
 
 	// STRICT: Compare CAS blocks
-	for i := range xetgoShard.CASInfos {
-		xetgoCAS := xetgoShard.CASInfos[i]
+	for i := range rustrefShard.CASInfos {
+		rustrefCAS := rustrefShard.CASInfos[i]
 		nativeCAS := nativeShard.CASInfos[i]
 
-		if xetgoCAS.CASHash != nativeCAS.CASHash {
-			t.Errorf("Shard CAS %d hash mismatch: xet-go=%s native=%s",
-				i, xetgoCAS.CASHash, nativeCAS.CASHash)
+		if rustrefCAS.CASHash != nativeCAS.CASHash {
+			t.Errorf("Shard CAS %d hash mismatch: xet-core=%s native=%s",
+				i, rustrefCAS.CASHash, nativeCAS.CASHash)
 			continue
 		}
 
-		if xetgoCAS.NumBytesInCAS != nativeCAS.NumBytesInCAS {
-			t.Errorf("Shard CAS %d NumBytesInCAS mismatch: xet-go=%d native=%d",
-				i, xetgoCAS.NumBytesInCAS, nativeCAS.NumBytesInCAS)
+		if rustrefCAS.NumBytesInCAS != nativeCAS.NumBytesInCAS {
+			t.Errorf("Shard CAS %d NumBytesInCAS mismatch: xet-core=%d native=%d",
+				i, rustrefCAS.NumBytesInCAS, nativeCAS.NumBytesInCAS)
 		}
 
-		if len(xetgoCAS.Chunks) != len(nativeCAS.Chunks) {
-			t.Errorf("Shard CAS %d chunk count mismatch: xet-go=%d native=%d",
-				i, len(xetgoCAS.Chunks), len(nativeCAS.Chunks))
+		if len(rustrefCAS.Chunks) != len(nativeCAS.Chunks) {
+			t.Errorf("Shard CAS %d chunk count mismatch: xet-core=%d native=%d",
+				i, len(rustrefCAS.Chunks), len(nativeCAS.Chunks))
 			continue
 		}
 
 		// STRICT: Compare individual chunk entries in CAS
-		for j := range xetgoCAS.Chunks {
-			xetgoChunk := xetgoCAS.Chunks[j]
+		for j := range rustrefCAS.Chunks {
+			rustrefChunk := rustrefCAS.Chunks[j]
 			nativeChunk := nativeCAS.Chunks[j]
 
-			if xetgoChunk.ChunkHash != nativeChunk.ChunkHash {
-				t.Errorf("Shard CAS %d chunk %d hash mismatch: xet-go=%s native=%s",
-					i, j, xetgoChunk.ChunkHash, nativeChunk.ChunkHash)
+			if rustrefChunk.ChunkHash != nativeChunk.ChunkHash {
+				t.Errorf("Shard CAS %d chunk %d hash mismatch: xet-core=%s native=%s",
+					i, j, rustrefChunk.ChunkHash, nativeChunk.ChunkHash)
 			}
-			if xetgoChunk.UnpackedSegBytes != nativeChunk.UnpackedSegBytes {
-				t.Errorf("Shard CAS %d chunk %d UnpackedSegBytes mismatch: xet-go=%d native=%d",
-					i, j, xetgoChunk.UnpackedSegBytes, nativeChunk.UnpackedSegBytes)
+			if rustrefChunk.UnpackedSegBytes != nativeChunk.UnpackedSegBytes {
+				t.Errorf("Shard CAS %d chunk %d UnpackedSegBytes mismatch: xet-core=%d native=%d",
+					i, j, rustrefChunk.UnpackedSegBytes, nativeChunk.UnpackedSegBytes)
 			}
-			if xetgoChunk.ByteRangeStart != nativeChunk.ByteRangeStart {
-				t.Errorf("Shard CAS %d chunk %d ByteRangeStart mismatch: xet-go=%d native=%d",
-					i, j, xetgoChunk.ByteRangeStart, nativeChunk.ByteRangeStart)
+			if rustrefChunk.ByteRangeStart != nativeChunk.ByteRangeStart {
+				t.Errorf("Shard CAS %d chunk %d ByteRangeStart mismatch: xet-core=%d native=%d",
+					i, j, rustrefChunk.ByteRangeStart, nativeChunk.ByteRangeStart)
 			}
 		}
 	}
 
 	t.Logf("✓ Shard content matches between clients (%d files, %d CAS blocks)",
-		len(xetgoShard.Files), len(xetgoShard.CASInfos))
+		len(rustrefShard.Files), len(rustrefShard.CASInfos))
 }
 
 // compareReconstructionPaths verifies both clients query reconstruction for the same file hash
-func compareReconstructionPaths(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, expectedFileHash string) {
+func compareReconstructionPaths(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, expectedFileHash string) {
 	t.Helper()
 
-	for _, req := range xetgoReqs {
+	for _, req := range rustrefReqs {
 		if strings.Contains(req.Path, "/reconstructions/") {
 			parts := strings.SplitSeq(req.Path, "/")
 			for part := range parts {
 				if len(part) == 64 && isHexString(part) {
 					if part != expectedFileHash {
-						t.Errorf("xet-go reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
+						t.Errorf("xet-core reconstruction query uses wrong file hash: got %s want %s", part, expectedFileHash)
 					}
 				}
 			}
@@ -1073,16 +1079,16 @@ func compareReconstructionPaths(t *testing.T, xetgoReqs, nativeReqs []RequestRec
 }
 
 // compareXorbDownloadRanges compares Range headers on xorb download requests between clients
-func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestRecord) {
+func compareXorbDownloadRanges(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
 	t.Helper()
 
 	// Group download requests by xorb path (actual path, not normalized)
-	xetgoRangesByPath := make(map[string][]string)
+	rustrefRangesByPath := make(map[string][]string)
 	nativeRangesByPath := make(map[string][]string)
 
-	for _, req := range xetgoReqs {
+	for _, req := range rustrefReqs {
 		rangeHeader := req.Headers.Get("Range")
-		xetgoRangesByPath[req.Path] = append(xetgoRangesByPath[req.Path], rangeHeader)
+		rustrefRangesByPath[req.Path] = append(rustrefRangesByPath[req.Path], rangeHeader)
 	}
 
 	for _, req := range nativeReqs {
@@ -1092,17 +1098,17 @@ func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestReco
 
 	// For each xorb path, compare semantic range coverage. Clients may split
 	// ranges differently, but the downloaded byte intervals must be identical.
-	for path, xetgoRanges := range xetgoRangesByPath {
+	for path, rustrefRanges := range rustrefRangesByPath {
 		nativeRanges, ok := nativeRangesByPath[path]
 		if !ok {
-			t.Errorf("xet-go downloaded xorb %s but native did not", path)
+			t.Errorf("xet-core downloaded xorb %s but native did not", path)
 			continue
 		}
 
-		xMerged, xErr := mergeRanges(xetgoRanges)
+		xMerged, xErr := mergeRanges(rustrefRanges)
 		nMerged, nErr := mergeRanges(nativeRanges)
 		if xErr != nil {
-			t.Errorf("xet-go has invalid Range header for xorb %s: %v", path, xErr)
+			t.Errorf("xet-core has invalid Range header for xorb %s: %v", path, xErr)
 			continue
 		}
 		if nErr != nil {
@@ -1111,14 +1117,14 @@ func compareXorbDownloadRanges(t *testing.T, xetgoReqs, nativeReqs []RequestReco
 		}
 
 		if !equalByteRanges(xMerged, nMerged) {
-			t.Errorf("Xorb %s merged byte-range mismatch: xet-go=%v native=%v", path, xMerged, nMerged)
+			t.Errorf("Xorb %s merged byte-range mismatch: xet-core=%v native=%v", path, xMerged, nMerged)
 		}
 	}
 
 	// Check for native-only xorb downloads
 	for path := range nativeRangesByPath {
-		if _, ok := xetgoRangesByPath[path]; !ok {
-			t.Errorf("native downloaded xorb %s but xet-go did not", path)
+		if _, ok := rustrefRangesByPath[path]; !ok {
+			t.Errorf("native downloaded xorb %s but xet-core did not", path)
 		}
 	}
 }
@@ -1200,25 +1206,25 @@ func equalByteRanges(a, b []byteRange) bool {
 	return true
 }
 
-// compareBatchDownloadRequests compares HTTP request patterns between xet-go and the
+// compareBatchDownloadRequests compares HTTP request patterns between xet-core and the
 // native client for a multi-file batch download.
 // It asserts that the native client uses the batch /reconstructions endpoint and that
 // both clients cover the same byte ranges when downloading xorb data.
-func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestRecord, fileHashes []xet.FileHash) {
+func compareBatchDownloadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, fileHashes []xet.FileHash) {
 	t.Helper()
 
-	xetgoByType := groupRequestsByType(xetgoReqs)
+	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// Log which reconstruction strategy each client used — xet-go may call individual
+	// Log which reconstruction strategy each client used — xet-core may call individual
 	// endpoints while native should use the batch endpoint.
-	xetgoBatchRecon := len(xetgoByType["GET:/reconstructions"])
+	rustrefBatchRecon := len(rustrefByType["GET:/reconstructions"])
 	nativeBatchRecon := len(nativeByType["GET:/reconstructions"])
-	xetgoSingleRecon := len(xetgoByType["GET:/v1/reconstructions/{hash}"]) + len(xetgoByType["GET:/v2/reconstructions/{hash}"])
+	rustrefSingleRecon := len(rustrefByType["GET:/v1/reconstructions/{hash}"]) + len(rustrefByType["GET:/v2/reconstructions/{hash}"])
 	nativeSingleRecon := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
 
-	t.Logf("Reconstruction: xet-go — %d batch, %d single-file; native — %d batch, %d single-file",
-		xetgoBatchRecon, xetgoSingleRecon, nativeBatchRecon, nativeSingleRecon)
+	t.Logf("Reconstruction: xet-core — %d batch, %d single-file; native — %d batch, %d single-file",
+		rustrefBatchRecon, rustrefSingleRecon, nativeBatchRecon, nativeSingleRecon)
 
 	// STRICT: native client must use the batch endpoint for multiple files.
 	if nativeBatchRecon == 0 {
@@ -1230,17 +1236,17 @@ func compareBatchDownloadRequests(t *testing.T, xetgoReqs, nativeReqs []RequestR
 	}
 
 	// Both clients must download xorb data to reconstruct the files.
-	xetgoXorbReqs := xetgoByType["GET:/v1/xorbs/default/{hash}"]
+	rustrefXorbReqs := rustrefByType["GET:/v1/xorbs/default/{hash}"]
 	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}"]
-	if len(xetgoXorbReqs) == 0 && len(nativeXorbReqs) > 0 {
-		t.Errorf("xet-go did not download any xorb data while native did")
+	if len(rustrefXorbReqs) == 0 && len(nativeXorbReqs) > 0 {
+		t.Errorf("xet-core did not download any xorb data while native did")
 	}
-	if len(nativeXorbReqs) == 0 && len(xetgoXorbReqs) > 0 {
-		t.Errorf("native client did not download any xorb data while xet-go did")
+	if len(nativeXorbReqs) == 0 && len(rustrefXorbReqs) > 0 {
+		t.Errorf("native client did not download any xorb data while xet-core did")
 	}
 
 	// STRICT: both clients must cover identical byte ranges per xorb.
-	compareXorbDownloadRanges(t, xetgoXorbReqs, nativeXorbReqs)
+	compareXorbDownloadRanges(t, rustrefXorbReqs, nativeXorbReqs)
 
 	t.Logf("✓ Batch download xorb-range conformance passed for %d files", len(fileHashes))
 }
@@ -1526,9 +1532,9 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 			batchReconCount, singleReconCount)
 	})
 
-	t.Run("xetgo_batch_download_comparison", func(t *testing.T) {
+	t.Run("rustref_batch_download_comparison", func(t *testing.T) {
 		// Setup a dedicated proxy-recorded server so we can observe every HTTP
-		// request made by both xet-go and the native client.
+		// request made by both xet-core and the native client.
 		cmpStorDir := t.TempDir()
 		var cmpStor storage.Storage
 		var cmpSrv *server.Handler
@@ -1565,7 +1571,7 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 
 		// Upload three files — one tiny, two larger — to exercise multiple xorbs.
 		cmpDatasets := [][]byte{
-			[]byte("xetgo-vs-native batch comparison – small"),
+			[]byte("rustref-vs-native batch comparison – small"),
 			utils.MakeRandData(1024 * 1024),
 			utils.MakeRepeatData(1024 * 1024),
 		}
@@ -1578,31 +1584,31 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 			cmpHashes[i] = hash
 		}
 
-		// ── xet-go batch download ────────────────────────────────────────────────
+		// ── xet-core batch download ────────────────────────────────────────────────
 		cmpProxy.ClearRequests()
 		tempDir := t.TempDir()
-		xetgoDownloadReqs := make([]xetgo.DownloadRequest, len(cmpDatasets))
+		rustrefDownloadReqs := make([]rustref.DownloadRequest, len(cmpDatasets))
 		for i, h := range cmpHashes {
-			xetgoDownloadReqs[i] = xetgo.DownloadRequest{
-				DestinationPath: filepath.Join(tempDir, fmt.Sprintf("xetgo-%d.bin", i)),
+			rustrefDownloadReqs[i] = rustref.DownloadRequest{
+				DestinationPath: filepath.Join(tempDir, fmt.Sprintf("rustref-%d.bin", i)),
 				Hash:            h.String(),
 				FileSize:        int64(len(cmpDatasets[i])),
 			}
 		}
-		if _, err := xetgo.DownloadFiles(xetgoDownloadReqs, cmpHTTP.URL, nil); err != nil {
-			t.Fatalf("xet-go DownloadFiles failed: %v", err)
+		if _, err := rustref.DownloadFiles(rustrefDownloadReqs, cmpHTTP.URL, nil); err != nil {
+			t.Fatalf("xet-core DownloadFiles failed: %v", err)
 		}
-		xetgoHTTPReqs := cmpProxy.GetRequests()
+		rustrefHTTPReqs := cmpProxy.GetRequests()
 
-		// Verify xet-go reconstructed the correct content.
+		// Verify xet-core reconstructed the correct content.
 		for i, data := range cmpDatasets {
-			got, err := os.ReadFile(xetgoDownloadReqs[i].DestinationPath)
+			got, err := os.ReadFile(rustrefDownloadReqs[i].DestinationPath)
 			if err != nil {
-				t.Errorf("read xet-go file %d: %v", i, err)
+				t.Errorf("read xet-core file %d: %v", i, err)
 				continue
 			}
 			if !bytes.Equal(got, data) {
-				t.Errorf("xet-go file %d content mismatch: got %d bytes, want %d bytes", i, len(got), len(data))
+				t.Errorf("xet-core file %d content mismatch: got %d bytes, want %d bytes", i, len(got), len(data))
 			}
 		}
 
@@ -1638,6 +1644,6 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		nativeHTTPReqs := cmpProxy.GetRequests()
 
 		// ── compare HTTP request patterns ────────────────────────────────────────
-		compareBatchDownloadRequests(t, xetgoHTTPReqs, nativeHTTPReqs, cmpHashes)
+		compareBatchDownloadRequests(t, rustrefHTTPReqs, nativeHTTPReqs, cmpHashes)
 	})
 }

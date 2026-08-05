@@ -134,7 +134,7 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 	}
 
 	// Sort CAS blocks by hash for a deterministic shard layout that matches
-	// the reference implementation (xet-go).
+	// the reference implementation.
 	sort.Slice(sh.CASInfos, func(i, j int) bool {
 		return sh.CASInfos[i].CASHash.String() < sh.CASInfos[j].CASHash.String()
 	})

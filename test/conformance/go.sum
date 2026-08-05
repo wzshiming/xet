@@ -8,8 +8,6 @@ github.com/pierrec/lz4/v4 v4.1.26 h1:GrpZw1gZttORinvzBdXPUXATeqlJjqUG/D87TKMnhjY
 github.com/pierrec/lz4/v4 v4.1.26/go.mod h1:EoQMVJgeeEOMsCqCzqFm2O0cJvljX2nGZjcRIPL34O4=
 github.com/wzshiming/httpseek v0.6.1 h1:nmrpxl7SNtj8KmmZ8XRMCnKVfOvj1yNAGXNYtPfeRoA=
 github.com/wzshiming/httpseek v0.6.1/go.mod h1:YoZhlLIwNjTBDXIT8NpK5zRjOgZouRXPaBfjVXdqMMs=
-github.com/wzshiming/xet-go v0.0.4 h1:ldZQAeCsIyeRTMRkd39QGgPJJov0G4Rb69H1dLZg7tI=
-github.com/wzshiming/xet-go v0.0.4/go.mod h1:vhlynAJBAeEhZqNE4PK95iOgN7ULSnx47X1S70T/nF4=
 github.com/zeebo/assert v1.1.0 h1:hU1L1vLTHsnO8x8c9KAR5GmM5QscxHg5RNU5z5qbUWY=
 github.com/zeebo/assert v1.1.0/go.mod h1:Pq9JiuJQpG8JLJdtkwrJESF0Foym2/D9XMU5ciN/wJ0=
 github.com/zeebo/blake3 v0.2.4 h1:KYQPkhpRtcqh0ssGYcKLG1JYvddkEA8QwCM/yBqhaZI=

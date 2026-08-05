@@ -42,6 +42,15 @@ jobs:
       with:
         go-version-file: test/conformance/go.mod
 
+    - name: Set up Rust
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup default stable
+
+    - name: Build xet-core reference
+      working-directory: test/conformance
+      run: cargo build --release --locked
+
     - name: Run conformance tests
       working-directory: test/conformance
       run: go test ./...

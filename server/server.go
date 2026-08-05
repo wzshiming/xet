@@ -88,6 +88,8 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleDownloadXorb).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
+	s.root.HandleFunc("/v2/shards", s.handleUploadShardV2).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/xet-bridge/{sha256}", s.handleXetBridge).Methods(http.MethodGet, http.MethodHead)
 
@@ -375,7 +377,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, xorbHashStr, time.Time{}, xorbReader)
 }
 
-// handleUploadShard handles POST /shards
+// handleUploadShard handles the legacy and v1 shard upload endpoints.
 func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	// Authenticate
 	if !s.authenticate(r) {
@@ -388,32 +390,9 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body io.Reader = r.Body
-
-	body = io.LimitReader(body, r.ContentLength)
-
-	// Deserialize and validate shard.
-	shardObj := shard.NewShard()
-	if err := shardObj.Decode(body, false); err != nil {
-		http.Error(w, "Invalid shard format: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := shardObj.Validate(); err != nil {
-		http.Error(w, "Invalid shard: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	for _, casBlock := range shardObj.CASInfos {
-		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
-		if err != nil || !exists {
-			http.Error(w, "Invalid shard: referenced xorb not uploaded", http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Store shard
-	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
+	wasInserted, status, err := s.storeUploadedShard(r)
 	if err != nil {
-		http.Error(w, "Failed to store shard", http.StatusInternalServerError)
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -429,6 +408,54 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleUploadShardV2 handles POST /v2/shards. The current xet-core client
+// expects an NDJSON progress stream terminated by a result event.
+func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticate(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return
+	}
+
+	if _, status, err := s.storeUploadedShard(r); err != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	_, _ = io.WriteString(w, "{\"type\":\"validating\",\"verified\":1,\"total\":1}\n")
+	_, _ = io.WriteString(w, "{\"type\":\"committing\",\"stage\":\"syncing\"}\n")
+	_, _ = io.WriteString(w, "{\"type\":\"result\"}\n")
+}
+
+func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
+	body := io.LimitReader(r.Body, r.ContentLength)
+
+	shardObj := shard.NewShard()
+	if err := shardObj.Decode(body, false); err != nil {
+		return false, http.StatusBadRequest, fmt.Errorf("invalid shard format: %w", err)
+	}
+	if err := shardObj.Validate(); err != nil {
+		return false, http.StatusBadRequest, fmt.Errorf("invalid shard: %w", err)
+	}
+	for _, casBlock := range shardObj.CASInfos {
+		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
+		if err != nil || !exists {
+			return false, http.StatusBadRequest, fmt.Errorf("invalid shard: referenced xorb not uploaded")
+		}
+	}
+
+	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
+	if err != nil {
+		return false, http.StatusInternalServerError, fmt.Errorf("failed to store shard")
+	}
+	return wasInserted, http.StatusOK, nil
 }
 
 // handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}
@@ -452,8 +479,9 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serialize shard without footer (for API responses) and stream directly
-	reader, err := shardObj.Encode(false)
+	// Global dedup responses are persisted shard objects and include the footer
+	// required by current xet-core clients.
+	reader, err := shardObj.Encode(true)
 	if err != nil {
 		http.Error(w, "Failed to serialize shard", http.StatusInternalServerError)
 		return

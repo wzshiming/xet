@@ -235,5 +235,6 @@ func (s *Shard) SetFooter() {
 		StoredBytes:            storedBytes,
 		MaterializedBytes:      materializedBytes,
 		ShardCreationTimestamp: uint64(time.Now().Unix()),
+		ShardKeyExpiry:         ^uint64(0),
 	}
 }
