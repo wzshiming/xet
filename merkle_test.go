@@ -5,6 +5,23 @@ import (
 	"testing"
 )
 
+func TestComputeFileHashEmptyUsesZeroHash(t *testing.T) {
+	if got := ComputeFileHash(nil, nil); got != (FileHash{}) {
+		t.Fatalf("ComputeFileHash(nil, nil) = %s, want ZERO_HASH", got)
+	}
+}
+
+func TestComputeFileHashNonEmptyZeroRootUsesKeyedHash(t *testing.T) {
+	got := ComputeFileHash([]ChunkHash{{}}, []uint64{1})
+	want := FileHash(computeFileHash(make([]byte, hashSize)))
+	if got != want {
+		t.Fatalf("ComputeFileHash([ZERO_HASH], [1]) = %s, want %s", got, want)
+	}
+	if got == (FileHash{}) {
+		t.Fatal("non-empty file hash must not use the empty-file ZERO_HASH special case")
+	}
+}
+
 /*
 Child 1:
 

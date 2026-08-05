@@ -25,6 +25,13 @@ type ChunkInfo struct {
 // BuildShard constructs a Shard from the provided file and chunk information.
 func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 	sh := NewShard()
+	firstFileChunks := make(map[xet.ChunkHash]struct{}, len(files))
+	for _, file := range files {
+		if len(file.ChunkIndices) == 0 {
+			continue
+		}
+		firstFileChunks[chunks[file.ChunkIndices[0]].Hash] = struct{}{}
+	}
 
 	// Build file blocks.
 	for _, file := range files {
@@ -108,10 +115,16 @@ func BuildShard(files []FileInfo, chunks []ChunkInfo) *Shard {
 			cb = &CASBlock{CASHash: chunk.XorbHash}
 			casBlocks[chunk.XorbHash] = cb
 		}
+		var flags ChunkFlags
+		_, isFirstFileChunk := firstFileChunks[chunk.Hash]
+		if IsChunkGlobalDedupEligible(chunk.Hash, isFirstFileChunk, 0) {
+			flags = ChunkGlobalDedupEligible
+		}
 		cb.Chunks = append(cb.Chunks, CASChunkSequenceEntry{
 			ChunkHash:        chunk.Hash,
 			ByteRangeStart:   cb.NumBytesInCAS,
 			UnpackedSegBytes: chunk.Size,
+			Flags:            flags,
 		})
 		cb.NumBytesInCAS += chunk.Size
 	}

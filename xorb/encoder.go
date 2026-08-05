@@ -13,8 +13,9 @@ import (
 // Call Encode for each chunk, then Close to flush the footer (if withFooter),
 // then SummoryHash to retrieve the overall xorb hash.
 type Encoder struct {
-	w          io.Writer
-	withFooter bool
+	w               io.Writer
+	withFooter      bool
+	uniquenessNonce [4]byte
 
 	// Accumulated per-chunk metadata
 	chunkHashes     []xet.ChunkHash
@@ -37,6 +38,19 @@ func NewEncoder(w io.Writer, withFooter bool) *Encoder {
 	}
 }
 
+// SetUniquenessNonce stores nonce in the first four bytes of the footer
+// buffer. It may be called before Close and does not affect the xorb hash.
+func (e *Encoder) SetUniquenessNonce(nonce [4]byte) error {
+	if e.err != nil {
+		return e.err
+	}
+	if e.finalized {
+		return fmt.Errorf("encoder already finalized")
+	}
+	e.uniquenessNonce = nonce
+	return nil
+}
+
 // Write compresses chunk and writes the 8-byte header followed by compressed data to w.
 func (e *Encoder) Write(chunk []byte) (int, error) {
 	if e.err != nil {
@@ -44,6 +58,18 @@ func (e *Encoder) Write(chunk []byte) (int, error) {
 	}
 	if e.finalized {
 		e.err = fmt.Errorf("encoder already finalized")
+		return 0, e.err
+	}
+	if len(chunk) > xet.MaxChunkSize {
+		e.err = fmt.Errorf("chunk size %d exceeds maximum %d", len(chunk), xet.MaxChunkSize)
+		return 0, e.err
+	}
+	if len(e.chunkHashes) >= xet.MaxChunksPerXorb {
+		e.err = fmt.Errorf("chunk count would exceed maximum %d", xet.MaxChunksPerXorb)
+		return 0, e.err
+	}
+	if e.unpackedPos > xet.MaxXorbSize || uint64(len(chunk)) > xet.MaxXorbSize-e.unpackedPos {
+		e.err = fmt.Errorf("raw payload size would exceed maximum %d", xet.MaxXorbSize)
 		return 0, e.err
 	}
 
@@ -157,7 +183,9 @@ func (e *Encoder) writeFooter() error {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(offset))
 	}
 
-	// Trailer: num_chunks (4), hash_offset_from_end (4), boundary_offset_from_end (4), reserved (16)
+	// Trailer: num_chunks (4), hash_offset_from_end (4),
+	// boundary_offset_from_end (4), footer buffer (16). The footer buffer starts
+	// with an optional 4-byte uniqueness nonce followed by 12 reserved zero bytes.
 	footerEndPos := len(buf) + 4 + 4 + 4 + 16
 
 	hashOffsetFromEnd := uint32(footerEndPos - 40)
@@ -167,7 +195,8 @@ func (e *Encoder) writeFooter() error {
 	buf = binary.LittleEndian.AppendUint32(buf, numChunks)
 	buf = binary.LittleEndian.AppendUint32(buf, hashOffsetFromEnd)
 	buf = binary.LittleEndian.AppendUint32(buf, boundaryOffsetFromEnd)
-	var reserved [16]byte
+	buf = append(buf, e.uniquenessNonce[:]...)
+	var reserved [12]byte
 	buf = append(buf, reserved[:]...)
 
 	// Trailing footer length (4 bytes)

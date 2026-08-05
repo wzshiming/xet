@@ -56,6 +56,12 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		if uncompressedSize > xet.MaxChunkSize {
 			return fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
 		}
+		if len(chunkHashes) >= xet.MaxChunksPerXorb {
+			return fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
+		}
+		if unpackedEndOffset > xet.MaxXorbSize || uint64(uncompressedSize) > xet.MaxXorbSize-unpackedEndOffset {
+			return fmt.Errorf("raw payload size exceeds maximum %d", xet.MaxXorbSize)
+		}
 
 		if _, err := io.ReadFull(r, tmp[:compressedSize]); err != nil {
 			return fmt.Errorf("failed to read compressed chunk data: %w", err)
@@ -153,10 +159,18 @@ func validateWithFooter(
 	packedBase := bOff + 12
 	unpackedBase := packedBase + int(numChunks)*4
 
-	// Parse trailer: num_chunks (4) + hash_offset_from_end (4) + boundary_offset_from_end (4) + reserved (16)
+	// Parse trailer: num_chunks (4) + hash_offset_from_end (4) +
+	// boundary_offset_from_end (4) + footer buffer (16). Readers ignore the
+	// first four footer-buffer bytes (the uniqueness nonce); the remaining 12
+	// reserved bytes must be zero.
 	trailerOff := unpackedBase + int(numChunks)*4
 	if binary.LittleEndian.Uint32(remaining[trailerOff:trailerOff+4]) != numChunks {
 		return fmt.Errorf("invalid footer: trailer num_chunks mismatch")
+	}
+	reserved := remaining[trailerOff+16 : trailerOff+28]
+	var zeroReserved [12]byte
+	if !bytes.Equal(reserved, zeroReserved[:]) {
+		return fmt.Errorf("invalid footer: reserved footer buffer bytes must be zero")
 	}
 	return nil
 }

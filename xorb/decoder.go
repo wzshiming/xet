@@ -19,6 +19,7 @@ type Decoder struct {
 
 	chunkHashes []xet.ChunkHash
 	chunkSizes  []uint64
+	rawSize     uint64
 
 	done     bool
 	xorbHash *xet.XorbHash
@@ -100,6 +101,14 @@ func (d *Decoder) Read(p []byte) (int, error) {
 		d.err = fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
 		return 0, d.err
 	}
+	if len(d.chunkHashes) >= xet.MaxChunksPerXorb {
+		d.err = fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
+		return 0, d.err
+	}
+	if d.rawSize > xet.MaxXorbSize || uint64(uncompressedSize) > xet.MaxXorbSize-d.rawSize {
+		d.err = fmt.Errorf("raw payload size exceeds maximum %d", xet.MaxXorbSize)
+		return 0, d.err
+	}
 
 	if _, err := io.ReadFull(d.r, p[:compressedSize]); err != nil {
 		d.err = fmt.Errorf("failed to read chunk data: %w", err)
@@ -117,6 +126,7 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	h := xet.ComputeChunkHash(uncompressed)
 	d.chunkHashes = append(d.chunkHashes, h)
 	d.chunkSizes = append(d.chunkSizes, uint64(uncompressedSize))
+	d.rawSize += uint64(uncompressedSize)
 
 	if len(uncompressed) > len(p) {
 		d.err = fmt.Errorf("output buffer too small: need %d bytes", len(uncompressed))
