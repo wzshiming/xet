@@ -47,6 +47,13 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 // ResolveResponse extracts the file hash and a CAS TokenProvider from an
 // already-executed HTTP response that contains XET link headers.
 func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Response) (xet.FileHash, client.AuthProvider, error) {
+	return ResolveResponseWithToken(ctx, httpClient, resp, "")
+}
+
+// ResolveResponseWithToken extracts the file hash and a CAS AuthProvider from
+// an already-executed HTTP response that contains XET link headers. token is
+// sent only to the xet-auth endpoint and is useful for gated repositories.
+func ResolveResponseWithToken(ctx context.Context, httpClient *http.Client, resp *http.Response, token string) (xet.FileHash, client.AuthProvider, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		return xet.FileHash{}, nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
@@ -83,12 +90,12 @@ func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Re
 		return xet.FileHash{}, nil, fmt.Errorf("parse X-Xet-Hash: %w", err)
 	}
 
-	initial, err := fetchXETAuthToken(ctx, httpClient, authURL, "")
+	initial, err := fetchXETAuthToken(ctx, httpClient, authURL, token)
 	if err != nil {
 		return xet.FileHash{}, nil, fmt.Errorf("fetch xet auth token: %w", err)
 	}
 
-	provider := newTokenProviderFromURL(httpClient, authURL, initial)
+	provider := newTokenProviderFromURL(httpClient, authURL, token, initial)
 	return fileHash, provider, nil
 }
 

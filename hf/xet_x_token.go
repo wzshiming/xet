@@ -73,10 +73,11 @@ func newTokenProvider(httpClient *http.Client, target Target, hfToken, mode stri
 // newTokenProviderFromURL creates a provider that refreshes by calling authURL
 // directly. An optional pre-fetched token can be provided to avoid an
 // immediate network round-trip.
-func newTokenProviderFromURL(httpClient *http.Client, authURL string, initial *tokenData) client.AuthProvider {
+func newTokenProviderFromURL(httpClient *http.Client, authURL, hfToken string, initial *tokenData) client.AuthProvider {
 	return &tokenProvider{
 		httpClient: httpClient,
 		tokenURL:   authURL,
+		hfToken:    hfToken,
 		current:    initial,
 	}
 }

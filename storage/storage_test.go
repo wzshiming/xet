@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -98,5 +100,49 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	fs.fileIndex.Add(fileHash, shardHash)
 	if _, err := fs.GetShard(context.Background(), secondFileHash); err != nil {
 		t.Fatalf("GetShard(second file): %v", err)
+	}
+}
+
+func TestPutShardNormalizesXETCoreEmptyFileSHA256(t *testing.T) {
+	basePath := t.TempDir()
+	fs, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fileHash := xet.ComputeFileHash(nil, nil)
+	s := shard.NewShard()
+	s.AddFile(shard.FileBlock{
+		FileHash:     fileHash,
+		Flags:        shard.FileWithVerification | shard.FileWithMetadataExt,
+		Entries:      []shard.FileDataSequenceEntry{},
+		Verification: []xet.VerificationHash{},
+		MetadataExt:  &shard.FileMetadataExt{},
+	})
+
+	inserted, err := fs.PutShard(context.Background(), s)
+	if err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+
+	wantSHA256 := sha256.Sum256(nil)
+	if got := s.Files[0].MetadataExt.SHA256Hash; got != shard.NewSHA256Hash(wantSHA256) {
+		t.Fatalf("normalized SHA-256 = %s, want %x", got.String(), wantSHA256)
+	}
+	if _, err := os.Stat(filepath.Join(basePath, "sha256", shard.NewSHA256Hash(wantSHA256).String())); err != nil {
+		t.Fatalf("standard empty-file SHA-256 index is missing: %v", err)
+	}
+
+	r, err := fs.GetReconstructedFile(context.Background(), "default", wantSHA256)
+	if err != nil {
+		t.Fatalf("GetReconstructedFile: %v", err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read reconstructed empty file: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("reconstructed empty file contains %d bytes", len(data))
 	}
 }

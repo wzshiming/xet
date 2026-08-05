@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -211,7 +212,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	}
 
 	// Build reconstruction response
-	response, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV1(r.Context(), requestStorage(s.storage, r), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -259,7 +260,7 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 			// Skip files not found; caller can check which hashes are absent.
 			continue
 		}
-		single, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", sh, fileHash, "")
+		single, err := download.BuildReconstructionResponseV1(r.Context(), requestStorage(s.storage, r), "default", sh, fileHash, "")
 		if err != nil {
 			continue
 		}
@@ -295,7 +296,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Build V2 reconstruction response
-	response, err := download.BuildReconstructionResponseV2(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV2(r.Context(), requestStorage(s.storage, r), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -524,4 +525,37 @@ func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.ChunkHash) (x
 	}
 
 	return xet.XorbHash{}, 0, false
+}
+
+type absoluteURLStorage struct {
+	storage.Storage
+	baseURL string
+}
+
+func requestStorage(stor storage.Storage, r *http.Request) download.StorageAdapter {
+	return absoluteURLStorage{Storage: stor, baseURL: requestBaseURL(r)}
+}
+
+func (s absoluteURLStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
+	raw := s.Storage.GetXorbURL(namespace, xorbHash)
+	u, err := url.Parse(raw)
+	if err != nil || u.IsAbs() {
+		return raw
+	}
+	base, err := url.Parse(s.baseURL + "/")
+	if err != nil {
+		return raw
+	}
+	return base.ResolveReference(u).String()
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded != "" {
+		scheme = forwarded
+	}
+	return scheme + "://" + r.Host
 }

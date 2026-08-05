@@ -256,23 +256,37 @@ func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 	if _, err := os.Stat(xorbPath); err == nil {
 		return false, nil // Already exists
 	}
-	// Write xorb to disk using streaming
-	f, err := os.OpenFile(xorbPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Use a unique temporary file so concurrent uploads of the same xorb cannot
+	// truncate or corrupt one another.
+	f, err := os.CreateTemp(filepath.Dir(xorbPath), filepath.Base(xorbPath)+".tmp-")
 	if err != nil {
 		return false, fmt.Errorf("create xorb file: %w", err)
+	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("set xorb file permissions: %w", err)
 	}
 
 	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
 	if err != nil {
 		f.Close()
-		os.Remove(xorbPath + ".tmp")
 		return false, fmt.Errorf("validate xorb: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return false, fmt.Errorf("close xorb file: %w", err)
+	}
 
 	// Atomically rename temp file to final path
-	if err := os.Rename(xorbPath+".tmp", xorbPath); err != nil {
-		os.Remove(xorbPath + ".tmp")
+	fs.mut.Lock()
+	defer fs.mut.Unlock()
+	if _, err := os.Stat(xorbPath); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("check xorb before finalize: %w", err)
+	}
+	if err := os.Rename(tmpPath, xorbPath); err != nil {
 		return false, fmt.Errorf("finalize xorb file: %w", err)
 	}
 
@@ -344,11 +358,14 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		if err != nil {
 			return false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
-		if s.Files[i].MetadataExt != nil && s.Files[i].MetadataExt.SHA256Hash != shard.NewSHA256Hash(computed) {
+		computedHash := shard.NewSHA256Hash(computed)
+		if s.Files[i].MetadataExt != nil &&
+			s.Files[i].MetadataExt.SHA256Hash != computedHash &&
+			!isXETCoreEmptyFile(&s.Files[i]) {
 			return false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
 		}
 
-		s.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(computed)}
+		s.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: computedHash}
 		s.Files[i].Flags |= shard.FileWithMetadataExt
 	}
 
@@ -465,11 +482,17 @@ func (fs *FileStorage) openXorb(casHash xet.XorbHash) (*xorbFile, error) {
 	return xf, nil
 }
 
-func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
-	if len(fileBlock.Entries) == 0 {
-		return [32]byte{}, nil
-	}
+// xet-core represents an empty file's computed SHA-256 as the zero value in
+// shard metadata. Accept that wire-level sentinel and normalize it to the
+// standard SHA-256 of empty content before persisting the shard.
+func isXETCoreEmptyFile(file *shard.FileBlock) bool {
+	return file.MetadataExt != nil &&
+		file.FileHash == (xet.FileHash{}) &&
+		len(file.Entries) == 0 &&
+		file.MetadataExt.SHA256Hash == (shard.SHA256Hash{})
+}
 
+func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
 	h := sha256.New()
 	buf := make([]byte, xet.MaxChunkSize)
 	for _, entry := range fileBlock.Entries {

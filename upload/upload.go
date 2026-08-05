@@ -216,7 +216,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		fileInfos[index].Hash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 		fileHashes[index] = fileInfos[index].Hash
 
-		if options.enableSHA256 && len(fileInfos[index].ChunkIndices) != 0 {
+		if options.enableSHA256 {
 			copy(fileInfos[index].SHA256[:], sha256Hasher.Sum(nil))
 		}
 	}

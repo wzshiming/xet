@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -143,5 +145,63 @@ func TestXetBridgeRejectsInvalidAndUnknownSHA256(t *testing.T) {
 		if rec.Code != test.want {
 			t.Errorf("GET %s: status = %d, want %d", test.path, rec.Code, test.want)
 		}
+	}
+}
+
+func TestReconstructionMakesRelativeXorbURLAbsolute(t *testing.T) {
+	ctx := context.Background()
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("absolute fetch URL")
+	var encoded bytes.Buffer
+	encoder := xorb.NewEncoder(&encoded, true)
+	if _, err := encoder.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	xorbHash := encoder.SummoryHash()
+	if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	chunkHash := xet.ComputeChunkHash(data)
+	fileHash := xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(data))})
+	sh := shard.NewShard()
+	sh.AddCASBlock(shard.CASBlock{
+		CASHash: xorbHash,
+		Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(data))}},
+	})
+	sh.AddFile(shard.FileBlock{
+		FileHash: fileHash,
+		Entries: []shard.FileDataSequenceEntry{{
+			CASHash: xorbHash, UnpackedSegBytes: uint32(len(data)), ChunkIndexEnd: 1,
+		}},
+	})
+	if _, err := stor.PutShard(ctx, sh); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/reconstructions/"+fileHash.String(), nil)
+	req.Host = "mirror.example"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	NewHandler(WithStorage(stor)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var reconstruction download.ReconstructionResponseV1
+	if err := json.NewDecoder(rec.Body).Decode(&reconstruction); err != nil {
+		t.Fatal(err)
+	}
+	entries := reconstruction.FetchInfo[xorbHash.String()]
+	if len(entries) == 0 {
+		t.Fatal("missing fetch info")
+	}
+	want := "https://mirror.example/v1/xorbs/default/" + xorbHash.String()
+	if got := entries[0].URL; got != want {
+		t.Fatalf("xorb URL = %q, want %q", got, want)
 	}
 }
