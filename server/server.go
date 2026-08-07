@@ -410,30 +410,6 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleUploadShardV2 handles POST /v2/shards. The current xet-core client
-// expects an NDJSON progress stream terminated by a result event.
-func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	if r.ContentLength <= 0 {
-		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
-		return
-	}
-
-	if _, status, err := s.storeUploadedShard(r); err != nil {
-		http.Error(w, err.Error(), status)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	_, _ = io.WriteString(w, "{\"type\":\"validating\",\"verified\":1,\"total\":1}\n")
-	_, _ = io.WriteString(w, "{\"type\":\"committing\",\"stage\":\"syncing\"}\n")
-	_, _ = io.WriteString(w, "{\"type\":\"result\"}\n")
-}
-
 func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 	body := io.LimitReader(r.Body, r.ContentLength)
 

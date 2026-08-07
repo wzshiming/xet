@@ -169,8 +169,20 @@ func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header htt
 
 	// Use the getHttpClient for retry with resume with range requests.
 	resp, err := c.getHttpClient.Do(req)
+	if err != nil && req.Header.Get("Range") != "" {
+		// Some CAS signed-range endpoints return 206 without Content-Range.
+		// httpseek correctly rejects that as a resumable HTTP response, but the
+		// original one-shot response is still usable, so retry without the
+		// resumable transport.
+		resp, err = c.doWithNetworkRetry(req)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetch xorb: %w", err)
+	}
+
+	if req.Header.Get("Range") != "" &&
+		(resp.StatusCode == http.StatusPartialContent || isExactWholeRangeResponse(req, resp)) {
+		return resp.Body, nil
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -179,6 +191,23 @@ func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header htt
 	}
 
 	return resp.Body, nil
+}
+
+// isExactWholeRangeResponse accepts the behavior used by xet-core's signed
+// fetch_term URLs: the URL itself identifies the requested term, so the server
+// may return that exact byte range as a 200 response while ignoring Range.
+// Requiring the exact Content-Length prevents accidentally treating a full xorb
+// response as the requested sub-range.
+func isExactWholeRangeResponse(req *http.Request, resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK || resp.ContentLength < 0 {
+		return false
+	}
+	var start, end int64
+	n, err := fmt.Sscanf(req.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+	if err != nil || n != 2 || start < 0 || end < start {
+		return false
+	}
+	return resp.ContentLength == end-start+1
 }
 
 // DownloadXorbsMultipart sends one multi-range request and returns the multipart reader.

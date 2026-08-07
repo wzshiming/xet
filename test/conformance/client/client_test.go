@@ -21,6 +21,7 @@ import (
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/test/conformance/rustref"
+	"github.com/wzshiming/xet/test/conformance/testutil"
 	"github.com/wzshiming/xet/test/conformance/utils"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -158,237 +159,257 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Run("upload_conformance", func(t *testing.T) {
-				// Create separate temp directories for each client's storage
-				rustrefStorageDir := t.TempDir()
-				nativeStorageDir := t.TempDir()
+				for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
+					protocol := protocol
+					t.Run(protocol.String(), func(t *testing.T) {
+						// Create separate temp directories for each client's storage
+						rustrefStorageDir := t.TempDir()
+						nativeStorageDir := t.TempDir()
 
-				// Setup server for xet-core
-				var rustrefStor storage.Storage
-				var rustrefSrv *server.Handler
-				var rustrefProxy *RecordingProxy
-				var rustrefHttpSrv *httptest.Server
+						// Setup server for xet-core
+						var rustrefStor storage.Storage
+						var rustrefSrv *server.Handler
+						var rustrefProxy *RecordingProxy
+						var rustrefHttpSrv *httptest.Server
 
-				rustrefHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if rustrefProxy != nil {
-						rustrefProxy.ServeHTTP(w, r)
-					} else {
-						http.Error(w, "server not initialized", http.StatusInternalServerError)
-					}
-				}))
-				defer rustrefHttpSrv.Close()
+						rustrefHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if rustrefProxy != nil {
+								rustrefProxy.ServeHTTP(w, r)
+							} else {
+								http.Error(w, "server not initialized", http.StatusInternalServerError)
+							}
+						}))
+						defer rustrefHttpSrv.Close()
 
-				var err error
-				rustrefStor, err = storage.NewFileStorage(
-					storage.WithBasePath(rustrefStorageDir),
-					storage.WithBaseURL(rustrefHttpSrv.URL),
-				)
-				if err != nil {
-					t.Fatalf("Failed to create xet-core storage: %v", err)
+						var err error
+						rustrefStor, err = storage.NewFileStorage(
+							storage.WithBasePath(rustrefStorageDir),
+							storage.WithBaseURL(rustrefHttpSrv.URL),
+						)
+						if err != nil {
+							t.Fatalf("Failed to create xet-core storage: %v", err)
+						}
+
+						rustrefSrv = server.NewHandler(server.WithStorage(rustrefStor))
+						rustrefProxy = NewRecordingProxy(rustrefSrv)
+
+						// Upload with xet-core
+						tempDir := t.TempDir()
+						rustrefFile := filepath.Join(tempDir, "rustref-upload.bin")
+						if err := os.WriteFile(rustrefFile, tt.data, 0644); err != nil {
+							t.Fatalf("Failed to write xet-core upload file: %v", err)
+						}
+
+						uploadResults, err := rustref.UploadFilesWithVersion(
+							[]string{rustrefFile},
+							rustrefHttpSrv.URL,
+							nil,   // token
+							nil,   // sha256s (computed automatically)
+							false, // skipSHA256
+							protocol,
+						)
+						if err != nil {
+							t.Fatalf("Failed to upload file with xet-core: %v", err)
+						}
+
+						if len(uploadResults) != 1 {
+							t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
+						}
+
+						rustrefRequests := rustrefProxy.GetRequests()
+
+						// Setup server for native client
+						var nativeStor storage.Storage
+						var nativeSrv *server.Handler
+						var nativeProxy *RecordingProxy
+						var nativeHttpSrv *httptest.Server
+
+						nativeHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if nativeProxy != nil {
+								nativeProxy.ServeHTTP(w, r)
+							} else {
+								http.Error(w, "server not initialized", http.StatusInternalServerError)
+							}
+						}))
+						defer nativeHttpSrv.Close()
+
+						nativeStor, err = storage.NewFileStorage(
+							storage.WithBasePath(nativeStorageDir),
+							storage.WithBaseURL(nativeHttpSrv.URL),
+						)
+						if err != nil {
+							t.Fatalf("Failed to create native storage: %v", err)
+						}
+
+						nativeSrv = server.NewHandler(server.WithStorage(nativeStor))
+						nativeProxy = NewRecordingProxy(nativeSrv)
+
+						// Upload with native client
+						nativeClient, err := client.NewClient(
+							client.WithBaseURL(nativeHttpSrv.URL),
+							client.WithCacheDir(t.TempDir()),
+						)
+						if err != nil {
+							t.Fatalf("create native client: %v", err)
+						}
+
+						nativeFile := filepath.Join(tempDir, "native-upload.bin")
+						if err := os.WriteFile(nativeFile, tt.data, 0644); err != nil {
+							t.Fatalf("Failed to write native upload file: %v", err)
+						}
+
+						f, err := os.Open(nativeFile)
+						if err != nil {
+							t.Fatalf("Failed to open native upload file: %v", err)
+						}
+						defer func() {
+							if err := f.Close(); err != nil {
+								t.Fatalf("Failed to close native upload file: %v", err)
+							}
+						}()
+
+						fileHash, err := testutil.UploadFileWithProtocol(context.Background(), nativeClient, protocol, f)
+						if err != nil {
+							t.Fatalf("Failed to upload file with native client: %v", err)
+						}
+
+						nativeRequests := nativeProxy.GetRequests()
+
+						// Compare requests
+						compareUploadRequests(t, protocol, rustrefRequests, nativeRequests, uploadResults[0].Hash, fileHash.String())
+					})
 				}
-
-				rustrefSrv = server.NewHandler(server.WithStorage(rustrefStor))
-				rustrefProxy = NewRecordingProxy(rustrefSrv)
-
-				// Upload with xet-core
-				tempDir := t.TempDir()
-				rustrefFile := filepath.Join(tempDir, "rustref-upload.bin")
-				if err := os.WriteFile(rustrefFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write xet-core upload file: %v", err)
-				}
-
-				uploadResults, err := rustref.UploadFiles(
-					[]string{rustrefFile},
-					rustrefHttpSrv.URL,
-					nil,   // token
-					nil,   // sha256s (computed automatically)
-					false, // skipSHA256
-				)
-				if err != nil {
-					t.Fatalf("Failed to upload file with xet-core: %v", err)
-				}
-
-				if len(uploadResults) != 1 {
-					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
-				}
-
-				rustrefRequests := rustrefProxy.GetRequests()
-
-				// Setup server for native client
-				var nativeStor storage.Storage
-				var nativeSrv *server.Handler
-				var nativeProxy *RecordingProxy
-				var nativeHttpSrv *httptest.Server
-
-				nativeHttpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if nativeProxy != nil {
-						nativeProxy.ServeHTTP(w, r)
-					} else {
-						http.Error(w, "server not initialized", http.StatusInternalServerError)
-					}
-				}))
-				defer nativeHttpSrv.Close()
-
-				nativeStor, err = storage.NewFileStorage(
-					storage.WithBasePath(nativeStorageDir),
-					storage.WithBaseURL(nativeHttpSrv.URL),
-				)
-				if err != nil {
-					t.Fatalf("Failed to create native storage: %v", err)
-				}
-
-				nativeSrv = server.NewHandler(server.WithStorage(nativeStor))
-				nativeProxy = NewRecordingProxy(nativeSrv)
-
-				// Upload with native client
-				nativeClient, err := client.NewClient(
-					client.WithBaseURL(nativeHttpSrv.URL),
-					client.WithCacheDir(t.TempDir()),
-				)
-				if err != nil {
-					t.Fatalf("create native client: %v", err)
-				}
-
-				nativeFile := filepath.Join(tempDir, "native-upload.bin")
-				if err := os.WriteFile(nativeFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write native upload file: %v", err)
-				}
-
-				f, err := os.Open(nativeFile)
-				if err != nil {
-					t.Fatalf("Failed to open native upload file: %v", err)
-				}
-				defer func() {
-					if err := f.Close(); err != nil {
-						t.Fatalf("Failed to close native upload file: %v", err)
-					}
-				}()
-
-				fileHash, err := nativeClient.UploadFile(context.Background(), f)
-				if err != nil {
-					t.Fatalf("Failed to upload file with native client: %v", err)
-				}
-
-				nativeRequests := nativeProxy.GetRequests()
-
-				// Compare requests
-				compareUploadRequests(t, rustrefRequests, nativeRequests, uploadResults[0].Hash, fileHash.String())
 			})
 
 			t.Run("download_conformance", func(t *testing.T) {
-				// Setup shared server
-				storageDir := t.TempDir()
-				var stor storage.Storage
-				var srv *server.Handler
-				var proxy *RecordingProxy
-				var httpSrv *httptest.Server
+				for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
+					protocol := protocol
+					t.Run(protocol.String(), func(t *testing.T) {
+						// Setup shared server
+						storageDir := t.TempDir()
+						var stor storage.Storage
+						var srv *server.Handler
+						var proxy *RecordingProxy
+						var httpSrv *httptest.Server
 
-				httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if proxy != nil {
-						proxy.ServeHTTP(w, r)
-					} else {
-						http.Error(w, "server not initialized", http.StatusInternalServerError)
-					}
-				}))
-				defer httpSrv.Close()
+						httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							if proxy != nil {
+								proxy.ServeHTTP(w, r)
+							} else {
+								http.Error(w, "server not initialized", http.StatusInternalServerError)
+							}
+						}))
+						defer httpSrv.Close()
 
-				var err error
-				stor, err = storage.NewFileStorage(
-					storage.WithBasePath(storageDir),
-					storage.WithBaseURL(httpSrv.URL),
-				)
-				if err != nil {
-					t.Fatalf("Failed to create storage: %v", err)
+						var err error
+						stor, err = storage.NewFileStorage(
+							storage.WithBasePath(storageDir),
+							storage.WithBaseURL(httpSrv.URL),
+						)
+						if err != nil {
+							t.Fatalf("Failed to create storage: %v", err)
+						}
+
+						srv = server.NewHandler(server.WithStorage(stor))
+						proxy = NewRecordingProxy(srv)
+
+						// First upload file using native client
+						nativeClient, err := client.NewClient(
+							client.WithBaseURL(httpSrv.URL),
+							client.WithCacheDir(t.TempDir()),
+						)
+						if err != nil {
+							t.Fatalf("create native client: %v", err)
+						}
+
+						tempDir := t.TempDir()
+						uploadFile := filepath.Join(tempDir, "upload.bin")
+						if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+							t.Fatalf("Failed to write upload file: %v", err)
+						}
+
+						f, err := os.Open(uploadFile)
+						if err != nil {
+							t.Fatalf("Failed to open upload file: %v", err)
+						}
+
+						fileHash, err := nativeClient.UploadFile(context.Background(), f)
+						f.Close()
+						if err != nil {
+							t.Fatalf("Failed to upload file: %v", err)
+						}
+
+						// Download with xet-core
+						proxy.ClearRequests()
+						rustrefDownloadFile := filepath.Join(tempDir, "rustref-download.bin")
+						downloadReq := []rustref.DownloadRequest{
+							{
+								DestinationPath: rustrefDownloadFile,
+								Hash:            fileHash.String(),
+								FileSize:        int64(len(tt.data)),
+							},
+						}
+
+						_, err = rustref.DownloadFilesWithVersion(downloadReq, httpSrv.URL, nil, protocol)
+						if err != nil {
+							t.Fatalf("Failed to download file with xet-core: %v", err)
+						}
+
+						rustrefRequests := proxy.GetRequests()
+
+						// Download with native client
+						proxy.ClearRequests()
+						nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
+						nativeFile, err := os.Create(nativeDownloadFile)
+						if err != nil {
+							t.Fatalf("Failed to create native download file: %v", err)
+						}
+						err = testutil.DownloadFileWithProtocol(context.Background(), nativeClient, protocol, fileHash, nativeFile)
+						nativeFile.Close()
+						if err != nil {
+							t.Fatalf("Failed to download file with native client: %v", err)
+						}
+
+						nativeDownloadedData, err := os.ReadFile(nativeDownloadFile)
+						if err != nil {
+							t.Fatalf("Failed to read downloaded data: %v", err)
+						}
+
+						nativeRequests := proxy.GetRequests()
+
+						// Verify downloaded content matches
+						rustrefDownloadedData, err := os.ReadFile(rustrefDownloadFile)
+						if err != nil {
+							t.Fatalf("Failed to read xet-core downloaded file: %v", err)
+						}
+
+						if !bytes.Equal(rustrefDownloadedData, tt.data) {
+							t.Errorf("xet-core downloaded data mismatch: got %d bytes, want %d bytes", len(rustrefDownloadedData), len(tt.data))
+						}
+
+						if !bytes.Equal(nativeDownloadedData, tt.data) {
+							t.Errorf("native downloaded data mismatch: got %d bytes, want %d bytes", len(nativeDownloadedData), len(tt.data))
+						}
+
+						// Compare download requests
+						compareDownloadRequests(t, protocol, rustrefRequests, nativeRequests, fileHash.String())
+					})
 				}
-
-				srv = server.NewHandler(server.WithStorage(stor))
-				proxy = NewRecordingProxy(srv)
-
-				// First upload file using native client
-				nativeClient, err := client.NewClient(
-					client.WithBaseURL(httpSrv.URL),
-					client.WithCacheDir(t.TempDir()),
-				)
-				if err != nil {
-					t.Fatalf("create native client: %v", err)
-				}
-
-				tempDir := t.TempDir()
-				uploadFile := filepath.Join(tempDir, "upload.bin")
-				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write upload file: %v", err)
-				}
-
-				f, err := os.Open(uploadFile)
-				if err != nil {
-					t.Fatalf("Failed to open upload file: %v", err)
-				}
-
-				fileHash, err := nativeClient.UploadFile(context.Background(), f)
-				f.Close()
-				if err != nil {
-					t.Fatalf("Failed to upload file: %v", err)
-				}
-
-				// Download with xet-core
-				proxy.ClearRequests()
-				rustrefDownloadFile := filepath.Join(tempDir, "rustref-download.bin")
-				downloadReq := []rustref.DownloadRequest{
-					{
-						DestinationPath: rustrefDownloadFile,
-						Hash:            fileHash.String(),
-						FileSize:        int64(len(tt.data)),
-					},
-				}
-
-				_, err = rustref.DownloadFiles(downloadReq, httpSrv.URL, nil)
-				if err != nil {
-					t.Fatalf("Failed to download file with xet-core: %v", err)
-				}
-
-				rustrefRequests := proxy.GetRequests()
-
-				// Download with native client
-				proxy.ClearRequests()
-				nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
-				nativeFile, err := os.Create(nativeDownloadFile)
-				if err != nil {
-					t.Fatalf("Failed to create native download file: %v", err)
-				}
-				err = nativeClient.DownloadFile(context.Background(), fileHash, nativeFile)
-				nativeFile.Close()
-				if err != nil {
-					t.Fatalf("Failed to download file with native client: %v", err)
-				}
-
-				nativeDownloadedData, err := os.ReadFile(nativeDownloadFile)
-				if err != nil {
-					t.Fatalf("Failed to read downloaded data: %v", err)
-				}
-
-				nativeRequests := proxy.GetRequests()
-
-				// Verify downloaded content matches
-				rustrefDownloadedData, err := os.ReadFile(rustrefDownloadFile)
-				if err != nil {
-					t.Fatalf("Failed to read xet-core downloaded file: %v", err)
-				}
-
-				if !bytes.Equal(rustrefDownloadedData, tt.data) {
-					t.Errorf("xet-core downloaded data mismatch: got %d bytes, want %d bytes", len(rustrefDownloadedData), len(tt.data))
-				}
-
-				if !bytes.Equal(nativeDownloadedData, tt.data) {
-					t.Errorf("native downloaded data mismatch: got %d bytes, want %d bytes", len(nativeDownloadedData), len(tt.data))
-				}
-
-				// Compare download requests
-				compareDownloadRequests(t, rustrefRequests, nativeRequests, fileHash.String())
 			})
 		})
 	}
 }
 
 func TestClientUploadConformanceWithExistingData(t *testing.T) {
+	for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
+		protocol := protocol
+		t.Run(protocol.String(), func(t *testing.T) {
+			testClientUploadConformanceWithExistingData(t, protocol)
+		})
+	}
+}
+
+func testClientUploadConformanceWithExistingData(t *testing.T, protocol rustref.ProtocolVersion) {
 	seedData := utils.MakeRepeatData(8 * 1024 * 1024)
 	targetData := append([]byte{}, seedData[:4*1024*1024]...)
 	targetData = append(targetData, utils.MakeRandData(4*1024*1024)...)
@@ -439,12 +460,12 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	rustrefSrv = server.NewHandler(server.WithStorage(rustrefStor))
 	rustrefProxy = NewRecordingProxy(rustrefSrv)
 
-	if _, err := rustref.UploadFiles([]string{rustrefSeedFile}, rustrefHTTP.URL, nil, nil, false); err != nil {
+	if _, err := rustref.UploadFilesWithVersion([]string{rustrefSeedFile}, rustrefHTTP.URL, nil, nil, false, protocol); err != nil {
 		t.Fatalf("seed upload with xet-core failed: %v", err)
 	}
 	rustrefProxy.ClearRequests()
 
-	rustrefResults, err := rustref.UploadFiles([]string{rustrefTargetFile}, rustrefHTTP.URL, nil, nil, false)
+	rustrefResults, err := rustref.UploadFilesWithVersion([]string{rustrefTargetFile}, rustrefHTTP.URL, nil, nil, false, protocol)
 	if err != nil {
 		t.Fatalf("target upload with xet-core failed: %v", err)
 	}
@@ -491,7 +512,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native seed file: %v", err)
 	}
-	if _, err := nativeClient.UploadFile(context.Background(), seedReader); err != nil {
+	if _, err := testutil.UploadFileWithProtocol(context.Background(), nativeClient, protocol, seedReader); err != nil {
 		_ = seedReader.Close()
 		t.Fatalf("seed upload with native client failed: %v", err)
 	}
@@ -504,7 +525,7 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open native target file: %v", err)
 	}
-	nativeHash, err := nativeClient.UploadFile(context.Background(), targetReader)
+	nativeHash, err := testutil.UploadFileWithProtocol(context.Background(), nativeClient, protocol, targetReader)
 	if err != nil {
 		_ = targetReader.Close()
 		t.Fatalf("target upload with native client failed: %v", err)
@@ -514,11 +535,11 @@ func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	}
 	nativeRequests := nativeProxy.GetRequests()
 
-	compareUploadRequests(t, rustrefRequests, nativeRequests, rustrefResults[0].Hash, nativeHash.String())
+	compareUploadRequests(t, protocol, rustrefRequests, nativeRequests, rustrefResults[0].Hash, nativeHash.String())
 }
 
 // compareUploadRequests compares HTTP requests from xet-core and native clients for uploads
-func compareUploadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, rustrefHash, nativeHash string) {
+func compareUploadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustrefReqs, nativeReqs []RequestRecord, rustrefHash, nativeHash string) {
 	t.Helper()
 
 	// STRICT: Verify that file hashes match
@@ -531,13 +552,13 @@ func compareUploadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord
 	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// STRICT: All non-dedup request type counts must match after canonicalizing
-	// v1/v2 variants. Dedup probes are validated semantically below.
-	assertCanonicalTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
-		"GET:/v{version}/chunks/default/{hash}": true,
-		"POST:/v{version}/chunks/default:query": true,
-		"HEAD:/v{version}/xorbs/default/{hash}": true,
-		"POST:/v{version}/xorbs/default/{hash}": true,
+	// STRICT: All non-dedup request type counts must match for this exact
+	// protocol. Dedup probes are validated semantically below.
+	assertTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
+		"GET:/v1/chunks/default/{hash}": true,
+		"POST:/v1/chunks/default:query": true,
+		"HEAD:/v1/xorbs/default/{hash}": true,
+		"POST:/v1/xorbs/default/{hash}": true,
 	})
 
 	// STRICT: Both must upload exactly one shard
@@ -548,6 +569,10 @@ func compareUploadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord
 	}
 	if nativeShardCount != 1 {
 		t.Errorf("native client uploaded %d shards, expected exactly 1", nativeShardCount)
+	}
+	wantShardType := "POST:/" + protocol.String() + "/shards"
+	if len(rustrefByType[wantShardType]) != 1 || len(nativeByType[wantShardType]) != 1 {
+		t.Errorf("%s shard endpoint mismatch: xet-core=%d native=%d", protocol, len(rustrefByType[wantShardType]), len(nativeByType[wantShardType]))
 	}
 
 	// STRICT: Dedup chunk queries must target the same chunk hash set.
@@ -578,27 +603,41 @@ func appendShardRequests(byType map[string][]RequestRecord) []RequestRecord {
 	return append(requests, byType["POST:/v2/shards"]...)
 }
 
+// xorbDownloadReqType is the request type for xorb data downloads. Unlike the
+// shard and reconstruction endpoints, xorb data is served from the same
+// unversioned path by both v1 and v2 protocols, so it is hardcoded rather than
+// derived from the selected protocol.
+const xorbDownloadReqType = "GET:/v1/xorbs/default/{hash}"
+
 // compareDownloadRequests compares HTTP requests from xet-core and native clients for downloads
-func compareDownloadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, fileHash string) {
+func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustrefReqs, nativeReqs []RequestRecord, fileHash string) {
 	t.Helper()
 
 	// Group requests by type
 	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
 
-	// STRICT: Both must query reconstruction (v1 or v2)
-	rustrefReconCount := len(rustrefByType["GET:/v1/reconstructions/{hash}"]) + len(rustrefByType["GET:/v2/reconstructions/{hash}"])
-	nativeReconCount := len(nativeByType["GET:/v1/reconstructions/{hash}"]) + len(nativeByType["GET:/v2/reconstructions/{hash}"])
-	if rustrefReconCount == 0 {
-		t.Errorf("xet-core did not query reconstruction")
+	// STRICT: Both must use only the selected reconstruction protocol. xet-core
+	// may repeat the query internally, so request counts are not compared.
+	wantReconType := "GET:/" + protocol.String() + "/reconstructions/{hash}"
+	if len(rustrefByType[wantReconType]) == 0 {
+		t.Errorf("xet-core did not query %s", wantReconType)
 	}
-	if nativeReconCount == 0 {
-		t.Errorf("native client did not query reconstruction")
+	if len(nativeByType[wantReconType]) == 0 {
+		t.Errorf("native did not query %s", wantReconType)
+	}
+	otherProtocol := rustref.ProtocolV1
+	if protocol == rustref.ProtocolV1 {
+		otherProtocol = rustref.ProtocolV2
+	}
+	otherReconType := "GET:/" + otherProtocol.String() + "/reconstructions/{hash}"
+	if len(rustrefByType[otherReconType]) != 0 || len(nativeByType[otherReconType]) != 0 {
+		t.Errorf("unexpected %s queries: xet-core=%d native=%d", otherReconType, len(rustrefByType[otherReconType]), len(nativeByType[otherReconType]))
 	}
 
 	// STRICT: Both must download xorb data
-	rustrefXorbDownloadCount := len(rustrefByType["GET:/v1/xorbs/default/{hash}"])
-	nativeXorbDownloadCount := len(nativeByType["GET:/v1/xorbs/default/{hash}"])
+	rustrefXorbDownloadCount := len(rustrefByType[xorbDownloadReqType])
+	nativeXorbDownloadCount := len(nativeByType[xorbDownloadReqType])
 	if rustrefXorbDownloadCount == 0 && nativeXorbDownloadCount > 0 {
 		t.Errorf("xet-core did not download any xorb data")
 	}
@@ -610,15 +649,15 @@ func compareDownloadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestReco
 	compareReconstructionPaths(t, rustrefReqs, nativeReqs, fileHash)
 
 	// STRICT: Compare xorb download Range headers
-	rustrefXorbReqs := rustrefByType["GET:/v1/xorbs/default/{hash}"]
-	nativeXorbReqs := nativeByType["GET:/v1/xorbs/default/{hash}"]
+	rustrefXorbReqs := rustrefByType[xorbDownloadReqType]
+	nativeXorbReqs := nativeByType[xorbDownloadReqType]
 	compareXorbDownloadRanges(t, rustrefXorbReqs, nativeXorbReqs)
 
 	// STRICT: Except for xorb data (validated by precise range coverage), all
-	// request types must match exactly after canonicalizing v1/v2 variants.
-	assertCanonicalTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
-		"GET:/v{version}/reconstructions/{hash}": true,
-		"GET:/v1/xorbs/default/{hash}":           true,
+	// request types must match exactly for the selected protocol.
+	assertTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
+		wantReconType:       true,
+		xorbDownloadReqType: true,
 	})
 
 	// Get request types for logging after strict checks.
@@ -630,42 +669,25 @@ func compareDownloadRequests(t *testing.T, rustrefReqs, nativeReqs []RequestReco
 	t.Logf("  native request types: %v", nativeTypes)
 }
 
-// canonicalizeRequestType normalizes versioned API prefixes so v1/v2 endpoints
-// compare as the same behavior for conformance purposes.
-func canonicalizeRequestType(reqType string) string {
-	parts := strings.SplitN(reqType, ":", 2)
-	if len(parts) != 2 {
-		return reqType
-	}
-	method := parts[0]
-	path := parts[1]
-	path = strings.Replace(path, "/v1/", "/v{version}/", 1)
-	path = strings.Replace(path, "/v2/", "/v{version}/", 1)
-	return method + ":" + path
-}
-
-// assertCanonicalTypeCountEquality enforces exact equality of request-type counts
-// after canonicalizing API versions.
-func assertCanonicalTypeCountEquality(t *testing.T, rustrefByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
+// assertTypeCountEquality enforces exact equality of request-type counts.
+func assertTypeCountEquality(t *testing.T, rustrefByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
 	t.Helper()
 
 	rustrefCounts := make(map[string]int)
 	nativeCounts := make(map[string]int)
 
 	for reqType, reqs := range rustrefByType {
-		canonical := canonicalizeRequestType(reqType)
-		if skipTypes != nil && (skipTypes[reqType] || skipTypes[canonical]) {
+		if skipTypes != nil && skipTypes[reqType] {
 			continue
 		}
-		rustrefCounts[canonical] += len(reqs)
+		rustrefCounts[reqType] += len(reqs)
 	}
 
 	for reqType, reqs := range nativeByType {
-		canonical := canonicalizeRequestType(reqType)
-		if skipTypes != nil && (skipTypes[reqType] || skipTypes[canonical]) {
+		if skipTypes != nil && skipTypes[reqType] {
 			continue
 		}
-		nativeCounts[canonical] += len(reqs)
+		nativeCounts[reqType] += len(reqs)
 	}
 
 	for key, xCount := range rustrefCounts {

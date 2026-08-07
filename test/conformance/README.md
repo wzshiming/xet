@@ -19,4 +19,3 @@ go test ./...
 
 Set `XET_CORE_REFERENCE_BIN` to an already-built reference executable to skip
 the automatic Cargo build.
-

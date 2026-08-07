@@ -2,6 +2,7 @@
 package rustref
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 type TokenInfo struct {
@@ -37,24 +39,161 @@ type ChunkInfo struct {
 	Size uint64 `json:"size"`
 }
 
+// ProtocolVersion selects the xet-core CAS API version without fallback.
+type ProtocolVersion uint32
+
+const (
+	ProtocolV1 ProtocolVersion = 1
+	ProtocolV2 ProtocolVersion = 2
+)
+
+func (v ProtocolVersion) String() string {
+	return fmt.Sprintf("v%d", v)
+}
+
 type uploadRequest struct {
-	FilePaths  []string   `json:"file_paths"`
-	Endpoint   string     `json:"endpoint"`
-	Token      *TokenInfo `json:"token,omitempty"`
-	SHA256s    []string   `json:"sha256s,omitempty"`
-	SkipSHA256 bool       `json:"skip_sha256"`
+	FilePaths  []string         `json:"file_paths"`
+	Endpoint   string           `json:"endpoint"`
+	Token      *TokenInfo       `json:"token,omitempty"`
+	SHA256s    []string         `json:"sha256s,omitempty"`
+	SkipSHA256 bool             `json:"skip_sha256"`
+	APIVersion *ProtocolVersion `json:"api_version,omitempty"`
 }
 
 type downloadRequest struct {
-	Files    []DownloadRequest `json:"files"`
-	Endpoint string            `json:"endpoint"`
-	Token    *TokenInfo        `json:"token,omitempty"`
+	Files      []DownloadRequest `json:"files"`
+	Endpoint   string            `json:"endpoint"`
+	Token      *TokenInfo        `json:"token,omitempty"`
+	APIVersion *ProtocolVersion  `json:"api_version,omitempty"`
 }
 
 var (
 	buildOnce sync.Once
 	buildErr  error
 )
+
+// Server is a running xet-core LocalTestServer owned by the reference helper.
+// Closing stdin asks the Rust process to stop and releases its temporary storage.
+type Server struct {
+	Endpoint string
+
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	cacheDir  string
+	stderr    bytes.Buffer
+	wait      chan error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// StartServer starts the xet-core in-memory CAS server and waits until its HTTP
+// endpoint is ready. The returned server must be closed by the caller.
+func StartServer() (*Server, error) {
+	if err := ensureBuilt(); err != nil {
+		return nil, err
+	}
+
+	cacheDir, err := os.MkdirTemp("", "xet-core-reference-server-cache-*")
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(referenceBinary(), "serve")
+	cmd.Env = referenceEnv(cacheDir)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = os.RemoveAll(cacheDir)
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = os.RemoveAll(cacheDir)
+		return nil, err
+	}
+
+	server := &Server{
+		cmd:      cmd,
+		stdin:    stdin,
+		cacheDir: cacheDir,
+		wait:     make(chan error, 1),
+	}
+	cmd.Stderr = &server.stderr
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = os.RemoveAll(cacheDir)
+		return nil, err
+	}
+	go func() {
+		server.wait <- cmd.Wait()
+	}()
+
+	type startupResult struct {
+		endpoint string
+		err      error
+		reader   *bufio.Reader
+	}
+	startup := make(chan startupResult, 1)
+	go func() {
+		reader := bufio.NewReader(stdout)
+		line, err := reader.ReadString('\n')
+		startup <- startupResult{
+			endpoint: strings.TrimSpace(line),
+			err:      err,
+			reader:   reader,
+		}
+	}()
+
+	var result startupResult
+	select {
+	case result = <-startup:
+	case <-time.After(30 * time.Second):
+		return nil, server.abortStart("timed out waiting for endpoint")
+	}
+	if result.err != nil {
+		return nil, server.abortStart(fmt.Sprintf("read endpoint: %v", result.err))
+	}
+	if !strings.HasPrefix(result.endpoint, "http://") && !strings.HasPrefix(result.endpoint, "https://") {
+		return nil, server.abortStart(fmt.Sprintf("invalid endpoint %q", result.endpoint))
+	}
+
+	server.Endpoint = result.endpoint
+	go func() {
+		_, _ = io.Copy(io.Discard, result.reader)
+	}()
+	return server, nil
+}
+
+func (s *Server) abortStart(message string) error {
+	_ = s.stdin.Close()
+	_ = s.cmd.Process.Kill()
+	<-s.wait
+	_ = os.RemoveAll(s.cacheDir)
+	if stderr := strings.TrimSpace(s.stderr.String()); stderr != "" {
+		return fmt.Errorf("start xet-core reference server: %s: %s", message, stderr)
+	}
+	return fmt.Errorf("start xet-core reference server: %s", message)
+}
+
+// Close gracefully stops the server and removes its temporary cache.
+func (s *Server) Close() error {
+	s.closeOnce.Do(func() {
+		_ = s.stdin.Close()
+		select {
+		case err := <-s.wait:
+			if err != nil {
+				s.closeErr = fmt.Errorf("stop xet-core reference server: %w: %s", err, strings.TrimSpace(s.stderr.String()))
+			}
+		case <-time.After(10 * time.Second):
+			_ = s.cmd.Process.Kill()
+			<-s.wait
+			s.closeErr = errors.New("stop xet-core reference server: timed out")
+		}
+		if err := os.RemoveAll(s.cacheDir); err != nil && s.closeErr == nil {
+			s.closeErr = err
+		}
+	})
+	return s.closeErr
+}
 
 func ChunkData(data []byte) ([]ChunkInfo, error) {
 	var result []ChunkInfo
@@ -93,6 +232,19 @@ func HashFiles(filePaths []string) ([]UploadResult, error) {
 }
 
 func UploadFiles(filePaths []string, endpoint string, token *TokenInfo, sha256s []string, skipSHA256 bool) ([]UploadResult, error) {
+	return uploadFiles(filePaths, endpoint, token, sha256s, skipSHA256, nil)
+}
+
+// UploadFilesWithVersion uploads files while forcing xet-core to use the
+// selected shard API version without auto-detection or fallback.
+func UploadFilesWithVersion(filePaths []string, endpoint string, token *TokenInfo, sha256s []string, skipSHA256 bool, version ProtocolVersion) ([]UploadResult, error) {
+	if err := validateProtocolVersion(version); err != nil {
+		return nil, err
+	}
+	return uploadFiles(filePaths, endpoint, token, sha256s, skipSHA256, &version)
+}
+
+func uploadFiles(filePaths []string, endpoint string, token *TokenInfo, sha256s []string, skipSHA256 bool, version *ProtocolVersion) ([]UploadResult, error) {
 	var result []UploadResult
 	err := runJSON("upload-files", uploadRequest{
 		FilePaths:  filePaths,
@@ -100,18 +252,40 @@ func UploadFiles(filePaths []string, endpoint string, token *TokenInfo, sha256s 
 		Token:      token,
 		SHA256s:    sha256s,
 		SkipSHA256: skipSHA256,
+		APIVersion: version,
 	}, &result)
 	return result, err
 }
 
 func DownloadFiles(files []DownloadRequest, endpoint string, token *TokenInfo) ([]string, error) {
+	return downloadFiles(files, endpoint, token, nil)
+}
+
+// DownloadFilesWithVersion downloads files while forcing xet-core to use the
+// selected reconstruction API version without auto-detection or fallback.
+func DownloadFilesWithVersion(files []DownloadRequest, endpoint string, token *TokenInfo, version ProtocolVersion) ([]string, error) {
+	if err := validateProtocolVersion(version); err != nil {
+		return nil, err
+	}
+	return downloadFiles(files, endpoint, token, &version)
+}
+
+func downloadFiles(files []DownloadRequest, endpoint string, token *TokenInfo, version *ProtocolVersion) ([]string, error) {
 	var result []string
 	err := runJSON("download-files", downloadRequest{
-		Files:    files,
-		Endpoint: endpoint,
-		Token:    token,
+		Files:      files,
+		Endpoint:   endpoint,
+		Token:      token,
+		APIVersion: version,
 	}, &result)
 	return result, err
+}
+
+func validateProtocolVersion(version ProtocolVersion) error {
+	if version != ProtocolV1 && version != ProtocolV2 {
+		return fmt.Errorf("unsupported protocol version %d", version)
+	}
+	return nil
 }
 
 func EncodeXorb(data []byte, withFooter bool, compression string) ([]byte, error) {
@@ -160,15 +334,7 @@ func runBytes(command string, args []string, input io.Reader) ([]byte, error) {
 	commandArgs := append([]string{command}, args...)
 	cmd := exec.Command(referenceBinary(), commandArgs...)
 	cmd.Stdin = input
-	noProxy := "127.0.0.1,localhost"
-	if existing := os.Getenv("NO_PROXY"); existing != "" {
-		noProxy += "," + existing
-	}
-	cmd.Env = append(os.Environ(),
-		"HF_XET_CACHE="+cacheDir,
-		"NO_PROXY="+noProxy,
-		"no_proxy="+noProxy,
-	)
+	cmd.Env = referenceEnv(cacheDir)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -180,6 +346,18 @@ func runBytes(command string, args []string, input io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("xet-core reference %s: %w: %s", command, err, message)
 	}
 	return stdout.Bytes(), nil
+}
+
+func referenceEnv(cacheDir string) []string {
+	noProxy := "127.0.0.1,localhost"
+	if existing := os.Getenv("NO_PROXY"); existing != "" {
+		noProxy += "," + existing
+	}
+	return append(os.Environ(),
+		"HF_XET_CACHE="+cacheDir,
+		"NO_PROXY="+noProxy,
+		"no_proxy="+noProxy,
+	)
 }
 
 func ensureBuilt() error {

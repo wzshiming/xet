@@ -10,14 +10,24 @@ import (
 	"github.com/wzshiming/xet/download"
 )
 
-// DownloadFile downloads and reconstructs a file from its hash into w, automatically falling back to V1 if V2 is not supported.
-// It seeks w to determine the current size for resume support.
+// reconstructionAPIVersion selects the reconstruction API version, mirroring
+// shardAPIVersion used by the upload path.
+type reconstructionAPIVersion uint8
+
+const (
+	reconstructionAPIVersionV1 reconstructionAPIVersion = 1
+	reconstructionAPIVersionV2 reconstructionAPIVersion = 2
+)
+
+// DownloadFile downloads and reconstructs a file from its hash into w,
+// automatically falling back to V1 if V2 is not supported. It seeks w to
+// determine the current size for resume support.
 func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
 	return c.DownloadFileWithAuthProvider(ctx, nil, fileHash, w)
 }
 
 // DownloadFileWithAuthProvider downloads and reconstructs a file using a
-// per-call auth provider.
+// per-call auth provider, falling back to V1 when the V2 API is unavailable.
 func (c *Client) DownloadFileWithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
 	err := c.DownloadFileV2WithAuthProvider(ctx, provider, fileHash, w)
 	if err != nil {
@@ -29,15 +39,33 @@ func (c *Client) DownloadFileWithAuthProvider(ctx context.Context, provider Auth
 	return nil
 }
 
-// DownloadFileV1 downloads and reconstructs a file from its hash into w.
-// It seeks w to determine the current size for resume support.
+// DownloadFileV1 downloads and reconstructs a file from its hash into w
+// through the V1 API. It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
 	return c.DownloadFileV1WithAuthProvider(ctx, nil, fileHash, w)
 }
 
 // DownloadFileV1WithAuthProvider downloads and reconstructs a file from its
-// hash into w using a per-call auth provider.
+// hash into w through the V1 API using a per-call auth provider.
 func (c *Client) DownloadFileV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
+	return c.downloadFileWithAuthProvider(ctx, provider, fileHash, w, reconstructionAPIVersionV1)
+}
+
+// DownloadFileV2 downloads and reconstructs a file from its hash into w
+// through the V2 API. It seeks w to determine the current size for resume support.
+func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
+	return c.DownloadFileV2WithAuthProvider(ctx, nil, fileHash, w)
+}
+
+// DownloadFileV2WithAuthProvider downloads and reconstructs a file from its
+// hash into w through the V2 API using a per-call auth provider.
+func (c *Client) DownloadFileV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
+	return c.downloadFileWithAuthProvider(ctx, provider, fileHash, w, reconstructionAPIVersionV2)
+}
+
+// downloadFileWithAuthProvider downloads and reconstructs a file from its hash
+// into w through the reconstruction API version selected by apiVersion.
+func (c *Client) downloadFileWithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker, apiVersion reconstructionAPIVersion) error {
 	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
 		resumeOffset = 0
@@ -50,6 +78,33 @@ func (c *Client) DownloadFileV1WithAuthProvider(ctx context.Context, provider Au
 		}
 	}
 
+	reader, expectedLength, err := c.newDownloadReader(ctx, provider, fileHash, header, resumeOffset, w, apiVersion)
+	if err != nil {
+		return err
+	}
+
+	n, err := io.Copy(w, reader)
+	if err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	if n != expectedLength {
+		return fmt.Errorf("downloaded file size mismatch: expected %d bytes, got %d bytes", expectedLength, n)
+	}
+	return nil
+}
+
+// newDownloadReader queries reconstruction through the selected API version
+// and returns a reader plus the expected reconstructed length. When a resume
+// (Range) query is rejected, it retries once from the start without a Range
+// header.
+func (c *Client) newDownloadReader(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker, apiVersion reconstructionAPIVersion) (io.Reader, int64, error) {
+	if apiVersion == reconstructionAPIVersionV1 {
+		return c.newDownloadReaderV1(ctx, provider, fileHash, header, resumeOffset, w)
+	}
+	return c.newDownloadReaderV2(ctx, provider, fileHash, header, resumeOffset, w)
+}
+
+func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.Reader, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
@@ -59,53 +114,18 @@ func (c *Client) DownloadFileV1WithAuthProvider(ctx context.Context, provider Au
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("query reconstruction: %w", err)
+			return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 		}
 	}
 
-	opts := []download.Option{
-		download.WithConcurrency(c.concurrency),
-	}
-	if c.progressFunc != nil {
-		opts = append(opts, download.WithProgressFunc(c.progressFunc))
-	}
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.cacheDir, opts...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.cacheDir, c.downloadOptions()...)
 	if err != nil {
-		return fmt.Errorf("initialize reader v1: %w", err)
+		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
-
-	expectedLength := download.ExpectedLengthV1(reconstructionResp)
-	n, err := io.Copy(w, reader)
-	if err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	if n != expectedLength {
-		return fmt.Errorf("downloaded file size mismatch: expected %d bytes, got %d bytes", expectedLength, n)
-	}
-	return nil
+	return reader, download.ExpectedLengthV1(reconstructionResp), nil
 }
 
-// DownloadFileV2 downloads and reconstructs a file from its hash into w using the V2 API.
-// It seeks w to determine the current size for resume support.
-func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
-	return c.DownloadFileV2WithAuthProvider(ctx, nil, fileHash, w)
-}
-
-// DownloadFileV2WithAuthProvider downloads and reconstructs a file from its
-// hash into w using the V2 API and a per-call auth provider.
-func (c *Client) DownloadFileV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
-	resumeOffset, err := w.Seek(0, io.SeekEnd)
-	if err != nil {
-		resumeOffset = 0
-	}
-
-	var header http.Header
-	if resumeOffset > 0 {
-		header = http.Header{
-			"Range": []string{fmt.Sprintf("bytes=%d-", resumeOffset)},
-		}
-	}
-
+func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.Reader, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
@@ -115,30 +135,27 @@ func (c *Client) DownloadFileV2WithAuthProvider(ctx context.Context, provider Au
 			}
 		}
 		if err != nil {
-			return fmt.Errorf("query reconstruction v2: %w", err)
+			return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
 		}
 	}
 
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.cacheDir, c.downloadOptions()...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
+	}
+	return reader, download.ExpectedLengthV2(reconstructionResp), nil
+}
+
+// downloadOptions returns the shared download options derived from the client
+// configuration.
+func (c *Client) downloadOptions() []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
 	}
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.cacheDir, opts...)
-	if err != nil {
-		return fmt.Errorf("initialize reader v2: %w", err)
-	}
-
-	expectedLength := download.ExpectedLengthV2(reconstructionResp)
-	n, err := io.Copy(w, reader)
-	if err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	if n != expectedLength {
-		return fmt.Errorf("downloaded file size mismatch: expected %d bytes, got %d bytes", expectedLength, n)
-	}
-	return nil
+	return opts
 }
 
 // DownloadFiles downloads multiple files using a single batch reconstruction request.
