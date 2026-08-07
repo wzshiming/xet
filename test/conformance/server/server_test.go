@@ -17,6 +17,7 @@ import (
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/test/conformance/rustref"
+	"github.com/wzshiming/xet/test/conformance/testutil"
 	"github.com/wzshiming/xet/test/conformance/utils"
 )
 
@@ -57,157 +58,163 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create temporary directory for storage
-			storageDir := t.TempDir()
+			for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
+				protocol := protocol
+				t.Run(protocol.String(), func(t *testing.T) {
+					// Create temporary directory for storage
+					storageDir := t.TempDir()
 
-			// Start test HTTP server first (without creating storage yet)
-			// We'll create storage after we know the server URL
-			var stor storage.Storage
-			var srv *server.Handler
-			var httpSrv *httptest.Server
+					// Start test HTTP server first (without creating storage yet)
+					// We'll create storage after we know the server URL
+					var stor storage.Storage
+					var srv *server.Handler
+					var httpSrv *httptest.Server
 
-			// Create a placeholder handler that will be replaced
-			httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if srv != nil {
-					srv.ServeHTTP(w, r)
-				} else {
-					http.Error(w, "server not initialized", http.StatusInternalServerError)
-				}
-			}))
-			defer httpSrv.Close()
+					// Create a placeholder handler that will be replaced
+					httpSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if srv != nil {
+							srv.ServeHTTP(w, r)
+						} else {
+							http.Error(w, "server not initialized", http.StatusInternalServerError)
+						}
+					}))
+					defer httpSrv.Close()
 
-			// Now create storage with the correct base URL
-			var err error
-			stor, err = storage.NewFileStorage(
-				storage.WithBasePath(storageDir),
-				storage.WithBaseURL(httpSrv.URL),
-			)
-			if err != nil {
-				t.Fatalf("Failed to create storage: %v", err)
+					// Now create storage with the correct base URL
+					var err error
+					stor, err = storage.NewFileStorage(
+						storage.WithBasePath(storageDir),
+						storage.WithBaseURL(httpSrv.URL),
+					)
+					if err != nil {
+						t.Fatalf("Failed to create storage: %v", err)
+					}
+
+					srv = server.NewHandler(server.WithStorage(stor))
+
+					// Create native client
+					nativeClient, err := client.NewClient(
+						client.WithBaseURL(httpSrv.URL),
+						client.WithCacheDir(t.TempDir()),
+					)
+					if err != nil {
+						t.Fatalf("create native client: %v", err)
+					}
+
+					t.Run("upload_with_rustref", func(t *testing.T) {
+						// Create temp directory and write test file
+						tempDir := t.TempDir()
+						uploadFile := filepath.Join(tempDir, "upload.bin")
+						if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+							t.Fatalf("Failed to write upload file: %v", err)
+						}
+
+						// Upload using xet-core client
+						uploadResults, err := rustref.UploadFilesWithVersion(
+							[]string{uploadFile},
+							httpSrv.URL,
+							nil,   // token
+							nil,   // sha256s (computed automatically)
+							false, // skipSHA256
+							protocol,
+						)
+						if err != nil {
+							t.Fatalf("Failed to upload file with xet-core: %v", err)
+						}
+
+						if len(uploadResults) != 1 {
+							t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
+						}
+
+						rustrefHash := uploadResults[0].Hash
+						t.Logf("xet-core uploaded file with hash %s", rustrefHash)
+
+						// Parse the hash for download
+						fileHash, err := xet.ParseFileHash(rustrefHash)
+						if err != nil {
+							t.Fatalf("Failed to parse hash from xet-core: %v", err)
+						}
+
+						// Download using native client to verify
+						nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
+						nativeFile, err := os.Create(nativeDownloadFile)
+						if err != nil {
+							t.Fatalf("Failed to create native download file: %v", err)
+						}
+						err = testutil.DownloadFileWithProtocol(context.Background(), nativeClient, protocol, fileHash, nativeFile)
+						nativeFile.Close()
+						if err != nil {
+							t.Fatalf("Failed to download file with native client: %v", err)
+						}
+
+						downloadedData, err := os.ReadFile(nativeDownloadFile)
+						if err != nil {
+							t.Fatalf("Failed to read downloaded data: %v", err)
+						}
+
+						// Verify downloaded content matches original
+						if !bytes.Equal(downloadedData, tt.data) {
+							t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
+								len(downloadedData), len(tt.data))
+						}
+
+						t.Logf("Successfully uploaded with xet-core and downloaded with native client")
+					})
+
+					t.Run("download_with_rustref", func(t *testing.T) {
+						// First upload the file using native client
+						tempDir := t.TempDir()
+						uploadFile := filepath.Join(tempDir, "upload.bin")
+						if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
+							t.Fatalf("Failed to write upload file: %v", err)
+						}
+
+						// Compute file info for upload
+						f, err := os.Open(uploadFile)
+						if err != nil {
+							t.Fatalf("Failed to open upload file: %v", err)
+						}
+
+						fileHash, err := testutil.UploadFileWithProtocol(context.Background(), nativeClient, protocol, f)
+						if err != nil {
+							t.Fatalf("Failed to upload file: %v", err)
+						}
+
+						// Download using xet-core client
+						downloadFile := filepath.Join(tempDir, "download-rustref.bin")
+						downloadReq := []rustref.DownloadRequest{
+							{
+								DestinationPath: downloadFile,
+								Hash:            fileHash.String(),
+								FileSize:        int64(len(tt.data)),
+							},
+						}
+
+						// Use xet-core to download from our server
+						downloaded, err := rustref.DownloadFilesWithVersion(downloadReq, httpSrv.URL, nil, protocol)
+						if err != nil {
+							t.Fatalf("Failed to download file with xet-core: %v", err)
+						}
+
+						if len(downloaded) != 1 {
+							t.Fatalf("Expected 1 downloaded file, got %d", len(downloaded))
+						}
+
+						// Verify downloaded content matches original
+						downloadedData, err := os.ReadFile(downloadFile)
+						if err != nil {
+							t.Fatalf("Failed to read downloaded file: %v", err)
+						}
+
+						if !bytes.Equal(downloadedData, tt.data) {
+							t.Errorf("Downloaded data (xet-core) does not match original (got %d bytes, want %d bytes)",
+								len(downloadedData), len(tt.data))
+						}
+
+						t.Logf("Successfully downloaded file using xet-core client with hash %s", fileHash.String())
+					})
+				})
 			}
-
-			srv = server.NewHandler(server.WithStorage(stor))
-
-			// Create native client
-			nativeClient, err := client.NewClient(
-				client.WithBaseURL(httpSrv.URL),
-				client.WithCacheDir(t.TempDir()),
-			)
-			if err != nil {
-				t.Fatalf("create native client: %v", err)
-			}
-
-			t.Run("upload_with_rustref", func(t *testing.T) {
-				// Create temp directory and write test file
-				tempDir := t.TempDir()
-				uploadFile := filepath.Join(tempDir, "upload.bin")
-				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write upload file: %v", err)
-				}
-
-				// Upload using xet-core client
-				uploadResults, err := rustref.UploadFiles(
-					[]string{uploadFile},
-					httpSrv.URL,
-					nil,   // token
-					nil,   // sha256s (computed automatically)
-					false, // skipSHA256
-				)
-				if err != nil {
-					t.Fatalf("Failed to upload file with xet-core: %v", err)
-				}
-
-				if len(uploadResults) != 1 {
-					t.Fatalf("Expected 1 upload result, got %d", len(uploadResults))
-				}
-
-				rustrefHash := uploadResults[0].Hash
-				t.Logf("xet-core uploaded file with hash %s", rustrefHash)
-
-				// Parse the hash for download
-				fileHash, err := xet.ParseFileHash(rustrefHash)
-				if err != nil {
-					t.Fatalf("Failed to parse hash from xet-core: %v", err)
-				}
-
-				// Download using native client to verify
-				nativeDownloadFile := filepath.Join(tempDir, "native-download.bin")
-				nativeFile, err := os.Create(nativeDownloadFile)
-				if err != nil {
-					t.Fatalf("Failed to create native download file: %v", err)
-				}
-				err = nativeClient.DownloadFile(context.Background(), fileHash, nativeFile)
-				nativeFile.Close()
-				if err != nil {
-					t.Fatalf("Failed to download file with native client: %v", err)
-				}
-
-				downloadedData, err := os.ReadFile(nativeDownloadFile)
-				if err != nil {
-					t.Fatalf("Failed to read downloaded data: %v", err)
-				}
-
-				// Verify downloaded content matches original
-				if !bytes.Equal(downloadedData, tt.data) {
-					t.Errorf("Downloaded data does not match original (got %d bytes, want %d bytes)",
-						len(downloadedData), len(tt.data))
-				}
-
-				t.Logf("Successfully uploaded with xet-core and downloaded with native client")
-			})
-
-			t.Run("download_with_rustref", func(t *testing.T) {
-				// First upload the file using native client
-				tempDir := t.TempDir()
-				uploadFile := filepath.Join(tempDir, "upload.bin")
-				if err := os.WriteFile(uploadFile, tt.data, 0644); err != nil {
-					t.Fatalf("Failed to write upload file: %v", err)
-				}
-
-				// Compute file info for upload
-				f, err := os.Open(uploadFile)
-				if err != nil {
-					t.Fatalf("Failed to open upload file: %v", err)
-				}
-
-				fileHash, err := nativeClient.UploadFile(context.Background(), f)
-				if err != nil {
-					t.Fatalf("Failed to upload file: %v", err)
-				}
-
-				// Download using xet-core client
-				downloadFile := filepath.Join(tempDir, "download-rustref.bin")
-				downloadReq := []rustref.DownloadRequest{
-					{
-						DestinationPath: downloadFile,
-						Hash:            fileHash.String(),
-						FileSize:        int64(len(tt.data)),
-					},
-				}
-
-				// Use xet-core to download from our server
-				downloaded, err := rustref.DownloadFiles(downloadReq, httpSrv.URL, nil)
-				if err != nil {
-					t.Fatalf("Failed to download file with xet-core: %v", err)
-				}
-
-				if len(downloaded) != 1 {
-					t.Fatalf("Expected 1 downloaded file, got %d", len(downloaded))
-				}
-
-				// Verify downloaded content matches original
-				downloadedData, err := os.ReadFile(downloadFile)
-				if err != nil {
-					t.Fatalf("Failed to read downloaded file: %v", err)
-				}
-
-				if !bytes.Equal(downloadedData, tt.data) {
-					t.Errorf("Downloaded data (xet-core) does not match original (got %d bytes, want %d bytes)",
-						len(downloadedData), len(tt.data))
-				}
-
-				t.Logf("Successfully downloaded file using xet-core client with hash %s", fileHash.String())
-			})
 		})
 
 		t.Run(tt.name, func(t *testing.T) {
@@ -865,7 +872,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 			}
 
 			// xet-core and native must agree on content.
-			if err == nil && !bytes.Equal(rustrefGot, nativeGot) {
+			if !bytes.Equal(rustrefGot, nativeGot) {
 				t.Errorf("file %d: xet-core and native content differ", i)
 			}
 		}

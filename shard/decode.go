@@ -13,6 +13,18 @@ import (
 // The reader is consumed incrementally without buffering the entire stream.
 // If withFooter is true, the shard must contain a footer; if false, it must not.
 func (s *Shard) Decode(r io.Reader, withFooter bool) error {
+	return s.decode(r, withFooter, nil)
+}
+
+// DecodeWithCASBlockCallback deserializes a shard and calls onCASBlock as each
+// complete CAS block is read. The callback runs synchronously before decoding
+// continues, allowing callers to validate CAS references while the rest of the
+// shard is still arriving.
+func (s *Shard) DecodeWithCASBlockCallback(r io.Reader, withFooter bool, onCASBlock func(CASBlock) error) error {
+	return s.decode(r, withFooter, onCASBlock)
+}
+
+func (s *Shard) decode(r io.Reader, withFooter bool, onCASBlock func(CASBlock) error) error {
 	var buf [48]byte
 
 	// Read 48-byte header
@@ -119,6 +131,11 @@ func (s *Shard) Decode(r io.Reader, withFooter bool) error {
 		}
 
 		s.CASInfos = append(s.CASInfos, cb)
+		if onCASBlock != nil {
+			if err := onCASBlock(cb); err != nil {
+				return fmt.Errorf("process CAS block %d: %w", len(s.CASInfos)-1, err)
+			}
+		}
 	}
 
 	// Read footer if present

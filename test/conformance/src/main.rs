@@ -2,6 +2,7 @@ use std::io::{Cursor, Read, Write};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use xet_client::cas_client::LocalTestServerBuilder;
 use xet_core_structures::merklehash::{MerkleHash, compute_data_hash, file_hash, xorb_hash};
 use xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks;
 use xet_core_structures::xorb_object::{
@@ -9,6 +10,7 @@ use xet_core_structures::xorb_object::{
 };
 use xet_data::deduplication::{Chunk, Chunker};
 use xet_pkg::legacy::{Sha256Policy, XetFileInfo, data_client};
+use xet_runtime::config::XetConfig;
 use xet_runtime::core::XetContext;
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +26,7 @@ struct UploadRequest {
     token: Option<TokenInfo>,
     sha256s: Option<Vec<String>>,
     skip_sha256: bool,
+    api_version: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +34,7 @@ struct DownloadRequest {
     files: Vec<DownloadFile>,
     endpoint: String,
     token: Option<TokenInfo>,
+    api_version: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,7 +90,7 @@ fn run() -> Result<()> {
             let request: UploadRequest = read_json()?;
             let policies = sha256_policies(&request)?;
             let token = request.token.map(|value| (value.token, value.expiry));
-            let context = XetContext::default()?;
+            let context = context_for_api_version(request.api_version)?;
             let runtime = context.runtime.clone();
             let result = runtime.bridge_sync(async move {
                 data_client::upload_async(
@@ -118,7 +122,7 @@ fn run() -> Result<()> {
                 })
                 .collect();
             let token = request.token.map(|value| (value.token, value.expiry));
-            let context = XetContext::default()?;
+            let context = context_for_api_version(request.api_version)?;
             let runtime = context.runtime.clone();
             let result = runtime.bridge_sync(async move {
                 data_client::download_async(
@@ -134,6 +138,7 @@ fn run() -> Result<()> {
             })??;
             write_json(&result)
         }
+        "serve" => serve(),
         "encode-xorb" => {
             let with_footer = parse_bool_arg(args.next(), "with_footer")?;
             let compression = args.next().unwrap_or_else(|| "auto".to_string());
@@ -145,6 +150,39 @@ fn run() -> Result<()> {
         }
         _ => bail!("unknown command {command:?}"),
     }
+}
+
+fn serve() -> Result<()> {
+    let context = XetContext::default()?;
+    let runtime = context.runtime.clone();
+    runtime.bridge_sync(async move {
+        let server = LocalTestServerBuilder::new().start().await;
+        println!("{}", server.http_endpoint());
+        std::io::stdout().flush()?;
+
+        // The Go test harness owns stdin. Keeping it open keeps the server alive;
+        // closing it provides a portable, graceful shutdown signal.
+        tokio::task::spawn_blocking(|| {
+            let mut byte = [0_u8; 1];
+            let _ = std::io::stdin().read(&mut byte)?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await??;
+        drop(server);
+        Ok::<_, anyhow::Error>(())
+    })??;
+    Ok(())
+}
+
+fn context_for_api_version(api_version: Option<u32>) -> Result<XetContext> {
+    if let Some(version) = api_version {
+        ensure!(matches!(version, 1 | 2), "api_version must be 1 or 2");
+    }
+
+    let mut config = XetConfig::new();
+    config.client.reconstruction_api_version = api_version;
+    config.client.shard_api_version = api_version;
+    Ok(XetContext::with_config(config)?)
 }
 
 fn read_stdin() -> Result<Vec<u8>> {
