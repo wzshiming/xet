@@ -51,7 +51,7 @@ func ResolveResponse(ctx context.Context, httpClient *http.Client, resp *http.Re
 		return xet.FileHash{}, nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
 	}
 
-	linkMap := parseLinkHeaders(resp.Header.Values("Link"))
+	linkMap := ParseLinkHeaders(resp.Header.Values("Link"))
 	reconURLStr := linkMap["xet-reconstruction-info"]
 	if reconURLStr == "" {
 		return xet.FileHash{}, nil, fmt.Errorf("missing xet-reconstruction-info link")
@@ -108,7 +108,8 @@ func normalizeRepoType(repoType string) string {
 	}
 }
 
-func parseLinkHeaders(values []string) map[string]string {
+// ParseLinkHeaders extracts rel -> URL pairs from Link header values.
+func ParseLinkHeaders(values []string) map[string]string {
 	result := make(map[string]string)
 	for _, value := range values {
 		parts := strings.SplitSeq(value, ",")
