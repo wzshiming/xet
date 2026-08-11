@@ -53,7 +53,7 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	cacheDir     string
+	cache        *CacheManager
 }
 
 type progressReader struct {
@@ -73,7 +73,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cacheDir string, opts *options) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cache *CacheManager, opts *options) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -110,7 +110,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		client:       client,
 		entries:      entries,
 		progressFunc: opts.progressFunc,
-		cacheDir:     cacheDir,
+		cache:        cache,
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -123,7 +123,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	newItems := make([]*prefetchEntry, 0, len(items))
 	for _, item := range items {
-		cc, err := openCachedRange(p.cacheDir, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+		cc, err := openCachedRange(p.cache, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
 		if err != nil {
 			return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
 		}
@@ -194,7 +194,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	var err error
 	key := entry.task.key
 
-	lockFile, err := lockChunkCache(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
+	lockFile, err := lockChunkCache(p.cache.dir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
@@ -208,7 +208,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}()
 
 	// Another process may have populated the cache while this worker waited.
-	cache, err = openCachedRange(p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
+	cache, err = openCachedRange(p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
@@ -240,7 +240,7 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}
 
 	dec := xorb.NewDecoder(reader, false)
-	cache, err = newLockedChunkCache(dec, p.cacheDir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
+	cache, err = newLockedChunkCache(dec, p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
 	if err != nil {
 		p.failEntry(entry, err)
 		return

@@ -9,6 +9,7 @@ import (
 	"net/url"
 
 	"github.com/wzshiming/httpseek"
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -29,6 +30,8 @@ type Client struct {
 	retries       int
 	progressFunc  progress.ProgressFunc
 	cacheDir      string
+	cacheSize     int64
+	cacheManager  *download.CacheManager
 }
 
 type Options func(*Client)
@@ -94,6 +97,16 @@ func WithCacheDir(cacheDir string) Options {
 	}
 }
 
+// WithCacheSize bounds the total size in bytes of the persistent disk chunk
+// cache; least recently used entries are evicted once the limit is exceeded.
+// Zero or negative keeps the cache unbounded. Defaults to
+// download.DefaultCacheSize (10 GB), matching xet-core.
+func WithCacheSize(sizeBytes int64) Options {
+	return func(c *Client) {
+		c.cacheSize = sizeBytes
+	}
+}
+
 // NewClient creates a new API client
 func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
@@ -101,10 +114,13 @@ func NewClient(opts ...Options) (*Client, error) {
 		namespace:   "default",
 		concurrency: 4,
 		retries:     5,
+		cacheSize:   download.DefaultCacheSize,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
+
+	c.cacheManager = download.NewCacheManager(c.cacheDir, c.cacheSize)
 
 	if c.httpClient.Transport == nil {
 		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()

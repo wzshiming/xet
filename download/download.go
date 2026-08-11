@@ -10,6 +10,16 @@ type Option func(*options)
 type options struct {
 	concurrency  int
 	progressFunc progress.ProgressFunc
+	cache        *CacheManager
+}
+
+// WithCacheManager shares one CacheManager across readers so the capacity
+// bound applies to the whole cache directory. When unset, each reader uses a
+// private manager for the cacheDir passed to its constructor.
+func WithCacheManager(cache *CacheManager) Option {
+	return func(o *options) {
+		o.cache = cache
+	}
 }
 
 // WithConcurrency configures how many xorb ranges are prefetched concurrently.

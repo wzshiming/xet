@@ -20,7 +20,8 @@ const testCacheHash = "0123456789abcdef"
 
 func TestChunkCachePublishesFinalSizeInName(t *testing.T) {
 	dir := t.TempDir()
-	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), dir, testCacheHash, 0, 1, 10, 20)
+	m := NewCacheManager(dir, 0)
+	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), m, testCacheHash, 0, 1, 10, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestChunkCachePublishesFinalSizeInName(t *testing.T) {
 		t.Fatal("partial lock path and final cache path do not reference the same inode")
 	}
 
-	cached, err := openCachedRange(dir, testCacheHash, 0, 1)
+	cached, err := openCachedRange(m, testCacheHash, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestChunkCacheIgnoresPartialAndWrongSizedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cached, err := openCachedRange(dir, testCacheHash, 0, 1)
+	cached, err := openCachedRange(NewCacheManager(dir, 0), testCacheHash, 0, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestChunkCacheIgnoresPartialAndWrongSizedFiles(t *testing.T) {
 
 func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	dir := t.TempDir()
-	cache, err := newChunkCache(bytes.NewReader([]byte("only-one-chunk")), dir, testCacheHash, 0, 2, 10, 20)
+	cache, err := newChunkCache(bytes.NewReader([]byte("only-one-chunk")), NewCacheManager(dir, 0), testCacheHash, 0, 2, 10, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,8 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 
 func TestChunkCacheConcurrentWriterReusesPublishedFile(t *testing.T) {
 	dir := t.TempDir()
-	first, err := newChunkCache(bytes.NewReader([]byte("first")), dir, testCacheHash, 0, 1, 10, 20)
+	m := NewCacheManager(dir, 0)
+	first, err := newChunkCache(bytes.NewReader([]byte("first")), m, testCacheHash, 0, 1, 10, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +132,7 @@ func TestChunkCacheConcurrentWriterReusesPublishedFile(t *testing.T) {
 	result := make(chan *chunkCache, 1)
 	errs := make(chan error, 1)
 	go func() {
-		cache, err := newChunkCache(bytes.NewReader([]byte("second")), dir, testCacheHash, 0, 1, 10, 20)
+		cache, err := newChunkCache(bytes.NewReader([]byte("second")), m, testCacheHash, 0, 1, 10, 20)
 		result <- cache
 		errs <- err
 	}()
@@ -211,8 +213,10 @@ func TestPrefetcherLocksBeforeNetworkRequest(t *testing.T) {
 	}
 	entry1 := &prefetchEntry{task: task, ready: make(chan struct{})}
 	entry2 := &prefetchEntry{task: task, ready: make(chan struct{})}
-	p1 := &prefetcher{ctx: context.Background(), client: client, cacheDir: t.TempDir()}
-	p2 := &prefetcher{ctx: context.Background(), client: client, cacheDir: p1.cacheDir}
+	// Separate managers over the same directory simulate two processes.
+	dir := t.TempDir()
+	p1 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
+	p2 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
 
 	done1 := make(chan struct{})
 	done2 := make(chan struct{})
