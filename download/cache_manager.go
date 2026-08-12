@@ -50,6 +50,11 @@ type CacheManager struct {
 	// evaluateLocked drains it for eviction candidates and reconcileLocked
 	// uses it to rebuild the LRU.
 	evicted []evictedEntry
+
+	// verified remembers published entries whose checksum already passed,
+	// keyed by final path, so each entry is verified at most once per
+	// manager.
+	verified sync.Map
 }
 
 // NewCacheManager creates a manager for the chunk cache at cacheDir (empty
@@ -101,6 +106,17 @@ func (m *CacheManager) release(path string) {
 	}
 }
 
+// wasVerified reports whether path already passed checksum verification.
+func (m *CacheManager) wasVerified(path string) bool {
+	_, ok := m.verified.Load(path)
+	return ok
+}
+
+// markVerified remembers that path passed checksum verification.
+func (m *CacheManager) markVerified(path string) {
+	m.verified.Store(path, struct{}{})
+}
+
 // evaluate reconciles tracked state with the cache directory, then evicts
 // least-recently-used entries until the total fits the capacity. Reconciling
 // first keeps the bound directory-level even when other managers or
@@ -134,6 +150,8 @@ func (m *CacheManager) evaluateLocked() {
 				skipped = append(skipped, ev)
 				continue
 			}
+			// A future file reusing this name must be verified afresh.
+			m.verified.Delete(ev.key)
 			m.total -= ev.entry.size
 		}
 	}
@@ -235,6 +253,7 @@ func (m *CacheManager) reconcileLocked() {
 		if !ok {
 			// The name vanished (evicted by another process); open handles
 			// keep the data alive but it no longer occupies the directory.
+			m.verified.Delete(ev.key)
 			continue
 		}
 		ev.entry.size = size
