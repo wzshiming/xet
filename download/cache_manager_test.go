@@ -52,7 +52,7 @@ func findFinalFile(t *testing.T, dir, hash string) string {
 		t.Fatal(err)
 	}
 	for _, de := range entries {
-		if _, _, _, _, _, ok := parseCacheFileName(de.Name()); ok {
+		if _, _, _, _, ok := parseCacheFileName(de.Name()); ok {
 			return filepath.Join(hashDir, de.Name())
 		}
 	}
@@ -190,13 +190,9 @@ func TestCacheEvictionSkipsFlockedEntry(t *testing.T) {
 	m := NewCacheManager(dir, 0)
 
 	finalPath := writeCacheEntry(t, m, testHashA, payload)
-	partialPath, ok := cachePartialPathFor(finalPath)
-	if !ok {
-		t.Fatal("no partial path for final file")
-	}
 
 	// Simulate another process holding the entry's flock.
-	lockFile, err := os.OpenFile(partialPath, os.O_RDWR, 0)
+	lockFile, err := os.OpenFile(finalPath, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,9 +213,6 @@ func TestCacheEvictionSkipsFlockedEntry(t *testing.T) {
 	m.evaluate()
 	if entryExists(t, dir, testHashA) {
 		t.Fatal("unlocked entry was not evicted")
-	}
-	if _, err := os.Stat(partialPath); !os.IsNotExist(err) {
-		t.Fatalf("partial file was not removed with the entry: %v", err)
 	}
 }
 
@@ -253,12 +246,12 @@ func TestCacheScanAdoptsExistingEntriesAndCleansOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A crashed download leaves an orphaned partial with no published file.
+	// A crashed download leaves an incomplete entry with no lock holder.
 	orphanDir := filepath.Join(dir, testHashC[:2], testHashC[2:])
 	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	orphan := filepath.Join(orphanDir, cacheFileBaseName(0, 1, 0, 10)+".partial")
+	orphan := filepath.Join(orphanDir, cacheFileName(0, 1, 0, 10))
 	if err := os.WriteFile(orphan, []byte("junk"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +260,7 @@ func TestCacheScanAdoptsExistingEntriesAndCleansOrphans(t *testing.T) {
 	fresh.prepare()
 
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Fatalf("orphaned partial was not cleaned up: %v", err)
+		t.Fatalf("crashed leftover was not cleaned up: %v", err)
 	}
 	if entryExists(t, dir, testHashA) {
 		t.Fatal("older adopted entry was not evicted")
@@ -280,32 +273,31 @@ func TestCacheScanAdoptsExistingEntriesAndCleansOrphans(t *testing.T) {
 	}
 }
 
-func TestCacheScanKeepsPartialOfPublishedEntry(t *testing.T) {
+func TestCacheScanKeepsLockedIncompleteEntry(t *testing.T) {
 	dir := t.TempDir()
-	payload := "0123456789"
-	finalPath := writeCacheEntry(t, NewCacheManager(dir, 0), testHashA, payload)
-	partialPath, _ := cachePartialPathFor(finalPath)
+	path := cacheFilePath(dir, testHashA, 0, 1, 0, 10)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("in-progress"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an active writer holding the entry's flock.
+	lockFile, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := flock.TryLock(lockFile); err != nil {
+		t.Fatal(err)
+	}
+	defer flock.Unlock(lockFile) //nolint:errcheck
 
 	fresh := NewCacheManager(dir, 0)
 	fresh.prepare()
 
-	if _, err := os.Stat(partialPath); err != nil {
-		t.Fatalf("partial flock target of published entry was removed: %v", err)
-	}
-	if !entryExists(t, dir, testHashA) {
-		t.Fatal("published entry disappeared")
-	}
-}
-
-func TestCachePartialPathFor(t *testing.T) {
-	final := filepath.Join("cache", "ab", "cdef", "0-4_10-20_1234")
-	got, ok := cachePartialPathFor(final)
-	if !ok {
-		t.Fatal("expected ok")
-	}
-	want := filepath.Join("cache", "ab", "cdef", "0-4_10-20.partial")
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("locked in-progress entry was removed: %v", err)
 	}
 }
 

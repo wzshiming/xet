@@ -49,20 +49,17 @@ func (r cacheRange) dir() string {
 	return filepath.Join(r.cacheDir, r.hash[:2], r.hash[2:])
 }
 
-func (r cacheRange) basePath() string {
-	return filepath.Join(r.dir(), cacheFileBaseName(r.chunkStart, r.chunkEnd, r.bytesStart, r.bytesEnd))
+func (r cacheRange) path() string {
+	return filepath.Join(r.dir(), cacheFileName(r.chunkStart, r.chunkEnd, r.bytesStart, r.bytesEnd))
 }
-
-func (r cacheRange) partialPath() string { return r.basePath() + ".partial" }
 
 // chunkCache is the single cache for decoded xorb chunk ranges.
 //
 // Each entry is stored as a single file at:
 //
-//	cacheDir/<hash[:2]>/<hash[2:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>_<fileSize>
+//	cacheDir/<hash[:2]>/<hash[2:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>
 //
-// where bytesStart and bytesEnd identify the source xorb byte range and
-// fileSize is the exact size of the completed cache file.
+// where bytesStart and bytesEnd identify the source xorb byte range.
 //
 // File format (all integers little-endian):
 //
@@ -76,13 +73,16 @@ func (r cacheRange) partialPath() string { return r.basePath() + ".partial" }
 //
 // The crc32 (IEEE) input is the data region followed by the header, so the
 // streaming writer hashes chunks as they arrive and folds in the offset table
-// when it is patched at publish time. It is checked lazily, on the first open
-// per manager. Files written before the trailer existed (ending right after
-// the data region) are adopted unverified.
+// when it is patched at seal time. It is checked lazily, on the first open
+// per manager.
 //
-// The .partial file is also the stable flock target. Once complete, the final
-// size-bearing name is hard-linked to the same inode, so data is written once
-// and readers only consider published final names.
+// The entry file itself is the flock target, held by its writer from creation
+// until the file is sealed. Completeness is arithmetic: the name fixes the
+// header size, so a file is complete exactly when its size equals the header
+// plus offset[N] plus the trailer. A file only grows from incomplete to
+// complete and complete files are never rewritten, only unlinked, so readers
+// adopt them without locking. Writers truncate leftovers of crashed downloads
+// in place; that is safe because readers never adopt incomplete files.
 type chunkCache struct {
 	dec            io.Reader
 	metas          []chunkRef
@@ -93,8 +93,7 @@ type chunkCache struct {
 	file           *os.File   // backing file
 	files          []*os.File // additional files for multi-file read path (fileIdx > 0)
 	lockFile       *os.File   // same handle as file while the write lock is held
-	partialPath    string
-	finalBasePath  string
+	path           string     // entry file path
 	expectedChunks uint32
 	crc            uint32 // incremental crc32 of the data region while writing
 	published      bool
@@ -102,21 +101,21 @@ type chunkCache struct {
 	refPaths       []string // cache files acquired from manager, released in Done
 }
 
-// cacheFileBaseName returns the stable portion of a cache entry name.
-func cacheFileBaseName(start, end uint32, bytesStart, bytesEnd int64) string {
+// cacheFileName returns the entry file name for a chunk range.
+func cacheFileName(start, end uint32, bytesStart, bytesEnd int64) string {
 	return fmt.Sprintf("%d-%d_%d-%d", start, end, bytesStart, bytesEnd)
 }
 
-func cacheFileBasePath(cacheDir, hash string, start, end uint32, bytesStart, bytesEnd int64) string {
-	return filepath.Join(cacheDir, hash[:2], hash[2:], cacheFileBaseName(start, end, bytesStart, bytesEnd))
+func cacheFilePath(cacheDir, hash string, start, end uint32, bytesStart, bytesEnd int64) string {
+	return filepath.Join(cacheDir, hash[:2], hash[2:], cacheFileName(start, end, bytesStart, bytesEnd))
 }
 
 // parseCacheFileName parses a filename of the form
-// "<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>_<fileSize>" and returns the components.
+// "<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>" and returns the components.
 // Returns ok=false if parsing fails.
-func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, bytesEnd, fileSize int64, ok bool) {
+func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64, ok bool) {
 	parts := strings.Split(name, "_")
-	if len(parts) != 3 {
+	if len(parts) != 2 {
 		return
 	}
 	chunkParts := strings.SplitN(parts[0], "-", 2)
@@ -143,11 +142,10 @@ func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, b
 	if err != nil || be < 0 {
 		return
 	}
-	size, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil || size <= 0 || ce < cs || be < bs {
+	if ce < cs || be < bs {
 		return
 	}
-	return uint32(cs), uint32(ce), bs, be, size, true
+	return uint32(cs), uint32(ce), bs, be, true
 }
 
 // newChunkCache creates a chunkCache that decodes chunks from dec and writes
@@ -180,7 +178,7 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 		return nil, err
 	}
 
-	// Cache eviction may unlink the partial file (or its directory) while a
+	// Cache eviction may unlink the entry file (or its directory) while a
 	// contender waits on the lock, so verify after locking that the handle
 	// still backs the path and retry on a fresh file otherwise.
 	const maxAttempts = 10
@@ -188,7 +186,7 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 		if err := os.MkdirAll(r.dir(), 0o755); err != nil {
 			return nil, fmt.Errorf("create cache dir: %w", err)
 		}
-		lockFile, err := os.OpenFile(r.partialPath(), os.O_RDWR|os.O_CREATE, 0o644)
+		lockFile, err := os.OpenFile(r.path(), os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
 			// Retry only races with eviction: the directory vanishing, or a
 			// delete-pending name on Windows (a permission error). Anything
@@ -197,13 +195,13 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			return nil, fmt.Errorf("create partial cache file: %w", err)
+			return nil, fmt.Errorf("create cache file: %w", err)
 		}
 		if err := flock.Lock(lockFile); err != nil {
 			lockFile.Close()
 			return nil, fmt.Errorf("lock cache file: %w", err)
 		}
-		pathInfo, statErr := os.Stat(r.partialPath())
+		pathInfo, statErr := os.Stat(r.path())
 		fileInfo, fstatErr := lockFile.Stat()
 		if statErr == nil && fstatErr == nil && os.SameFile(pathInfo, fileInfo) {
 			return lockFile, nil
@@ -211,7 +209,7 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 		flock.Unlock(lockFile) //nolint:errcheck
 		lockFile.Close()
 		if attempt >= maxAttempts {
-			return nil, fmt.Errorf("lock cache file: partial file keeps being replaced")
+			return nil, fmt.Errorf("lock cache file: entry file keeps being replaced")
 		}
 	}
 }
@@ -222,11 +220,11 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 		return nil, err
 	}
 
-	// The locked partial file is the backing data file. Reuse its inode so all
-	// current and future contenders synchronize on the same flock target.
+	// The locked entry file is the backing data file; truncation discards any
+	// leftover from a crashed download, which readers never adopt.
 	f := lockFile
 	if err := f.Truncate(0); err != nil {
-		return nil, fmt.Errorf("truncate partial cache file: %w", err)
+		return nil, fmt.Errorf("truncate cache file: %w", err)
 	}
 
 	// Write a placeholder header. The actual numOffsets is known from the
@@ -246,8 +244,7 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 		file:           f,
 		writePos:       int64(headerSize), // data starts after the header
 		lockFile:       lockFile,
-		partialPath:    r.partialPath(),
-		finalBasePath:  r.basePath(),
+		path:           r.path(),
 		expectedChunks: numChunks,
 		manager:        m,
 	}, nil
@@ -279,14 +276,13 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 	type candidate struct {
 		path       string
 		start, end uint32
-		size       int64
 	}
 	var candidates []candidate
 	for _, de := range files {
 		if de.IsDir() || strings.HasPrefix(de.Name(), ".") {
 			continue
 		}
-		cs, ce, _, _, size, ok := parseCacheFileName(de.Name())
+		cs, ce, _, _, ok := parseCacheFileName(de.Name())
 		if !ok {
 			continue
 		}
@@ -297,7 +293,6 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 			path:  filepath.Join(hashDir, de.Name()),
 			start: cs,
 			end:   ce,
-			size:  size,
 		})
 	}
 
@@ -341,43 +336,37 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 
 		f, err := os.Open(c.path)
 		if err != nil {
-			closeSegments()
 			// The entry may have been evicted between listing and opening;
-			// treat it as a cache miss. On Windows an evicted name that is
-			// still open elsewhere stays delete-pending and surfaces as a
-			// permission error.
+			// skip it. On Windows an evicted name that is still open elsewhere
+			// stays delete-pending and surfaces as a permission error.
 			if os.IsNotExist(err) || os.IsPermission(err) {
-				return nil, nil
+				continue
 			}
+			closeSegments()
 			return nil, err
 		}
 
-		// The final size is part of the published filename. A mismatch means
-		// the entry is incomplete or corrupted.
-		if fi, statErr := f.Stat(); statErr != nil || fi.Size() != c.size {
+		fi, statErr := f.Stat()
+		if statErr != nil {
 			f.Close()
-			closeSegments()
-			os.Remove(c.path) //nolint:errcheck
-			return nil, nil
+			continue
 		}
 
-		layout, err := readCacheFileLayout(f, c.start, c.end, c.size)
+		layout, err := readCacheFileLayout(f, c.start, c.end, fi.Size())
 		if err != nil {
+			// Still being written, or a crashed leftover; both are invisible
+			// to readers. Cleanup happens under the entry flock in reconcile.
 			f.Close()
-			closeSegments()
-			// Remove corrupted cache file so it doesn't cause repeated errors.
-			os.Remove(c.path) //nolint:errcheck
-			return nil, nil
+			continue
 		}
 
-		// Legacy files without a checksum are adopted unverified; new files
-		// are verified once per manager, on their first open.
-		if layout.hasCRC && !m.wasVerified(c.path) {
+		// Entries are verified once per manager, on their first open.
+		if !m.wasVerified(c.path) {
 			if err := verifyCacheFileCRC(f, layout); err != nil {
 				f.Close()
 				closeSegments()
 				// Remove the corrupted entry under its flock, like eviction.
-				removeCacheEntryFiles(c.path)
+				removeCacheEntry(c.path)
 				return nil, nil
 			}
 			m.markVerified(c.path)
@@ -387,11 +376,11 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 		if err != nil {
 			f.Close()
 			closeSegments()
-			// Remove corrupted cache file so it doesn't cause repeated errors.
-			os.Remove(c.path) //nolint:errcheck
+			// Remove the corrupted entry under its flock, like eviction.
+			removeCacheEntry(c.path)
 			return nil, nil
 		}
-		m.acquire(c.path, c.size)
+		m.acquire(c.path, fi.Size())
 		acquired = append(acquired, c.path)
 		segments = append(segments, fileSegment{metas: metas, file: f})
 		covered = needEnd
@@ -427,25 +416,27 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 	}, nil
 }
 
-// cacheFileLayout describes where the offset table and data live in a cache
-// file, and the checksum trailer carried by files written after it was added.
+// cacheFileLayout describes where the offset table, data, and checksum
+// trailer live in a sealed cache file.
 type cacheFileLayout struct {
 	numOffsets  uint32
 	headerBytes int64 // offset table ends here; the data region starts here
-	dataBytes   int64 // decoded data length; the trailer (if any) follows
+	dataBytes   int64 // decoded data length; the trailer follows
 	crc         uint32
-	hasCRC      bool
 }
 
-// readCacheFileLayout reads the offset count and decides which layout the
-// file uses via exact size arithmetic: files written before the checksum
-// existed end right after the data region, while current files carry a
-// trailing crc32. Anything else is structurally invalid.
+// readCacheFileLayout validates the exact size arithmetic that defines a
+// sealed entry: header, data, then a trailing crc32. Any other size means
+// the file is still being written or is a crashed leftover.
 func readCacheFileLayout(f *os.File, fileStart, fileEnd uint32, fileSize int64) (cacheFileLayout, error) {
 	if fileEnd < fileStart {
 		return cacheFileLayout{}, fmt.Errorf("invalid chunk range")
 	}
 	expected := fileEnd - fileStart + 1
+	headerBytes := 4 + 4*int64(expected)
+	if fileSize < headerBytes+4 {
+		return cacheFileLayout{}, fmt.Errorf("cache file incomplete")
+	}
 	var head [4]byte
 	if _, err := f.ReadAt(head[:], 0); err != nil {
 		return cacheFileLayout{}, err
@@ -453,7 +444,6 @@ func readCacheFileLayout(f *os.File, fileStart, fileEnd uint32, fileSize int64) 
 	if binary.LittleEndian.Uint32(head[:]) != expected {
 		return cacheFileLayout{}, fmt.Errorf("invalid cache offset count")
 	}
-	headerBytes := 4 + 4*int64(expected)
 	var lastBuf [4]byte
 	if _, err := f.ReadAt(lastBuf[:], headerBytes-4); err != nil {
 		return cacheFileLayout{}, err
@@ -463,20 +453,15 @@ func readCacheFileLayout(f *os.File, fileStart, fileEnd uint32, fileSize int64) 
 		headerBytes: headerBytes,
 		dataBytes:   int64(binary.LittleEndian.Uint32(lastBuf[:])),
 	}
-	switch fileSize {
-	case layout.headerBytes + layout.dataBytes:
-		// Legacy layout without a checksum trailer.
-		return layout, nil
-	case layout.headerBytes + layout.dataBytes + 4:
-		var crcBuf [4]byte
-		if _, err := f.ReadAt(crcBuf[:], fileSize-4); err != nil {
-			return cacheFileLayout{}, err
-		}
-		layout.crc = binary.LittleEndian.Uint32(crcBuf[:])
-		layout.hasCRC = true
-		return layout, nil
+	if fileSize != layout.headerBytes+layout.dataBytes+4 {
+		return cacheFileLayout{}, fmt.Errorf("cache file incomplete")
 	}
-	return cacheFileLayout{}, fmt.Errorf("cache file size mismatch")
+	var crcBuf [4]byte
+	if _, err := f.ReadAt(crcBuf[:], fileSize-4); err != nil {
+		return cacheFileLayout{}, err
+	}
+	layout.crc = binary.LittleEndian.Uint32(crcBuf[:])
+	return layout, nil
 }
 
 // verifyCacheFileCRC re-reads the whole file and compares it against the
@@ -643,8 +628,10 @@ func (c *chunkCache) LoadAll() error {
 	}
 }
 
-// finalize patches the offset table in the header with the actual chunk sizes,
-// then syncs the file to disk. No-op for read-only caches.
+// finalize patches the offset table in the header, seals the file with the
+// crc32 trailer, syncs it, and releases the write lock. The entry becomes
+// visible to readers once its size matches the sealed layout. No-op for
+// read-only caches.
 func (c *chunkCache) finalize() error {
 	c.mut.Lock()
 	defer c.mut.Unlock()
@@ -687,15 +674,16 @@ func (c *chunkCache) finalize() error {
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync cache file: %w", err)
 	}
-	info, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("stat cache file: %w", err)
-	}
-	finalPath := fmt.Sprintf("%s_%d", c.finalBasePath, info.Size())
-	if err := os.Link(c.partialPath, finalPath); err != nil {
-		return fmt.Errorf("publish cache file: %w", err)
-	}
 	c.published = true
+	if c.manager != nil {
+		// Track the sealed entry (still referenced by this open cache) before
+		// releasing the lock so eviction never catches it unreferenced. The
+		// freshly synced file matches the checksum it was sealed with, so
+		// remember it as verified.
+		c.manager.acquire(c.path, c.writePos+4)
+		c.manager.markVerified(c.path)
+		c.refPaths = append(c.refPaths, c.path)
+	}
 	if c.lockFile != nil {
 		if err := flock.Unlock(c.lockFile); err != nil {
 			return fmt.Errorf("unlock cache file: %w", err)
@@ -703,12 +691,7 @@ func (c *chunkCache) finalize() error {
 		c.lockFile = nil
 	}
 	if c.manager != nil {
-		// Track the published entry (still referenced by this open cache) and
-		// evict any overage now that the cache grew. The freshly synced file
-		// matches the checksum it was sealed with, so remember it as verified.
-		c.manager.acquire(finalPath, info.Size())
-		c.manager.markVerified(finalPath)
-		c.refPaths = append(c.refPaths, finalPath)
+		// Evict any overage now that the cache grew.
 		c.manager.evaluate()
 	}
 	return nil
@@ -719,6 +702,11 @@ func (c *chunkCache) finalize() error {
 func (c *chunkCache) Done() {
 	c.mut.Lock()
 	c.done = true
+	if c.file != nil && !c.readonly && !c.published {
+		// Discard the unfinished entry while still holding its lock so
+		// waiting contenders find an empty file and rewrite it.
+		c.file.Truncate(0) //nolint:errcheck
+	}
 	if c.lockFile != nil {
 		flock.Unlock(c.lockFile) //nolint:errcheck
 		c.lockFile = nil
@@ -726,9 +714,6 @@ func (c *chunkCache) Done() {
 	if c.file != nil {
 		c.file.Close()
 		c.file = nil
-	}
-	if !c.readonly && !c.published {
-		os.Remove(c.partialPath) //nolint:errcheck
 	}
 	for _, f := range c.files {
 		f.Close()
