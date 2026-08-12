@@ -3,6 +3,7 @@ package download
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,12 +66,19 @@ func (r cacheRange) partialPath() string { return r.basePath() + ".partial" }
 //
 // File format (all integers little-endian):
 //
+//	[crc32       uint32]           // checksum of everything after this field
 //	[numOffsets  uint32]           // = numChunks + 1
 //	[offset[0]   uint32]           // always 0
 //	[offset[1]   uint32]           // end of chunk 0
 //	...
 //	[offset[N]   uint32]           // = total data length
 //	[data bytes ...]               // decoded chunks concatenated
+//
+// The crc32 (IEEE) input is the data region followed by the header minus the
+// checksum field, so the streaming writer hashes chunks as they arrive and
+// folds in the offset table when it is patched at publish time. It is checked
+// lazily, on the first open per manager. Files written before the checksum
+// existed (starting directly with numOffsets) are adopted unverified.
 //
 // The .partial file is also the stable flock target. Once complete, the final
 // size-bearing name is hard-linked to the same inode, so data is written once
@@ -88,6 +96,7 @@ type chunkCache struct {
 	partialPath    string
 	finalBasePath  string
 	expectedChunks uint32
+	crc            uint32 // incremental crc32 of the data region while writing
 	published      bool
 	manager        *CacheManager
 	refPaths       []string // cache files acquired from manager, released in Done
@@ -221,12 +230,13 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 	}
 
 	// Write a placeholder header. The actual numOffsets is known from the
-	// chunk range, so we can write the correct header size upfront.
+	// chunk range, so we can write the correct header size upfront. The
+	// leading crc32 stays zero until finalize seals the file.
 	numChunks := chunkEnd - chunkStart
 	numOffsets := numChunks + 1
-	headerSize := 4 + 4*int(numOffsets)
+	headerSize := 8 + 4*int(numOffsets)
 	header := make([]byte, headerSize)
-	binary.LittleEndian.PutUint32(header[0:], numOffsets)
+	binary.LittleEndian.PutUint32(header[4:], numOffsets)
 	// offsets[0] = 0, the rest will be filled in during LoadAll.
 	if _, err := f.WriteAt(header, 0); err != nil {
 		return nil, fmt.Errorf("write header: %w", err)
@@ -352,7 +362,29 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 			return nil, nil
 		}
 
-		metas, err := readCacheFileMetas(f, c.start, c.end, needStart, needEnd, c.size)
+		layout, err := readCacheFileLayout(f, c.start, c.end)
+		if err != nil {
+			f.Close()
+			closeSegments()
+			// Remove corrupted cache file so it doesn't cause repeated errors.
+			os.Remove(c.path) //nolint:errcheck
+			return nil, nil
+		}
+
+		// Legacy files without a checksum are adopted unverified; new files
+		// are verified once per manager, on their first open.
+		if layout.hasCRC && !m.wasVerified(c.path) {
+			if err := verifyCacheFileCRC(f, layout, c.size); err != nil {
+				f.Close()
+				closeSegments()
+				// Remove the corrupted entry under its flock, like eviction.
+				removeCacheEntryFiles(c.path)
+				return nil, nil
+			}
+			m.markVerified(c.path)
+		}
+
+		metas, err := readCacheFileMetas(f, layout, c.start, needStart, needEnd, c.size)
 		if err != nil {
 			f.Close()
 			closeSegments()
@@ -396,35 +428,99 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 	}, nil
 }
 
+// cacheFileLayout describes where the offset table and data live in a cache
+// file, and the checksum carried by files written after the crc32 field was
+// added.
+type cacheFileLayout struct {
+	numOffsets  uint32
+	tableOff    int64 // file offset of the offset table
+	headerBytes int64 // total header size; the data region starts here
+	crc         uint32
+	hasCRC      bool
+}
+
+// readCacheFileLayout reads the fixed head of a cache file and decides which
+// layout it uses. New files start with [crc32][numOffsets]; legacy files
+// written before the checksum field start directly with [numOffsets]. The two
+// cannot be confused: the offset count implied by the file name is never
+// zero, while the word after a legacy count is offset[0], which always is.
+func readCacheFileLayout(f *os.File, fileStart, fileEnd uint32) (cacheFileLayout, error) {
+	if fileEnd < fileStart {
+		return cacheFileLayout{}, fmt.Errorf("invalid chunk range")
+	}
+	expected := fileEnd - fileStart + 1
+	var head [8]byte
+	if _, err := f.ReadAt(head[:], 0); err != nil {
+		return cacheFileLayout{}, err
+	}
+	if binary.LittleEndian.Uint32(head[4:]) == expected {
+		return cacheFileLayout{
+			numOffsets:  expected,
+			tableOff:    8,
+			headerBytes: 8 + 4*int64(expected),
+			crc:         binary.LittleEndian.Uint32(head[:4]),
+			hasCRC:      true,
+		}, nil
+	}
+	if binary.LittleEndian.Uint32(head[:4]) == expected {
+		return cacheFileLayout{
+			numOffsets:  expected,
+			tableOff:    4,
+			headerBytes: 4 + 4*int64(expected),
+		}, nil
+	}
+	return cacheFileLayout{}, fmt.Errorf("invalid cache offset count")
+}
+
+// verifyCacheFileCRC re-reads the whole file and compares it against the
+// checksum stored in the header. The CRC input is the data region followed by
+// the header minus the checksum field, the same order finalize feeds the
+// hasher.
+func verifyCacheFileCRC(f *os.File, layout cacheFileLayout, fileSize int64) error {
+	if layout.headerBytes > fileSize {
+		return fmt.Errorf("cache file is smaller than its header")
+	}
+	sum := uint32(0)
+	buf := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(buf)
+	for off := layout.headerBytes; off < fileSize; {
+		n := min(int64(len(buf)), fileSize-off)
+		if _, err := f.ReadAt(buf[:n], off); err != nil {
+			return err
+		}
+		sum = crc32.Update(sum, crc32.IEEETable, buf[:n])
+		off += n
+	}
+	hdr := make([]byte, layout.headerBytes-4)
+	if _, err := f.ReadAt(hdr, 4); err != nil {
+		return err
+	}
+	sum = crc32.Update(sum, crc32.IEEETable, hdr)
+	if sum != layout.crc {
+		return fmt.Errorf("cache file checksum mismatch")
+	}
+	return nil
+}
+
 // readCacheFileMetas reads metas for [chunkStart, chunkEnd) from an already-open
 // cache file. The caller is responsible for closing f in all cases.
-func readCacheFileMetas(f *os.File, fileStart, fileEnd, chunkStart, chunkEnd uint32, fileSize int64) ([]chunkRef, error) {
-	var countBuf [4]byte
-	if _, err := f.ReadAt(countBuf[:], 0); err != nil {
-		return nil, err
-	}
-	numOffsets := binary.LittleEndian.Uint32(countBuf[:])
-	if fileEnd < fileStart || numOffsets != fileEnd-fileStart+1 {
-		return nil, fmt.Errorf("invalid cache offset count")
-	}
-
+func readCacheFileMetas(f *os.File, layout cacheFileLayout, fileStart, chunkStart, chunkEnd uint32, fileSize int64) ([]chunkRef, error) {
 	if chunkStart < fileStart || chunkEnd < chunkStart {
 		return nil, fmt.Errorf("invalid chunk range")
 	}
 	idxStart := int(chunkStart - fileStart)
 	idxEnd := int(chunkEnd - fileStart)
-	if idxEnd >= int(numOffsets) || idxStart > idxEnd {
+	if idxEnd >= int(layout.numOffsets) || idxStart > idxEnd {
 		return nil, fmt.Errorf("invalid chunk range")
 	}
 
 	numChunks := int(chunkEnd - chunkStart)
 	rawBuf := make([]byte, (numChunks+1)*4)
-	if _, err := f.ReadAt(rawBuf, int64(4+idxStart*4)); err != nil {
+	if _, err := f.ReadAt(rawBuf, layout.tableOff+int64(idxStart)*4); err != nil {
 		return nil, err
 	}
 
-	headerBytes := int64(4 + 4*int(numOffsets))
-	dataBytes := fileSize - headerBytes
+	dataBytes := fileSize - layout.headerBytes
 	if dataBytes < 0 {
 		return nil, fmt.Errorf("cache file is smaller than its header")
 	}
@@ -436,7 +532,7 @@ func readCacheFileMetas(f *os.File, fileStart, fileEnd, chunkStart, chunkEnd uin
 			return nil, fmt.Errorf("invalid cache offsets")
 		}
 		metas[i] = chunkRef{
-			offset: headerBytes + int64(start),
+			offset: layout.headerBytes + int64(start),
 			size:   int32(end - start),
 		}
 	}
@@ -499,6 +595,7 @@ func (c *chunkCache) load() (int, error) {
 	if _, werr := c.file.WriteAt(tmp[:n], c.writePos); werr != nil {
 		return 0, fmt.Errorf("write chunk to file: %w", werr)
 	}
+	c.crc = crc32.Update(c.crc, crc32.IEEETable, tmp[:n])
 	c.metas = append(c.metas, chunkRef{offset: c.writePos, size: int32(n)})
 	c.writePos += int64(n)
 	return len(c.metas), nil
@@ -572,11 +669,14 @@ func (c *chunkCache) finalize() error {
 		offsets[i+1] = offsets[i] + uint32(m.size)
 	}
 
-	header := make([]byte, 4+4*int(numOffsets))
-	binary.LittleEndian.PutUint32(header[0:], numOffsets)
+	header := make([]byte, 8+4*int(numOffsets))
+	binary.LittleEndian.PutUint32(header[4:], numOffsets)
 	for i, o := range offsets {
-		binary.LittleEndian.PutUint32(header[4+4*i:], o)
+		binary.LittleEndian.PutUint32(header[8+4*i:], o)
 	}
+	// The data region was hashed chunk by chunk in load; fold in the header
+	// minus the checksum field to seal the file.
+	binary.LittleEndian.PutUint32(header[0:], crc32.Update(c.crc, crc32.IEEETable, header[4:]))
 	if _, err := file.WriteAt(header, 0); err != nil {
 		return fmt.Errorf("write cache header: %w", err)
 	}
@@ -600,8 +700,10 @@ func (c *chunkCache) finalize() error {
 	}
 	if c.manager != nil {
 		// Track the published entry (still referenced by this open cache) and
-		// evict any overage now that the cache grew.
+		// evict any overage now that the cache grew. The freshly synced file
+		// matches the checksum it was sealed with, so remember it as verified.
 		c.manager.acquire(finalPath, info.Size())
+		c.manager.markVerified(finalPath)
 		c.refPaths = append(c.refPaths, finalPath)
 		c.manager.evaluate()
 	}

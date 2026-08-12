@@ -3,6 +3,8 @@ package download
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -118,6 +120,108 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	cache.Done()
 	if _, err := os.Stat(cache.partialPath); !os.IsNotExist(err) {
 		t.Fatalf("partial cache was not removed: %v", err)
+	}
+}
+
+// corruptLastByte flips the final byte of the file at path.
+func corruptLastByte(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], info.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xff
+	if _, err := f.WriteAt(b[:], info.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChunkCacheRemovesEntryOnChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	writeCacheEntry(t, NewCacheManager(dir, 0), testCacheHash, "chunk")
+	corruptLastByte(t, findFinalFile(t, dir, testCacheHash))
+
+	// A fresh manager has no verification memory, so the first open must
+	// detect the corruption, drop the entry, and report a miss.
+	cached, err := openCachedRange(NewCacheManager(dir, 0), testCacheHash, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != nil {
+		cached.Done()
+		t.Fatal("corrupted cache entry was served")
+	}
+	if entryExists(t, dir, testCacheHash) {
+		t.Fatal("corrupted cache entry was not removed")
+	}
+}
+
+func TestChunkCacheVerifiesChecksumOncePerManager(t *testing.T) {
+	dir := t.TempDir()
+	writeCacheEntry(t, NewCacheManager(dir, 0), testCacheHash, "chunk")
+
+	m := NewCacheManager(dir, 0)
+	cached, err := openCachedRange(m, testCacheHash, 0, 1)
+	if err != nil || cached == nil {
+		t.Fatalf("open cached range: %v", err)
+	}
+	cached.Done()
+
+	// Corruption after the first verified open goes unnoticed by the same
+	// manager: verification is lazy and runs at most once per entry.
+	corruptLastByte(t, findFinalFile(t, dir, testCacheHash))
+	cached, err = openCachedRange(m, testCacheHash, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil {
+		t.Fatal("verified entry was re-verified and dropped")
+	}
+	cached.Done()
+}
+
+func TestChunkCacheAdoptsLegacyEntryWithoutChecksum(t *testing.T) {
+	dir := t.TempDir()
+	payload := "legacy-chunk"
+	// Legacy layout: [numOffsets][offset0][offset1][data], no crc32 field.
+	header := make([]byte, 12)
+	binary.LittleEndian.PutUint32(header[0:], 2)
+	binary.LittleEndian.PutUint32(header[8:], uint32(len(payload)))
+	content := append(header, payload...)
+
+	base := cacheFileBasePath(dir, testCacheHash, 0, 1, 0, int64(len(payload)))
+	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("%s_%d", base, len(content))
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cached, err := openCachedRange(NewCacheManager(dir, 0), testCacheHash, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil {
+		t.Fatal("legacy cache entry was not adopted")
+	}
+	defer cached.Done()
+	buf := make([]byte, 32)
+	n, err := cached.Chunk(0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Fatalf("got %q, want %q", got, payload)
 	}
 }
 
