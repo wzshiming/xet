@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -35,10 +34,10 @@ type evictedEntry struct {
 // evaluated when an entry is published or released, never on the read path,
 // and every evaluation first reconciles the tracked state with the directory
 // so the bound holds even when several managers or processes share it.
-// Cross-process (and cross-manager) safety relies on the per-entry .partial
-// flock: names are only unlinked while holding that lock, so active writers
-// are never disturbed, and already-open readers keep their data through the
-// open handles even after the names are removed.
+// Cross-process (and cross-manager) safety relies on the flock on the entry
+// file itself: names are only unlinked while holding that lock, so active
+// writers are never disturbed, and already-open readers keep their data
+// through the open handles even after the names are removed.
 type CacheManager struct {
 	mu       sync.Mutex
 	dir      string
@@ -76,8 +75,8 @@ func NewCacheManager(cacheDir string, capacity int64) *CacheManager {
 }
 
 // prepare reconciles tracked state with the cache directory (adopting
-// pre-existing entries and removing orphaned .partial files) and evicts any
-// overage before a download starts.
+// pre-existing entries and removing crashed incomplete entries) and evicts
+// any overage before a download starts.
 func (m *CacheManager) prepare() {
 	m.evaluate()
 }
@@ -88,7 +87,11 @@ func (m *CacheManager) acquire(path string, size int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if v, ok := m.lru.Get(path); ok {
-		v.(*cacheEntry).refs++
+		e := v.(*cacheEntry)
+		e.refs++
+		// The name may back a recreated file; refresh the tracked size.
+		m.total += size - e.size
+		e.size = size
 		return
 	}
 	m.lru.Add(path, &cacheEntry{size: size, refs: 1})
@@ -146,7 +149,7 @@ func (m *CacheManager) evaluateLocked() {
 			}
 			// Entries in use here or locked by another process are kept and
 			// become most recently used.
-			if ev.entry.refs > 0 || !removeCacheEntryFiles(ev.key) {
+			if ev.entry.refs > 0 || !removeCacheEntry(ev.key) {
 				skipped = append(skipped, ev)
 				continue
 			}
@@ -162,8 +165,8 @@ func (m *CacheManager) evaluateLocked() {
 
 // reconcileLocked re-reads the cache directory so the tracked state matches
 // disk: entries created by other managers or processes are adopted, entries
-// removed elsewhere are dropped, sizes are refreshed, and orphaned .partial
-// files left behind by crashed downloads are cleaned up. The recency order
+// removed elsewhere are dropped, sizes are refreshed, and incomplete entries
+// left behind by crashed downloads are cleaned up. The recency order
 // and refs of already-tracked entries are preserved.
 func (m *CacheManager) reconcileLocked() {
 	type diskEntry struct {
@@ -194,38 +197,31 @@ func (m *CacheManager) reconcileLocked() {
 			if err != nil {
 				continue
 			}
-			published := make(map[string]bool)
-			var partials []string
 			for _, de := range entries {
 				name := de.Name()
 				if de.IsDir() {
 					continue
 				}
-				if strings.HasSuffix(name, ".partial") {
-					partials = append(partials, name)
-					continue
-				}
-				if _, _, _, _, _, ok := parseCacheFileName(name); !ok {
+				cs, ce, _, _, ok := parseCacheFileName(name)
+				if !ok {
 					continue
 				}
 				info, err := de.Info()
 				if err != nil {
 					continue
 				}
-				published[name[:strings.LastIndex(name, "_")]] = true
-				// Account the real on-disk size; a corrupt entry whose size
-				// does not match its name must not inflate the total.
+				path := filepath.Join(dir, name)
+				if !isCompleteCacheFile(path, cs, ce, info.Size()) {
+					// Either an active download (protected by its flock) or a
+					// crashed leftover; only the latter can be removed.
+					removeIncompleteCacheEntry(path, cs, ce)
+					continue
+				}
 				found = append(found, diskEntry{
-					path:    filepath.Join(dir, name),
+					path:    path,
 					size:    info.Size(),
 					modTime: info.ModTime(),
 				})
-			}
-			for _, name := range partials {
-				if published[strings.TrimSuffix(name, ".partial")] {
-					continue
-				}
-				removeOrphanPartial(filepath.Join(dir, name))
 			}
 		}
 	}
@@ -274,37 +270,29 @@ func (m *CacheManager) reconcileLocked() {
 	}
 }
 
-// cachePartialPathFor returns the .partial flock target for a published cache
-// file path by stripping the trailing _<fileSize> component.
-func cachePartialPathFor(finalPath string) (string, bool) {
-	name := filepath.Base(finalPath)
-	idx := strings.LastIndex(name, "_")
-	if idx <= 0 {
-		return "", false
-	}
-	return filepath.Join(filepath.Dir(finalPath), name[:idx]+".partial"), true
-}
-
-// removeCacheEntryFiles unlinks a published cache file together with its
-// .partial flock target (both names share one inode). Names are only removed
-// while holding the entry's flock, so a writer that is mid-publish is never
-// disturbed. Returns false when the entry is in use elsewhere and must be
-// kept.
-func removeCacheEntryFiles(finalPath string) bool {
-	partialPath, ok := cachePartialPathFor(finalPath)
-	if !ok {
+// isCompleteCacheFile reports whether the file at path is a sealed cache
+// entry for the chunk range in its name.
+func isCompleteCacheFile(path string, chunkStart, chunkEnd uint32, size int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
 		return false
 	}
-	lockFile, err := os.OpenFile(partialPath, os.O_RDWR, 0)
+	defer f.Close()
+	_, err = readCacheFileLayout(f, chunkStart, chunkEnd, size)
+	return err == nil
+}
+
+// removeCacheEntry unlinks a cache entry file. The name is only removed
+// while holding the entry's flock, so an active writer is never disturbed.
+// Returns false when the entry is in use elsewhere and must be kept.
+func removeCacheEntry(path string) bool {
+	lockFile, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return false
 		}
-		// No flock target left, so no writer can be active on this entry.
-		if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
-			return false
-		}
-		removeEmptyCacheDirs(finalPath)
+		// The name is already gone (removed by another process).
+		removeEmptyCacheDirs(path)
 		return true
 	}
 	defer lockFile.Close()
@@ -312,24 +300,23 @@ func removeCacheEntryFiles(finalPath string) bool {
 		return false
 	}
 	defer flock.Unlock(lockFile) //nolint:errcheck
-	// Only remove names while the locked handle still backs partialPath;
-	// otherwise another process already recycled this entry.
-	pathInfo, statErr := os.Stat(partialPath)
+	// Only remove the name while the locked handle still backs it; otherwise
+	// another process already recycled this entry.
+	pathInfo, statErr := os.Stat(path)
 	fileInfo, fstatErr := lockFile.Stat()
 	if statErr != nil || fstatErr != nil || !os.SameFile(pathInfo, fileInfo) {
 		return false
 	}
-	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return false
 	}
-	os.Remove(partialPath) //nolint:errcheck
-	removeEmptyCacheDirs(finalPath)
+	removeEmptyCacheDirs(path)
 	return true
 }
 
-// removeOrphanPartial removes a .partial file that has no published sibling,
-// but only if no writer holds its flock.
-func removeOrphanPartial(path string) {
+// removeIncompleteCacheEntry removes a crashed leftover, but only if no
+// writer holds its flock and it is still incomplete once the lock is held.
+func removeIncompleteCacheEntry(path string, chunkStart, chunkEnd uint32) {
 	lockFile, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return
@@ -342,6 +329,10 @@ func removeOrphanPartial(path string) {
 	pathInfo, statErr := os.Stat(path)
 	fileInfo, fstatErr := lockFile.Stat()
 	if statErr != nil || fstatErr != nil || !os.SameFile(pathInfo, fileInfo) {
+		return
+	}
+	// The writer may have sealed the file between the check and the lock.
+	if _, err := readCacheFileLayout(lockFile, chunkStart, chunkEnd, fileInfo.Size()); err == nil {
 		return
 	}
 	os.Remove(path) //nolint:errcheck

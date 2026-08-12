@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -20,7 +19,7 @@ import (
 
 const testCacheHash = "0123456789abcdef"
 
-func TestChunkCachePublishesFinalSizeInName(t *testing.T) {
+func TestChunkCacheSealsEntryInPlace(t *testing.T) {
 	dir := t.TempDir()
 	m := NewCacheManager(dir, 0)
 	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), m, testCacheHash, 0, 1, 10, 20)
@@ -36,35 +35,18 @@ func TestChunkCachePublishesFinalSizeInName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var found bool
-	var finalInfo os.FileInfo
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".lock") {
-			t.Fatalf("unexpected separate lock file %q", entry.Name())
-		}
-		_, _, _, _, expectedSize, ok := parseCacheFileName(entry.Name())
-		if !ok {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.Size() != expectedSize {
-			t.Fatalf("filename size %d does not match file size %d", expectedSize, info.Size())
-		}
-		finalInfo = info
-		found = true
+	if len(entries) != 1 {
+		t.Fatalf("got %d files, want the single entry file", len(entries))
 	}
-	if !found {
-		t.Fatal("completed cache file was not published")
+	if got, want := entries[0].Name(), cacheFileName(0, 1, 10, 20); got != want {
+		t.Fatalf("got entry name %q, want %q", got, want)
 	}
-	partialInfo, err := os.Stat(cache.partialPath)
+	info, err := entries[0].Info()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !os.SameFile(partialInfo, finalInfo) {
-		t.Fatal("partial lock path and final cache path do not reference the same inode")
+	if got, want := info.Size(), cacheEntryFileSize("chunk"); got != want {
+		t.Fatalf("got entry size %d, want %d", got, want)
 	}
 
 	cached, err := openCachedRange(m, testCacheHash, 0, 1)
@@ -85,16 +67,14 @@ func TestChunkCachePublishesFinalSizeInName(t *testing.T) {
 	}
 }
 
-func TestChunkCacheIgnoresPartialAndWrongSizedFiles(t *testing.T) {
+func TestChunkCacheIgnoresIncompleteFiles(t *testing.T) {
 	dir := t.TempDir()
-	base := cacheFileBasePath(dir, testCacheHash, 0, 1, 10, 20)
-	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+	path := cacheFilePath(dir, testCacheHash, 0, 1, 10, 20)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(base+".partial", []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(base+"_999", []byte("short"), 0o644); err != nil {
+	// A crashed download: valid entry name, but not a sealed layout.
+	if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,6 +88,67 @@ func TestChunkCacheIgnoresPartialAndWrongSizedFiles(t *testing.T) {
 	}
 }
 
+func TestChunkCacheRewritesCrashedLeftoverInPlace(t *testing.T) {
+	dir := t.TempDir()
+	path := cacheFilePath(dir, testCacheHash, 0, 1, 10, 20)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("crashed-leftover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewCacheManager(dir, 0)
+	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), m, testCacheHash, 0, 1, 10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.readonly {
+		t.Fatal("crashed leftover was adopted instead of rewritten")
+	}
+	if err := cache.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	cache.Done()
+
+	cached, err := openCachedRange(m, testCacheHash, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil {
+		t.Fatal("rewritten entry was not adopted")
+	}
+	defer cached.Done()
+	buf := make([]byte, 16)
+	n, err := cached.Chunk(0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "chunk" {
+		t.Fatalf("got %q, want %q", got, "chunk")
+	}
+}
+
+func TestChunkCacheInProgressEntryInvisibleToReaders(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), m, testCacheHash, 0, 1, 10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Done()
+
+	// The writer holds the lock and the entry is not sealed yet.
+	cached, err := openCachedRange(m, testCacheHash, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != nil {
+		cached.Done()
+		t.Fatal("unsealed entry was visible to readers")
+	}
+}
+
 func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := newChunkCache(bytes.NewReader([]byte("only-one-chunk")), NewCacheManager(dir, 0), testCacheHash, 0, 2, 10, 20)
@@ -118,8 +159,20 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 		t.Fatalf("got %v, want chunk count error", err)
 	}
 	cache.Done()
-	if _, err := os.Stat(cache.partialPath); !os.IsNotExist(err) {
-		t.Fatalf("partial cache was not removed: %v", err)
+	info, err := os.Stat(cache.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("failed entry was not discarded, size %d", info.Size())
+	}
+	cached, err := openCachedRange(NewCacheManager(dir, 0), testCacheHash, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached != nil {
+		cached.Done()
+		t.Fatal("discarded entry was visible")
 	}
 }
 
@@ -190,20 +243,19 @@ func TestChunkCacheVerifiesChecksumOncePerManager(t *testing.T) {
 	cached.Done()
 }
 
-func TestChunkCacheAdoptsLegacyEntryWithoutChecksum(t *testing.T) {
+func TestChunkCacheRejectsEntryWithoutChecksumTrailer(t *testing.T) {
 	dir := t.TempDir()
 	payload := "legacy-chunk"
-	// Legacy layout: [numOffsets][offset0][offset1][data], no crc32 trailer.
+	// Layout without the crc32 trailer: [numOffsets][offset0][offset1][data].
 	header := make([]byte, 12)
 	binary.LittleEndian.PutUint32(header[0:], 2)
 	binary.LittleEndian.PutUint32(header[8:], uint32(len(payload)))
 	content := append(header, payload...)
 
-	base := cacheFileBasePath(dir, testCacheHash, 0, 1, 0, int64(len(payload)))
-	if err := os.MkdirAll(filepath.Dir(base), 0o755); err != nil {
+	path := cacheFilePath(dir, testCacheHash, 0, 1, 0, int64(len(payload)))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	path := fmt.Sprintf("%s_%d", base, len(content))
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -212,17 +264,9 @@ func TestChunkCacheAdoptsLegacyEntryWithoutChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cached == nil {
-		t.Fatal("legacy cache entry was not adopted")
-	}
-	defer cached.Done()
-	buf := make([]byte, 32)
-	n, err := cached.Chunk(0, buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(buf[:n]); got != payload {
-		t.Fatalf("got %q, want %q", got, payload)
+	if cached != nil {
+		cached.Done()
+		t.Fatal("unsealed entry was adopted")
 	}
 }
 
@@ -267,6 +311,55 @@ func TestChunkCacheConcurrentWriterReusesPublishedFile(t *testing.T) {
 	}
 	if got := string(buf[:n]); got != "first" {
 		t.Fatalf("got %q, want first writer data", got)
+	}
+}
+
+func TestChunkCacheContenderRebuildsAfterWriterFailure(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	first, err := newChunkCache(bytes.NewReader([]byte("first")), m, testCacheHash, 0, 1, 10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		cache *chunkCache
+		err   error
+	}
+	results := make(chan result, 1)
+	go func() {
+		cache, err := newChunkCache(bytes.NewReader([]byte("second")), m, testCacheHash, 0, 1, 10, 20)
+		results <- result{cache, err}
+	}()
+
+	select {
+	case <-results:
+		t.Fatal("second writer did not wait for the lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// The first writer gives up without sealing the entry.
+	first.Done()
+
+	res := <-results
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	second := res.cache
+	defer second.Done()
+	if second.readonly {
+		t.Fatal("second writer adopted a discarded entry")
+	}
+	if err := second.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, err := second.Chunk(0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "second" {
+		t.Fatalf("got %q, want %q", got, "second")
 	}
 }
 
