@@ -191,6 +191,40 @@ func (s *Handler) authenticate(r *http.Request) bool {
 	return s.authFn(parts[1])
 }
 
+// externalBase returns the server's externally visible base URL derived
+// from the request, honoring X-Forwarded-Proto when behind a proxy.
+func externalBase(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	return scheme + "://" + r.Host
+}
+
+// requestBaseStorage resolves relative xorb URLs against a request-derived
+// base; xet clients reject relative URLs ("relative URL without a base").
+type requestBaseStorage struct {
+	download.StorageAdapter
+	base string
+}
+
+func (s requestBaseStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
+	u := s.StorageAdapter.GetXorbURL(namespace, xorbHash)
+	if strings.HasPrefix(u, "/") {
+		return s.base + u
+	}
+	return u
+}
+
+// reconstructionStorage returns the storage to use when building
+// reconstruction responses for the given request.
+func (s *Handler) reconstructionStorage(r *http.Request) download.StorageAdapter {
+	return requestBaseStorage{StorageAdapter: s.storage, base: externalBase(r)}
+}
+
 // handleGetReconstruction handles GET /v1/reconstructions/{file_hash}
 func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
 	// Extract file hash from path using mux
@@ -211,7 +245,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	}
 
 	// Build reconstruction response
-	response, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV1(r.Context(), s.reconstructionStorage(r), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -253,13 +287,14 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 		FetchInfo: make(map[string][]download.FetchInfoEntry),
 	}
 
+	recStorage := s.reconstructionStorage(r)
 	for _, fileHash := range fileHashes {
 		sh, err := s.storage.GetShard(r.Context(), fileHash)
 		if err != nil {
 			// Skip files not found; caller can check which hashes are absent.
 			continue
 		}
-		single, err := download.BuildReconstructionResponseV1(r.Context(), s.storage, "default", sh, fileHash, "")
+		single, err := download.BuildReconstructionResponseV1(r.Context(), recStorage, "default", sh, fileHash, "")
 		if err != nil {
 			continue
 		}
@@ -295,7 +330,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Build V2 reconstruction response
-	response, err := download.BuildReconstructionResponseV2(r.Context(), s.storage, "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV2(r.Context(), s.reconstructionStorage(r), "default", shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
