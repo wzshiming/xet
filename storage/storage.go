@@ -178,6 +178,16 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 	return fs, nil
 }
 
+// objectPath returns the git-style fanout path for a hash-named object:
+// basePath/<kind>/<name[:2]>/<name[2:]>. The fanout keeps directory sizes
+// bounded; a flat layout accumulates tens of thousands of entries per model.
+func (fs *FileStorage) objectPath(kind, name string) string {
+	if len(name) <= 2 {
+		return filepath.Join(fs.basePath, kind, name)
+	}
+	return filepath.Join(fs.basePath, kind, name[:2], name[2:])
+}
+
 // hasFile checks whether a file hash already has a shard mapping.
 func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
 	fs.fileMut.Lock()
@@ -187,7 +197,7 @@ func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
 		return true, nil
 	}
 
-	filePath := filepath.Join(fs.basePath, "files", fileHash.String())
+	filePath := fs.objectPath("files", fileHash.String())
 	if _, err := os.Stat(filePath); err == nil {
 		return true, nil
 	} else if !os.IsNotExist(err) {
@@ -206,7 +216,7 @@ func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 		return fs.getShardByHash(value.(string))
 	}
 
-	indexPath := filepath.Join(fs.basePath, "files", fileHash.String())
+	indexPath := fs.objectPath("files", fileHash.String())
 	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
 		return nil, fmt.Errorf("read file index: %w", err)
@@ -226,7 +236,7 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 		return value.(*shard.Shard), nil
 	}
 
-	shardPath := filepath.Join(fs.basePath, "shards", shardHash)
+	shardPath := fs.objectPath("shards", shardHash)
 	f, err := os.Open(shardPath)
 	if err != nil {
 		return nil, err
@@ -250,11 +260,14 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 
 // PutXorb stores an xorb
 func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
-	xorbPath := filepath.Join(fs.basePath, "xorbs", xorbHash.String())
+	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
 	// Check if xorb already exists
 	if _, err := os.Stat(xorbPath); err == nil {
 		return false, nil // Already exists
+	}
+	if err := os.MkdirAll(filepath.Dir(xorbPath), 0755); err != nil {
+		return false, fmt.Errorf("create xorb directory: %w", err)
 	}
 	// Write xorb to disk using streaming
 	f, err := os.OpenFile(xorbPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -281,7 +294,7 @@ func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 
 // GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
 func (fs *FileStorage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
-	xorbPath := filepath.Join(fs.basePath, "xorbs", xorbHash.String())
+	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
 	f, err := os.Open(xorbPath)
 	if err != nil {
@@ -303,7 +316,7 @@ func (fs *FileStorage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 		return true, nil
 	}
 
-	xorbPath := filepath.Join(fs.basePath, "xorbs", xorbHash.String())
+	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
 	_, err := os.Stat(xorbPath)
 	if err == nil {
@@ -394,12 +407,14 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		return false, fmt.Errorf("close shard file: %w", err)
 	}
 
-	shardPath := filepath.Join(shardsDir, shardHash)
+	shardPath := fs.objectPath("shards", shardHash)
 	wasInserted := true
 	if _, err := os.Stat(shardPath); err == nil {
 		wasInserted = false
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("check shard file: %w", err)
+	} else if err := os.MkdirAll(filepath.Dir(shardPath), 0755); err != nil {
+		return false, fmt.Errorf("create shard directory: %w", err)
 	} else if err := os.Rename(tmpPath, shardPath); err != nil {
 		return false, fmt.Errorf("finalize shard file: %w", err)
 	} else {
@@ -414,7 +429,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		fs.fileMut.Lock()
 		fs.fileIndex.Add(file.FileHash, shardHash)
 		fs.fileMut.Unlock()
-		indexPath := filepath.Join(fs.basePath, "files", file.FileHash.String())
+		indexPath := fs.objectPath("files", file.FileHash.String())
 		if err := writeIndexFile(indexPath, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -422,7 +437,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			chunkPath := filepath.Join(fs.basePath, "chunks", chunk.ChunkHash.String())
+			chunkPath := fs.objectPath("chunks", chunk.ChunkHash.String())
 			err := writeIndexFile(chunkPath, shardHashData)
 			if err != nil {
 				return wasInserted, fmt.Errorf("write chunk index: %w", err)
@@ -430,7 +445,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		}
 	}
 	for _, file := range s.Files {
-		sha256Path := filepath.Join(fs.basePath, "sha256", file.MetadataExt.SHA256Hash.String())
+		sha256Path := fs.objectPath("sha256", file.MetadataExt.SHA256Hash.String())
 		if err := writeIndexFile(sha256Path, []byte(file.FileHash.String())); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -455,7 +470,7 @@ func (fs *FileStorage) openXorb(casHash xet.XorbHash) (*xorbFile, error) {
 			return xf, nil
 		}
 	}
-	xorbPath := filepath.Join(fs.basePath, "xorbs", casHash.String())
+	xorbPath := fs.objectPath("xorbs", casHash.String())
 	f, err := os.Open(xorbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open xorb %s: %w", casHash.String(), err)
@@ -522,7 +537,7 @@ func (fs *FileStorage) getShardBySHA256(ctx context.Context, _ string, digest [3
 		return fs.GetShard(ctx, value.(xet.FileHash))
 	}
 
-	indexPath := filepath.Join(fs.basePath, "sha256", hex.EncodeToString(digest[:]))
+	indexPath := fs.objectPath("sha256", hex.EncodeToString(digest[:]))
 	b, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -557,7 +572,7 @@ func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string
 		return fs.getShardByHash(value.(string))
 	}
 
-	chunkPath := filepath.Join(fs.basePath, "chunks", chunkHash.String())
+	chunkPath := fs.objectPath("chunks", chunkHash.String())
 	b, err := os.ReadFile(chunkPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -576,6 +591,9 @@ func writeIndexFile(path string, value []byte) error {
 	_, err := os.Stat(path)
 	if err == nil {
 		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
 	}
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, value, 0644); err != nil {
@@ -603,7 +621,7 @@ func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) strin
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
 func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	xorbPath := filepath.Join(fs.basePath, "xorbs", xorbHash.String())
+	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 	f, err := os.Open(xorbPath)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to open xorb file: %w", err)

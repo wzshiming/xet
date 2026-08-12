@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,14 +34,14 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	if err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
-	shardEntries, err := os.ReadDir(filepath.Join(basePath, "shards"))
+	shardHashes, err := fanoutEntries(filepath.Join(basePath, "shards"))
 	if err != nil {
 		t.Fatalf("read shards directory: %v", err)
 	}
-	if len(shardEntries) != 1 {
-		t.Fatalf("shards directory contains %d entries, want 1", len(shardEntries))
+	if len(shardHashes) != 1 {
+		t.Fatalf("shards directory contains %d entries, want 1", len(shardHashes))
 	}
-	shardHash := shardEntries[0].Name()
+	shardHash := shardHashes[0]
 	if cached, ok := fs.shardIndex.Get(shardHash); !ok || cached.(*shard.Shard) != s {
 		t.Fatal("shard was not added to the shard cache")
 	}
@@ -52,7 +53,7 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	}
 
 	for _, hash := range []xet.FileHash{fileHash, secondFileHash} {
-		indexData, err := os.ReadFile(filepath.Join(basePath, "files", hash.String()))
+		indexData, err := os.ReadFile(fs.objectPath("files", hash.String()))
 		if err != nil {
 			t.Fatalf("read file index %s: %v", hash, err)
 		}
@@ -64,7 +65,7 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 		t.Fatalf("legacy shard-index directory exists: %v", err)
 	}
 
-	indexData, err := os.ReadFile(filepath.Join(basePath, "chunks", chunkHash.String()))
+	indexData, err := os.ReadFile(fs.objectPath("chunks", chunkHash.String()))
 	if err != nil {
 		t.Fatalf("read chunk index: %v", err)
 	}
@@ -99,4 +100,26 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	if _, err := fs.GetShard(context.Background(), secondFileHash); err != nil {
 		t.Fatalf("GetShard(second file): %v", err)
 	}
+}
+
+// fanoutEntries returns the hash names reassembled from a fanout directory.
+func fanoutEntries(dir string) ([]string, error) {
+	var names []string
+	buckets, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, bucket := range buckets {
+		if !bucket.IsDir() {
+			return nil, fmt.Errorf("unexpected flat entry %q", bucket.Name())
+		}
+		sub, err := os.ReadDir(filepath.Join(dir, bucket.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range sub {
+			names = append(names, bucket.Name()+e.Name())
+		}
+	}
+	return names, nil
 }
