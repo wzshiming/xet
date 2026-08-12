@@ -42,7 +42,8 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("no cache manager provided")
 	}
 	// Adopt pre-existing entries and clean up orphaned partial files before
-	// the download starts.
+	// the download starts; only the manager's first prepare walks the cache
+	// directory.
 	cache.prepare()
 
 	termFetches, tasks, err := planReaderV1(reconstruction)
