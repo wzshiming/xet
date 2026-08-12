@@ -36,9 +36,9 @@ func setCapacity(m *CacheManager, capacity int64) {
 }
 
 // cacheEntryFileSize is the on-disk size of a single-chunk entry: header
-// (crc32 + numOffsets + 2 offsets) plus the payload.
+// (numOffsets + 2 offsets) plus the payload and the crc32 trailer.
 func cacheEntryFileSize(payload string) int64 {
-	return int64(4 + 4 + 4*2 + len(payload))
+	return int64(4 + 4*2 + len(payload) + 4)
 }
 
 func findFinalFile(t *testing.T, dir, hash string) string {

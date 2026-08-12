@@ -123,8 +123,9 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	}
 }
 
-// corruptLastByte flips the final byte of the file at path.
-func corruptLastByte(t *testing.T, path string) {
+// corruptDataByte flips the last byte of the data region, which sits just
+// before the four-byte crc32 trailer.
+func corruptDataByte(t *testing.T, path string) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -136,11 +137,11 @@ func corruptLastByte(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	var b [1]byte
-	if _, err := f.ReadAt(b[:], info.Size()-1); err != nil {
+	if _, err := f.ReadAt(b[:], info.Size()-5); err != nil {
 		t.Fatal(err)
 	}
 	b[0] ^= 0xff
-	if _, err := f.WriteAt(b[:], info.Size()-1); err != nil {
+	if _, err := f.WriteAt(b[:], info.Size()-5); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -148,7 +149,7 @@ func corruptLastByte(t *testing.T, path string) {
 func TestChunkCacheRemovesEntryOnChecksumMismatch(t *testing.T) {
 	dir := t.TempDir()
 	writeCacheEntry(t, NewCacheManager(dir, 0), testCacheHash, "chunk")
-	corruptLastByte(t, findFinalFile(t, dir, testCacheHash))
+	corruptDataByte(t, findFinalFile(t, dir, testCacheHash))
 
 	// A fresh manager has no verification memory, so the first open must
 	// detect the corruption, drop the entry, and report a miss.
@@ -178,7 +179,7 @@ func TestChunkCacheVerifiesChecksumOncePerManager(t *testing.T) {
 
 	// Corruption after the first verified open goes unnoticed by the same
 	// manager: verification is lazy and runs at most once per entry.
-	corruptLastByte(t, findFinalFile(t, dir, testCacheHash))
+	corruptDataByte(t, findFinalFile(t, dir, testCacheHash))
 	cached, err = openCachedRange(m, testCacheHash, 0, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +193,7 @@ func TestChunkCacheVerifiesChecksumOncePerManager(t *testing.T) {
 func TestChunkCacheAdoptsLegacyEntryWithoutChecksum(t *testing.T) {
 	dir := t.TempDir()
 	payload := "legacy-chunk"
-	// Legacy layout: [numOffsets][offset0][offset1][data], no crc32 field.
+	// Legacy layout: [numOffsets][offset0][offset1][data], no crc32 trailer.
 	header := make([]byte, 12)
 	binary.LittleEndian.PutUint32(header[0:], 2)
 	binary.LittleEndian.PutUint32(header[8:], uint32(len(payload)))
