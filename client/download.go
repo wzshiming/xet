@@ -82,6 +82,9 @@ func (c *Client) downloadFileWithAuthProvider(ctx context.Context, provider Auth
 	if err != nil {
 		return err
 	}
+	// Close releases cache references even when the copy stops early on a
+	// write error.
+	defer reader.Close()
 
 	n, err := io.Copy(w, reader)
 	if err != nil {
@@ -97,14 +100,14 @@ func (c *Client) downloadFileWithAuthProvider(ctx context.Context, provider Auth
 // and returns a reader plus the expected reconstructed length. When a resume
 // (Range) query is rejected, it retries once from the start without a Range
 // header.
-func (c *Client) newDownloadReader(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker, apiVersion reconstructionAPIVersion) (io.Reader, int64, error) {
+func (c *Client) newDownloadReader(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker, apiVersion reconstructionAPIVersion) (io.ReadCloser, int64, error) {
 	if apiVersion == reconstructionAPIVersionV1 {
 		return c.newDownloadReaderV1(ctx, provider, fileHash, header, resumeOffset, w)
 	}
 	return c.newDownloadReaderV2(ctx, provider, fileHash, header, resumeOffset, w)
 }
 
-func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.Reader, int64, error) {
+func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
@@ -118,14 +121,14 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.cacheDir, c.downloadOptions()...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.downloadOptions()...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
 	return reader, download.ExpectedLengthV1(reconstructionResp), nil
 }
 
-func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.Reader, int64, error) {
+func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
 		if resumeOffset > 0 {
@@ -139,7 +142,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.cacheDir, c.downloadOptions()...)
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.downloadOptions()...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
@@ -151,6 +154,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 func (c *Client) downloadOptions() []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
+		download.WithCacheManager(c.cacheManager),
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
@@ -162,13 +166,15 @@ func (c *Client) downloadOptions() []download.Option {
 // All files share one fetch_info map, so each xorb is fetched only once across the batch.
 // It returns a reader and size per file in the same order as fileHashes.
 // Individual errors are embedded per-entry; a nil reader means that file was not found.
-func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.FileHash) ([]io.Reader, []int64, error) {
+// Readers release their cache references when read to EOF; close any reader
+// that is not fully consumed.
+func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.FileHash) ([]io.ReadCloser, []int64, error) {
 	return c.DownloadFilesWithAuthProvider(ctx, nil, fileHashes)
 }
 
 // DownloadFilesWithAuthProvider downloads multiple files using a single batch
 // reconstruction request and a per-call auth provider.
-func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.FileHash) ([]io.Reader, []int64, error) {
+func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.FileHash) ([]io.ReadCloser, []int64, error) {
 	if len(fileHashes) == 0 {
 		return nil, nil, nil
 	}
@@ -178,7 +184,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		return nil, nil, fmt.Errorf("get batch reconstruction: %w", err)
 	}
 
-	readers := make([]io.Reader, len(fileHashes))
+	readers := make([]io.ReadCloser, len(fileHashes))
 	sizes := make([]int64, len(fileHashes))
 	for i, fileHash := range fileHashes {
 		terms, ok := batchResp.Files[fileHash.String()]
@@ -195,13 +201,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		opts := []download.Option{
-			download.WithConcurrency(c.concurrency),
-		}
-		if c.progressFunc != nil {
-			opts = append(opts, download.WithProgressFunc(c.progressFunc))
-		}
-		reader, err := download.NewReaderV1(ctx, c, singleResp, c.cacheDir, opts...)
+		reader, err := download.NewReaderV1(ctx, c, singleResp, c.downloadOptions()...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {
@@ -218,4 +218,8 @@ type errReader struct {
 
 func (e errReader) Read(p []byte) (n int, err error) {
 	return 0, e.err
+}
+
+func (e errReader) Close() error {
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/internal/pool"
@@ -34,9 +35,12 @@ func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStar
 		return cacheRange{}, fmt.Errorf("invalid cache range for hash %q", hash)
 	}
 	return cacheRange{
-		cacheDir: defaultCacheDir(cacheDir),
-		hash:     hash, chunkStart: chunkStart, chunkEnd: chunkEnd,
-		bytesStart: bytesStart, bytesEnd: bytesEnd,
+		cacheDir:   cacheDir,
+		hash:       hash,
+		chunkStart: chunkStart,
+		chunkEnd:   chunkEnd,
+		bytesStart: bytesStart,
+		bytesEnd:   bytesEnd,
 	}, nil
 }
 
@@ -85,6 +89,8 @@ type chunkCache struct {
 	finalBasePath  string
 	expectedChunks uint32
 	published      bool
+	manager        *CacheManager
+	refPaths       []string // cache files acquired from manager, released in Done
 }
 
 // cacheFileBaseName returns the stable portion of a cache entry name.
@@ -140,18 +146,18 @@ func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, b
 // completed file published by the first caller.
 //
 // The caller must call Done() to release the file lock.
-func newChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*chunkCache, error) {
-	lockFile, err := lockChunkCache(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+func newChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*chunkCache, error) {
+	lockFile, err := lockChunkCache(m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return nil, err
 	}
-	cache, err := openCachedRange(cacheDir, hash, chunkStart, chunkEnd)
+	cache, err := openCachedRange(m, hash, chunkStart, chunkEnd)
 	if err != nil || cache != nil {
 		flock.Unlock(lockFile) //nolint:errcheck
 		lockFile.Close()
 		return cache, err
 	}
-	cache, err = newLockedChunkCache(dec, cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd, lockFile)
+	cache, err = newLockedChunkCache(dec, m, hash, chunkStart, chunkEnd, bytesStart, bytesEnd, lockFile)
 	if err != nil {
 		flock.Unlock(lockFile) //nolint:errcheck
 		lockFile.Close()
@@ -164,23 +170,45 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(r.dir(), 0o755); err != nil {
-		return nil, fmt.Errorf("create cache dir: %w", err)
-	}
 
-	lockFile, err := os.OpenFile(r.partialPath(), os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("create partial cache file: %w", err)
-	}
-	if err := flock.Lock(lockFile); err != nil {
+	// Cache eviction may unlink the partial file (or its directory) while a
+	// contender waits on the lock, so verify after locking that the handle
+	// still backs the path and retry on a fresh file otherwise.
+	const maxAttempts = 10
+	for attempt := 0; ; attempt++ {
+		if err := os.MkdirAll(r.dir(), 0o755); err != nil {
+			return nil, fmt.Errorf("create cache dir: %w", err)
+		}
+		lockFile, err := os.OpenFile(r.partialPath(), os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			// Retry only races with eviction: the directory vanishing, or a
+			// delete-pending name on Windows (a permission error). Anything
+			// else is a persistent failure.
+			if (os.IsNotExist(err) || os.IsPermission(err)) && attempt < maxAttempts {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return nil, fmt.Errorf("create partial cache file: %w", err)
+		}
+		if err := flock.Lock(lockFile); err != nil {
+			lockFile.Close()
+			return nil, fmt.Errorf("lock cache file: %w", err)
+		}
+		pathInfo, statErr := os.Stat(r.partialPath())
+		fileInfo, fstatErr := lockFile.Stat()
+		if statErr == nil && fstatErr == nil && os.SameFile(pathInfo, fileInfo) {
+			return lockFile, nil
+		}
+		flock.Unlock(lockFile) //nolint:errcheck
 		lockFile.Close()
-		return nil, fmt.Errorf("lock cache file: %w", err)
+		if attempt >= maxAttempts {
+			return nil, fmt.Errorf("lock cache file: partial file keeps being replaced")
+		}
 	}
-	return lockFile, nil
 }
 
-func newLockedChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64, lockFile *os.File) (*chunkCache, error) {
-	r, err := newCacheRange(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64, lockFile *os.File) (*chunkCache, error) {
+	r, err := newCacheRange(m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +240,7 @@ func newLockedChunkCache(dec io.Reader, cacheDir, hash string, chunkStart, chunk
 		partialPath:    r.partialPath(),
 		finalBasePath:  r.basePath(),
 		expectedChunks: numChunks,
+		manager:        m,
 	}, nil
 }
 
@@ -225,15 +254,14 @@ func defaultCacheDir(cacheDir string) string {
 // openCachedRange opens one or more cache files that together cover
 // [chunkStart, chunkEnd). It scans the hash directory and assembles metas
 // from cached files. Returns nil if the range cannot be fully covered.
-func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunkCache, error) {
+func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) (*chunkCache, error) {
 	if len(hash) < 2 {
 		return nil, nil
 	}
-	cacheDir = defaultCacheDir(cacheDir)
-	hashDir := filepath.Join(cacheDir, hash[:2], hash[2:])
+	hashDir := filepath.Join(m.dir, hash[:2], hash[2:])
 	files, err := os.ReadDir(hashDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || os.IsPermission(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -276,10 +304,14 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 		metas []chunkRef
 		file  *os.File
 	}
+	var acquired []string
 	var segments []fileSegment
 	closeSegments := func() {
 		for _, seg := range segments {
 			seg.file.Close()
+		}
+		for _, p := range acquired {
+			m.release(p)
 		}
 	}
 	covered := chunkStart
@@ -301,6 +333,13 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 		f, err := os.Open(c.path)
 		if err != nil {
 			closeSegments()
+			// The entry may have been evicted between listing and opening;
+			// treat it as a cache miss. On Windows an evicted name that is
+			// still open elsewhere stays delete-pending and surfaces as a
+			// permission error.
+			if os.IsNotExist(err) || os.IsPermission(err) {
+				return nil, nil
+			}
 			return nil, err
 		}
 
@@ -321,6 +360,8 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 			os.Remove(c.path) //nolint:errcheck
 			return nil, nil
 		}
+		m.acquire(c.path, c.size)
+		acquired = append(acquired, c.path)
 		segments = append(segments, fileSegment{metas: metas, file: f})
 		covered = needEnd
 	}
@@ -332,10 +373,10 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 
 	var allMetas []chunkRef
 	for i, seg := range segments {
-		for _, m := range seg.metas {
+		for _, ref := range seg.metas {
 			allMetas = append(allMetas, chunkRef{
-				offset:  m.offset,
-				size:    m.size,
+				offset:  ref.offset,
+				size:    ref.size,
 				fileIdx: i,
 			})
 		}
@@ -350,6 +391,8 @@ func openCachedRange(cacheDir, hash string, chunkStart, chunkEnd uint32) (*chunk
 		readonly: true,
 		file:     segments[0].file,
 		files:    extraFiles,
+		manager:  m,
+		refPaths: acquired,
 	}, nil
 }
 
@@ -555,6 +598,13 @@ func (c *chunkCache) finalize() error {
 		}
 		c.lockFile = nil
 	}
+	if c.manager != nil {
+		// Track the published entry (still referenced by this open cache) and
+		// evict any overage now that the cache grew.
+		c.manager.acquire(finalPath, info.Size())
+		c.refPaths = append(c.refPaths, finalPath)
+		c.manager.evaluate()
+	}
 	return nil
 }
 
@@ -578,5 +628,21 @@ func (c *chunkCache) Done() {
 		f.Close()
 	}
 	c.files = nil
+	var mgr *CacheManager
+	if c.manager != nil {
+		for _, p := range c.refPaths {
+			c.manager.release(p)
+		}
+		if len(c.refPaths) > 0 {
+			mgr = c.manager
+		}
+		c.refPaths = nil
+		c.manager = nil
+	}
 	c.mut.Unlock()
+	if mgr != nil {
+		// References just dropped, so entries kept alive during the download
+		// become evictable now rather than at the next publish.
+		mgr.evaluate()
+	}
 }

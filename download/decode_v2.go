@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 
 	"github.com/wzshiming/xet/internal/pool"
@@ -29,22 +30,31 @@ type ReaderV2 struct {
 	err          error
 }
 
-// NewReaderV2 creates a new V2 reconstruction reader
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, cacheDir string, opts ...Option) (io.Reader, error) {
+// NewReaderV2 creates a new V2 reconstruction reader.
+func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
 	}
+
+	cache := options.cache
+	if cache == nil {
+		return nil, fmt.Errorf("no cache manager provided")
+	}
+	// Adopt pre-existing entries and clean up orphaned partial files before
+	// the download starts.
+	cache.prepare()
 
 	termFetches, tasks, err := planReaderV2(reconstruction)
 	if err != nil {
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cacheDir, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
+
 	return &ReaderV2{
 		client:         client,
 		ctx:            ctx,
@@ -140,6 +150,16 @@ func (r *ReaderV2) cleanup() {
 	r.prefetcher = nil
 	r.currentCache = nil
 	r.currentTerm = nil
+}
+
+// Close releases the prefetcher and all cache references held by the reader.
+// It is safe to call multiple times and after Read has returned io.EOF.
+func (r *ReaderV2) Close() error {
+	r.cleanup()
+	if r.err == nil {
+		r.err = fs.ErrClosed
+	}
+	return nil
 }
 
 // finishCurrentTerm advances to the next reconstruction term.
