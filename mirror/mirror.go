@@ -414,6 +414,16 @@ func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bo
 // irrelevant. The array is rewritten in a streaming pass, so a listing is
 // never buffered whole; no upstream header is forwarded, only the body is
 // relayed.
+// treeLFS is the lfs pointer block of a hub tree entry; OID is the sha256
+// naming the file bytes. The entry itself stays a raw map because expand
+// requests add fields (lastCommit, securityFileStatus, ...) that must pass
+// through untouched.
+type treeLFS struct {
+	OID         string `json:"oid"`
+	PointerSize int64  `json:"pointerSize"`
+	Size        int64  `json:"size"`
+}
+
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 	u := h.upstreamURL(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
@@ -445,29 +455,29 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	dec := json.NewDecoder(body)
-	dec.UseNumber() // keep large sizes byte-exact through the re-encode
 	if _, err := dec.Token(); err != nil {
 		return
 	}
 	_, _ = io.WriteString(w, "[")
 	for first := true; dec.More(); first = false {
-		var item map[string]any
+		// Raw values keep every untouched field byte-exact through the re-encode.
+		var item map[string]json.RawMessage
 		if err := dec.Decode(&item); err != nil {
 			// Mid-stream failure: stop without the closing bracket so the
 			// client sees invalid JSON rather than a truncated listing.
 			return
 		}
 		if _, ok := item["xetHash"]; ok {
-			var sha string
-			if lfs, _ := item["lfs"].(map[string]any); lfs != nil {
-				sha, _ = lfs["oid"].(string)
-				sha = strings.TrimPrefix(sha, "sha256:")
+			var lfs treeLFS
+			if raw, ok := item["lfs"]; ok {
+				_ = json.Unmarshal(raw, &lfs)
 			}
 			h.mu.Lock()
-			hash, ok := h.sha256s[sha]
+			hash, ok := h.sha256s[lfs.OID]
 			h.mu.Unlock()
 			if ok {
-				item["xetHash"] = hash
+				quoted, _ := json.Marshal(hash)
+				item["xetHash"] = quoted
 			} else {
 				delete(item, "xetHash")
 			}
