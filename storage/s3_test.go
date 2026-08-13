@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -272,4 +273,48 @@ func listObjectKeys(t *testing.T, ss *S3Storage) map[string]struct{} {
 		keys[aws.ToString(obj.Key)] = struct{}{}
 	}
 	return keys
+}
+
+func TestS3StorageGetXorbURL(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+
+	encoded, xorbHash := encodeTestXorb(t, true, []byte("presign me"))
+	if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	u := ss.GetXorbURL("default", xorbHash)
+	if !strings.HasPrefix(u, "http") || !strings.Contains(u, "X-Amz-Signature") {
+		t.Fatalf("GetXorbURL() = %q, want a presigned absolute URL", u)
+	}
+
+	// Presigned URLs must serve ranged GETs with no extra auth headers,
+	// matching how clients fetch reconstruction terms.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=2-5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusPartialContent)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, encoded[2:6]) {
+		t.Fatalf("range body = %q, want %q", body, encoded[2:6])
+	}
+
+	// Disabled presigning falls back to the server-served xorb path.
+	plain := newTestS3Storage(t, WithS3Presign(false))
+	if got, want := plain.GetXorbURL("ns", xorbHash), "/v1/xorbs/ns/"+xorbHash.String(); got != want {
+		t.Fatalf("GetXorbURL() with presign disabled = %q, want %q", got, want)
+	}
 }

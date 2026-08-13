@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -24,15 +25,22 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
+// defaultPresignExpiry keeps presigned xorb URLs valid long enough for
+// clients to work through a large reconstruction term by term.
+const defaultPresignExpiry = time.Hour
+
 // S3Storage implements Storage backed by an S3-compatible object store. It
 // uses the same object layout as FileStorage (xorbs/, shards/, files/,
 // chunks/, sha256/ with a two-character fanout), so a bucket populated by
 // syncing a FileStorage directory is directly usable.
 type S3Storage struct {
-	client  *s3.Client
-	bucket  string
-	prefix  string
-	baseURL string
+	client        *s3.Client
+	presignClient *s3.PresignClient
+	bucket        string
+	prefix        string
+	baseURL       string
+	presign       bool
+	presignExpiry time.Duration
 
 	fileIndex    *lru.Cache // bounded file hash -> shard hash
 	shardIndex   *lru.Cache // bounded shard hash -> shard cache
@@ -108,16 +116,36 @@ func WithS3PathStyle(pathStyle bool) S3Option {
 	}
 }
 
+// WithS3Presign controls whether xorb download URLs are presigned S3 GET
+// URLs (default) or relative paths served through the CAS server. Disable
+// it when clients cannot reach the S3 endpoint directly.
+func WithS3Presign(presign bool) S3Option {
+	return func(ss *S3Storage) {
+		ss.presign = presign
+	}
+}
+
+// WithS3PresignExpiry sets how long presigned xorb URLs stay valid.
+func WithS3PresignExpiry(expiry time.Duration) S3Option {
+	return func(ss *S3Storage) {
+		if expiry > 0 {
+			ss.presignExpiry = expiry
+		}
+	}
+}
+
 // NewS3Storage creates an S3-backed storage. Credentials are resolved
 // through the standard AWS configuration chain (environment variables,
 // shared config, IAM roles) unless a client is injected with WithS3Client.
 func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 	ss := &S3Storage{
-		fileIndex:    lru.New(defaultFileCacheSize),
-		shardIndex:   lru.New(defaultShardCacheSize),
-		chunkIndex:   lru.New(defaultChunkCacheSize),
-		sha256Index:  lru.New(defaultSHA256CacheSize),
-		offsetsIndex: lru.New(defaultOffsetsCacheSize),
+		presign:       true,
+		presignExpiry: defaultPresignExpiry,
+		fileIndex:     lru.New(defaultFileCacheSize),
+		shardIndex:    lru.New(defaultShardCacheSize),
+		chunkIndex:    lru.New(defaultChunkCacheSize),
+		sha256Index:   lru.New(defaultSHA256CacheSize),
+		offsetsIndex:  lru.New(defaultOffsetsCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -144,6 +172,7 @@ func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 			o.UsePathStyle = ss.pathStyle
 		})
 	}
+	ss.presignClient = s3.NewPresignClient(ss.client)
 
 	return ss, nil
 }
@@ -584,8 +613,20 @@ func (ss *S3Storage) GetReconstructedFile(ctx context.Context, namespace string,
 	return newReconstructedFile(ctx, ss, namespace, sh, sha256)
 }
 
-// GetXorbURL generates a URL for accessing xorb data
+// GetXorbURL generates a URL for accessing xorb data. By default it is a
+// presigned S3 GET URL so clients fetch xorb ranges straight from the object
+// store; with presigning disabled (or failing) the URL routes through the
+// CAS server's xorb endpoint like FileStorage.
 func (ss *S3Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
+	if ss.presign {
+		req, err := ss.presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(ss.bucket),
+			Key:    aws.String(ss.objectKey("xorbs", xorbHash.String())),
+		}, s3.WithPresignExpires(ss.presignExpiry))
+		if err == nil {
+			return req.URL
+		}
+	}
 	if ss.baseURL == "" {
 		// If no base URL is configured, return a relative path
 		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String())

@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +101,32 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 
 	for _, file := range files {
 		t.Run(file.name, func(t *testing.T) {
+			// Reconstruction must hand out presigned S3 URLs pointing at the
+			// object store, not at the CAS server.
+			var reconstruction struct {
+				FetchInfo map[string][]struct {
+					URL string `json:"url"`
+				} `json:"fetch_info"`
+			}
+			resp := doRequest(t, http.MethodGet, downloadServer.URL+"/v1/reconstructions/"+file.hash.String(), nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("reconstruction status = %d", resp.StatusCode)
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&reconstruction); err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if len(reconstruction.FetchInfo) == 0 {
+				t.Fatal("reconstruction has no fetch info")
+			}
+			for _, entries := range reconstruction.FetchInfo {
+				for _, entry := range entries {
+					if !strings.HasPrefix(entry.URL, endpoint+"/") || !strings.Contains(entry.URL, "X-Amz-Signature") {
+						t.Fatalf("fetch URL = %q, want presigned URL at %s", entry.URL, endpoint)
+					}
+				}
+			}
+
 			// Full xet download path: reconstruction plus ranged xorb terms.
 			out, err := os.Create(filepath.Join(t.TempDir(), "out"))
 			if err != nil {
@@ -119,7 +147,7 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 			// Bridge path: complete file and a byte range.
 			digest := sha256.Sum256(file.data)
 			url := downloadServer.URL + "/xet-bridge/" + hex.EncodeToString(digest[:])
-			resp := doRequest(t, http.MethodGet, url, nil)
+			resp = doRequest(t, http.MethodGet, url, nil)
 			assertResponse(t, resp, http.StatusOK, file.data)
 
 			if len(file.data) > 1024 {
