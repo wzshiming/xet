@@ -19,6 +19,7 @@
 package mirror
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -105,6 +106,7 @@ type Handler struct {
 	mu       sync.Mutex
 	flight   singleflight.Group
 	entries  map[string]*fileEntry
+	sha256s  map[string]string // sha256 -> xet hash of ready entries
 	branches map[string]*branchEntry
 	tasks    map[string]*task
 }
@@ -200,6 +202,10 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mirror: load index: %w", err)
 	}
+	h.sha256s = map[string]string{}
+	for _, e := range h.entries {
+		h.indexSHA256(e)
+	}
 	h.branches, err = loadBranches(branchDir)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: load branches: %w", err)
@@ -240,6 +246,20 @@ func NewHandler(opts ...Option) (*Handler, error) {
 			if h.upstreamToken != "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+h.upstreamToken)
 			}
+		},
+		// Upstream response headers are dropped; only the body is relayed,
+		// plus its type and the redirect target without which 3xx cannot work.
+		ModifyResponse: func(resp *http.Response) error {
+			ct := resp.Header.Get("Content-Type")
+			loc := resp.Header.Get("Location")
+			resp.Header = http.Header{}
+			if ct != "" {
+				resp.Header.Set("Content-Type", ct)
+			}
+			if loc != "" {
+				resp.Header.Set("Location", loc)
+			}
+			return nil
 		},
 	}
 	if h.next == nil {
@@ -386,16 +406,16 @@ func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bo
 }
 
 // handleTree proxies a tree listing API request, rewriting each entry's
-// xetHash: files the mirror already holds advertise the mirror's own hash so
-// xet clients reconstruct them from the mirror CAS; all other entries lose
-// the hash so clients fall back to the resolve flow, which ingests through
-// the mirror. Left untouched, upstream hashes would send clients directly to
-// the upstream CAS, bypassing the mirror entirely. Hashes are only looked up
-// under immutable commits: branch revisions go through their pinned commit
-// mapping when fresh and are otherwise stripped, so a live listing is never
-// paired with hashes of content the branch no longer points at.
+// xetHash: entries whose lfs sha256 oid matches a file the mirror already
+// holds advertise the mirror's own hash so xet clients reconstruct them from
+// the mirror CAS; all other entries lose the hash so clients fall back to
+// the resolve flow, which ingests through the mirror. Left untouched,
+// upstream hashes would send clients directly to the upstream CAS, bypassing
+// the mirror entirely. Matching by content makes revision and repo
+// irrelevant. The array is rewritten in a streaming pass, so a listing is
+// never buffered whole; no upstream header is forwarded, only the body is
+// relayed.
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
-	m := apiTreeRe.FindStringSubmatch(r.URL.EscapedPath())
 	u := h.upstreamURL(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
 		u += "?" + r.URL.RawQuery
@@ -414,113 +434,95 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 		_ = resp.Body.Close()
 	}()
 
-	// Pagination (Link) and the other upstream headers pass through; entity
-	// headers are recomputed for the rewritten body.
-	for k, vs := range resp.Header {
-		switch http.CanonicalHeaderKey(k) {
-		case "Content-Length", "Content-Encoding", "Transfer-Encoding":
-			continue
-		}
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
+	body := bufio.NewReader(resp.Body)
+	if resp.StatusCode != http.StatusOK || !startsJSONArray(body) {
+		// Error status or unexpected shape: relay the bytes untouched.
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, body)
+		return
 	}
 
-	var items []map[string]any
-	var body []byte
-	if resp.StatusCode == http.StatusOK {
-		body, err = io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	dec := json.NewDecoder(body)
+	dec.UseNumber() // keep large sizes byte-exact through the re-encode
+	if _, err := dec.Token(); err != nil {
+		return
+	}
+	_, _ = io.WriteString(w, "[")
+	for first := true; dec.More(); first = false {
+		var item map[string]any
+		if err := dec.Decode(&item); err != nil {
+			// Mid-stream failure: stop without the closing bracket so the
+			// client sees invalid JSON rather than a truncated listing.
+			return
+		}
+		if _, ok := item["xetHash"]; ok {
+			var sha string
+			if lfs, _ := item["lfs"].(map[string]any); lfs != nil {
+				sha, _ = lfs["oid"].(string)
+				sha = strings.TrimPrefix(sha, "sha256:")
+			}
+			h.mu.Lock()
+			hash, ok := h.sha256s[sha]
+			h.mu.Unlock()
+			if ok {
+				item["xetHash"] = hash
+			} else {
+				delete(item, "xetHash")
+			}
+		}
+		out, err := json.Marshal(item)
 		if err != nil {
-			http.Error(w, "read upstream tree failed", http.StatusBadGateway)
+			return
+		}
+		if !first {
+			_, _ = io.WriteString(w, ",")
+		}
+		if _, err := w.Write(out); err != nil {
 			return
 		}
 	}
-	if body == nil || json.Unmarshal(body, &items) != nil {
-		// Error status or unexpected shape: relay untouched.
-		w.WriteHeader(resp.StatusCode)
-		if body != nil {
-			_, _ = w.Write(body)
-		} else {
-			_, _ = io.Copy(w, resp.Body)
-		}
-		return
-	}
-
-	var ready map[string]string
-	lookupRev := m[3]
-	if !commitRevRe.MatchString(lookupRev) {
-		// Branch trees only advertise hashes through a fresh pinned commit;
-		// probing is left to the resolve path.
-		lookupRev = ""
-		name := strings.TrimPrefix(repoResolvePrefix(m[1], m[2]), "/") + "\x00" + m[3]
-		h.mu.Lock()
-		if b := h.branches[name]; b != nil && !h.branchStale(b) {
-			lookupRev = b.Commit
-		}
-		h.mu.Unlock()
-	}
-	if lookupRev != "" {
-		ready = h.readyFileHashes(repoResolvePrefix(m[1], m[2]), lookupRev)
-	}
-	for _, item := range items {
-		if _, ok := item["xetHash"]; !ok {
-			continue
-		}
-		path, _ := item["path"].(string)
-		if hash, ok := ready[path]; ok {
-			item["xetHash"] = hash
-		} else {
-			delete(item, "xetHash")
-		}
-	}
-
-	out, err := json.Marshal(items)
-	if err != nil {
-		http.Error(w, "encode tree failed", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Del("Etag") // body differs from upstream
-	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(out)
+	_, _ = io.WriteString(w, "]")
 }
 
-// repoResolvePrefix maps an API repo type and id to the repo prefix used in
-// resolve keys: models live at the root, other types keep their segment.
-func repoResolvePrefix(repoType, repoID string) string {
-	if repoType == "models" {
-		return "/" + repoID
+// startsJSONArray peeks past leading whitespace and reports whether the next
+// byte opens a JSON array, consuming nothing.
+func startsJSONArray(br *bufio.Reader) bool {
+	for i := 1; ; i++ {
+		buf, _ := br.Peek(i)
+		if len(buf) < i {
+			return false
+		}
+		switch buf[i-1] {
+		case ' ', '\t', '\r', '\n':
+		default:
+			return buf[i-1] == '['
+		}
 	}
-	return "/" + repoType + "/" + repoID
 }
 
-// readyFileHashes returns path -> local xet hash for ready entries of the
-// given repo whose key revision or ingested commit matches rev.
-func (h *Handler) readyFileHashes(repoPrefix, rev string) map[string]string {
-	prefix := repoPrefix + "/resolve/"
-	out := map[string]string{}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for key, e := range h.entries {
-		if e.State != stateReady || e.FileHash == "" || !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		rest := key[len(prefix):]
-		i := strings.IndexByte(rest, '/')
-		if i < 0 {
-			continue
-		}
-		if rest[:i] != rev && e.Commit != rev {
-			continue
-		}
-		// Keys hold escaped paths; tree entries carry them unescaped.
-		path := rest[i+1:]
-		if unescaped, err := url.PathUnescape(path); err == nil {
-			path = unescaped
-		}
-		out[path] = e.FileHash
+// indexSHA256 records e's content mapping for tree rewrites; the caller
+// holds h.mu (or is still single-threaded).
+func (h *Handler) indexSHA256(e *fileEntry) {
+	if e.State == stateReady && e.FileHash != "" && e.SHA256 != "" {
+		h.sha256s[e.SHA256] = e.FileHash
 	}
-	return out
+}
+
+// dropSHA256 removes old's content mapping unless another ready entry still
+// names the same bytes; the caller holds h.mu.
+func (h *Handler) dropSHA256(old *fileEntry) {
+	if old.SHA256 == "" {
+		return
+	}
+	for _, e := range h.entries {
+		if e.State == stateReady && e.SHA256 == old.SHA256 {
+			return
+		}
+	}
+	delete(h.sha256s, old.SHA256)
 }
 
 // task tracks one in-flight ingestion. All concurrent requests for the same
@@ -757,6 +759,7 @@ func (h *Handler) runTask(key string, t *task, pre *probeResult) {
 
 	h.mu.Lock()
 	h.entries[key] = entry
+	h.indexSHA256(entry)
 	delete(h.tasks, key)
 	h.mu.Unlock()
 	t.spool.markRemove() // bytes now live in storage; drop the spool when drained
@@ -965,6 +968,7 @@ func (h *Handler) revalidate(ctx context.Context, key string, e *fileEntry) *fil
 	h.mu.Lock()
 	if h.entries[key] == e {
 		delete(h.entries, key)
+		h.dropSHA256(e)
 	}
 	h.mu.Unlock()
 	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, key))
