@@ -855,9 +855,10 @@ func TestMirrorTreeRewrite(t *testing.T) {
 	// upstream must serve the commit-keyed path the ingest will fetch.
 	upstream.commit = strings.Repeat("ab", 20)
 	upstream.set("/org/repo/resolve/"+upstream.commit+"/model.bin", data)
+	oid := fmt.Sprintf("%x", sha256.Sum256(data))
 	treeJSON := []byte(`[
-		{"type":"file","path":"model.bin","size":131072,"xetHash":"upstream-hash-1"},
-		{"type":"file","path":"other.bin","size":7,"xetHash":"upstream-hash-2"},
+		{"type":"file","path":"model.bin","size":131072,"lfs":{"oid":"` + oid + `","size":131072,"pointerSize":134},"xetHash":"upstream-hash-1"},
+		{"type":"file","path":"other.bin","size":7,"lfs":{"oid":"` + strings.Repeat("00", 32) + `","size":7,"pointerSize":133},"xetHash":"upstream-hash-2"},
 		{"type":"directory","path":"sub"}
 	]`)
 	upstream.api["/api/models/org/repo/tree/main"] = treeJSON
@@ -923,9 +924,8 @@ func TestMirrorTreeRewrite(t *testing.T) {
 		}
 	})
 
-	// Branch trees resolve through the pinned commit mapping established by
-	// the resolve requests above.
-	t.Run("branch rev advertises via pinned commit", func(t *testing.T) {
+	// Branch trees match by content too; no pinned commit is involved.
+	t.Run("branch rev advertises local hash", func(t *testing.T) {
 		for _, item := range fetchTree("main") {
 			hash, ok := item["xetHash"]
 			switch item["path"] {
@@ -941,7 +941,7 @@ func TestMirrorTreeRewrite(t *testing.T) {
 		}
 	})
 
-	// The tree rev the client uses must not resolve entries of other repos.
+	// Entries without a matching lfs oid (here: none at all) lose the hash.
 	t.Run("other repo unaffected", func(t *testing.T) {
 		upstream.mu.Lock()
 		upstream.api["/api/models/org/other/tree/main"] = []byte(`[{"type":"file","path":"model.bin","size":1,"xetHash":"h"}]`)

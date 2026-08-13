@@ -19,6 +19,7 @@
 package mirror
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -241,6 +242,19 @@ func NewHandler(opts ...Option) (*Handler, error) {
 				pr.Out.Header.Set("Authorization", "Bearer "+h.upstreamToken)
 			}
 		},
+		// Upstream response headers are dropped except the entity headers
+		// describing the relayed body and the redirect target without which
+		// 3xx cannot work.
+		ModifyResponse: func(resp *http.Response) error {
+			kept := http.Header{}
+			for _, k := range []string{"Content-Type", "Content-Length", "Etag", "Date", "Location"} {
+				if v := resp.Header.Get(k); v != "" {
+					kept.Set(k, v)
+				}
+			}
+			resp.Header = kept
+			return nil
+		},
 	}
 	if h.next == nil {
 		h.next = proxy
@@ -385,17 +399,26 @@ func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bo
 	return "", pr, false
 }
 
+// treeLFS is the lfs pointer block of a hub tree entry; OID is the sha256
+// naming the file bytes. The entry itself stays a raw map because expand
+// requests add fields (lastCommit, securityFileStatus, ...) that must pass
+// through untouched.
+type treeLFS struct {
+	OID         string `json:"oid"`
+	PointerSize int64  `json:"pointerSize"`
+	Size        int64  `json:"size"`
+}
+
 // handleTree proxies a tree listing API request, rewriting each entry's
-// xetHash: files the mirror already holds advertise the mirror's own hash so
-// xet clients reconstruct them from the mirror CAS; all other entries lose
-// the hash so clients fall back to the resolve flow, which ingests through
-// the mirror. Left untouched, upstream hashes would send clients directly to
-// the upstream CAS, bypassing the mirror entirely. Hashes are only looked up
-// under immutable commits: branch revisions go through their pinned commit
-// mapping when fresh and are otherwise stripped, so a live listing is never
-// paired with hashes of content the branch no longer points at.
+// xetHash: entries whose lfs sha256 oid resolves in local storage advertise
+// the mirror's own hash so xet clients reconstruct them from the mirror CAS;
+// all other entries lose the hash so clients fall back to the resolve flow,
+// which ingests through the mirror. Left untouched, upstream hashes would
+// send clients directly to the upstream CAS, bypassing the mirror entirely.
+// Matching by content makes revision and repo irrelevant. The array is
+// rewritten in a streaming pass, so a listing is never buffered whole; no
+// upstream header is forwarded, only the body is relayed.
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
-	m := apiTreeRe.FindStringSubmatch(r.URL.EscapedPath())
 	u := h.upstreamURL(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
 		u += "?" + r.URL.RawQuery
@@ -414,113 +437,84 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 		_ = resp.Body.Close()
 	}()
 
-	// Pagination (Link) and the other upstream headers pass through; entity
-	// headers are recomputed for the rewritten body.
-	for k, vs := range resp.Header {
-		switch http.CanonicalHeaderKey(k) {
-		case "Content-Length", "Content-Encoding", "Transfer-Encoding":
-			continue
-		}
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
+	body := bufio.NewReader(resp.Body)
+	if resp.StatusCode != http.StatusOK || !startsJSONArray(body) {
+		// Error status or unexpected shape: relay the bytes untouched.
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, body)
+		return
 	}
 
-	var items []map[string]any
-	var body []byte
-	if resp.StatusCode == http.StatusOK {
-		body, err = io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	dec := json.NewDecoder(body)
+	if _, err := dec.Token(); err != nil {
+		return
+	}
+	_, _ = io.WriteString(w, "[")
+	for first := true; dec.More(); first = false {
+		// Raw values keep every untouched field byte-exact through the re-encode.
+		var item map[string]json.RawMessage
+		if err := dec.Decode(&item); err != nil {
+			// Mid-stream failure: stop without the closing bracket so the
+			// client sees invalid JSON rather than a truncated listing.
+			return
+		}
+		if _, ok := item["xetHash"]; ok {
+			var lfs treeLFS
+			if raw, ok := item["lfs"]; ok {
+				_ = json.Unmarshal(raw, &lfs)
+			}
+			if hash, ok := h.lookupXetHash(r.Context(), lfs.OID); ok {
+				quoted, _ := json.Marshal(hash)
+				item["xetHash"] = quoted
+			} else {
+				delete(item, "xetHash")
+			}
+		}
+		out, err := json.Marshal(item)
 		if err != nil {
-			http.Error(w, "read upstream tree failed", http.StatusBadGateway)
+			return
+		}
+		if !first {
+			_, _ = io.WriteString(w, ",")
+		}
+		if _, err := w.Write(out); err != nil {
 			return
 		}
 	}
-	if body == nil || json.Unmarshal(body, &items) != nil {
-		// Error status or unexpected shape: relay untouched.
-		w.WriteHeader(resp.StatusCode)
-		if body != nil {
-			_, _ = w.Write(body)
-		} else {
-			_, _ = io.Copy(w, resp.Body)
-		}
-		return
-	}
+	_, _ = io.WriteString(w, "]")
+}
 
-	var ready map[string]string
-	lookupRev := m[3]
-	if !commitRevRe.MatchString(lookupRev) {
-		// Branch trees only advertise hashes through a fresh pinned commit;
-		// probing is left to the resolve path.
-		lookupRev = ""
-		name := strings.TrimPrefix(repoResolvePrefix(m[1], m[2]), "/") + "\x00" + m[3]
-		h.mu.Lock()
-		if b := h.branches[name]; b != nil && !h.branchStale(b) {
-			lookupRev = b.Commit
+// startsJSONArray peeks past leading whitespace and reports whether the next
+// byte opens a JSON array, consuming nothing.
+func startsJSONArray(br *bufio.Reader) bool {
+	for i := 1; ; i++ {
+		buf, _ := br.Peek(i)
+		if len(buf) < i {
+			return false
 		}
-		h.mu.Unlock()
-	}
-	if lookupRev != "" {
-		ready = h.readyFileHashes(repoResolvePrefix(m[1], m[2]), lookupRev)
-	}
-	for _, item := range items {
-		if _, ok := item["xetHash"]; !ok {
-			continue
-		}
-		path, _ := item["path"].(string)
-		if hash, ok := ready[path]; ok {
-			item["xetHash"] = hash
-		} else {
-			delete(item, "xetHash")
+		switch buf[i-1] {
+		case ' ', '\t', '\r', '\n':
+		default:
+			return buf[i-1] == '['
 		}
 	}
+}
 
-	out, err := json.Marshal(items)
+// lookupXetHash resolves an lfs sha256 oid to the local xet file hash through
+// the storage sha256 index; ok is false when the content is not held locally.
+func (h *Handler) lookupXetHash(ctx context.Context, oid string) (string, bool) {
+	digest, err := hex.DecodeString(oid)
+	if err != nil || len(digest) != sha256.Size {
+		return "", false
+	}
+	fileHash, err := h.storage.GetFileHashBySHA256(ctx, "default", [32]byte(digest))
 	if err != nil {
-		http.Error(w, "encode tree failed", http.StatusInternalServerError)
-		return
+		return "", false
 	}
-	w.Header().Del("Etag") // body differs from upstream
-	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
-	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(out)
-}
-
-// repoResolvePrefix maps an API repo type and id to the repo prefix used in
-// resolve keys: models live at the root, other types keep their segment.
-func repoResolvePrefix(repoType, repoID string) string {
-	if repoType == "models" {
-		return "/" + repoID
-	}
-	return "/" + repoType + "/" + repoID
-}
-
-// readyFileHashes returns path -> local xet hash for ready entries of the
-// given repo whose key revision or ingested commit matches rev.
-func (h *Handler) readyFileHashes(repoPrefix, rev string) map[string]string {
-	prefix := repoPrefix + "/resolve/"
-	out := map[string]string{}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for key, e := range h.entries {
-		if e.State != stateReady || e.FileHash == "" || !strings.HasPrefix(key, prefix) {
-			continue
-		}
-		rest := key[len(prefix):]
-		i := strings.IndexByte(rest, '/')
-		if i < 0 {
-			continue
-		}
-		if rest[:i] != rev && e.Commit != rev {
-			continue
-		}
-		// Keys hold escaped paths; tree entries carry them unescaped.
-		path := rest[i+1:]
-		if unescaped, err := url.PathUnescape(path); err == nil {
-			path = unescaped
-		}
-		out[path] = e.FileHash
-	}
-	return out
+	return fileHash.String(), true
 }
 
 // task tracks one in-flight ingestion. All concurrent requests for the same
