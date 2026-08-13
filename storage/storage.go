@@ -46,6 +46,9 @@ type Storage interface {
 
 	// GetReconstructedFile returns a ReadSeekCloser for a file reconstructed from a shard by its SHA-256 digest.
 	GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error)
+
+	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest.
+	GetFileHashBySHA256(ctx context.Context, namespace string, sha256 [32]byte) (xet.FileHash, error)
 }
 
 // FileStorage implements Storage using the filesystem
@@ -564,29 +567,39 @@ func (fs *FileStorage) GetShard(ctx context.Context, fileHash xet.FileHash) (*sh
 	return fs.getShard(fileHash)
 }
 
-func (fs *FileStorage) getShardBySHA256(ctx context.Context, _ string, digest [32]byte) (*shard.Shard, error) {
+// GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded
+// at ingest, reading the sha256 index file through the bounded cache.
+func (fs *FileStorage) GetFileHashBySHA256(ctx context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
 	fs.sha256Mut.Lock()
 	value, exists := fs.sha256Index.Get(digest)
 	fs.sha256Mut.Unlock()
 	if exists {
-		return fs.GetShard(ctx, value.(xet.FileHash))
+		return value.(xet.FileHash), nil
 	}
 
 	indexPath := fs.objectPath("sha256", hex.EncodeToString(digest[:]))
 	b, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("SHA-256 not found")
+			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
 		}
-		return nil, fmt.Errorf("read SHA-256 index: %w", err)
+		return xet.FileHash{}, fmt.Errorf("read SHA-256 index: %w", err)
 	}
 	fileHash, err := xet.ParseFileHash(strings.TrimSpace(string(b)))
 	if err != nil {
-		return nil, fmt.Errorf("invalid SHA-256 index: %w", err)
+		return xet.FileHash{}, fmt.Errorf("invalid SHA-256 index: %w", err)
 	}
 	fs.sha256Mut.Lock()
 	fs.sha256Index.Add(digest, fileHash)
 	fs.sha256Mut.Unlock()
+	return fileHash, nil
+}
+
+func (fs *FileStorage) getShardBySHA256(ctx context.Context, namespace string, digest [32]byte) (*shard.Shard, error) {
+	fileHash, err := fs.GetFileHashBySHA256(ctx, namespace, digest)
+	if err != nil {
+		return nil, err
+	}
 	return fs.GetShard(ctx, fileHash)
 }
 

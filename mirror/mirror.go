@@ -106,7 +106,6 @@ type Handler struct {
 	mu       sync.Mutex
 	flight   singleflight.Group
 	entries  map[string]*fileEntry
-	sha256s  map[string]string // sha256 -> xet hash of ready entries
 	branches map[string]*branchEntry
 	tasks    map[string]*task
 }
@@ -201,10 +200,6 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h.entries, err = loadIndex(h.indexDir)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: load index: %w", err)
-	}
-	h.sha256s = map[string]string{}
-	for _, e := range h.entries {
-		h.indexSHA256(e)
 	}
 	h.branches, err = loadBranches(branchDir)
 	if err != nil {
@@ -404,16 +399,6 @@ func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bo
 	return "", pr, false
 }
 
-// handleTree proxies a tree listing API request, rewriting each entry's
-// xetHash: entries whose lfs sha256 oid matches a file the mirror already
-// holds advertise the mirror's own hash so xet clients reconstruct them from
-// the mirror CAS; all other entries lose the hash so clients fall back to
-// the resolve flow, which ingests through the mirror. Left untouched,
-// upstream hashes would send clients directly to the upstream CAS, bypassing
-// the mirror entirely. Matching by content makes revision and repo
-// irrelevant. The array is rewritten in a streaming pass, so a listing is
-// never buffered whole; no upstream header is forwarded, only the body is
-// relayed.
 // treeLFS is the lfs pointer block of a hub tree entry; OID is the sha256
 // naming the file bytes. The entry itself stays a raw map because expand
 // requests add fields (lastCommit, securityFileStatus, ...) that must pass
@@ -424,6 +409,15 @@ type treeLFS struct {
 	Size        int64  `json:"size"`
 }
 
+// handleTree proxies a tree listing API request, rewriting each entry's
+// xetHash: entries whose lfs sha256 oid resolves in local storage advertise
+// the mirror's own hash so xet clients reconstruct them from the mirror CAS;
+// all other entries lose the hash so clients fall back to the resolve flow,
+// which ingests through the mirror. Left untouched, upstream hashes would
+// send clients directly to the upstream CAS, bypassing the mirror entirely.
+// Matching by content makes revision and repo irrelevant. The array is
+// rewritten in a streaming pass, so a listing is never buffered whole; no
+// upstream header is forwarded, only the body is relayed.
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 	u := h.upstreamURL(r.URL.EscapedPath())
 	if r.URL.RawQuery != "" {
@@ -472,10 +466,7 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 			if raw, ok := item["lfs"]; ok {
 				_ = json.Unmarshal(raw, &lfs)
 			}
-			h.mu.Lock()
-			hash, ok := h.sha256s[lfs.OID]
-			h.mu.Unlock()
-			if ok {
+			if hash, ok := h.lookupXetHash(r.Context(), lfs.OID); ok {
 				quoted, _ := json.Marshal(hash)
 				item["xetHash"] = quoted
 			} else {
@@ -512,26 +503,18 @@ func startsJSONArray(br *bufio.Reader) bool {
 	}
 }
 
-// indexSHA256 records e's content mapping for tree rewrites; the caller
-// holds h.mu (or is still single-threaded).
-func (h *Handler) indexSHA256(e *fileEntry) {
-	if e.State == stateReady && e.FileHash != "" && e.SHA256 != "" {
-		h.sha256s[e.SHA256] = e.FileHash
+// lookupXetHash resolves an lfs sha256 oid to the local xet file hash through
+// the storage sha256 index; ok is false when the content is not held locally.
+func (h *Handler) lookupXetHash(ctx context.Context, oid string) (string, bool) {
+	digest, err := hex.DecodeString(oid)
+	if err != nil || len(digest) != sha256.Size {
+		return "", false
 	}
-}
-
-// dropSHA256 removes old's content mapping unless another ready entry still
-// names the same bytes; the caller holds h.mu.
-func (h *Handler) dropSHA256(old *fileEntry) {
-	if old.SHA256 == "" {
-		return
+	fileHash, err := h.storage.GetFileHashBySHA256(ctx, "default", [32]byte(digest))
+	if err != nil {
+		return "", false
 	}
-	for _, e := range h.entries {
-		if e.State == stateReady && e.SHA256 == old.SHA256 {
-			return
-		}
-	}
-	delete(h.sha256s, old.SHA256)
+	return fileHash.String(), true
 }
 
 // task tracks one in-flight ingestion. All concurrent requests for the same
@@ -768,7 +751,6 @@ func (h *Handler) runTask(key string, t *task, pre *probeResult) {
 
 	h.mu.Lock()
 	h.entries[key] = entry
-	h.indexSHA256(entry)
 	delete(h.tasks, key)
 	h.mu.Unlock()
 	t.spool.markRemove() // bytes now live in storage; drop the spool when drained
@@ -977,7 +959,6 @@ func (h *Handler) revalidate(ctx context.Context, key string, e *fileEntry) *fil
 	h.mu.Lock()
 	if h.entries[key] == e {
 		delete(h.entries, key)
-		h.dropSHA256(e)
 	}
 	h.mu.Unlock()
 	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, key))
