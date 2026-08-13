@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
@@ -24,13 +25,34 @@ func main() {
 	authToken := flag.String("token", "", "Authentication token; also the secret for minted short-lived tokens (optional, if set, clients must provide this token or a minted one)")
 	upstream := flag.String("upstream", "", "Upstream hub URL to mirror, e.g. https://huggingface.co (enables mirror mode)")
 	upstreamToken := flag.String("upstream-token", "", "Bearer token the mirror uses against the upstream hub")
+	s3Bucket := flag.String("s3-bucket", "", "S3 bucket for xorbs and shards (enables S3 storage; credentials come from the standard AWS config chain)")
+	s3Prefix := flag.String("s3-prefix", "", "Key prefix within the S3 bucket (optional)")
+	s3Endpoint := flag.String("s3-endpoint", "", "Custom S3 endpoint URL, e.g. for MinIO (optional)")
+	s3Region := flag.String("s3-region", "", "S3 region (optional, falls back to AWS config chain)")
+	s3PathStyle := flag.Bool("s3-path-style", false, "Use path-style S3 addressing (required by MinIO and most self-hosted stores)")
 	flag.Parse()
 
-	// Create storage
-	storage, err := storage.NewFileStorage(
-		storage.WithBasePath(*storageDir),
-		storage.WithBaseURL(*baseURL),
-	)
+	// Create storage: S3 when a bucket is configured, local filesystem otherwise.
+	var stor storage.Storage
+	var err error
+	if *s3Bucket != "" {
+		stor, err = storage.NewS3Storage(context.Background(),
+			storage.WithS3Bucket(*s3Bucket),
+			storage.WithS3Prefix(*s3Prefix),
+			storage.WithS3Endpoint(*s3Endpoint),
+			storage.WithS3Region(*s3Region),
+			storage.WithS3PathStyle(*s3PathStyle),
+			storage.WithS3BaseURL(*baseURL),
+		)
+		if err == nil {
+			fmt.Printf("S3 storage enabled, bucket: %s\n", *s3Bucket)
+		}
+	} else {
+		stor, err = storage.NewFileStorage(
+			storage.WithBasePath(*storageDir),
+			storage.WithBaseURL(*baseURL),
+		)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create storage: %v\n", err)
 		os.Exit(1)
@@ -71,7 +93,7 @@ func main() {
 		}
 
 		next, err = mirror.NewHandler(
-			mirror.WithStorage(storage),
+			mirror.WithStorage(stor),
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
 			mirror.WithExternalURL(*baseURL),
@@ -89,7 +111,7 @@ func main() {
 
 	// Create server
 	next = server.NewHandler(
-		server.WithStorage(storage),
+		server.WithStorage(stor),
 		server.WithAuthFunc(authFn),
 		server.WithNext(next),
 	)

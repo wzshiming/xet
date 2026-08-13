@@ -20,8 +20,21 @@ jobs:
       with:
         go-version-file: go.mod
 
+    - name: Start MinIO
+      run: |
+        docker run -d --name minio -p 9000:9000 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+        timeout 60 bash -c 'until curl -sf http://127.0.0.1:9000/minio/health/live; do sleep 1; done'
+
     - name: Run Go tests
       run: go test ./...
+      env:
+        XET_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+        AWS_ACCESS_KEY_ID: minioadmin
+        AWS_SECRET_ACCESS_KEY: minioadmin
+        AWS_REGION: us-east-1
 
     - name: Build xetc
       run: go build -o xetc ./cmd/xetc
