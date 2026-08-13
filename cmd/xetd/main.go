@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/handlers"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
@@ -61,12 +62,21 @@ func main() {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
 		// The mirror handles resolve/token requests and proxies the rest to
 		// the upstream; the CAS server below matches its own routes first.
+		xetClient, err := client.NewClient(
+			client.WithCacheDir(filepath.Join(*storageDir, "mirror", "chunks")),
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create xet client: %v\n", err)
+			os.Exit(1)
+		}
+
 		next, err = mirror.NewHandler(
 			mirror.WithStorage(storage),
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
 			mirror.WithExternalURL(*baseURL),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
+			mirror.WithClient(xetClient),
 			mirror.WithMintToken(issuer.Mint),
 		)
 		if err != nil {
