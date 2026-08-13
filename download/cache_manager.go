@@ -15,6 +15,12 @@ import (
 // xet-core's default chunk cache size (HF_XET_CHUNK_CACHE_SIZE_BYTES).
 const DefaultCacheSize int64 = 10_000_000_000
 
+// reconcileInterval is the minimum time between full directory walks on the
+// eviction slow path. The walk re-syncs tracked state with entries created
+// or removed by other managers and processes; throttling it keeps a cache
+// hovering at capacity from re-scanning the tree on every published range.
+const reconcileInterval = time.Minute
+
 // cacheEntry is the LRU bookkeeping for one published cache file.
 type cacheEntry struct {
 	size int64
@@ -30,10 +36,14 @@ type evictedEntry struct {
 // CacheManager bounds the total size of one chunk cache directory.
 //
 // Entries are tracked in an in-memory LRU that is touched once when a cache
-// file is acquired and once more when its user is done. Eviction is
-// evaluated when an entry is published or released, never on the read path,
-// and every evaluation first reconciles the tracked state with the directory
-// so the bound holds even when several managers or processes share it.
+// file is acquired and once more when its user is done. Publishing or
+// releasing a range is O(1) in-memory bookkeeping while the tracked total
+// stays under capacity; eviction only runs once it reaches capacity. The
+// full directory walk that keeps the bound directory-wide — adopting entries
+// created by other managers or processes and cleaning up crashed leftovers —
+// runs once when the manager is first prepared and afterwards only right
+// before evicting, at most once per reconcileInterval, never on the
+// per-range path.
 // Cross-process (and cross-manager) safety relies on the flock on the entry
 // file itself: names are only unlinked while holding that lock, so active
 // writers are never disturbed, and already-open readers keep their data
@@ -45,8 +55,12 @@ type CacheManager struct {
 	lru      *lru.Cache
 	total    int64
 
+	// lastReconcile is when reconcileLocked last walked the directory; the
+	// zero value means the initial scan has not happened yet.
+	lastReconcile time.Time
+
 	// evicted accumulates entries popped from the LRU via RemoveOldest;
-	// evaluateLocked drains it for eviction candidates and reconcileLocked
+	// evictLocked drains it for eviction candidates and reconcileLocked
 	// uses it to rebuild the LRU.
 	evicted []evictedEntry
 
@@ -74,11 +88,16 @@ func NewCacheManager(cacheDir string, capacity int64) *CacheManager {
 	return m
 }
 
-// prepare reconciles tracked state with the cache directory (adopting
-// pre-existing entries and removing crashed incomplete entries) and evicts
-// any overage before a download starts.
+// prepare runs the one-time directory scan that adopts pre-existing entries
+// and removes crashed incomplete entries, then evicts any overage before a
+// download starts. Calls after the first cost the same as evaluate.
 func (m *CacheManager) prepare() {
-	m.evaluate()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastReconcile.IsZero() {
+		m.reconcileLocked()
+	}
+	m.evaluateLocked()
 }
 
 // acquire records one use of the cache file at path and refreshes its LRU
@@ -120,18 +139,30 @@ func (m *CacheManager) markVerified(path string) {
 	m.verified.Store(path, struct{}{})
 }
 
-// evaluate reconciles tracked state with the cache directory, then evicts
-// least-recently-used entries until the total fits the capacity. Reconciling
-// first keeps the bound directory-level even when other managers or
-// processes write to the same directory.
+// evaluate evicts least-recently-used entries when the tracked total has
+// reached capacity; below capacity it is O(1) and touches no directory.
 func (m *CacheManager) evaluate() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.reconcileLocked()
 	m.evaluateLocked()
 }
 
+// evaluateLocked is the eviction slow path, entered only once the tracked
+// total reaches capacity. Before evicting it reconciles the tracked state
+// with the directory — throttled to reconcileInterval — so entries written
+// by other managers or processes are counted, stale names are dropped, and
+// the bound stays directory-wide.
 func (m *CacheManager) evaluateLocked() {
+	if m.capacity <= 0 || m.total < m.capacity {
+		return
+	}
+	if time.Since(m.lastReconcile) >= reconcileInterval {
+		m.reconcileLocked()
+	}
+	m.evictLocked()
+}
+
+func (m *CacheManager) evictLocked() {
 	if m.capacity <= 0 {
 		return
 	}
@@ -169,6 +200,8 @@ func (m *CacheManager) evaluateLocked() {
 // left behind by crashed downloads are cleaned up. The recency order
 // and refs of already-tracked entries are preserved.
 func (m *CacheManager) reconcileLocked() {
+	m.lastReconcile = time.Now()
+
 	type diskEntry struct {
 		path    string
 		size    int64

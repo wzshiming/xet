@@ -68,7 +68,105 @@ const (
 	testHashA = "aa11111111111111"
 	testHashB = "bb22222222222222"
 	testHashC = "cc33333333333333"
+	testHashD = "dd44444444444444"
 )
+
+// trackedTotal reads the manager's in-memory byte total.
+func trackedTotal(m *CacheManager) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.total
+}
+
+// writeOrphanEntry drops an incomplete cache entry with no lock holder, as a
+// crashed download would leave behind.
+func writeOrphanEntry(t *testing.T, dir, hash string) string {
+	t.Helper()
+	orphan := cacheFilePath(dir, hash, 0, 1, 0, 10)
+	if err := os.MkdirAll(filepath.Dir(orphan), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return orphan
+}
+
+func TestCachePublishUnderCapacityIsInMemoryOnly(t *testing.T) {
+	dir := t.TempDir()
+	payload := "0123456789"
+	entrySize := cacheEntryFileSize(payload)
+
+	// An entry from another manager and a crashed leftover, both unknown to
+	// the manager under test.
+	writeCacheEntry(t, NewCacheManager(dir, 0), testHashB, payload)
+	orphan := writeOrphanEntry(t, dir, testHashC)
+
+	// Publishing and releasing while under capacity must stay in memory: the
+	// foreign entry is not adopted and the leftover is not cleaned up.
+	m := NewCacheManager(dir, entrySize*10)
+	writeCacheEntry(t, m, testHashA, payload)
+	if got := trackedTotal(m); got != entrySize {
+		t.Fatalf("under-capacity publish should only track its own entry: total %d, want %d", got, entrySize)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("crashed leftover should be untouched on the publish path: %v", err)
+	}
+
+	// The first prepare is the slow path: it adopts the foreign entry and
+	// cleans up the leftover.
+	m.prepare()
+	if got := trackedTotal(m); got != entrySize*2 {
+		t.Fatalf("prepare should adopt the foreign entry: total %d, want %d", got, entrySize*2)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("prepare should clean up crashed leftovers: %v", err)
+	}
+}
+
+func TestCacheEvictionThrottlesDirectoryWalk(t *testing.T) {
+	dir := t.TempDir()
+	payload := "0123456789"
+	entrySize := cacheEntryFileSize(payload)
+	m := NewCacheManager(dir, entrySize*2)
+
+	// Filling the cache to capacity runs the first full walk.
+	writeCacheEntry(t, m, testHashA, payload)
+	writeCacheEntry(t, m, testHashB, payload)
+
+	// A foreign entry written after that walk is not re-discovered while the
+	// throttle is active: the next overage is resolved from tracked state
+	// alone, evicting the oldest tracked entry.
+	writeCacheEntry(t, NewCacheManager(dir, 0), testHashC, payload)
+	writeCacheEntry(t, m, testHashD, payload)
+
+	if entryExists(t, dir, testHashA) {
+		t.Fatal("oldest tracked entry was not evicted")
+	}
+	if !entryExists(t, dir, testHashB) || !entryExists(t, dir, testHashD) {
+		t.Fatal("tracked entries within capacity were evicted")
+	}
+	if !entryExists(t, dir, testHashC) {
+		t.Fatal("foreign entry should survive eviction within the reconcile interval")
+	}
+	if got := trackedTotal(m); got != entrySize*2 {
+		t.Fatalf("throttled eviction should not adopt foreign entries: total %d, want %d", got, entrySize*2)
+	}
+}
+
+func TestCachePrepareScansOnce(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	m.prepare()
+
+	// A leftover appearing after the initial scan is only cleaned up on the
+	// slow path, not by later prepares.
+	orphan := writeOrphanEntry(t, dir, testHashA)
+	m.prepare()
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("prepare after the initial scan should not walk the directory: %v", err)
+	}
+}
 
 func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	dir := t.TempDir()
