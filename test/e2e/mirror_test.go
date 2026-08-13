@@ -7,9 +7,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -239,17 +239,32 @@ func pollResolveStatus(t *testing.T, resolveURL string, want int) string {
 }
 
 // waitIndexPersisted waits for the on-disk index entry, the mirror's
-// persistence contract for ready files.
+// persistence contract for ready files. Entries live under per-commit
+// directories; branch mappings under index/branches do not count.
 func waitIndexPersisted(t *testing.T, cacheDir string) {
 	t.Helper()
 	dir := filepath.Join(cacheDir, "index")
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		entries, _ := os.ReadDir(dir)
-		for _, de := range entries {
-			if strings.HasSuffix(de.Name(), ".json") {
-				return
+		found := false
+		_ = filepath.WalkDir(dir, func(path string, de fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
 			}
+			if de.IsDir() {
+				if de.Name() == "branches" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasSuffix(de.Name(), ".json") {
+				found = true
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		if found {
+			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
