@@ -247,18 +247,17 @@ func NewHandler(opts ...Option) (*Handler, error) {
 				pr.Out.Header.Set("Authorization", "Bearer "+h.upstreamToken)
 			}
 		},
-		// Upstream response headers are dropped; only the body is relayed,
-		// plus its type and the redirect target without which 3xx cannot work.
+		// Upstream response headers are dropped except the entity headers
+		// describing the relayed body and the redirect target without which
+		// 3xx cannot work.
 		ModifyResponse: func(resp *http.Response) error {
-			ct := resp.Header.Get("Content-Type")
-			loc := resp.Header.Get("Location")
-			resp.Header = http.Header{}
-			if ct != "" {
-				resp.Header.Set("Content-Type", ct)
+			kept := http.Header{}
+			for _, k := range []string{"Content-Type", "Content-Length", "Etag", "Date", "Location"} {
+				if v := resp.Header.Get(k); v != "" {
+					kept.Set(k, v)
+				}
 			}
-			if loc != "" {
-				resp.Header.Set("Location", loc)
-			}
+			resp.Header = kept
 			return nil
 		},
 	}
