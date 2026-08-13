@@ -247,7 +247,7 @@ func NewHandler(opts ...Option) (*Handler, error) {
 		// 3xx cannot work.
 		ModifyResponse: func(resp *http.Response) error {
 			kept := http.Header{}
-			for _, k := range []string{"Content-Type", "Content-Length", "Etag", "Date", "Location"} {
+			for _, k := range []string{"Content-Type", "Content-Length", "Content-Encoding", "Etag", "Date", "Location"} {
 				if v := resp.Header.Get(k); v != "" {
 					kept.Set(k, v)
 				}
