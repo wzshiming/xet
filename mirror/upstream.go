@@ -30,6 +30,11 @@ func (t *authInjector) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.inner.RoundTrip(req)
 }
 
+// upstreamURL maps a local resolve path to the upstream equivalent.
+func (h *Handler) upstreamURL(key string) string {
+	return strings.TrimRight(h.upstream.String(), "/") + key
+}
+
 // probeResult captures upstream metadata for one resolve path. Everything is
 // taken from response headers only, so no platform-specific adapters exist.
 type probeResult struct {
