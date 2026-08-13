@@ -16,6 +16,7 @@ Implemented in this repository:
 - Shard and xorb encode/decode paths
 - Upload and download client workflows
 - CAS server implementation for local or self-hosted usage
+- Mirror mode: full-cache middle layer bridging xet and plain hubs
 - Hugging Face token/LFS based integration helpers
 - Conformance and unit tests for key protocol paths
 

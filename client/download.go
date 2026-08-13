@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,7 +32,7 @@ func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.W
 func (c *Client) DownloadFileWithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
 	err := c.DownloadFileV2WithAuthProvider(ctx, provider, fileHash, w)
 	if err != nil {
-		if err == errNotFound {
+		if errors.Is(err, errNotFound) {
 			return c.DownloadFileV1WithAuthProvider(ctx, provider, fileHash, w)
 		}
 		return err
@@ -110,7 +111,10 @@ func (c *Client) newDownloadReader(ctx context.Context, provider AuthProvider, f
 func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
-		if resumeOffset > 0 {
+		// Only a rejected Range query warrants restarting from scratch; a 404
+		// means the file is absent and rewinding would just lose the resume
+		// offset.
+		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
 				reconstructionResp, err = c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, nil)
@@ -131,7 +135,9 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
 	reconstructionResp, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	if err != nil {
-		if resumeOffset > 0 {
+		// A missing V2 endpoint must not rewind w: the caller falls back to
+		// V1, which resumes from the same offset.
+		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
 				reconstructionResp, err = c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, nil)
