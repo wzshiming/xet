@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+
+	"github.com/wzshiming/xet"
 )
 
 // ChunkDataRange scans the chunk-data region of an xorb stream and returns
@@ -49,4 +51,58 @@ func ChunkDataRange(r io.ReadSeeker, chunkStart, chunkEnd uint32) (startByte, en
 			return startByte, offset - 1, nil
 		}
 	}
+}
+
+// ScanChunkOffsets scans every chunk header and returns the cumulative packed
+// end-offset (including the 8-byte header) of each chunk. It rewinds to the
+// stream start first and stops at EOF (chunk-only format) or at the footer.
+func ScanChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind xorb: %w", err)
+	}
+
+	var offsets []uint64
+	var headerBuf [8]byte
+	offset := int64(0)
+
+	for {
+		n, err := io.ReadFull(r, headerBuf[:])
+		if err == io.EOF {
+			return offsets, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read chunk header: %w", err)
+		}
+
+		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
+			return offsets, nil
+		}
+
+		if len(offsets) >= xet.MaxChunksPerXorb {
+			return nil, fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
+		}
+
+		compressedSize := int64(headerBuf[1]) | int64(headerBuf[2])<<8 | int64(headerBuf[3])<<16
+		if _, err := r.Seek(compressedSize, io.SeekCurrent); err != nil {
+			return nil, fmt.Errorf("seek past chunk data: %w", err)
+		}
+		offset += 8 + compressedSize
+		offsets = append(offsets, uint64(offset))
+	}
+}
+
+// ChunkDataRangeFromOffsets computes the same inclusive [startByte, endByte]
+// range as ChunkDataRange from cumulative packed end-offsets, without stream
+// access.
+func ChunkDataRangeFromOffsets(offsets []uint64, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
+	if chunkStart >= chunkEnd {
+		return 0, 0, fmt.Errorf("invalid chunk range: chunkStart (%d) must be less than chunkEnd (%d)", chunkStart, chunkEnd)
+	}
+	if uint64(chunkEnd) > uint64(len(offsets)) {
+		return 0, 0, fmt.Errorf("chunk range [%d, %d) out of bounds: xorb has %d chunks", chunkStart, chunkEnd, len(offsets))
+	}
+	if chunkStart > 0 {
+		startByte = int64(offsets[chunkStart-1])
+	}
+	return startByte, int64(offsets[chunkEnd-1]) - 1, nil
 }

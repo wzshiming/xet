@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
@@ -122,4 +124,80 @@ func fanoutEntries(dir string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// encodeTestXorb serializes chunks as an xorb, with or without footer.
+func encodeTestXorb(t *testing.T, withFooter bool, chunks ...[]byte) ([]byte, xet.XorbHash) {
+	t.Helper()
+	var encoded bytes.Buffer
+	enc := xorb.NewEncoder(&encoded, withFooter)
+	for _, c := range chunks {
+		if _, err := enc.Write(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes(), enc.SummoryHash()
+}
+
+func TestGetXorbDataRangeFromOffsets(t *testing.T) {
+	chunks := [][]byte{
+		bytes.Repeat([]byte{1}, 1000),
+		[]byte("second chunk"),
+		bytes.Repeat([]byte("abc"), 700),
+	}
+	numChunks := uint32(len(chunks))
+
+	// Reference ranges scanned from the chunk-data region, which is identical
+	// for footer and chunk-only formats.
+	reference, _ := encodeTestXorb(t, false, chunks...)
+
+	for _, format := range []struct {
+		name       string
+		withFooter bool
+	}{
+		{"footer", true},
+		{"chunk-only", false},
+	} {
+		t.Run(format.name, func(t *testing.T) {
+			fs, err := NewFileStorage(WithBasePath(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, xorbHash := encodeTestXorb(t, format.withFooter, chunks...)
+			if _, err := fs.PutXorb(context.Background(), "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+				t.Fatal(err)
+			}
+
+			for start := uint32(0); start < numChunks; start++ {
+				for end := start + 1; end <= numChunks; end++ {
+					wantStart, wantEnd, err := xorb.ChunkDataRange(bytes.NewReader(reference), start, end)
+					if err != nil {
+						t.Fatalf("ChunkDataRange(%d, %d): %v", start, end, err)
+					}
+					gotStart, gotEnd, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, start, end)
+					if err != nil {
+						t.Fatalf("GetXorbDataRange(%d, %d): %v", start, end, err)
+					}
+					if gotStart != wantStart || gotEnd != wantEnd {
+						t.Fatalf("range [%d, %d) = [%d, %d], want [%d, %d]", start, end, gotStart, gotEnd, wantStart, wantEnd)
+					}
+				}
+			}
+
+			if _, _, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, 0, numChunks+1); err == nil {
+				t.Fatal("GetXorbDataRange() accepted out-of-bounds chunk range")
+			}
+
+			// Cached offsets keep serving ranges without touching the xorb file.
+			if err := os.Remove(fs.objectPath("xorbs", xorbHash.String())); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, 1, 2); err != nil {
+				t.Fatalf("GetXorbDataRange() after xorb removal: %v", err)
+			}
+		})
+	}
 }
