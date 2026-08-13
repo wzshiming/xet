@@ -129,10 +129,17 @@ func WithUpstreamToken(token string) Option {
 	return func(h *Handler) { h.upstreamToken = token }
 }
 
-// WithCacheDir sets the directory holding the persisted index, in-flight
-// spool files, and the xet chunk cache. Defaults to ./xet-mirror.
+// WithCacheDir sets the directory holding the persisted index and in-flight
+// spool files. Defaults to ./xet-mirror.
 func WithCacheDir(dir string) Option {
 	return func(h *Handler) { h.cacheDir = dir }
+}
+
+// WithClient sets the xet client used for upstream xet downloads, letting
+// the caller configure it (chunk cache location, concurrency, ...). When
+// unset a default client is created.
+func WithClient(c *client.Client) Option {
+	return func(h *Handler) { h.xetClient = c }
 }
 
 // WithExternalURL sets the externally visible base URL used in Link headers
@@ -190,8 +197,7 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h.indexDir = filepath.Join(h.cacheDir, "index")
 	h.spoolDir = filepath.Join(h.cacheDir, "spool")
 	branchDir := h.branchDir()
-	chunkCacheDir := filepath.Join(h.cacheDir, "chunks")
-	for _, dir := range []string{h.indexDir, branchDir, h.spoolDir, chunkCacheDir} {
+	for _, dir := range []string{h.indexDir, branchDir, h.spoolDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("mirror: create %s: %w", dir, err)
 		}
@@ -224,11 +230,11 @@ func NewHandler(opts ...Option) (*Handler, error) {
 		}),
 	}
 
-	// Without an explicit cache dir the client would fall back to a shared
-	// location under os.TempDir; keep the chunk cache with the mirror data.
-	h.xetClient, err = client.NewClient(client.WithCacheDir(chunkCacheDir))
-	if err != nil {
-		return nil, fmt.Errorf("mirror: create xet client: %w", err)
+	if h.xetClient == nil {
+		h.xetClient, err = client.NewClient()
+		if err != nil {
+			return nil, fmt.Errorf("mirror: create xet client: %w", err)
+		}
 	}
 
 	h.localAdapter = &localCAS{storage: h.storage, namespace: "default"}
@@ -921,7 +927,6 @@ func (h *Handler) ingestSpool(ctx context.Context, t *task, key string) (*fileEn
 		fileHash, err := upload.UploadFile(ctx, h.localAdapter, f,
 			upload.WithEnableSHA256(true),
 			upload.WithConcurrency(4),
-			upload.WithCacheDir(h.spoolDir),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("ingest into storage: %w", err)
