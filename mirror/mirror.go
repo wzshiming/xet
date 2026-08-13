@@ -50,6 +50,15 @@ import (
 // treated as an opaque repo identity, so no platform-specific routing exists.
 var resolveRe = regexp.MustCompile(`^/(.+?)/resolve/([^/]+)/(.+)$`)
 
+// apiTreeRe matches hub tree listing API paths. Their entries carry per-file
+// xet hashes that would steer downstream clients straight to the upstream CAS.
+var apiTreeRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/(.+?)/tree/([^/]+)(/.*)?$`)
+
+// xetTokenRe matches the hub token refresh route hub clients construct
+// themselves ({endpoint}/api/{type}s/{repo}/xet-read-token/{revision})
+// when the resolve response carries no xet-auth Link header.
+var xetTokenRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/(.+?)/xet-read-token/([^/]+)$`)
+
 // commitRevRe matches revision strings that pin an immutable commit.
 var commitRevRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -93,10 +102,11 @@ type Handler struct {
 	next         http.Handler
 	localAdapter *localCAS
 
-	mu      sync.Mutex
-	flight  singleflight.Group
-	entries map[string]*fileEntry
-	tasks   map[string]*task
+	mu       sync.Mutex
+	flight   singleflight.Group
+	entries  map[string]*fileEntry
+	branches map[string]*branchEntry
+	tasks    map[string]*task
 }
 
 // Option configures the Handler.
@@ -178,8 +188,9 @@ func NewHandler(opts ...Option) (*Handler, error) {
 
 	h.indexDir = filepath.Join(h.cacheDir, "index")
 	h.spoolDir = filepath.Join(h.cacheDir, "spool")
+	branchDir := h.branchDir()
 	chunkCacheDir := filepath.Join(h.cacheDir, "chunks")
-	for _, dir := range []string{h.indexDir, h.spoolDir, chunkCacheDir} {
+	for _, dir := range []string{h.indexDir, branchDir, h.spoolDir, chunkCacheDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("mirror: create %s: %w", dir, err)
 		}
@@ -188,6 +199,10 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h.entries, err = loadIndex(h.indexDir)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: load index: %w", err)
+	}
+	h.branches, err = loadBranches(branchDir)
+	if err != nil {
+		return nil, fmt.Errorf("mirror: load branches: %w", err)
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
@@ -242,6 +257,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleToken(w, r)
 		return
 	}
+	if r.Method == http.MethodGet && xetTokenRe.MatchString(p) {
+		// Clients that skipped the resolve HEAD (hub tree caches) refresh
+		// their CAS credential here; answer locally so they stay on the
+		// mirror instead of the upstream CAS.
+		h.handleToken(w, r)
+		return
+	}
+	if r.Method == http.MethodGet && apiTreeRe.MatchString(p) {
+		h.handleTree(w, r)
+		return
+	}
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && resolveRe.MatchString(p) {
 		h.handleResolve(w, r, p)
 		return
@@ -286,6 +312,217 @@ func (h *Handler) upstreamURL(key string) string {
 	return strings.TrimRight(h.upstream.String(), "/") + key
 }
 
+func (h *Handler) branchDir() string {
+	return filepath.Join(h.indexDir, "branches")
+}
+
+// branchStale reports whether a branch mapping must be re-checked, following
+// the revalidation cadence: zero interval re-checks every request, negative
+// never does.
+func (h *Handler) branchStale(b *branchEntry) bool {
+	if h.revalidateInterval < 0 {
+		return false
+	}
+	return time.Since(b.CheckedAt) >= h.revalidateInterval
+}
+
+// branchProbe is the singleflight result of a branch mapping refresh. The
+// probe result is handed back to the caller whose key was probed so its
+// ingest task can reuse it instead of probing again.
+type branchProbe struct {
+	b   *branchEntry
+	key string
+	pr  *probeResult
+}
+
+// branchCommit resolves a branch revision to the upstream commit it points
+// at, probing the upstream when the cached mapping is stale. It reports
+// ok=false when no real commit is available (upstreams that synthesize
+// pseudo-commits keep the branch-keyed flow with per-entry revalidation);
+// probe failures fall back to the last known commit so cached content stays
+// served while the upstream is unreachable. The returned probe result is
+// non-nil when this call probed the upstream for exactly this key.
+func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bool) {
+	name := m[1] + "\x00" + m[2]
+	h.mu.Lock()
+	b := h.branches[name]
+	h.mu.Unlock()
+	if b != nil && !h.branchStale(b) {
+		return b.Commit, nil, b.Commit != ""
+	}
+
+	v, _, _ := h.flight.Do("branch\x00"+name, func() (any, error) {
+		h.mu.Lock()
+		b := h.branches[name]
+		h.mu.Unlock()
+		if b != nil && !h.branchStale(b) {
+			return &branchProbe{b: b}, nil
+		}
+		// Background context: the probe result is shared by every request of
+		// the repo branch, so one disconnecting client must not fail it.
+		pr, err := h.probe(context.Background(), key)
+		if err != nil {
+			return &branchProbe{b: b}, nil // unreachable upstream: serve the last known commit
+		}
+		nb := &branchEntry{Repo: m[1], Rev: m[2], CheckedAt: time.Now()}
+		if pr.realCommit && commitRevRe.MatchString(pr.commit) {
+			nb.Commit = pr.commit
+		}
+		h.mu.Lock()
+		h.branches[name] = nb
+		h.mu.Unlock()
+		_ = persistBranch(h.branchDir(), nb)
+		return &branchProbe{b: nb, key: key, pr: pr}, nil
+	})
+	bp := v.(*branchProbe)
+	var pr *probeResult
+	if bp.key == key {
+		pr = bp.pr
+	}
+	if bp.b != nil {
+		return bp.b.Commit, pr, bp.b.Commit != ""
+	}
+	return "", pr, false
+}
+
+// handleTree proxies a tree listing API request, rewriting each entry's
+// xetHash: files the mirror already holds advertise the mirror's own hash so
+// xet clients reconstruct them from the mirror CAS; all other entries lose
+// the hash so clients fall back to the resolve flow, which ingests through
+// the mirror. Left untouched, upstream hashes would send clients directly to
+// the upstream CAS, bypassing the mirror entirely. Hashes are only looked up
+// under immutable commits: branch revisions go through their pinned commit
+// mapping when fresh and are otherwise stripped, so a live listing is never
+// paired with hashes of content the branch no longer points at.
+func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
+	m := apiTreeRe.FindStringSubmatch(r.URL.EscapedPath())
+	u := h.upstreamURL(r.URL.EscapedPath())
+	if r.URL.RawQuery != "" {
+		u += "?" + r.URL.RawQuery
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp, err := h.fetchClient.Do(req)
+	if err != nil {
+		http.Error(w, "upstream tree fetch failed", http.StatusBadGateway)
+		return
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	// Pagination (Link) and the other upstream headers pass through; entity
+	// headers are recomputed for the rewritten body.
+	for k, vs := range resp.Header {
+		switch http.CanonicalHeaderKey(k) {
+		case "Content-Length", "Content-Encoding", "Transfer-Encoding":
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+
+	var items []map[string]any
+	var body []byte
+	if resp.StatusCode == http.StatusOK {
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "read upstream tree failed", http.StatusBadGateway)
+			return
+		}
+	}
+	if body == nil || json.Unmarshal(body, &items) != nil {
+		// Error status or unexpected shape: relay untouched.
+		w.WriteHeader(resp.StatusCode)
+		if body != nil {
+			_, _ = w.Write(body)
+		} else {
+			_, _ = io.Copy(w, resp.Body)
+		}
+		return
+	}
+
+	var ready map[string]string
+	lookupRev := m[3]
+	if !commitRevRe.MatchString(lookupRev) {
+		// Branch trees only advertise hashes through a fresh pinned commit;
+		// probing is left to the resolve path.
+		lookupRev = ""
+		name := strings.TrimPrefix(repoResolvePrefix(m[1], m[2]), "/") + "\x00" + m[3]
+		h.mu.Lock()
+		if b := h.branches[name]; b != nil && !h.branchStale(b) {
+			lookupRev = b.Commit
+		}
+		h.mu.Unlock()
+	}
+	if lookupRev != "" {
+		ready = h.readyFileHashes(repoResolvePrefix(m[1], m[2]), lookupRev)
+	}
+	for _, item := range items {
+		if _, ok := item["xetHash"]; !ok {
+			continue
+		}
+		path, _ := item["path"].(string)
+		if hash, ok := ready[path]; ok {
+			item["xetHash"] = hash
+		} else {
+			delete(item, "xetHash")
+		}
+	}
+
+	out, err := json.Marshal(items)
+	if err != nil {
+		http.Error(w, "encode tree failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Del("Etag") // body differs from upstream
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(out)
+}
+
+// repoResolvePrefix maps an API repo type and id to the repo prefix used in
+// resolve keys: models live at the root, other types keep their segment.
+func repoResolvePrefix(repoType, repoID string) string {
+	if repoType == "models" {
+		return "/" + repoID
+	}
+	return "/" + repoType + "/" + repoID
+}
+
+// readyFileHashes returns path -> local xet hash for ready entries of the
+// given repo whose key revision or ingested commit matches rev.
+func (h *Handler) readyFileHashes(repoPrefix, rev string) map[string]string {
+	prefix := repoPrefix + "/resolve/"
+	out := map[string]string{}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for key, e := range h.entries {
+		if e.State != stateReady || e.FileHash == "" || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rest := key[len(prefix):]
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			continue
+		}
+		if rest[:i] != rev && e.Commit != rev {
+			continue
+		}
+		// Keys hold escaped paths; tree entries carry them unescaped.
+		path := rest[i+1:]
+		if unescaped, err := url.PathUnescape(path); err == nil {
+			path = unescaped
+		}
+		out[path] = e.FileHash
+	}
+	return out
+}
+
 // task tracks one in-flight ingestion. All concurrent requests for the same
 // key attach to it, so the upstream is downloaded exactly once per file.
 type task struct {
@@ -312,6 +549,20 @@ func (t *task) setSize(n int64) {
 func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request, key string) {
 	m := resolveRe.FindStringSubmatch(key)
 	rev := m[2]
+
+	// Branch revisions are pinned to the upstream commit they point at, so
+	// entries, tasks, and spools are all keyed by immutable content. The
+	// branch mapping is re-checked on the revalidation cadence; one probe
+	// covers every file of the repo branch and is reused by the ingest task.
+	var preProbe *probeResult
+	if !commitRevRe.MatchString(rev) {
+		commit, pr, ok := h.branchCommit(key, m)
+		preProbe = pr
+		if ok {
+			rev = commit
+			key = "/" + m[1] + "/resolve/" + rev + "/" + m[3]
+		}
+	}
 
 	h.mu.Lock()
 	t := h.tasks[key]
@@ -341,7 +592,7 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request, key stri
 		}
 	}
 
-	t, e, err := h.startTask(key)
+	t, e, err := h.startTask(key, preProbe)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -383,8 +634,9 @@ func (h *Handler) serveTaskOrEntry(w http.ResponseWriter, r *http.Request, key s
 // startTask returns the in-flight ingestion task for key, or the entry when
 // the ingest already completed (or failed and is backing off). Only the task
 // startup itself runs inside the singleflight, so the task is registered
-// exactly once per key.
-func (h *Handler) startTask(key string) (*task, *fileEntry, error) {
+// exactly once per key. A pre-probe result from the branch mapping refresh is
+// handed to the task so the upstream is not probed twice.
+func (h *Handler) startTask(key string, pre *probeResult) (*task, *fileEntry, error) {
 	v, err, _ := h.flight.Do(key, func() (any, error) {
 		// A previous flight may have registered a task, or finished the whole
 		// ingest, between the caller's check and this one.
@@ -408,7 +660,7 @@ func (h *Handler) startTask(key string) (*task, *fileEntry, error) {
 		h.mu.Lock()
 		h.tasks[key] = nt
 		h.mu.Unlock()
-		go h.runTask(key, nt)
+		go h.runTask(key, nt, pre)
 		return nt, nil
 	})
 	if err != nil {
@@ -423,11 +675,14 @@ func (h *Handler) startTask(key string) (*task, *fileEntry, error) {
 // runTask executes one ingestion end to end on a background context; client
 // disconnects never cancel it. The spool opens after the probe so partial
 // bytes from a previous failed task (or a previous process) are resumed when
-// the upstream etag still matches.
-func (h *Handler) runTask(key string, t *task) {
+// the upstream etag still matches. A non-nil pre stands in for the probe.
+func (h *Handler) runTask(key string, t *task, pre *probeResult) {
 	ctx := context.Background()
 
-	pr, err := h.probe(ctx, key)
+	pr, err := pre, error(nil)
+	if pr == nil {
+		pr, err = h.probe(ctx, key)
+	}
 	if err == nil {
 		switch {
 		case pr.status == http.StatusNotFound:
@@ -712,7 +967,7 @@ func (h *Handler) revalidate(ctx context.Context, key string, e *fileEntry) *fil
 		delete(h.entries, key)
 	}
 	h.mu.Unlock()
-	_ = os.Remove(indexEntryPath(h.indexDir, key))
+	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, key))
 	return nil
 }
 

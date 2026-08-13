@@ -38,7 +38,10 @@ type probeResult struct {
 	etag   string
 	sha256 string // set when the upstream etag looks like a SHA-256
 	commit string
-	xet    bool // upstream advertised xet link headers on the resolve response
+	// realCommit records that commit came from the upstream rather than
+	// being synthesized; only real commits may pin branch revisions.
+	realCommit bool
+	xet        bool // upstream advertised xet link headers on the resolve response
 }
 
 var hexSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -93,6 +96,7 @@ func (h *Handler) probe(ctx context.Context, key string) (*probeResult, error) {
 	if hexSHA256Re.MatchString(res.etag) {
 		res.sha256 = res.etag
 	}
+	res.realCommit = res.commit != ""
 	if res.commit == "" {
 		// Hub clients (huggingface_hub) refuse to download when the resolve
 		// response has no X-Repo-Commit; synthesize one for upstreams (e.g.

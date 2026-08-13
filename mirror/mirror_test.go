@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,6 +208,7 @@ func downloadViaXet(t *testing.T, resolveURL string) []byte {
 type plainUpstream struct {
 	mu       sync.Mutex
 	files    map[string][]byte
+	api      map[string][]byte // raw JSON served under /api/ paths
 	commit   string
 	dataGETs atomic.Int64
 	seenAuth sync.Map // Authorization values observed on any request
@@ -215,7 +217,7 @@ type plainUpstream struct {
 }
 
 func newPlainUpstream() *plainUpstream {
-	return &plainUpstream{files: map[string][]byte{}, commit: "commit-1"}
+	return &plainUpstream{files: map[string][]byte{}, api: map[string][]byte{}, commit: "commit-1"}
 }
 
 func (u *plainUpstream) set(path string, data []byte) {
@@ -234,6 +236,19 @@ func (u *plainUpstream) get(path string) ([]byte, bool) {
 func (u *plainUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		u.seenAuth.Store(auth, true)
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		u.mu.Lock()
+		data, ok := u.api[r.URL.Path]
+		u.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+		return
 	}
 
 	if strings.HasPrefix(r.URL.Path, "/cdn") {
@@ -798,26 +813,380 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 
 	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 
-	resp, err := http.Get(fx.srv.URL + "/xet-token")
+	for _, path := range []string{"/xet-token", "/api/models/org/repo/xet-read-token/main"} {
+		resp, err := http.Get(fx.srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tok struct {
+			CASURL string `json:"casUrl"`
+			Token  string `json:"accessToken"`
+			Exp    int64  `json:"exp"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&tok)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tok.CASURL != fx.srv.URL {
+			t.Fatalf("%s: casUrl = %q, want %q", path, tok.CASURL, fx.srv.URL)
+		}
+		if tok.Exp <= time.Now().Unix() {
+			t.Fatalf("%s: exp = %d, want in the future", path, tok.Exp)
+		}
+		if !fx.issuer.Validate(tok.Token, time.Now()) {
+			t.Fatalf("%s: minted token does not validate", path)
+		}
+	}
+}
+
+func TestMirrorTreeRewrite(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	data := make([]byte, 128*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	const resolvePath = "/org/repo/resolve/main/model.bin"
+	upstream.set(resolvePath, data)
+	// A real commit revision: branch requests get pinned to it, so the
+	// upstream must serve the commit-keyed path the ingest will fetch.
+	upstream.commit = strings.Repeat("ab", 20)
+	upstream.set("/org/repo/resolve/"+upstream.commit+"/model.bin", data)
+	treeJSON := []byte(`[
+		{"type":"file","path":"model.bin","size":131072,"xetHash":"upstream-hash-1"},
+		{"type":"file","path":"other.bin","size":7,"xetHash":"upstream-hash-2"},
+		{"type":"directory","path":"sub"}
+	]`)
+	upstream.api["/api/models/org/repo/tree/main"] = treeJSON
+	upstream.api["/api/models/org/repo/tree/"+upstream.commit] = treeJSON
+
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+
+	fetchTree := func(rev string) []map[string]any {
+		t.Helper()
+		resp, err := http.Get(fx.srv.URL + "/api/models/org/repo/tree/" + rev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("tree status = %d, want 200", resp.StatusCode)
+		}
+		var items []map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 3 {
+			t.Fatalf("tree has %d entries, want 3", len(items))
+		}
+		return items
+	}
+
+	t.Run("uncached files lose xetHash", func(t *testing.T) {
+		for _, item := range fetchTree("main") {
+			if _, ok := item["xetHash"]; ok {
+				t.Fatalf("entry %v still carries xetHash", item["path"])
+			}
+		}
+	})
+
+	// Ingest model.bin, then the tree must advertise the mirror's own hash.
+	resolveURL := fx.srv.URL + resolvePath
+	resp, err := http.Get(resolveURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
-	var tok struct {
-		CASURL string `json:"casUrl"`
-		Token  string `json:"accessToken"`
-		Exp    int64  `json:"exp"`
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	ready := waitReady(t, resolveURL)
+	localHash := ready.Header.Get("X-Xet-Hash")
+	if localHash == "" {
+		t.Fatal("ready resolve response has no X-Xet-Hash")
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
+
+	t.Run("cached file advertises local hash on commit rev", func(t *testing.T) {
+		for _, item := range fetchTree(upstream.commit) {
+			hash, ok := item["xetHash"]
+			switch item["path"] {
+			case "model.bin":
+				if hash != localHash {
+					t.Fatalf("model.bin xetHash = %v, want %q", hash, localHash)
+				}
+			default:
+				if ok {
+					t.Fatalf("entry %v still carries xetHash", item["path"])
+				}
+			}
+		}
+	})
+
+	// Branch trees resolve through the pinned commit mapping established by
+	// the resolve requests above.
+	t.Run("branch rev advertises via pinned commit", func(t *testing.T) {
+		for _, item := range fetchTree("main") {
+			hash, ok := item["xetHash"]
+			switch item["path"] {
+			case "model.bin":
+				if hash != localHash {
+					t.Fatalf("model.bin xetHash = %v, want %q", hash, localHash)
+				}
+			default:
+				if ok {
+					t.Fatalf("entry %v still carries xetHash", item["path"])
+				}
+			}
+		}
+	})
+
+	// The tree rev the client uses must not resolve entries of other repos.
+	t.Run("other repo unaffected", func(t *testing.T) {
+		upstream.mu.Lock()
+		upstream.api["/api/models/org/other/tree/main"] = []byte(`[{"type":"file","path":"model.bin","size":1,"xetHash":"h"}]`)
+		upstream.mu.Unlock()
+		resp, err := http.Get(fx.srv.URL + "/api/models/org/other/tree/main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var items []map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := items[0]["xetHash"]; ok {
+			t.Fatal("other repo's entry kept xetHash despite no cache")
+		}
+	})
+}
+
+func TestMirrorBranchPinning(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	commit1 := strings.Repeat("11", 20)
+	commit2 := strings.Repeat("22", 20)
+	data1 := []byte("content at commit one")
+	data2 := []byte("content at commit two, updated")
+
+	upstream.commit = commit1
+	upstream.set("/org/repo/resolve/main/f.bin", data1)
+	upstream.set("/org/repo/resolve/"+commit1+"/f.bin", data1)
+
+	// Zero interval: the branch mapping is re-checked on every request.
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+	resolveURL := fx.srv.URL + "/org/repo/resolve/main/f.bin"
+
+	fetch := func(url string) []byte {
+		t.Helper()
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		return body
+	}
+
+	if got := fetch(resolveURL); !bytes.Equal(got, data1) {
+		t.Fatal("initial branch fetch mismatch")
+	}
+	waitReady(t, resolveURL)
+
+	// The entry is keyed by the pinned commit, so a commit-pinned request
+	// serves from cache without touching the branch.
+	if got := fetch(fx.srv.URL + "/org/repo/resolve/" + commit1 + "/f.bin"); !bytes.Equal(got, data1) {
+		t.Fatal("commit-pinned fetch mismatch")
+	}
+
+	// Move the branch upstream: the next branch request re-pins and ingests
+	// the new content, while the old commit stays served from cache.
+	upstream.commit = commit2
+	upstream.set("/org/repo/resolve/main/f.bin", data2)
+	upstream.set("/org/repo/resolve/"+commit2+"/f.bin", data2)
+
+	if got := fetch(resolveURL); !bytes.Equal(got, data2) {
+		t.Fatal("branch fetch after move mismatch")
+	}
+	waitReady(t, resolveURL)
+	if got := fetch(fx.srv.URL + "/org/repo/resolve/" + commit1 + "/f.bin"); !bytes.Equal(got, data1) {
+		t.Fatal("old commit no longer served after branch move")
+	}
+}
+
+func TestBranchEntryPath(t *testing.T) {
+	dir := filepath.Join("idx", "branches")
+
+	cases := []struct {
+		repo, rev string
+		want      string // relative to dir
+	}{
+		{"Qwen/Qwen3-0.6B", "main", "Qwen/Qwen3-0.6B/main.json"},
+		{"gpt2", "main", "gpt2/main.json"},
+		{"datasets/org/repo", "refs%2Fpr%2F1", "datasets/org/repo/refs%252Fpr%252F1.json"},
+		// Traversal and hostile names stay escaped.
+		{"..", "main", "%2E./main.json"},
+		{"org/..", "..", "org/%2E./%2E..json"},
+		{".hidden/repo", ".rev", "%2Ehidden/repo/%2Erev.json"},
+		{"a%b", "r", "a%25b/r.json"},
+		{"org/", "r", "org/%00/r.json"},
+		// A repo segment ending in .json cannot collide with mapping files.
+		{"org/main.json", "x", "org/main%2Ejson/x.json"},
+	}
+	for _, c := range cases {
+		want := filepath.Join(dir, filepath.FromSlash(c.want))
+		if got := branchEntryPath(dir, c.repo, c.rev); got != want {
+			t.Errorf("branchEntryPath(%q, %q) = %q, want %q", c.repo, c.rev, got, want)
+		}
+	}
+
+	t.Run("never escapes the branch dir", func(t *testing.T) {
+		hostile := []struct{ repo, rev string }{
+			{"../../etc", "passwd"},
+			{"..", ".."},
+			{"a/../../b", "r"},
+			{"", ""},
+			{"./.", "."},
+		}
+		for _, c := range hostile {
+			p := branchEntryPath(dir, c.repo, c.rev)
+			rel, err := filepath.Rel(dir, p)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				t.Errorf("branchEntryPath(%q, %q) = %q escapes %q", c.repo, c.rev, p, dir)
+			}
+		}
+	})
+
+	t.Run("overlong segment falls back to hashed name", func(t *testing.T) {
+		repo := strings.Repeat("x", 300)
+		sum := sha256.Sum256([]byte(repo + "@main"))
+		want := filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
+		if got := branchEntryPath(dir, repo, "main"); got != want {
+			t.Errorf("branchEntryPath overlong = %q, want hashed fallback %q", got, want)
+		}
+	})
+}
+
+// TestMirrorIndexLayout: branch mappings land at human-readable nested paths
+// and file entries group under their commit directory.
+func TestMirrorIndexLayout(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	commit := strings.Repeat("ab", 20)
+	data := []byte("layout test content")
+	upstream.commit = commit
+	upstream.set("/Qwen/Qwen3-0.6B/resolve/main/f.bin", data)
+	upstream.set("/Qwen/Qwen3-0.6B/resolve/"+commit+"/f.bin", data)
+
+	cacheDir := t.TempDir()
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), cacheDir)
+	resolveURL := fx.srv.URL + "/Qwen/Qwen3-0.6B/resolve/main/f.bin"
+
+	resp, err := http.Get(resolveURL)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if tok.CASURL != fx.srv.URL {
-		t.Fatalf("casUrl = %q, want %q", tok.CASURL, fx.srv.URL)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	waitReady(t, resolveURL)
+
+	mappingPath := filepath.Join(cacheDir, "index", "branches", "Qwen", "Qwen3-0.6B", "main.json")
+	raw, err := os.ReadFile(mappingPath)
+	if err != nil {
+		t.Fatalf("read branch mapping: %v", err)
 	}
-	if tok.Exp <= time.Now().Unix() {
-		t.Fatalf("exp = %d, want in the future", tok.Exp)
+	var b branchEntry
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
 	}
-	if !fx.issuer.Validate(tok.Token, time.Now()) {
-		t.Fatal("minted token does not validate")
+	if b.Repo != "Qwen/Qwen3-0.6B" || b.Rev != "main" || b.Commit != commit {
+		t.Fatalf("branch mapping = %+v, want repo Qwen/Qwen3-0.6B rev main commit %s", b, commit)
+	}
+
+	key := "/Qwen/Qwen3-0.6B/resolve/" + commit + "/f.bin"
+	sum := sha256.Sum256([]byte(key))
+	entryPath := filepath.Join(cacheDir, "index", commit, hex.EncodeToString(sum[:])+".json")
+	if _, err := os.Stat(entryPath); err != nil {
+		t.Fatalf("file entry not grouped under commit dir: %v", err)
+	}
+}
+
+// TestMirrorIndexMigration: entries persisted by older layouts (hashed branch
+// mapping names, flat file entries) move to their canonical locations on
+// startup and stay loaded.
+func TestMirrorIndexMigration(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	cacheDir := t.TempDir()
+	commit := strings.Repeat("cd", 20)
+
+	// Legacy hashed branch mapping.
+	branchDir := filepath.Join(cacheDir, "index", "branches")
+	if err := os.MkdirAll(branchDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	b := &branchEntry{Repo: "org/repo", Rev: "main", Commit: commit, CheckedAt: time.Now()}
+	rawB, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bSum := sha256.Sum256([]byte("org/repo@main"))
+	legacyBranch := filepath.Join(branchDir, hex.EncodeToString(bSum[:])+".json")
+	if err := os.WriteFile(legacyBranch, rawB, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Legacy flat file entry.
+	key := "/org/repo/resolve/" + commit + "/f.bin"
+	e := &fileEntry{Key: key, State: stateReady, Size: 1, ETag: "etag-1", Commit: commit, CheckedAt: time.Now()}
+	rawE, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eSum := sha256.Sum256([]byte(key))
+	flatEntry := filepath.Join(cacheDir, "index", hex.EncodeToString(eSum[:])+".json")
+	if err := os.WriteFile(flatEntry, rawE, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), cacheDir)
+
+	if _, err := os.Stat(legacyBranch); !os.IsNotExist(err) {
+		t.Fatalf("legacy hashed branch mapping still present: %v", err)
+	}
+	readable := filepath.Join(branchDir, "org", "repo", "main.json")
+	if _, err := os.Stat(readable); err != nil {
+		t.Fatalf("migrated branch mapping missing: %v", err)
+	}
+
+	if _, err := os.Stat(flatEntry); !os.IsNotExist(err) {
+		t.Fatalf("legacy flat entry still present: %v", err)
+	}
+	moved := filepath.Join(cacheDir, "index", commit, hex.EncodeToString(eSum[:])+".json")
+	if _, err := os.Stat(moved); err != nil {
+		t.Fatalf("migrated file entry missing: %v", err)
+	}
+
+	fx.handler.mu.Lock()
+	loadedEntry := fx.handler.entries[key]
+	loadedBranch := fx.handler.branches["org/repo\x00main"]
+	fx.handler.mu.Unlock()
+	if loadedEntry == nil {
+		t.Fatal("migrated file entry not loaded")
+	}
+	if loadedBranch == nil || loadedBranch.Commit != commit {
+		t.Fatalf("migrated branch mapping not loaded: %+v", loadedBranch)
 	}
 }
