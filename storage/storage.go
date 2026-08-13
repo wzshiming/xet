@@ -37,6 +37,11 @@ type Storage interface {
 	// PutShard stores a shard by its hash
 	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
+	// PinFile marks a file as a permanent GC root, exempting it and the
+	// storage it references from garbage collection. Direct uploads are
+	// pinned; mirror ingests are not, so retention can reclaim them.
+	PinFile(ctx context.Context, namespace string, fileHash xet.FileHash) error
+
 	// GetShard retrieves a shard by file hash
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)
 
@@ -167,6 +172,7 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 		filepath.Join(fs.basePath, "files"),
 		filepath.Join(fs.basePath, "chunks"),
 		filepath.Join(fs.basePath, "sha256"),
+		filepath.Join(fs.basePath, "pins"),
 	}
 
 	for _, dir := range dirs {
@@ -452,6 +458,17 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	}
 
 	return wasInserted, nil
+}
+
+// PinFile marks a file as a permanent GC root with an empty marker file at
+// pins/<file-hash>. Pinning is idempotent and does not require the file to
+// exist yet; a pin that never gains a file index entry is swept as garbage.
+func (fs *FileStorage) PinFile(_ context.Context, _ string, fileHash xet.FileHash) error {
+	pinPath := fs.objectPath("pins", fileHash.String())
+	if err := writeIndexFile(pinPath, nil); err != nil {
+		return fmt.Errorf("write pin for file %s: %w", fileHash.String(), err)
+	}
+	return nil
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on

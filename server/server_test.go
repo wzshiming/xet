@@ -125,6 +125,81 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 	})
 }
 
+// TestUploadedShardIsPinnedAgainstMirrorRootedGC uploads a file through the
+// HTTP shard endpoint and proves it survives a collection rooted only in a
+// (here empty) mirror index, the mixed mirror + self-hosted deployment.
+func TestUploadedShardIsPinnedAgainstMirrorRootedGC(t *testing.T) {
+	ctx := context.Background()
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(stor))
+
+	content := []byte("self-hosted model weights")
+	var encoded bytes.Buffer
+	encoder := xorb.NewEncoder(&encoded, true)
+	if _, err := encoder.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	xorbHash := encoder.SummoryHash()
+	if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	chunkHash := xet.ComputeChunkHash(content)
+	shardObj := shard.NewShard()
+	shardObj.AddFile(shard.FileBlock{
+		FileHash: xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(content))}),
+		Entries: []shard.FileDataSequenceEntry{
+			{CASHash: xorbHash, UnpackedSegBytes: uint32(len(content)), ChunkIndexEnd: 1},
+		},
+	})
+	shardObj.AddCASBlock(shard.CASBlock{
+		CASHash:       xorbHash,
+		Chunks:        []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(content))}},
+		NumBytesInCAS: uint32(len(content)),
+	})
+	shardBody, err := shardObj.Encode(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(shardBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/shards", bytes.NewReader(raw)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+
+	// A mirror-rooted collection with no ready entries would otherwise
+	// remove everything the upload just stored.
+	res, err := stor.GC(ctx, storage.WithGCGracePeriod(0), storage.WithGCRoots(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.LiveFiles != 1 || res.RemovedShards != 0 || res.RemovedXorbs != 0 {
+		t.Fatalf("GC = %+v, upload was not pinned", res)
+	}
+
+	digest := sha256.Sum256(content)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/xet-bridge/"+hex.EncodeToString(digest[:]), nil))
+	resp := rec.Result()
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !bytes.Equal(got, content) {
+		t.Fatalf("status = %d, body = %q, want the uploaded content", resp.StatusCode, got)
+	}
+}
+
 func TestXetBridgeRejectsInvalidAndUnknownSHA256(t *testing.T) {
 	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {

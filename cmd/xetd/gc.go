@@ -12,8 +12,10 @@ import (
 
 // runPeriodicGC runs one in-process collection per interval on the serving
 // storage. With a mirror, retention is applied through the handler first so
-// memory and disk stay consistent, and its live entries become the roots;
-// otherwise every uploaded file is a root and only orphans are collected.
+// memory and disk stay consistent, and its live entries become the roots -
+// together with pinned direct uploads, so self-hosted content coexisting
+// with the mirror is never collected; otherwise every uploaded file is a
+// root and only orphans are collected.
 func runPeriodicGC(st *storage.FileStorage, m *mirror.Handler, interval, grace, pruneAge time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -37,10 +39,9 @@ func runPeriodicGC(st *storage.FileStorage, m *mirror.Handler, interval, grace, 
 			fmt.Fprintf(os.Stderr, "gc: %v\n", err)
 			continue
 		}
-		if removed := res.RemovedFiles + res.RemovedShards + res.RemovedXorbs + res.RemovedChunks + res.RemovedSHA256s + res.RemovedTemps; removed > 0 {
+		if removed := res.RemovedFiles + res.RemovedShards + res.RemovedXorbs + res.RemovedChunks + res.RemovedSHA256s + res.RemovedPins + res.RemovedTemps; removed > 0 {
 			fmt.Printf("gc: removed %d objects, reclaimed %d bytes (%d files, %d shards, %d xorbs live)\n",
 				removed, res.ReclaimedBytes, res.LiveFiles, res.LiveShards, res.LiveXorbs)
 		}
 	}
 }
-

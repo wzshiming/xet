@@ -23,7 +23,7 @@ func main() {
 	authToken := flag.String("token", "", "Authentication token; also the secret for minted short-lived tokens (optional, if set, clients must provide this token or a minted one)")
 	upstream := flag.String("upstream", "", "Upstream hub URL to mirror, e.g. https://huggingface.co (enables mirror mode)")
 	upstreamToken := flag.String("upstream-token", "", "Bearer token the mirror uses against the upstream hub")
-	gcInterval := flag.Duration("gc-interval", 0, "Run in-process garbage collection at this interval while serving (0 disables); roots are the mirror index in mirror mode, every uploaded file otherwise")
+	gcInterval := flag.Duration("gc-interval", 0, "Run in-process garbage collection at this interval while serving (0 disables); roots are the mirror index plus pinned direct uploads in mirror mode, every uploaded file otherwise")
 	gcGrace := flag.Duration("gc-grace", storage.DefaultGCGracePeriod, "GC never removes objects modified within this window; must exceed the longest upload or ingest")
 	gcPruneIndex := flag.Duration("gc-prune-index", 0, "During periodic GC, drop mirror index entries and branch pins not used within this window (0 disables)")
 	flag.Parse()

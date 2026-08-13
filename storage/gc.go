@@ -35,6 +35,7 @@ type GCResult struct {
 	RemovedXorbs   int
 	RemovedChunks  int
 	RemovedSHA256s int
+	RemovedPins    int
 	RemovedTemps   int
 
 	ReclaimedBytes int64
@@ -51,10 +52,11 @@ type gcConfig struct {
 type GCOption func(*gcConfig)
 
 // WithGCRoots restricts the live set to the given root file hashes, e.g. the
-// mirror's ready index entries. Without this option every stored file index
-// entry is a root, which is the model for a standalone CAS server: uploaded
-// files stay forever and only orphaned shards, xorbs and dangling index
-// entries are collected.
+// mirror's ready index entries, plus every pinned file (see PinFile), so
+// directly uploaded content survives collections rooted in the mirror index.
+// Without this option every stored file index entry is a root, which is the
+// model for a standalone CAS server: uploaded files stay forever and only
+// orphaned shards, xorbs and dangling index entries are collected.
 func WithGCRoots(roots []xet.FileHash) GCOption {
 	return func(c *gcConfig) {
 		c.roots = roots
@@ -78,13 +80,14 @@ func WithGCDryRun(dryRun bool) GCOption {
 var objectNameRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // GC performs a mark-and-sweep collection over the storage directory. Roots
-// are file hashes (see WithGCRoots); from each root the files index resolves
-// to a shard, and the shard to every xorb it references. Everything else -
-// file and sha256 index entries of unreachable files, shards nobody
-// references, xorbs no live shard uses, chunk index entries pointing at dead
-// shards, and stale temporary files - is removed, oldest-reference first so a
-// crash mid-sweep never leaves an index entry pointing at a removed object
-// that a live one referenced.
+// are file hashes: the set given via WithGCRoots plus every pinned file, or
+// every stored file when no explicit set is given. From each root the files
+// index resolves to a shard, and the shard to every xorb it references.
+// Everything else - file and sha256 index entries of unreachable files,
+// shards nobody references, xorbs no live shard uses, chunk index entries
+// pointing at dead shards, dangling pins, and stale temporary files - is
+// removed, oldest-reference first so a crash mid-sweep never leaves an index
+// entry pointing at a removed object that a live one referenced.
 //
 // Objects modified within the grace period are neither collected nor treated
 // as broken; file index entries younger than the grace period additionally
@@ -109,11 +112,23 @@ func (fs *FileStorage) GC(ctx context.Context, opts ...GCOption) (*GCResult, err
 	cutoff := time.Now().Add(-cfg.grace)
 	res := &GCResult{}
 
-	// Mark phase: gather candidate roots. With an explicit root set, file
-	// index entries still inside the grace window are pinned as well.
+	// Mark phase: gather candidate roots. With an explicit root set, pinned
+	// files (direct uploads) and file index entries still inside the grace
+	// window are roots as well.
 	candidates := map[string]struct{}{}
 	for _, h := range cfg.roots {
 		candidates[h.String()] = struct{}{}
+	}
+	if cfg.hasRoots {
+		err := fs.gcWalk("pins", func(name, _ string, _ os.FileInfo, isObject bool) error {
+			if isObject {
+				candidates[name] = struct{}{}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	err := fs.gcWalk("files", func(name, _ string, info os.FileInfo, isObject bool) error {
 		if !isObject {
@@ -176,6 +191,10 @@ func (fs *FileStorage) GC(ctx context.Context, opts ...GCOption) (*GCResult, err
 		removed *int
 		dead    func(name, path string) bool
 	}{
+		{"pins", &res.RemovedPins, func(name, _ string) bool {
+			_, live := liveFiles[name]
+			return !live // only dangling pins: a resolvable pin makes its file live
+		}},
 		{"files", &res.RemovedFiles, func(name, _ string) bool {
 			_, live := liveFiles[name]
 			return !live

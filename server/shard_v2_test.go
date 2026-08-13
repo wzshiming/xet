@@ -35,6 +35,10 @@ func (s *shardV2TestStorage) PutShard(context.Context, *shard.Shard) (bool, erro
 	return true, nil
 }
 
+func (s *shardV2TestStorage) PinFile(context.Context, string, xet.FileHash) error {
+	return nil
+}
+
 type shardUploadWireEvent struct {
 	Type      string `json:"type"`
 	Verified  uint64 `json:"verified"`

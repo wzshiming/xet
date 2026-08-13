@@ -385,6 +385,51 @@ func TestGCKeepsXorbsDeduplicatedFromDeadShards(t *testing.T) {
 	}
 }
 
+func TestGCPinnedFilesSurviveExplicitRoots(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A direct upload (pinned) and a mirror ingest (unpinned), with no
+	// explicit roots at all: only the pin keeps content alive.
+	pinned := putTestFile(t, fs, []byte("self-hosted upload"))
+	unpinned := putTestFile(t, fs, []byte("mirror ingested content"))
+	if err := fs.PinFile(ctx, "default", pinned.fileHash); err != nil {
+		t.Fatal(err)
+	}
+	// A pin whose file never landed is itself garbage.
+	danglingHash := xet.FileHash{0xde, 0xad}
+	if err := fs.PinFile(ctx, "default", danglingHash); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := fs.GC(ctx,
+		WithGCGracePeriod(0),
+		WithGCRoots(nil),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.LiveFiles != 1 || res.RemovedFiles != 1 || res.RemovedShards != 1 || res.RemovedXorbs != 1 {
+		t.Fatalf("counts = live %d, files %d, shards %d, xorbs %d; want 1/1/1/1",
+			res.LiveFiles, res.RemovedFiles, res.RemovedShards, res.RemovedXorbs)
+	}
+	if res.RemovedPins != 1 || res.BrokenRoots != 1 {
+		t.Fatalf("RemovedPins = %d, BrokenRoots = %d; want dangling pin swept and counted", res.RemovedPins, res.BrokenRoots)
+	}
+
+	mustExist(t, fs.objectPath("pins", pinned.fileHash.String()))
+	mustExist(t, fs.objectPath("files", pinned.fileHash.String()))
+	mustExist(t, fs.objectPath("shards", pinned.shardHash))
+	mustExist(t, fs.objectPath("xorbs", pinned.xorbHash.String()))
+	mustNotExist(t, fs.objectPath("pins", danglingHash.String()))
+	mustNotExist(t, fs.objectPath("files", unpinned.fileHash.String()))
+	mustNotExist(t, fs.objectPath("shards", unpinned.shardHash))
+	mustNotExist(t, fs.objectPath("xorbs", unpinned.xorbHash.String()))
+}
+
 func TestGCSweepsStaleTempFiles(t *testing.T) {
 	basePath := t.TempDir()
 	fs, err := NewFileStorage(WithBasePath(basePath))

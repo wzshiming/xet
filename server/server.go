@@ -466,6 +466,13 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 	if err != nil {
 		return false, http.StatusInternalServerError, fmt.Errorf("failed to store shard")
 	}
+	// Direct uploads are pinned as permanent GC roots; pinning also when the
+	// shard already existed covers re-uploads of content the mirror ingested.
+	for _, fileBlock := range shardObj.Files {
+		if err := s.storage.PinFile(r.Context(), "default", fileBlock.FileHash); err != nil {
+			return false, http.StatusInternalServerError, fmt.Errorf("failed to pin uploaded file")
+		}
+	}
 	return wasInserted, http.StatusOK, nil
 }
 
