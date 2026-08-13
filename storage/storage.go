@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,19 +50,21 @@ type Storage interface {
 
 // FileStorage implements Storage using the filesystem
 type FileStorage struct {
-	basePath    string
-	baseURL     string
-	fileIndex   *lru.Cache // bounded file hash -> shard hash
-	shardIndex  *lru.Cache // bounded shard hash -> shard cache
-	chunkIndex  *lru.Cache // bounded chunk hash -> shard hash
-	sha256Index *lru.Cache // bounded SHA-256 -> file hash
-	xorbIndex   *lru.Cache // bounded xorb hash -> *xorbFile
+	basePath     string
+	baseURL      string
+	fileIndex    *lru.Cache // bounded file hash -> shard hash
+	shardIndex   *lru.Cache // bounded shard hash -> shard cache
+	chunkIndex   *lru.Cache // bounded chunk hash -> shard hash
+	sha256Index  *lru.Cache // bounded SHA-256 -> file hash
+	xorbIndex    *lru.Cache // bounded xorb hash -> *xorbFile
+	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
 
-	fileMut   sync.Mutex // guards fileIndex
-	shardMut  sync.Mutex // guards shardIndex
-	chunkMut  sync.Mutex // guards chunkIndex
-	sha256Mut sync.Mutex // guards sha256Index
-	xorbMut   sync.Mutex // guards xorbIndex
+	fileMut    sync.Mutex // guards fileIndex
+	shardMut   sync.Mutex // guards shardIndex
+	chunkMut   sync.Mutex // guards chunkIndex
+	sha256Mut  sync.Mutex // guards sha256Index
+	xorbMut    sync.Mutex // guards xorbIndex
+	offsetsMut sync.Mutex // guards offsetsIndex
 }
 
 // xorbFile wraps an open xorb handle with its own mutex so that only uses of
@@ -77,6 +80,7 @@ const defaultShardCacheSize = 512
 const defaultChunkCacheSize = 4096
 const defaultSHA256CacheSize = 4096
 const defaultXorbCacheSize = 512
+const defaultOffsetsCacheSize = 512
 
 type Option func(*FileStorage)
 
@@ -136,13 +140,14 @@ func WithXorbCacheSize(size int) Option {
 // NewFileStorage creates a new filesystem-based storage
 func NewFileStorage(opts ...Option) (*FileStorage, error) {
 	fs := &FileStorage{
-		basePath:    "./xet",
-		baseURL:     "",
-		fileIndex:   lru.New(defaultFileCacheSize),
-		shardIndex:  lru.New(defaultShardCacheSize),
-		chunkIndex:  lru.New(defaultChunkCacheSize),
-		sha256Index: lru.New(defaultSHA256CacheSize),
-		xorbIndex:   lru.New(defaultXorbCacheSize),
+		basePath:     "./xet",
+		baseURL:      "",
+		fileIndex:    lru.New(defaultFileCacheSize),
+		shardIndex:   lru.New(defaultShardCacheSize),
+		chunkIndex:   lru.New(defaultChunkCacheSize),
+		sha256Index:  lru.New(defaultSHA256CacheSize),
+		xorbIndex:    lru.New(defaultXorbCacheSize),
+		offsetsIndex: lru.New(defaultOffsetsCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -480,6 +485,38 @@ func (fs *FileStorage) openXorb(casHash xet.XorbHash) (*xorbFile, error) {
 	return xf, nil
 }
 
+// xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
+// the xorb, from the in-memory cache, the xorb footer, or a full header scan
+// for footer-less xorbs. Once cached, chunk ranges are computed without
+// touching the xorb file.
+func (fs *FileStorage) xorbChunkOffsets(xorbHash xet.XorbHash) ([]uint64, error) {
+	fs.offsetsMut.Lock()
+	if v, ok := fs.offsetsIndex.Get(xorbHash); ok {
+		fs.offsetsMut.Unlock()
+		return v.([]uint64), nil
+	}
+	fs.offsetsMut.Unlock()
+
+	xf, err := fs.openXorb(xorbHash)
+	if err != nil {
+		return nil, err
+	}
+	xf.mut.Lock()
+	offsets, err := xorb.ReadChunkOffsets(xf.f)
+	if errors.Is(err, xorb.ErrNoFooter) {
+		offsets, err = xorb.ScanChunkOffsets(xf.f)
+	}
+	xf.mut.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
+	}
+
+	fs.offsetsMut.Lock()
+	fs.offsetsIndex.Add(xorbHash, offsets)
+	fs.offsetsMut.Unlock()
+	return offsets, nil
+}
+
 func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
 	if len(fileBlock.Entries) == 0 {
 		return [32]byte{}, nil
@@ -492,23 +529,21 @@ func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.F
 			return [32]byte{}, err
 		}
 
-		// Cached handles are shared, and their seek offsets are mutable, so the
-		// whole seek+read sequence is serialized per handle. Different xorbs
-		// proceed in parallel.
+		offsets, err := fs.xorbChunkOffsets(entry.CASHash)
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("locate xorb chunks: %w", err)
+		}
+		start, end, err := xorb.ChunkDataRangeFromOffsets(offsets, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("locate xorb chunks: %w", err)
+		}
+		// Cached handles are shared; holding the handle lock keeps eviction from
+		// closing the file mid-read. Different xorbs proceed in parallel.
 		xf, err := fs.openXorb(entry.CASHash)
 		if err != nil {
 			return [32]byte{}, err
 		}
 		xf.mut.Lock()
-		if _, err := xf.f.Seek(0, io.SeekStart); err != nil {
-			xf.mut.Unlock()
-			return [32]byte{}, fmt.Errorf("rewind xorb %s: %w", entry.CASHash.String(), err)
-		}
-		start, end, err := xorb.ChunkDataRange(xf.f, entry.ChunkIndexStart, entry.ChunkIndexEnd)
-		if err != nil {
-			xf.mut.Unlock()
-			return [32]byte{}, fmt.Errorf("locate xorb chunks: %w", err)
-		}
 		decoder := xorb.NewDecoder(io.NewSectionReader(xf.f, start, end-start+1), false)
 		written, err := io.CopyBuffer(h, decoder, buf)
 		xf.mut.Unlock()
@@ -620,17 +655,12 @@ func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) strin
 // The returned range includes the 8-byte chunk header for each chunk, so that
 // xet-core can parse the header (version, compressed/uncompressed size,
 // compression type) when it downloads that byte range.
+// Ranges are computed from cached per-xorb chunk offsets, so the xorb file is
+// only read (footer or full scan) the first time it is seen.
 func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	xorbPath := fs.objectPath("xorbs", xorbHash.String())
-	f, err := os.Open(xorbPath)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to open xorb file: %w", err)
-	}
-	defer f.Close()
-
-	startByte, endByte, err = xorb.ChunkDataRange(f, chunkStart, chunkEnd)
+	offsets, err := fs.xorbChunkOffsets(xorbHash)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
-	return startByte, endByte, nil
+	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
 }
