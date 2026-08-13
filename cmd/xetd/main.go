@@ -32,6 +32,7 @@ func main() {
 	s3PathStyle := flag.Bool("s3-path-style", false, "Use path-style S3 addressing (required by MinIO and most self-hosted stores)")
 	s3Presign := flag.Bool("s3-presign", true, "Serve xorb downloads as presigned S3 GET URLs; disable when clients cannot reach the S3 endpoint")
 	s3PresignExpiry := flag.Duration("s3-presign-expiry", time.Hour, "Validity of presigned xorb URLs")
+	s3PresignEndpoint := flag.String("s3-presign-endpoint", "", "Endpoint used in presigned xorb URLs when clients reach the object store at a different address than the server (optional, defaults to -s3-endpoint)")
 	flag.Parse()
 
 	// Create storage: S3 when a bucket is configured, local filesystem otherwise.
@@ -46,6 +47,7 @@ func main() {
 			storage.WithS3PathStyle(*s3PathStyle),
 			storage.WithS3Presign(*s3Presign),
 			storage.WithS3PresignExpiry(*s3PresignExpiry),
+			storage.WithS3PresignEndpoint(*s3PresignEndpoint),
 			storage.WithS3BaseURL(*baseURL),
 		)
 		if err == nil {

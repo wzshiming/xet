@@ -317,4 +317,11 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 	if got, want := plain.GetXorbURL("ns", xorbHash), "/v1/xorbs/ns/"+xorbHash.String(); got != want {
 		t.Fatalf("GetXorbURL() with presign disabled = %q, want %q", got, want)
 	}
+
+	// A distinct presign endpoint moves only the URL host, not the API client.
+	public := newTestS3Storage(t, WithS3PresignEndpoint("http://public.example:9000"))
+	got := public.GetXorbURL("default", xorbHash)
+	if !strings.HasPrefix(got, "http://public.example:9000/") || !strings.Contains(got, "X-Amz-Signature") {
+		t.Fatalf("GetXorbURL() with presign endpoint = %q, want presigned URL at public.example", got)
+	}
 }

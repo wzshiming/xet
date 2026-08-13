@@ -34,13 +34,14 @@ const defaultPresignExpiry = time.Hour
 // chunks/, sha256/ with a two-character fanout), so a bucket populated by
 // syncing a FileStorage directory is directly usable.
 type S3Storage struct {
-	client        *s3.Client
-	presignClient *s3.PresignClient
-	bucket        string
-	prefix        string
-	baseURL       string
-	presign       bool
-	presignExpiry time.Duration
+	client          *s3.Client
+	presignClient   *s3.PresignClient
+	bucket          string
+	prefix          string
+	baseURL         string
+	presign         bool
+	presignExpiry   time.Duration
+	presignEndpoint string
 
 	fileIndex    *lru.Cache // bounded file hash -> shard hash
 	shardIndex   *lru.Cache // bounded shard hash -> shard cache
@@ -134,6 +135,17 @@ func WithS3PresignExpiry(expiry time.Duration) S3Option {
 	}
 }
 
+// WithS3PresignEndpoint presigns xorb URLs against a different endpoint than
+// the one the server itself uses, for deployments where clients reach the
+// object store through a public address while the server uses an internal
+// one. Signatures cover the host, so the two endpoints must be the same
+// store; defaults to the server's endpoint.
+func WithS3PresignEndpoint(endpoint string) S3Option {
+	return func(ss *S3Storage) {
+		ss.presignEndpoint = endpoint
+	}
+}
+
 // NewS3Storage creates an S3-backed storage. Credentials are resolved
 // through the standard AWS configuration chain (environment variables,
 // shared config, IAM roles) unless a client is injected with WithS3Client.
@@ -172,7 +184,15 @@ func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 			o.UsePathStyle = ss.pathStyle
 		})
 	}
-	ss.presignClient = s3.NewPresignClient(ss.client)
+	if ss.presignEndpoint != "" {
+		// The presign client never sends requests; it only shapes and signs
+		// the URL, so a client copy with the public endpoint is enough.
+		presignOpts := ss.client.Options()
+		presignOpts.BaseEndpoint = aws.String(ss.presignEndpoint)
+		ss.presignClient = s3.NewPresignClient(s3.New(presignOpts))
+	} else {
+		ss.presignClient = s3.NewPresignClient(ss.client)
+	}
 
 	return ss, nil
 }
