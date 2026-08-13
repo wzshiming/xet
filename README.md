@@ -17,6 +17,7 @@ Implemented in this repository:
 - Upload and download client workflows
 - CAS server implementation for local or self-hosted usage
 - Mirror mode: full-cache middle layer bridging xet and plain hubs
+- Garbage collection for storage and the mirror index (periodic in-server via `xetd -gc-interval`)
 - Hugging Face token/LFS based integration helpers
 - Conformance and unit tests for key protocol paths
 

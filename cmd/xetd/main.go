@@ -23,6 +23,9 @@ func main() {
 	authToken := flag.String("token", "", "Authentication token; also the secret for minted short-lived tokens (optional, if set, clients must provide this token or a minted one)")
 	upstream := flag.String("upstream", "", "Upstream hub URL to mirror, e.g. https://huggingface.co (enables mirror mode)")
 	upstreamToken := flag.String("upstream-token", "", "Bearer token the mirror uses against the upstream hub")
+	gcInterval := flag.Duration("gc-interval", 0, "Run in-process garbage collection at this interval while serving (0 disables); roots are the mirror index in mirror mode, every uploaded file otherwise")
+	gcGrace := flag.Duration("gc-grace", storage.DefaultGCGracePeriod, "GC never removes objects modified within this window; must exceed the longest upload or ingest")
+	gcPruneIndex := flag.Duration("gc-prune-index", 0, "During periodic GC, drop mirror index entries and branch pins not used within this window (0 disables)")
 	flag.Parse()
 
 	// Create storage
@@ -56,12 +59,13 @@ func main() {
 	}
 
 	var next http.Handler
+	var mirrorHandler *mirror.Handler
 
 	if *upstream != "" {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
 		// The mirror handles resolve/token requests and proxies the rest to
 		// the upstream; the CAS server below matches its own routes first.
-		next, err = mirror.NewHandler(
+		mirrorHandler, err = mirror.NewHandler(
 			mirror.WithStorage(storage),
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
@@ -73,8 +77,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
 			os.Exit(1)
 		}
+		next = mirrorHandler
 
 		fmt.Printf("Mirror mode enabled, upstream: %s\n", *upstream)
+	}
+
+	if *gcInterval > 0 {
+		go runPeriodicGC(storage, mirrorHandler, *gcInterval, *gcGrace, *gcPruneIndex)
+		fmt.Printf("Periodic GC enabled, interval: %s, grace: %s\n", *gcInterval, *gcGrace)
 	}
 
 	// Create server
