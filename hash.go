@@ -154,6 +154,21 @@ func ComputeChunkHash(data []byte) ChunkHash {
 	return result
 }
 
+// HMAC returns the keyed form of the chunk hash: a BLAKE3 keyed hash of the
+// raw hash bytes, matching xet-core's MerkleHash::hmac. CAS servers key the
+// chunk hashes in returned global-dedup shards with a per-shard key.
+func (h ChunkHash) HMAC(key [32]byte) ChunkHash {
+	hasher, err := blake3.NewKeyed(key[:])
+	if err != nil {
+		// Unreachable: NewKeyed only fails for keys that are not 32 bytes.
+		panic("blake3.NewKeyed: " + err.Error())
+	}
+	hasher.Write(h[:])
+	var result ChunkHash
+	hasher.Sum(result[:0])
+	return result
+}
+
 // computeInternalNodeHash computes the hash of an internal node using INTERNAL_NODE_KEY
 func computeInternalNodeHash(data []byte) hash {
 	hasher := internalNodeKeyPool.Get().(*blake3.Hasher)

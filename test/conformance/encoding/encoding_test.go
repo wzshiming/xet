@@ -97,6 +97,56 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+// TestHMACConformance verifies ChunkHash.HMAC matches xet-core's
+// MerkleHash::hmac, which keys the chunk hashes in global-dedup shards.
+func TestHMACConformance(t *testing.T) {
+	var sequential, ones [32]byte
+	for i := range sequential {
+		sequential[i] = byte(i)
+		ones[i] = 0xFF
+	}
+
+	hashes := []xet.ChunkHash{
+		{}, // zero hash
+		xet.ChunkHash(sequential),
+		xet.ChunkHash(ones),
+		xet.ComputeChunkHash([]byte("Hello World!")),
+		xet.ComputeChunkHash(utils.MakeRandData(4096)),
+	}
+	keys := [][32]byte{
+		{}, // zero key: the primitive still computes; only the shard layer treats it as unkeyed
+		sequential,
+		ones,
+		[32]byte(xet.ComputeChunkHash([]byte("per-shard hmac key"))),
+	}
+
+	var cases []rustref.HMACCase
+	var native []string
+	for _, chunkHash := range hashes {
+		for _, key := range keys {
+			cases = append(cases, rustref.HMACCase{
+				Hash: chunkHash.String(),
+				Key:  xet.ChunkHash(key).String(),
+			})
+			native = append(native, chunkHash.HMAC(key).String())
+		}
+	}
+
+	reference, err := rustref.HashHMAC(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reference) != len(cases) {
+		t.Fatalf("result count mismatch: got %d want %d", len(reference), len(cases))
+	}
+	for i := range cases {
+		if native[i] != reference[i] {
+			t.Errorf("hmac mismatch for hash=%s key=%s: native=%s reference=%s",
+				cases[i].Hash, cases[i].Key, native[i], reference[i])
+		}
+	}
+}
+
 func TestXorbConformance(t *testing.T) {
 	tests := []struct {
 		name string

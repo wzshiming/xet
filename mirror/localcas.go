@@ -44,7 +44,9 @@ func (l *localCAS) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upl
 	return &upload.ShardUploadResponse{Result: result}, nil
 }
 
-func (l *localCAS) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+// Local shards are stored with raw chunk hashes, so keyed-shard candidates
+// are unnecessary here.
+func (l *localCAS) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, _ ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
 		if _, ok := results[chunkHash]; ok {

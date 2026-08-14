@@ -37,8 +37,8 @@ func (a authProviderUploadAdapter) UploadShard(ctx context.Context, shardObj *sh
 	return a.client.UploadShardWithAuthProvider(ctx, a.provider, shardObj)
 }
 
-func (a authProviderUploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return a.client.QueryDedupShardsWithAuthProvider(ctx, a.provider, chunkHashes)
+func (a authProviderUploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+	return a.client.QueryDedupShardsWithAuthProvider(ctx, a.provider, chunkHashes, candidates...)
 }
 
 // UploadFile uploads a single file through the V1 shard API and returns its hash.

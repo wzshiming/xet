@@ -50,6 +50,12 @@ struct ChunkInfo {
     size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct HmacCase {
+    hash: String,
+    key: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UploadResult {
     hash: String,
@@ -77,6 +83,7 @@ fn run() -> Result<()> {
         "hash-xorb" => write_json(&hash_list(HashKind::Xorb)?),
         "hash-file" => write_json(&hash_list(HashKind::File)?),
         "hash-range" => write_json(&hash_list(HashKind::Range)?),
+        "hash-hmac" => write_json(&hash_hmac()?),
         "hash-files" => {
             let paths: Vec<String> = read_json()?;
             let context = XetContext::default()?;
@@ -244,6 +251,19 @@ fn hash_list(kind: HashKind) -> Result<String> {
         }
     };
     Ok(hash.hex())
+}
+
+/// Keyed chunk hashes as used for HMAC-keyed global-dedup shards.
+fn hash_hmac() -> Result<Vec<String>> {
+    let cases: Vec<HmacCase> = read_json()?;
+    cases
+        .into_iter()
+        .map(|case| {
+            let hash = MerkleHash::from_hex(&case.hash)?;
+            let key = MerkleHash::from_hex(&case.key)?;
+            Ok(hash.hmac(key).hex())
+        })
+        .collect()
 }
 
 fn sha256_policies(request: &UploadRequest) -> Result<Vec<Sha256Policy>> {

@@ -225,6 +225,20 @@ func hashList(command string, chunks []ChunkInfo) (string, error) {
 	return result, err
 }
 
+// HMACCase pairs a chunk hash with an HMAC key, both in XET hex form.
+type HMACCase struct {
+	Hash string `json:"hash"`
+	Key  string `json:"key"`
+}
+
+// HashHMAC computes keyed chunk hashes via xet-core's MerkleHash::hmac, as
+// applied to chunk hashes in HMAC-keyed global-dedup shards.
+func HashHMAC(cases []HMACCase) ([]string, error) {
+	var result []string
+	err := runJSON("hash-hmac", cases, &result)
+	return result, err
+}
+
 func HashFiles(filePaths []string) ([]UploadResult, error) {
 	var result []UploadResult
 	err := runJSON("hash-files", filePaths, &result)
