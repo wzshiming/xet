@@ -1180,7 +1180,8 @@ func TestMirrorIndexMigration(t *testing.T) {
 	}
 
 	fx.handler.mu.Lock()
-	loadedEntry := fx.handler.entries[key]
+	k, _ := parseResolveKey(key)
+	loadedEntry := fx.handler.entries[k]
 	loadedBranch := fx.handler.branches["org/repo\x00main"]
 	fx.handler.mu.Unlock()
 	if loadedEntry == nil {

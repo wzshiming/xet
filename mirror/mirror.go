@@ -62,11 +62,37 @@ const (
 )
 
 var (
-	errUpstreamNotFound = errors.New("upstream file not found")
+	// ErrUpstreamNotFound reports that the upstream hub has no file at the
+	// requested key. Errors returned by Ingest match it with errors.Is.
+	ErrUpstreamNotFound = errors.New("upstream file not found")
 	// errSpoolCorrupt marks spooled bytes that failed verification; the spool
 	// must be discarded rather than kept for resume.
 	errSpoolCorrupt = errors.New("spool corrupt")
 )
+
+// resolveKey identifies one (repo, rev, path) file and keys the in-memory
+// entry and task maps. Fields hold escaped URL path segments exactly as they
+// appear in the hub-style resolve path.
+type resolveKey struct {
+	repo string
+	rev  string
+	path string
+}
+
+// parseResolveKey splits a hub-style download path into its key.
+func parseResolveKey(p string) (resolveKey, bool) {
+	m := resolveRe.FindStringSubmatch(p)
+	if m == nil {
+		return resolveKey{}, false
+	}
+	return resolveKey{repo: m[1], rev: m[2], path: m[3]}, true
+}
+
+// String renders the hub-style resolve path, the form used for upstream
+// URLs, spool names, and the persisted index.
+func (k resolveKey) String() string {
+	return "/" + k.repo + "/resolve/" + k.rev + "/" + k.path
+}
 
 // Handler is the mirror HTTP front end: resolve requests are served from the
 // local cache (ingesting on miss) and the token endpoint hands downstream
@@ -95,9 +121,9 @@ type Handler struct {
 
 	mu       sync.Mutex
 	flight   singleflight.Group
-	entries  map[string]*fileEntry
+	entries  map[resolveKey]*fileEntry
 	branches map[string]*branchEntry
-	tasks    map[string]*task
+	tasks    map[resolveKey]*task
 }
 
 // Option configures the Handler.
@@ -165,8 +191,8 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h := &Handler{
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
-		entries:            map[string]*fileEntry{},
-		tasks:              map[string]*task{},
+		entries:            map[resolveKey]*fileEntry{},
+		tasks:              map[resolveKey]*task{},
 	}
 	for _, opt := range opts {
 		opt(h)

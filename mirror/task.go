@@ -22,6 +22,7 @@ type task struct {
 	spool    *spool        // set by runTask before probed closes (when the probe succeeded)
 	probed   chan struct{} // closed once probe metadata (or probeErr) is set
 	sized    chan struct{} // closed once size is known or no early source remains
+	done     chan struct{} // closed once the task finished and its entry is published
 	sizeOnce sync.Once
 	probeErr error
 	notFound bool
@@ -43,8 +44,8 @@ func (t *task) setSize(n int64) {
 // startup itself runs inside the singleflight, so the task is registered
 // exactly once per key. A pre-probe result from the branch mapping refresh is
 // handed to the task so the upstream is not probed twice.
-func (h *Handler) startTask(key string, pre *probeResult) (*task, *fileEntry, error) {
-	v, err, _ := h.flight.Do(key, func() (any, error) {
+func (h *Handler) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry, error) {
+	v, err, _ := h.flight.Do(key.String(), func() (any, error) {
 		// A previous flight may have registered a task, or finished the whole
 		// ingest, between the caller's check and this one.
 		h.mu.Lock()
@@ -62,7 +63,7 @@ func (h *Handler) startTask(key string, pre *probeResult) (*task, *fileEntry, er
 				return e, nil
 			}
 		}
-		nt := &task{probed: make(chan struct{}), sized: make(chan struct{})}
+		nt := &task{probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
 		nt.size.Store(-1)
 		h.mu.Lock()
 		h.tasks[key] = nt
@@ -79,34 +80,82 @@ func (h *Handler) startTask(key string, pre *probeResult) (*task, *fileEntry, er
 	return nil, v.(*fileEntry), nil
 }
 
+// acquire is the shared resolution flow behind both the HTTP resolve path and
+// Ingest: it pins branch revisions to their upstream commit and returns what
+// the request attaches to — the in-flight task, or the terminal entry (ready,
+// revalidated on the usual cadence, or failed and still inside its retry
+// backoff) — starting a new ingest task when neither exists. Exactly one of
+// the returned task and entry is non-nil; the returned key carries the branch
+// pin. ctx bounds only the revalidation probe.
+func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *task, *fileEntry, error) {
+	var preProbe *probeResult
+	if !commitRevRe.MatchString(key.rev) {
+		commit, pr, ok := h.branchCommit(key)
+		preProbe = pr
+		if ok {
+			key.rev = commit
+		}
+	}
+
+	h.mu.Lock()
+	t := h.tasks[key]
+	e := h.entries[key]
+	h.mu.Unlock()
+
+	if t != nil {
+		return key, t, nil, nil
+	}
+	if e != nil {
+		switch e.State {
+		case stateReady:
+			if h.needsRevalidate(e, key.rev) {
+				e = h.revalidate(ctx, key, e)
+			}
+			if e != nil {
+				return key, nil, e, nil
+			}
+			// stale: fall through and re-ingest
+		case stateFailed:
+			if time.Now().Before(e.nextRetry) {
+				return key, nil, e, nil
+			}
+		}
+	}
+
+	t, e, err := h.startTask(key, preProbe)
+	return key, t, e, err
+}
+
 // runTask executes one ingestion end to end on a background context; client
 // disconnects never cancel it. The spool opens after the probe so partial
 // bytes from a previous failed task (or a previous process) are resumed when
 // the upstream etag still matches. A non-nil pre stands in for the probe.
-func (h *Handler) runTask(key string, t *task, pre *probeResult) {
+func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 	ctx := context.Background()
+	upath := key.String()
+	defer close(t.done) // the entry is published by then, on every path
 
 	pr, err := pre, error(nil)
 	if pr == nil {
-		pr, err = h.probe(ctx, key)
+		pr, err = h.probe(ctx, upath)
 	}
 	if err == nil {
 		switch {
 		case pr.status == http.StatusNotFound:
-			err = errUpstreamNotFound
+			err = ErrUpstreamNotFound
 		case pr.status < 200 || pr.status >= 300:
 			err = fmt.Errorf("upstream status %d", pr.status)
 		}
 	}
 	if err != nil {
 		t.probeErr = err
-		t.notFound = errors.Is(err, errUpstreamNotFound)
+		t.notFound = errors.Is(err, ErrUpstreamNotFound)
 		close(t.probed)
 		h.failTask(key, t, err)
 		return
 	}
 
-	sp, err := openSpool(h.spoolDir, key, pr.etag, pr.size)
+	sp, err := openSpool(h.spoolDir, upath, pr.etag, pr.size)
 	if err != nil {
 		t.probeErr = err
 		close(t.probed)
@@ -132,9 +181,9 @@ func (h *Handler) runTask(key string, t *task, pre *probeResult) {
 		// The xet ingest reports no size before completion; when the probe
 		// found none there is no early source, so stop replies waiting for one.
 		t.setSize(-1)
-		err = h.fetchXet(ctx, t, key)
+		err = h.fetchXet(ctx, t, upath)
 	default:
-		err = h.fetchPlain(ctx, t, key)
+		err = h.fetchPlain(ctx, t, upath)
 	}
 	if err == nil {
 		if want := t.size.Load(); want >= 0 && t.spool.size() != want {
@@ -170,7 +219,7 @@ func (h *Handler) runTask(key string, t *task, pre *probeResult) {
 }
 
 // failTask records a failure with exponential backoff and clears the task.
-func (h *Handler) failTask(key string, t *task, err error) {
+func (h *Handler) failTask(key resolveKey, t *task, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	failures := 1
@@ -180,7 +229,7 @@ func (h *Handler) failTask(key string, t *task, err error) {
 	shift := min(failures-1, maxFailureShift)
 	backoff := min(failureBackoffBase<<shift, failureBackoffCap)
 	h.entries[key] = &fileEntry{
-		Key:       key,
+		Key:       key.String(),
 		State:     stateFailed,
 		failures:  failures,
 		nextRetry: time.Now().Add(backoff),
@@ -192,7 +241,7 @@ func (h *Handler) failTask(key string, t *task, err error) {
 
 // ingestSpool verifies the spooled bytes and runs the standard upload pipeline
 // against local storage, then returns the ready index entry.
-func (h *Handler) ingestSpool(ctx context.Context, t *task, key string) (*fileEntry, error) {
+func (h *Handler) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fileEntry, error) {
 	f, err := os.Open(t.spool.f.Name())
 	if err != nil {
 		return nil, fmt.Errorf("open spool: %w", err)
@@ -212,7 +261,7 @@ func (h *Handler) ingestSpool(ctx context.Context, t *task, key string) (*fileEn
 	}
 
 	entry := &fileEntry{
-		Key:       key,
+		Key:       key.String(),
 		State:     stateReady,
 		SHA256:    digest,
 		Size:      size,
