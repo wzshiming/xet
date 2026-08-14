@@ -172,9 +172,9 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 	dirs := []string{
 		filepath.Join(fs.basePath, "xorbs"),
 		filepath.Join(fs.basePath, "shards"),
-		filepath.Join(fs.basePath, "files"),
-		filepath.Join(fs.basePath, "chunks"),
-		filepath.Join(fs.basePath, "sha256"),
+		filepath.Join(fs.basePath, "index", "files"),
+		filepath.Join(fs.basePath, "index", "chunks"),
+		filepath.Join(fs.basePath, "index", "sha256"),
 	}
 
 	for _, dir := range dirs {
@@ -205,7 +205,7 @@ func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
 		return true, nil
 	}
 
-	filePath := fs.objectPath("files", fileHash.String())
+	filePath := fs.objectPath("index/files", fileHash.String())
 	if _, err := os.Stat(filePath); err == nil {
 		return true, nil
 	} else if !os.IsNotExist(err) {
@@ -214,8 +214,8 @@ func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
 	return false, nil
 }
 
-// getShard resolves a file hash through files/<file-hash>, whose contents are
-// the hash of the serialized shard stored at shards/<shard-hash>.
+// getShard resolves a file hash through index/files/<file-hash>, whose contents
+// are the hash of the serialized shard stored at shards/<shard-hash>.
 func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 	fs.fileMut.Lock()
 	value, exists := fs.fileIndex.Get(fileHash)
@@ -224,7 +224,7 @@ func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 		return fs.getShardByHash(value.(string))
 	}
 
-	indexPath := fs.objectPath("files", fileHash.String())
+	indexPath := fs.objectPath("index/files", fileHash.String())
 	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
 		return nil, fmt.Errorf("read file index: %w", err)
@@ -437,7 +437,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		fs.fileMut.Lock()
 		fs.fileIndex.Add(file.FileHash, shardHash)
 		fs.fileMut.Unlock()
-		indexPath := fs.objectPath("files", file.FileHash.String())
+		indexPath := fs.objectPath("index/files", file.FileHash.String())
 		if err := writeIndexFile(indexPath, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -445,7 +445,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			chunkPath := fs.objectPath("chunks", chunk.ChunkHash.String())
+			chunkPath := fs.objectPath("index/chunks", chunk.ChunkHash.String())
 			err := writeIndexFile(chunkPath, shardHashData)
 			if err != nil {
 				return wasInserted, fmt.Errorf("write chunk index: %w", err)
@@ -453,7 +453,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		}
 	}
 	for _, file := range s.Files {
-		sha256Path := fs.objectPath("sha256", file.MetadataExt.SHA256Hash.String())
+		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
 		if err := writeIndexFile(sha256Path, []byte(file.FileHash.String())); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -577,7 +577,7 @@ func (fs *FileStorage) GetFileHashBySHA256(ctx context.Context, _ string, digest
 		return value.(xet.FileHash), nil
 	}
 
-	indexPath := fs.objectPath("sha256", hex.EncodeToString(digest[:]))
+	indexPath := fs.objectPath("index/sha256", hex.EncodeToString(digest[:]))
 	b, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -620,7 +620,7 @@ func (fs *FileStorage) GetShardByChunkHash(ctx context.Context, namespace string
 		return fs.getShardByHash(value.(string))
 	}
 
-	chunkPath := fs.objectPath("chunks", chunkHash.String())
+	chunkPath := fs.objectPath("index/chunks", chunkHash.String())
 	b, err := os.ReadFile(chunkPath)
 	if err != nil {
 		if os.IsNotExist(err) {

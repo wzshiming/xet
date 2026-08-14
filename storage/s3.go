@@ -30,9 +30,9 @@ import (
 const defaultPresignExpiry = time.Hour
 
 // S3Storage implements Storage backed by an S3-compatible object store. It
-// uses the same object layout as FileStorage (xorbs/, shards/, files/,
-// chunks/, sha256/ with a two-character fanout), so a bucket populated by
-// syncing a FileStorage directory is directly usable.
+// uses the same object layout as FileStorage (xorbs/, shards/, index/files/,
+// index/chunks/, index/sha256/ with a two-character fanout), so a bucket
+// populated by syncing a FileStorage directory is directly usable.
 type S3Storage struct {
 	client          *s3.Client
 	presignClient   *s3.PresignClient
@@ -392,7 +392,7 @@ func (ss *S3Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, 
 		return true, nil
 	}
 
-	_, exists, err := ss.headObject(ctx, ss.objectKey("files", fileHash.String()))
+	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
 		return false, fmt.Errorf("check file index: %w", err)
 	}
@@ -489,24 +489,24 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		return false, fmt.Errorf("upload shard: %w", err)
 	}
 
-	// The files/ index is written last: hasFile treats it as the commit
+	// The index/files/ index is written last: hasFile treats it as the commit
 	// marker, so a partial failure leaves a retryable shard instead of one
 	// that reports "already exists" with missing chunk/sha256 indexes.
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			if err := ss.putIndexObject(ctx, ss.objectKey("chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
+			if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
 				return wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
-		if err := ss.putIndexObject(ctx, ss.objectKey("sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
+		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
-		if err := ss.putIndexObject(ctx, ss.objectKey("files", file.FileHash.String()), shardHashData); err != nil {
+		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
@@ -562,7 +562,7 @@ func (ss *S3Storage) GetShard(ctx context.Context, fileHash xet.FileHash) (*shar
 		return ss.getShardByHash(ctx, value.(string))
 	}
 
-	data, err := ss.getObject(ctx, ss.objectKey("files", fileHash.String()))
+	data, err := ss.getObject(ctx, ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
 		return nil, fmt.Errorf("read file index: %w", err)
 	}
@@ -582,7 +582,7 @@ func (ss *S3Storage) GetShardByChunkHash(ctx context.Context, _ string, chunkHas
 		return ss.getShardByHash(ctx, value.(string))
 	}
 
-	data, err := ss.getObject(ctx, ss.objectKey("chunks", chunkHash.String()))
+	data, err := ss.getObject(ctx, ss.objectKey("index/chunks", chunkHash.String()))
 	if err != nil {
 		if isS3NotFound(err) {
 			return nil, fmt.Errorf("chunk not found")
@@ -606,7 +606,7 @@ func (ss *S3Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [
 		return value.(xet.FileHash), nil
 	}
 
-	data, err := ss.getObject(ctx, ss.objectKey("sha256", hex.EncodeToString(digest[:])))
+	data, err := ss.getObject(ctx, ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
 		if isS3NotFound(err) {
 			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
