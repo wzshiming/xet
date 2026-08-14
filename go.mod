@@ -39,6 +39,8 @@ require (
 	github.com/klauspost/cpuid/v2 v2.0.12 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	go.etcd.io/bbolt v1.3.5 // indirect
 	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d // indirect
 	golang.org/x/tools v0.8.0 // indirect
+	gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce // indirect
 )

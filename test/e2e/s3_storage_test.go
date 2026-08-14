@@ -13,11 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/johannesboyne/gofakes3"
+	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
@@ -25,42 +23,29 @@ import (
 )
 
 // TestS3StorageUploadRestartAndDownload runs the full upload/download cycle
-// against a real S3-compatible store (MinIO in CI). It is skipped unless
-// XET_TEST_S3_ENDPOINT is set; credentials come from the AWS env chain.
+// against an in-process S3 double (gofakes3) through the production option
+// path. Both storage instances share one backend, so the restart below
+// proves nothing is served from memory.
 func TestS3StorageUploadRestartAndDownload(t *testing.T) {
-	endpoint := os.Getenv("XET_TEST_S3_ENDPOINT")
-	if endpoint == "" {
-		t.Skip("XET_TEST_S3_ENDPOINT not set")
-	}
 	ctx := context.Background()
 
-	bucket := fmt.Sprintf("xet-e2e-%d", time.Now().UnixNano())
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
+	const bucket = "xet-e2e"
+	backend := s3mem.New()
+	if err := backend.CreateBucket(bucket); err != nil {
 		t.Fatal(err)
 	}
-	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(endpoint)
-		o.UsePathStyle = true
-	})
-	if _, err := s3Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		// Best-effort cleanup so runs against a persistent store do not
-		// accumulate buckets.
-		p := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
-		for p.HasMorePages() {
-			page, err := p.NextPage(ctx)
-			if err != nil {
-				return
-			}
-			for _, obj := range page.Contents {
-				_, _ = s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: obj.Key})
-			}
-		}
-		_, _ = s3Client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
-	})
+	s3Server := httptest.NewServer(gofakes3.New(backend).Server())
+	defer s3Server.Close()
+	endpoint := s3Server.URL
+
+	// NewS3Storage resolves credentials and checksum behavior from the AWS
+	// env chain; gofakes3 cannot parse the aws-chunked bodies the SDK sends
+	// when default request checksums are on.
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
 
 	// Constructed through the production option path, not an injected client.
 	newStorage := func() storage.Storage {
