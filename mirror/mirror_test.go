@@ -122,12 +122,18 @@ func newMirrorFixture(t *testing.T, upstream string, storageDir, cacheDir string
 		t.Fatal(err)
 	}
 
+	proxy, err := NewUpstreamProxy(upstream, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	h, err := NewHandler(append([]Option{
 		WithStorage(stor),
 		WithUpstream(upstream),
 		WithExternalURL(srv.URL),
 		WithCacheDir(cacheDir),
 		WithMintToken(issuer.Mint),
+		WithNext(proxy),
 	}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
@@ -806,7 +812,11 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 
-	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), WithUpstreamToken("up-secret"))
+	proxy, err := NewUpstreamProxy(upstreamSrv.URL, "up-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), WithUpstreamToken("up-secret"), WithNext(proxy))
 
 	req, _ := http.NewRequest(http.MethodGet, fx.srv.URL+"/api/models/org/repo", nil)
 	req.Header.Set("Authorization", "Bearer downstream-junk")

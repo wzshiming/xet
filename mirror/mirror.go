@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -96,11 +95,11 @@ func (k resolveKey) String() string {
 
 // Handler is the mirror HTTP front end: resolve requests are served from the
 // local cache (ingesting on miss) and the token endpoint hands downstream
-// clients their CAS credential. Everything else falls through to next, which
-// defaults to a reverse proxy that forwards to the upstream with the mirror's
-// credentials injected (control plane only, never file bytes). Mount the
-// Handler as the CAS server's next; token minting and validation are wired by
-// the caller through WithMintToken and the server's AuthFunc.
+// clients their CAS credential. Everything else falls through to next
+// (404 when unset); wire NewUpstreamProxy there to forward the control plane
+// to the upstream. Mount the Handler as the CAS server's next; token minting
+// and validation are wired by the caller through WithMintToken and the
+// server's AuthFunc.
 type Handler struct {
 	storage            storage.Storage
 	upstreamRaw        string
@@ -173,8 +172,8 @@ func WithMintToken(mint func(now time.Time) (token string, exp int64)) Option {
 }
 
 // WithNext sets the handler for requests that are neither resolve nor token
-// requests. When unset it defaults to a reverse proxy that forwards to the
-// upstream with the mirror's credentials injected.
+// requests. When unset such requests are answered with 404; pass
+// NewUpstreamProxy to forward them to the upstream instead.
 func WithNext(next http.Handler) Option {
 	return func(h *Handler) { h.next = next }
 }
@@ -256,43 +255,14 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h.localAdapter = &localCAS{storage: h.storage, namespace: "default"}
 
 	if h.next == nil {
-		h.next = h.newUpstreamProxy()
+		h.next = http.NotFoundHandler()
 	}
 
 	return h, nil
 }
 
-// newUpstreamProxy builds the default next handler: a reverse proxy that
-// forwards control-plane requests to the upstream with the mirror's
-// credentials injected.
-func (h *Handler) newUpstreamProxy() http.Handler {
-	return &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(h.upstream)
-			pr.Out.Host = h.upstream.Host
-			pr.Out.Header.Del("Authorization")
-			if h.upstreamToken != "" {
-				pr.Out.Header.Set("Authorization", "Bearer "+h.upstreamToken)
-			}
-		},
-		// Upstream response headers are dropped except the entity headers
-		// describing the relayed body and the redirect target without which
-		// 3xx cannot work.
-		ModifyResponse: func(resp *http.Response) error {
-			kept := http.Header{}
-			for _, k := range []string{"Content-Type", "Content-Length", "Content-Encoding", "Etag", "Date", "Location"} {
-				if v := resp.Header.Get(k); v != "" {
-					kept.Set(k, v)
-				}
-			}
-			resp.Header = kept
-			return nil
-		},
-	}
-}
-
 // ServeHTTP handles resolve and token requests; everything else falls through
-// to next (the upstream proxy by default).
+// to next.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.EscapedPath()
 	if p == tokenEndpointPath && r.Method == http.MethodGet {

@@ -98,6 +98,12 @@ func main() {
 			os.Exit(1)
 		}
 
+		proxy, err := mirror.NewUpstreamProxy(*upstream, *upstreamToken)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create upstream proxy: %v\n", err)
+			os.Exit(1)
+		}
+
 		next, err = mirror.NewHandler(
 			mirror.WithStorage(stor),
 			mirror.WithUpstream(*upstream),
@@ -106,6 +112,7 @@ func main() {
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
 			mirror.WithClient(xetClient),
 			mirror.WithMintToken(issuer.Mint),
+			mirror.WithNext(proxy),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
