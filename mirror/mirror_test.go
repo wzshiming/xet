@@ -140,6 +140,30 @@ func newMirrorFixture(t *testing.T, upstream string, storageDir, cacheDir string
 		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
 		server.WithNext(h),
 	)))
+	// Ingest tasks keep writing to storage and cache after clients disconnect;
+	// wait for them so the t.TempDir removals running after this cleanup do
+	// not race those writes.
+	t.Cleanup(func() {
+		timeout := time.After(30 * time.Second)
+		for {
+			h.mu.Lock()
+			var done chan struct{}
+			for _, tk := range h.tasks {
+				done = tk.done
+				break
+			}
+			h.mu.Unlock()
+			if done == nil {
+				return
+			}
+			select {
+			case <-done:
+			case <-timeout:
+				t.Error("mirror fixture: in-flight ingest tasks did not finish")
+				return
+			}
+		}
+	})
 	return &mirrorFixture{srv: srv, handler: h, stor: stor, issuer: issuer}
 }
 
