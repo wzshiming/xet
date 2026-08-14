@@ -152,40 +152,52 @@ func ChunkData(r io.Reader, fn func(offset int64, chunk []byte) error) error {
 }
 
 // findChunkBoundary fills buf with the next chunk and returns its size.
+// It scans the bufio internal buffer via Peek/Discard to avoid per-byte ReadByte overhead.
 func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
 	var (
 		hash uint64
 		size int
 	)
 
-	for size < MinChunkSize {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				return size, io.EOF
-			}
-			return 0, fmt.Errorf("read chunk prefix: %w", err)
-		}
-
-		buf[size] = b
-		size++
-		hash = (hash << 1) + lookupTable[b]
-	}
-
 	for size < MaxChunkSize {
-		b, err := reader.ReadByte()
+		data, err := reader.Peek(1)
 		if err != nil {
 			if err == io.EOF {
 				return size, io.EOF
 			}
 			return 0, fmt.Errorf("read chunk data: %w", err)
 		}
+		if buffered := reader.Buffered(); buffered > len(data) {
+			data, _ = reader.Peek(buffered)
+		}
+		if remain := MaxChunkSize - size; len(data) > remain {
+			data = data[:remain]
+		}
 
-		buf[size] = b
-		size++
-		hash = (hash << 1) + lookupTable[b]
+		consumed := len(data)
+		found := false
 
-		if (hash & GearhashMask) == 0 {
+		i := 0
+		// No boundary checks until the chunk reaches MinChunkSize.
+		for prefix := MinChunkSize - size; i < len(data) && i < prefix; i++ {
+			hash = (hash << 1) + lookupTable[data[i]]
+		}
+		for ; i < len(data); i++ {
+			hash = (hash << 1) + lookupTable[data[i]]
+			if (hash & GearhashMask) == 0 {
+				consumed = i + 1
+				found = true
+				break
+			}
+		}
+
+		copy(buf[size:], data[:consumed])
+		size += consumed
+		if _, err := reader.Discard(consumed); err != nil {
+			return 0, fmt.Errorf("read chunk data: %w", err)
+		}
+
+		if found {
 			return size, nil
 		}
 	}
