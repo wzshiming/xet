@@ -42,6 +42,9 @@ func (t *merkleTree) ComputeRoot() hash {
 	// Build initial list of entries
 	entries := t.node
 
+	// Scratch buffer shared by every merge; sized so appends never grow it.
+	buf := make([]byte, 0, MaxChildren*mergeLineMax)
+
 	// Iteratively collapse until single root remains
 	for len(entries) > 1 {
 		nextLevel := nodesPool.Get().([]node)[:0]
@@ -53,7 +56,7 @@ func (t *merkleTree) ComputeRoot() hash {
 			cutEnd := readIdx + cutSize
 
 			// Merge this group
-			merged := mergeNodes(entries[readIdx:cutEnd])
+			merged := mergeNodes(entries[readIdx:cutEnd], buf)
 			nextLevel = append(nextLevel, merged)
 
 			readIdx = cutEnd
@@ -104,16 +107,21 @@ func nextMergeCut(nodes []node) int {
 	return end
 }
 
-// mergeNodes merges a sequence of nodes into a single parent node
-func mergeNodes(nodes []node) node {
+// mergeLineMax is the longest encoded child line in an internal node input:
+// 64 (hash hex) + 3 (" : ") + 20 (max uint64 digits) + 1 ("\n").
+const mergeLineMax = 64 + 3 + 20 + 1
+
+// mergeNodes merges a sequence of nodes into a single parent node. buf is a
+// scratch buffer reused across calls; it needs capacity for
+// MaxChildren*mergeLineMax bytes to stay allocation-free.
+func mergeNodes(nodes []node, buf []byte) node {
 	// Build the input for the internal node hash
 	// Format: "{hash_hex} : {size}\n" for each child
-	// Each line: 64 (hash hex) + 3 (" : ") + 6 (chunk max digits) + 1 ("\n") = 88 bytes max
-	input := make([]byte, 0, len(nodes)*74)
+	input := buf[:0]
 	var totalSize uint64
 
 	for _, n := range nodes {
-		input = append(input, n.hash.String()...)
+		input = appendHash(input, n.hash)
 		input = append(input, " : "...)
 		input = strconv.AppendUint(input, n.size, 10)
 		input = append(input, '\n')

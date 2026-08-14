@@ -120,18 +120,27 @@ func (h VerificationHash) String() string {
 
 func formatHash(h hash) string {
 	var out [64]byte
+	return string(appendHash(out[:0], h))
+}
+
+// appendHash appends the XET-format hex encoding of h to dst without
+// allocating, always writing exactly 64 bytes.
+func appendHash(dst []byte, h hash) []byte {
+	var out [64]byte
 	for i := range out {
 		out[i] = '0'
 	}
 
-	var tmp [8]byte
+	// A uint64 in hex is up to 16 digits; undersizing this forces
+	// strconv.AppendUint to heap-allocate on every call.
+	var tmp [16]byte
 	for seg := range 4 {
 		offset := seg * 8
 		val := binary.LittleEndian.Uint64(h[offset : offset+8])
 		s := strconv.AppendUint(tmp[:0], val, 16)
 		copy(out[seg*16+16-len(s):], s)
 	}
-	return string(out[:])
+	return append(dst, out[:]...)
 }
 
 // ComputeChunkHash computes the hash of a chunk using DATA_KEY

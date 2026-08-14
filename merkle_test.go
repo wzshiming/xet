@@ -113,3 +113,23 @@ func decodeRawHash(hexStr string) (hash, error) {
 	copy(hash[:], bytes)
 	return hash, nil
 }
+
+func BenchmarkComputeFileHash(b *testing.B) {
+	const numChunks = 100000
+	chunkHashes := make([]ChunkHash, numChunks)
+	chunkSizes := make([]uint64, numChunks)
+	for i := range chunkHashes {
+		var seed [8]byte
+		seed[0] = byte(i)
+		seed[1] = byte(i >> 8)
+		seed[2] = byte(i >> 16)
+		chunkHashes[i] = ComputeChunkHash(seed[:])
+		chunkSizes[i] = uint64(40000 + i%50000)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ComputeFileHash(chunkHashes, chunkSizes)
+	}
+}
