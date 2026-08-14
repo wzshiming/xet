@@ -112,15 +112,16 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 
 		data := buf[:size]
 
-		// Apply skip for the first chunk of the first term
-		if r.termIdx == 0 && r.chunkIdx == r.localStart && r.skipBytes > 0 {
+		// Apply OffsetIntoFirstRange skip; it may span multiple leading chunks
+		if r.termIdx == 0 && r.skipBytes > 0 {
 			if r.skipBytes >= size {
 				r.skipBytes -= size
 				r.chunkIdx++
 				r.chunkOffset = 0
 				continue
 			}
-			data = data[r.skipBytes:]
+			// Fold into chunkOffset so re-reading this chunk stays aligned
+			r.chunkOffset = int(r.skipBytes)
 			r.skipBytes = 0
 		}
 
