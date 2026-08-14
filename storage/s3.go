@@ -246,6 +246,16 @@ func (ss *S3Storage) headObject(ctx context.Context, key string) (int64, bool, e
 }
 
 func (ss *S3Storage) getObject(ctx context.Context, key string) ([]byte, error) {
+	body, err := ss.getObjectReader(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	return io.ReadAll(body)
+}
+
+// getObjectReader returns the object body as a stream; the caller must close it.
+func (ss *S3Storage) getObjectReader(ctx context.Context, key string) (io.ReadCloser, error) {
 	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(ss.bucket),
 		Key:    aws.String(key),
@@ -253,8 +263,7 @@ func (ss *S3Storage) getObject(ctx context.Context, key string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	return out.Body, nil
 }
 
 // getObjectRange returns the [start, end] byte range (inclusive) of an object.
@@ -533,12 +542,13 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 		return value.(*shard.Shard), nil
 	}
 
-	data, err := ss.getObject(ctx, ss.objectKey("shards", shardHash))
+	body, err := ss.getObjectReader(ctx, ss.objectKey("shards", shardHash))
 	if err != nil {
 		return nil, err
 	}
+	defer body.Close()
 	s := shard.NewShard()
-	if err := s.Decode(bytes.NewReader(data), true); err != nil {
+	if err := s.Decode(body, true); err != nil {
 		return nil, err
 	}
 
