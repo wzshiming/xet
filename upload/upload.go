@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
@@ -55,39 +54,6 @@ func (s *syncReadSeeker) readAt(buf []byte, offset int64) error {
 		return fmt.Errorf("read chunk: %w", err)
 	}
 	return nil
-}
-
-// lazyChunkSeeker implements io.ReadSeeker over a contiguous slice of a
-// syncReadSeeker. Each Read performs an atomic seek+read via readAt so that
-// concurrent goroutines encoding different xorbs from the same underlying file
-// do not race on the shared ReadSeeker position.
-type lazyChunkSeeker struct {
-	sr   *syncReadSeeker
-	base int64 // absolute file offset where this chunk begins
-	pos  int64 // current read position relative to the chunk start
-}
-
-func (l *lazyChunkSeeker) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-		l.pos = offset
-	case io.SeekCurrent:
-		l.pos += offset
-	default:
-		return 0, fmt.Errorf("lazyChunkSeeker: unsupported whence %d", whence)
-	}
-	return l.pos, nil
-}
-
-func (l *lazyChunkSeeker) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if err := l.sr.readAt(p, l.base+l.pos); err != nil {
-		return 0, err
-	}
-	l.pos += int64(len(p))
-	return len(p), nil
 }
 
 // chunkInfo contains information about a chunk within a file.
@@ -172,6 +138,13 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	for index, readSeeker := range readSeekers {
 		sr := newSyncReadSeeker(readSeeker)
 
+		// ChunkData offsets are relative to the reader's current position;
+		// record it so readAt can seek with absolute offsets.
+		base, err := readSeeker.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, fmt.Errorf("get start offset for file %d: %w", index, err)
+		}
+
 		var sha256Hasher hash.Hash
 		var reader io.Reader = readSeeker
 		if options.enableSHA256 {
@@ -182,7 +155,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		var chunkHashes []xet.ChunkHash
 		var chunkSizes []uint64
 
-		err := xet.ChunkData(reader, func(offset int64, chunk []byte) error {
+		err = xet.ChunkData(reader, func(offset int64, chunk []byte) error {
 			chunkHash := xet.ComputeChunkHash(chunk)
 
 			chunkHashes = append(chunkHashes, chunkHash)
@@ -195,7 +168,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 					Hash: chunkHash,
 					Chunk: Chunk{
 						Reader: sr,
-						Offset: offset,
+						Offset: base + offset,
 						Size:   uint32(len(chunk)),
 					},
 				})
@@ -216,6 +189,8 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		fileInfos[index].Hash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 		fileHashes[index] = fileInfos[index].Hash
 
+		// Zero-entry files keep the zero "not available" SHA256: servers
+		// recompute the digest from file terms and reject a mismatch.
 		if options.enableSHA256 && len(fileInfos[index].ChunkIndices) != 0 {
 			copy(fileInfos[index].SHA256[:], sha256Hasher.Sum(nil))
 		}
@@ -426,6 +401,8 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 	for range concurrency {
 		go func() {
 			defer wg.Done()
+			buf := pool.GetChunkBuf()
+			defer pool.PutChunkBuf(buf)
 			for group := range prepareQueue {
 				if ctx.Err() != nil {
 					return
@@ -441,12 +418,11 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				}
 				tmpPath := tmpFile.Name()
 
-				buf := pool.GetChunkBuf()
-				defer pool.PutChunkBuf(buf)
-
 				encoder := xorb.NewEncoder(tmpFile, true)
 				for _, chunk := range group.Chunks {
 					if err := chunk.Reader.readAt(buf[:chunk.Size], chunk.Offset); err != nil {
+						tmpFile.Close()
+						os.Remove(tmpPath)
 						errOnce.Do(func() {
 							firstErr = fmt.Errorf("read chunk data: %w", err)
 							cancel()
@@ -454,6 +430,8 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 						return
 					}
 					if _, err := encoder.Write(buf[:chunk.Size]); err != nil {
+						tmpFile.Close()
+						os.Remove(tmpPath)
 						errOnce.Do(func() {
 							firstErr = fmt.Errorf("encode chunk: %w", err)
 							cancel()
@@ -530,6 +508,10 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 	}
 
 	wg.Wait()
+	if firstErr == nil {
+		// Workers exit silently when the parent context is canceled.
+		firstErr = ctx.Err()
+	}
 	if firstErr != nil {
 		for _, item := range prepared {
 			_ = os.Remove(item.path)
@@ -549,7 +531,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 		}
 	}
 
-	var doneBytes atomic.Int64
 	wg = sync.WaitGroup{}
 	wg.Add(concurrency)
 	for range concurrency {
@@ -590,7 +571,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				cacheMu.Unlock()
 
 				if progressFunc != nil {
-					doneBytes.Add(item.size)
 					progressFunc(item.hash.String(), item.size, item.size)
 				}
 			}
@@ -598,6 +578,9 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 	}
 
 	wg.Wait()
+	if firstErr == nil {
+		firstErr = ctx.Err()
+	}
 	if firstErr != nil {
 		for _, item := range prepared {
 			_ = os.Remove(item.path)
@@ -605,6 +588,5 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 		return firstErr
 	}
 
-	_ = doneBytes.Load()
 	return nil
 }
