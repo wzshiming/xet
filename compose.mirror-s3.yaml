@@ -1,0 +1,47 @@
+services:
+  s3:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=adminadmin
+      - MINIO_ROOT_PASSWORD=adminadmin
+    entrypoint:
+      - sh
+      - -c
+    command:
+      - |
+        mkdir -p /data/xet && \
+        /usr/bin/docker-entrypoint.sh server /data/ --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  xetd:
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-}
+    environment:
+      # Credentials resolve through the standard AWS config chain.
+      AWS_ACCESS_KEY_ID: adminadmin
+      AWS_SECRET_ACCESS_KEY: adminadmin
+    command:
+      - -addr=:8080
+      - -storage=/data
+      - -upstream=${XET_UPSTREAM:-https://huggingface.co}
+      - -upstream-token=${HF_TOKEN:-}
+      - -s3-bucket=xet
+      - -s3-prefix=xet-data
+      - -s3-endpoint=http://s3:9000
+      - -s3-region=us-east-1
+      - -s3-path-style
+      - -s3-presign-endpoint=http://localhost:9000
+    ports:
+      - "8080:8080"
+    volumes:
+      - xetd-data:/data
+
+volumes:
+  minio-data:
+  xetd-data:

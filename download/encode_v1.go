@@ -94,7 +94,10 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}
 
-		xorbURL := storage.GetXorbURL(namespace, entry.CASHash)
+		xorbURL, err := storage.GetXorbURL(namespace, entry.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get xorb URL: %w", err)
+		}
 
 		fetchEntry := FetchInfoEntry{
 			Range: ChunkRange{

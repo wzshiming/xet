@@ -11,12 +11,19 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
+// xorbRangeReader is the subset of Storage that reconstructedFile needs to
+// stream chunk ranges out of stored xorbs.
+type xorbRangeReader interface {
+	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
+	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
+}
+
 // reconstructedFile exposes a shard file as an io.ReadSeekCloser. Seeking is
 // implemented in terms of reconstruction entries, so http.ServeContent can
 // provide HEAD and byte-range responses without materializing the whole file.
 type reconstructedFile struct {
 	ctx       context.Context
-	storage   *FileStorage
+	storage   xorbRangeReader
 	namespace string
 	entries   []shard.FileDataSequenceEntry
 	offsets   []int64
@@ -32,7 +39,7 @@ type reconstructedFile struct {
 	closed     bool
 }
 
-func newReconstructedFile(ctx context.Context, stor *FileStorage, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
+func newReconstructedFile(ctx context.Context, stor xorbRangeReader, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
 	var file *shard.FileBlock
 	for i := range sh.Files {
 		if sh.Files[i].MetadataExt != nil && sh.Files[i].MetadataExt.SHA256Hash == shard.NewSHA256Hash(digest) {

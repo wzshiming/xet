@@ -211,12 +211,15 @@ type requestBaseStorage struct {
 	base string
 }
 
-func (s requestBaseStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
-	u := s.StorageAdapter.GetXorbURL(namespace, xorbHash)
-	if strings.HasPrefix(u, "/") {
-		return s.base + u
+func (s requestBaseStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error) {
+	u, err := s.StorageAdapter.GetXorbURL(namespace, xorbHash)
+	if err != nil {
+		return "", err
 	}
-	return u
+	if strings.HasPrefix(u, "/") {
+		return s.base + u, nil
+	}
+	return u, nil
 }
 
 // reconstructionStorage returns the storage to use when building
