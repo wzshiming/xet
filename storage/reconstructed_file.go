@@ -121,6 +121,17 @@ func (r *reconstructedFile) Seek(offset int64, whence int) (int64, error) {
 	if next < 0 {
 		return 0, fmt.Errorf("negative seek position %d", next)
 	}
+	if next == r.position {
+		return next, nil
+	}
+	// Reposition within the buffered chunk to avoid reopening the entry.
+	if r.chunk != nil {
+		if pos := int64(r.chunkPos) + next - r.position; pos >= 0 && pos <= int64(len(r.chunk)) {
+			r.chunkPos = int(pos)
+			r.position = next
+			return next, nil
+		}
+	}
 	r.closeEntry()
 	r.position = next
 	return next, nil
