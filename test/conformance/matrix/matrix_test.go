@@ -120,6 +120,7 @@ func matrixServers() []serverKind {
 	return []serverKind{
 		{name: "xet-core_server", start: startXetCoreServer},
 		{name: "wzshiming_xet_server", start: startGoServer},
+		{name: "wzshiming_xet_server_s3", start: startGoServerS3},
 	}
 }
 
