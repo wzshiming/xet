@@ -1,0 +1,18 @@
+services:
+  xetd:
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-}
+    command:
+      - -addr=:8080
+      - -storage=/data
+      - -upstream=${XET_UPSTREAM:-https://huggingface.co}
+      - -upstream-token=${HF_TOKEN:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - xetd-data:/data
+
+volumes:
+  xetd-data:
