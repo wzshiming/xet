@@ -94,6 +94,7 @@ type chunkCache struct {
 	files          []*os.File // additional files for multi-file read path (fileIdx > 0)
 	lockFile       *os.File   // same handle as file while the write lock is held
 	path           string     // entry file path
+	hash           string     // xorb hash, set for writers to hint the merger
 	expectedChunks uint32
 	crc            uint32 // incremental crc32 of the data region while writing
 	published      bool
@@ -245,6 +246,7 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 		writePos:       int64(headerSize), // data starts after the header
 		lockFile:       lockFile,
 		path:           r.path(),
+		hash:           hash,
 		expectedChunks: numChunks,
 		manager:        m,
 	}, nil
@@ -405,6 +407,10 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 	extraFiles := make([]*os.File, len(segments)-1)
 	for i := 1; i < len(segments); i++ {
 		extraFiles[i-1] = segments[i].file
+	}
+	if len(segments) > 1 {
+		// Several files served one range; schedule their compaction.
+		m.noteMergeCandidate(hash)
 	}
 	return &chunkCache{
 		metas:    allMetas,
@@ -693,6 +699,7 @@ func (c *chunkCache) finalize() error {
 	if c.manager != nil {
 		// Evict any overage now that the cache grew.
 		c.manager.evaluate()
+		c.manager.noteMergeCandidate(c.hash)
 	}
 	return nil
 }
