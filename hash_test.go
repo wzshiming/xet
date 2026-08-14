@@ -26,6 +26,26 @@ func TestComputeChunkHash(t *testing.T) {
 	}
 }
 
+func TestChunkHashHMAC(t *testing.T) {
+	h := ComputeChunkHash([]byte("Hello World!"))
+	key1 := [32]byte{1}
+	key2 := [32]byte{2}
+
+	keyed := h.HMAC(key1)
+	if keyed == h {
+		t.Error("keyed hash must differ from the raw hash")
+	}
+	if keyed != h.HMAC(key1) {
+		t.Error("HMAC must be deterministic for the same key and hash")
+	}
+	if keyed == h.HMAC(key2) {
+		t.Error("different keys must produce different keyed hashes")
+	}
+	if keyed == ComputeChunkHash([]byte("other")).HMAC(key1) {
+		t.Error("different hashes must produce different keyed hashes")
+	}
+}
+
 /*
 The XET hash string format interprets the 32-byte hash as four
 little-endian 64-bit unsigned values and prints each as 16

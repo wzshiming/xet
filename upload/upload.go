@@ -296,8 +296,8 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	return fileHashes, nil
 }
 
-func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, probes []xet.ChunkHash) error {
-	m, err := client.QueryDedupShards(ctx, probes)
+func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, probes []xet.ChunkHash, candidates []xet.ChunkHash) error {
+	m, err := client.QueryDedupShards(ctx, probes, candidates...)
 	if err != nil {
 		return fmt.Errorf("query dedup shards: %w", err)
 	}
@@ -321,7 +321,9 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []
 
 	cache := make(map[xet.ChunkHash]*DeduplicationResult, len(chunkHashes))
 
-	if err := queryShards(ctx, client, cache, globalDedupProbeChunkHashes); err != nil {
+	// Pass every chunk hash as a keyed-shard candidate so entries in
+	// HMAC-keyed shards can be matched back to raw hashes.
+	if err := queryShards(ctx, client, cache, globalDedupProbeChunkHashes, chunkHashes); err != nil {
 		return nil, fmt.Errorf("query shards: %w", err)
 	}
 

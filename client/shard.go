@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -202,13 +203,18 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 // QueryDedupShard downloads the deduplication shard for the given chunk hash and
 // returns all chunk locations indexed by that shard, enabling local O(1) lookups
 // for any chunk that shares the same shard (xet-core style local dedup).
-func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return c.QueryDedupShardWithAuthProvider(ctx, nil, chunkHash)
+//
+// candidates are additional raw chunk hashes the caller wants dedup info for.
+// They are needed for HMAC-keyed shards (production CAS): stored hashes are
+// keyed and cannot be reversed, so only hashes offered as candidates can be
+// matched. Unkeyed shards ignore candidates and index every stored hash.
+func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+	return c.QueryDedupShardWithAuthProvider(ctx, nil, chunkHash, candidates...)
 }
 
 // QueryDedupShard downloads the deduplication shard for the given chunk hash
 // with a per-call auth provider.
-func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHash xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	baseURL, err := c.getBaseURL(ctx, provider)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
@@ -256,6 +262,17 @@ func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider A
 			IsNew:     true,
 		},
 	}
+
+	if shardObj.Footer != nil && shardObj.Footer.IsExpired(time.Now()) {
+		// The shard key has expired, so its xorb references can no longer be
+		// relied on for dedup; treat the probe as new data.
+		return results, nil
+	}
+
+	if shardObj.Footer != nil && shardObj.Footer.IsKeyed() {
+		return matchKeyedDedupShard(shardObj, chunkHash, candidates, results), nil
+	}
+
 	for _, casBlock := range shardObj.CASInfos {
 		for i, casChunk := range casBlock.Chunks {
 			results[casChunk.ChunkHash] = &upload.DeduplicationResult{
@@ -270,16 +287,57 @@ func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider A
 	return results, nil
 }
 
+// matchKeyedDedupShard resolves raw candidate hashes against a shard whose
+// stored chunk hashes are HMAC-keyed with the footer's ChunkHashKey
+// (xet-core MDBShardInfo::keyed_chunk_hash semantics).
+func matchKeyedDedupShard(shardObj *shard.Shard, chunkHash xet.ChunkHash, candidates []xet.ChunkHash, results map[xet.ChunkHash]*upload.DeduplicationResult) map[xet.ChunkHash]*upload.DeduplicationResult {
+	type chunkLocation struct {
+		xorbHash   xet.XorbHash
+		chunkIndex uint32
+	}
+
+	keyed := make(map[xet.ChunkHash]chunkLocation)
+	for _, casBlock := range shardObj.CASInfos {
+		for i, casChunk := range casBlock.Chunks {
+			keyed[casChunk.ChunkHash] = chunkLocation{
+				xorbHash:   casBlock.CASHash,
+				chunkIndex: uint32(i),
+			}
+		}
+	}
+
+	key := shardObj.Footer.ChunkHashKey
+	for _, candidate := range append([]xet.ChunkHash{chunkHash}, candidates...) {
+		if existing, ok := results[candidate]; ok && !existing.IsNew {
+			continue
+		}
+		location, ok := keyed[candidate.HMAC(key)]
+		if !ok {
+			continue
+		}
+		results[candidate] = &upload.DeduplicationResult{
+			ChunkHash:  candidate,
+			IsNew:      false,
+			XorbHash:   location.xorbHash,
+			ChunkIndex: location.chunkIndex,
+		}
+	}
+
+	return results
+}
+
 // QueryDedupShards checks multiple chunk hashes against the global
 // deduplication index. It prefers the batch endpoint and falls back to single
-// chunk queries when the batch endpoint is unavailable.
-func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return c.QueryDedupShardsWithAuthProvider(ctx, nil, chunkHashes)
+// chunk queries when the batch endpoint is unavailable. candidates are the
+// raw chunk hashes matched against HMAC-keyed shards on the fallback path;
+// see QueryDedupShard.
+func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+	return c.QueryDedupShardsWithAuthProvider(ctx, nil, chunkHashes, candidates...)
 }
 
 // QueryDedupShards checks multiple chunk hashes against the global
 // deduplication index with a per-call auth provider.
-func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	if len(chunkHashes) == 0 {
 		return nil, nil
 	}
@@ -317,7 +375,7 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-		return c.queryChunksDeduplicationFallback(ctx, provider, chunkHashes)
+		return c.queryChunksDeduplicationFallback(ctx, provider, chunkHashes, candidates)
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -362,16 +420,18 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 	return results, nil
 }
 
-func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash, candidates []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
-		result, err := c.QueryDedupShardWithAuthProvider(ctx, provider, chunkHash)
+		result, err := c.QueryDedupShardWithAuthProvider(ctx, provider, chunkHash, candidates...)
 		if err != nil {
 			return nil, err
 		}
 
 		for _, dedupResult := range result {
-			if _, ok := results[dedupResult.ChunkHash]; ok {
+			// Keep found locations; a hash marked new by one probe's shard
+			// may still be found in a later probe's shard.
+			if existing, ok := results[dedupResult.ChunkHash]; ok && !existing.IsNew {
 				continue
 			}
 			results[dedupResult.ChunkHash] = dedupResult

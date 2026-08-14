@@ -132,6 +132,18 @@ type Footer struct {
 	FooterOffset           uint64
 }
 
+// IsKeyed reports whether the chunk hashes in this shard are HMAC-keyed with
+// ChunkHashKey. An all-zero key means the shard stores raw chunk hashes.
+func (f *Footer) IsKeyed() bool {
+	return f.ChunkHashKey != [32]byte{}
+}
+
+// IsExpired reports whether the shard key expiry has passed at now.
+// SetFooter uses ^uint64(0), which never expires.
+func (f *Footer) IsExpired(now time.Time) bool {
+	return f.ShardKeyExpiry <= uint64(now.Unix())
+}
+
 // Shard magic sequence (bytes 15-31 of the tag)
 var shardMagicSequence = [17]byte{
 	0x55, 0x69, 0x67, 0x45, 0x6a, 0x7b, 0x81, 0x57,
