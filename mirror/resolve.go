@@ -10,64 +10,25 @@ import (
 	"time"
 )
 
-// handleResolve serves GET/HEAD for hub-style download paths.
-func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request, key string) {
-	m := resolveRe.FindStringSubmatch(key)
-	rev := m[2]
-
-	// Branch revisions are pinned to the upstream commit they point at, so
-	// entries, tasks, and spools are all keyed by immutable content. The
-	// branch mapping is re-checked on the revalidation cadence; one probe
-	// covers every file of the repo branch and is reused by the ingest task.
-	var preProbe *probeResult
-	if !commitRevRe.MatchString(rev) {
-		commit, pr, ok := h.branchCommit(key, m)
-		preProbe = pr
-		if ok {
-			rev = commit
-			key = "/" + m[1] + "/resolve/" + rev + "/" + m[3]
-		}
-	}
-
-	h.mu.Lock()
-	t := h.tasks[key]
-	e := h.entries[key]
-	h.mu.Unlock()
-
-	if t != nil {
-		h.serveTaskOrEntry(w, r, key, t)
+// handleResolve serves GET/HEAD for hub-style download paths. The shared
+// acquire flow pins branch revisions, so entries, tasks, and spools are all
+// keyed by immutable content and reused by Ingest.
+func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request, p string) {
+	key, ok := parseResolveKey(p)
+	if !ok {
+		http.NotFound(w, r)
 		return
 	}
-	if e != nil {
-		switch e.State {
-		case stateReady:
-			if h.needsRevalidate(e, rev) {
-				e = h.revalidate(r.Context(), key, e)
-			}
-			if e != nil {
-				h.serveReady(w, r, e)
-				return
-			}
-			// stale: fall through and re-ingest
-		case stateFailed:
-			if time.Now().Before(e.nextRetry) {
-				h.serveFailed(w, e)
-				return
-			}
-		}
-	}
-
-	t, e, err := h.startTask(key, preProbe)
+	key, t, e, err := h.acquire(r.Context(), key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if e != nil {
-		// Lost the race: another request finished (or failed) the ingest first.
-		h.serveEntry(w, r, e)
+	if t != nil {
+		h.serveTaskOrEntry(w, r, key, t)
 		return
 	}
-	h.serveTaskOrEntry(w, r, key, t)
+	h.serveEntry(w, r, e)
 }
 
 // serveEntry answers from a completed entry, ready or failed.
@@ -82,7 +43,7 @@ func (h *Handler) serveEntry(w http.ResponseWriter, r *http.Request, e *fileEntr
 // serveTaskOrEntry streams from the in-flight task, falling back to the entry
 // published by a completed ingest when the spool was drained and removed
 // before this request could attach.
-func (h *Handler) serveTaskOrEntry(w http.ResponseWriter, r *http.Request, key string, t *task) {
+func (h *Handler) serveTaskOrEntry(w http.ResponseWriter, r *http.Request, key resolveKey, t *task) {
 	if h.serveFromTask(w, r, t) {
 		return
 	}
@@ -107,8 +68,8 @@ func (h *Handler) needsRevalidate(e *fileEntry, rev string) bool {
 // revalidate re-probes the upstream. It returns the entry to serve, or nil
 // when the entry went stale and must be re-ingested. Upstream errors keep
 // serving the cached copy.
-func (h *Handler) revalidate(ctx context.Context, key string, e *fileEntry) *fileEntry {
-	pr, err := h.probe(ctx, key)
+func (h *Handler) revalidate(ctx context.Context, key resolveKey, e *fileEntry) *fileEntry {
+	pr, err := h.probe(ctx, key.String())
 	if err != nil || pr.status < 200 || pr.status >= 300 {
 		return e
 	}

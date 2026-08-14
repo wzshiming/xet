@@ -87,8 +87,8 @@ func readEntry(path string) *fileEntry {
 // loadIndex reads all persisted entries from dir: entries grouped under
 // per-commit directories plus legacy flat files, which are moved under their
 // commit directory as they are seen.
-func loadIndex(dir string) (map[string]*fileEntry, error) {
-	files := make(map[string]*fileEntry)
+func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
+	files := make(map[resolveKey]*fileEntry)
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -111,7 +111,9 @@ func loadIndex(dir string) (map[string]*fileEntry, error) {
 					continue
 				}
 				if e := readEntry(filepath.Join(dir, de.Name(), se.Name())); e != nil {
-					files[e.Key] = e
+					if k, ok := parseResolveKey(e.Key); ok {
+						files[k] = e
+					}
 				}
 			}
 			continue
@@ -124,7 +126,9 @@ func loadIndex(dir string) (map[string]*fileEntry, error) {
 		if e == nil {
 			continue
 		}
-		files[e.Key] = e
+		if k, ok := parseResolveKey(e.Key); ok {
+			files[k] = e
+		}
 		// Legacy flat entry: move it under its commit directory.
 		if indexEntryPath(dir, e.Commit, e.Key) != path && persistEntry(dir, e) == nil {
 			_ = os.Remove(path)

@@ -48,7 +48,7 @@ func (h *Handler) branchStale(b *branchEntry) bool {
 // ingest task can reuse it instead of probing again.
 type branchProbe struct {
 	b   *branchEntry
-	key string
+	key resolveKey
 	pr  *probeResult
 }
 
@@ -59,8 +59,8 @@ type branchProbe struct {
 // probe failures fall back to the last known commit so cached content stays
 // served while the upstream is unreachable. The returned probe result is
 // non-nil when this call probed the upstream for exactly this key.
-func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bool) {
-	name := m[1] + "\x00" + m[2]
+func (h *Handler) branchCommit(key resolveKey) (string, *probeResult, bool) {
+	name := key.repo + "\x00" + key.rev
 	h.mu.Lock()
 	b := h.branches[name]
 	h.mu.Unlock()
@@ -77,11 +77,11 @@ func (h *Handler) branchCommit(key string, m []string) (string, *probeResult, bo
 		}
 		// Background context: the probe result is shared by every request of
 		// the repo branch, so one disconnecting client must not fail it.
-		pr, err := h.probe(context.Background(), key)
+		pr, err := h.probe(context.Background(), key.String())
 		if err != nil {
 			return &branchProbe{b: b}, nil // unreachable upstream: serve the last known commit
 		}
-		nb := &branchEntry{Repo: m[1], Rev: m[2], CheckedAt: time.Now()}
+		nb := &branchEntry{Repo: key.repo, Rev: key.rev, CheckedAt: time.Now()}
 		if pr.realCommit && commitRevRe.MatchString(pr.commit) {
 			nb.Commit = pr.commit
 		}
