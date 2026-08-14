@@ -28,6 +28,11 @@ const reconcileInterval = time.Minute
 // lifts the pause immediately.
 const evictBackoff = time.Second
 
+// mergeDebounce is how long a hash directory must stay quiet after its last
+// merge hint before the background merger compacts it; hints from ranges
+// still being written keep pushing the work back.
+const mergeDebounce = 2 * time.Second
+
 // cacheEntry is the LRU bookkeeping for one published cache file.
 type cacheEntry struct {
 	size int64
@@ -80,6 +85,16 @@ type CacheManager struct {
 	// keyed by final path, so each entry is verified at most once per
 	// manager.
 	verified sync.Map
+
+	// mergeQuiet is the per-hash quiet period before compaction runs.
+	mergeQuiet time.Duration
+
+	// pendingMerge maps a xorb hash to its last merge hint time; drained by
+	// mergeWorker once the hash has been quiet for mergeQuiet.
+	pendingMerge map[string]time.Time
+
+	// mergeRunning reports whether a mergeWorker goroutine is active.
+	mergeRunning bool
 }
 
 // NewCacheManager creates a manager for the chunk cache at cacheDir (empty
@@ -88,9 +103,10 @@ type CacheManager struct {
 // cache directory and pass it to every reader sharing that directory.
 func NewCacheManager(cacheDir string, capacity int64) *CacheManager {
 	m := &CacheManager{
-		dir:      defaultCacheDir(cacheDir),
-		capacity: capacity,
-		lru:      lru.New(0),
+		dir:        defaultCacheDir(cacheDir),
+		capacity:   capacity,
+		lru:        lru.New(0),
+		mergeQuiet: mergeDebounce,
 	}
 	m.lru.OnEvicted = func(key lru.Key, value any) {
 		k, _ := key.(string)
@@ -142,6 +158,89 @@ func (m *CacheManager) release(path string) {
 			}
 		}
 	}
+}
+
+// noteMergeCandidate schedules a background compaction of hash's cache
+// directory once it has been quiet for mergeQuiet.
+func (m *CacheManager) noteMergeCandidate(hash string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(hash) < 2 {
+		return
+	}
+	if m.pendingMerge == nil {
+		m.pendingMerge = make(map[string]time.Time)
+	}
+	m.pendingMerge[hash] = time.Now()
+	if !m.mergeRunning {
+		m.mergeRunning = true
+		go m.mergeWorker()
+	}
+}
+
+// mergeWorker drains pendingMerge, compacting each hash directory after it
+// has been quiet for mergeQuiet, and exits once nothing is pending.
+func (m *CacheManager) mergeWorker() {
+	for {
+		m.mu.Lock()
+		var hash string
+		var oldest time.Time
+		for h, t := range m.pendingMerge {
+			if hash == "" || t.Before(oldest) {
+				hash, oldest = h, t
+			}
+		}
+		if hash == "" {
+			m.mergeRunning = false
+			m.mu.Unlock()
+			return
+		}
+		wait := m.mergeQuiet - time.Since(oldest)
+		if wait <= 0 {
+			delete(m.pendingMerge, hash)
+		}
+		m.mu.Unlock()
+		if wait > 0 {
+			time.Sleep(wait)
+			continue
+		}
+		mergeHashDir(m, hash) //nolint:errcheck
+	}
+}
+
+// forgetIfIdle unlinks the sealed entry at path and drops it from tracking,
+// but only when no in-process user holds a reference; in-use or flocked
+// entries are kept for normal eviction. Returns true when the name is gone.
+func (m *CacheManager) forgetIfIdle(path string) bool {
+	m.mu.Lock()
+	if v, ok := m.lru.Get(path); ok {
+		if e := v.(*cacheEntry); e.refs > 0 {
+			m.mu.Unlock()
+			return false
+		}
+	}
+	m.mu.Unlock()
+	if !removeCacheEntry(path) {
+		return false
+	}
+	m.mu.Lock()
+	if v, ok := m.lru.Get(path); ok {
+		e := v.(*cacheEntry)
+		m.total -= e.size
+		m.lru.Remove(path)
+		// Remove fires OnEvicted; drop the bookkeeping entry it queued so
+		// the next eviction pass does not double-count this file.
+		kept := m.evicted[:0]
+		for _, ev := range m.evicted {
+			if ev.key != path {
+				kept = append(kept, ev)
+			}
+		}
+		m.evicted = kept
+	}
+	m.verified.Delete(path)
+	m.mu.Unlock()
+	return true
 }
 
 // wasVerified reports whether path already passed checksum verification.
