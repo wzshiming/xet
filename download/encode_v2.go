@@ -109,7 +109,10 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 	// A more sophisticated implementation could group consecutive/nearby ranges
 	for xorbHashStr, ranges := range xorbFetchRanges {
 		xorbHash, _ := xet.ParseXorbHash(xorbHashStr)
-		xorbURL := storage.GetXorbURL(namespace, xorbHash)
+		xorbURL, err := storage.GetXorbURL(namespace, xorbHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get xorb URL: %w", err)
+		}
 
 		var descriptors []XorbRangeDescriptor
 		for _, r := range ranges {

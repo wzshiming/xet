@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -140,12 +142,10 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	}
 }
 
-func TestS3StorageShardRoundTrip(t *testing.T) {
-	ctx := context.Background()
-	ss := newTestS3Storage(t, WithS3Prefix("some/prefix"))
-
-	parts := [][]byte{[]byte("first part "), []byte("and the second part")}
-	fileData := bytes.Join(parts, nil)
+// putTestShard uploads one single-chunk xorb per part and returns a shard
+// describing the concatenation of parts as one file.
+func putTestShard(t *testing.T, ctx context.Context, ss *S3Storage, parts [][]byte) (*shard.Shard, xet.FileHash) {
+	t.Helper()
 	shardObj := shard.NewShard()
 	fileBlock := shard.FileBlock{}
 	var chunkHashes []xet.ChunkHash
@@ -177,6 +177,16 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 	fileBlock.FileHash = fileHash
 	shardObj.AddFile(fileBlock)
+	return shardObj, fileHash
+}
+
+func TestS3StorageShardRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t, WithS3Prefix("some/prefix"))
+
+	parts := [][]byte{[]byte("first part "), []byte("and the second part")}
+	fileData := bytes.Join(parts, nil)
+	shardObj, fileHash := putTestShard(t, ctx, ss, parts)
 
 	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
@@ -210,7 +220,7 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 		t.Fatal("loaded wrong shard")
 	}
 
-	byChunk, err := fresh.GetShardByChunkHash(ctx, "default", chunkHashes[0])
+	byChunk, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(parts[0]))
 	if err != nil {
 		t.Fatalf("GetShardByChunkHash: %v", err)
 	}
@@ -284,7 +294,10 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u := ss.GetXorbURL("default", xorbHash)
+	u, err := ss.GetXorbURL("default", xorbHash)
+	if err != nil {
+		t.Fatalf("GetXorbURL() error: %v", err)
+	}
 	if !strings.HasPrefix(u, "http") || !strings.Contains(u, "X-Amz-Signature") {
 		t.Fatalf("GetXorbURL() = %q, want a presigned absolute URL", u)
 	}
@@ -314,14 +327,111 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 
 	// Disabled presigning falls back to the server-served xorb path.
 	plain := newTestS3Storage(t, WithS3Presign(false))
-	if got, want := plain.GetXorbURL("ns", xorbHash), "/v1/xorbs/ns/"+xorbHash.String(); got != want {
-		t.Fatalf("GetXorbURL() with presign disabled = %q, want %q", got, want)
+	if got, err := plain.GetXorbURL("ns", xorbHash); err != nil || got != "/v1/xorbs/ns/"+xorbHash.String() {
+		t.Fatalf("GetXorbURL() with presign disabled = %q, %v", got, err)
 	}
 
 	// A distinct presign endpoint moves only the URL host, not the API client.
 	public := newTestS3Storage(t, WithS3PresignEndpoint("http://public.example:9000"))
-	got := public.GetXorbURL("default", xorbHash)
+	got, err := public.GetXorbURL("default", xorbHash)
+	if err != nil {
+		t.Fatalf("GetXorbURL() with presign endpoint error: %v", err)
+	}
 	if !strings.HasPrefix(got, "http://public.example:9000/") || !strings.Contains(got, "X-Amz-Signature") {
 		t.Fatalf("GetXorbURL() with presign endpoint = %q, want presigned URL at public.example", got)
+	}
+}
+
+// flakyHTTPClient fails requests matching the configured predicate and
+// forwards everything else.
+type flakyHTTPClient struct {
+	mu   sync.Mutex
+	fail func(*http.Request) bool
+}
+
+func (fc *flakyHTTPClient) setFail(fail func(*http.Request) bool) {
+	fc.mu.Lock()
+	fc.fail = fail
+	fc.mu.Unlock()
+}
+
+func (fc *flakyHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	fc.mu.Lock()
+	fail := fc.fail
+	fc.mu.Unlock()
+	if fail != nil && fail(req) {
+		return nil, fmt.Errorf("injected failure: %s %s", req.Method, req.URL.Path)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// TestS3StoragePutShardRetryAfterPartialFailure kills PutShard midway through
+// its index writes and verifies a retry fully repairs the shard instead of
+// reporting "already exists" with indexes missing.
+func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	backend := s3mem.New()
+	if err := backend.CreateBucket("test-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(gofakes3.New(backend).Server())
+	t.Cleanup(srv.Close)
+
+	fc := &flakyHTTPClient{}
+	client := s3.New(s3.Options{
+		BaseEndpoint:               aws.String(srv.URL),
+		Region:                     "us-east-1",
+		Credentials:                credentials.NewStaticCredentialsProvider("test", "test", ""),
+		UsePathStyle:               true,
+		HTTPClient:                 fc,
+		Retryer:                    aws.NopRetryer{},
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	})
+	ss, err := NewS3Storage(ctx, WithS3Client(client), WithS3Bucket("test-bucket"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts := [][]byte{[]byte("retry me")}
+	shardObj, fileHash := putTestShard(t, ctx, ss, parts)
+
+	// First attempt dies while writing SHA-256 indexes, after the shard
+	// object and chunk indexes are already stored.
+	fc.setFail(func(req *http.Request) bool {
+		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/sha256/")
+	})
+	if _, err := ss.PutShard(ctx, shardObj); err == nil {
+		t.Fatal("PutShard() succeeded despite injected failure")
+	}
+
+	// The partial shard must not count as existing, in cache or in S3.
+	if exists, err := ss.hasFile(ctx, fileHash); err != nil || exists {
+		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	}
+
+	fc.setFail(nil)
+	if _, err := ss.PutShard(ctx, shardObj); err != nil {
+		t.Fatalf("PutShard() retry: %v", err)
+	}
+
+	// A fresh storage must resolve every index written by the retry.
+	fresh, err := NewS3Storage(ctx, WithS3Client(client), WithS3Bucket("test-bucket"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(parts[0])
+	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, "default", digest)
+	if err != nil {
+		t.Fatalf("GetFileHashBySHA256 after retry: %v", err)
+	}
+	if gotFileHash != fileHash {
+		t.Fatal("SHA-256 index resolved wrong file hash")
+	}
+	if _, err := fresh.GetShard(ctx, fileHash); err != nil {
+		t.Fatalf("GetShard after retry: %v", err)
+	}
+	if _, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(parts[0])); err != nil {
+		t.Fatalf("GetShardByChunkHash after retry: %v", err)
 	}
 }

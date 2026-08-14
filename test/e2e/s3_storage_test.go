@@ -46,6 +46,21 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 	if _, err := s3Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		// Best-effort cleanup so runs against a persistent store do not
+		// accumulate buckets.
+		p := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+		for p.HasMorePages() {
+			page, err := p.NextPage(ctx)
+			if err != nil {
+				return
+			}
+			for _, obj := range page.Contents {
+				_, _ = s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: obj.Key})
+			}
+		}
+		_, _ = s3Client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)})
+	})
 
 	// Constructed through the production option path, not an injected client.
 	newStorage := func() storage.Storage {

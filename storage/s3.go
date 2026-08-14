@@ -127,6 +127,7 @@ func WithS3Presign(presign bool) S3Option {
 }
 
 // WithS3PresignExpiry sets how long presigned xorb URLs stay valid.
+// Non-positive values are ignored.
 func WithS3PresignExpiry(expiry time.Duration) S3Option {
 	return func(ss *S3Storage) {
 		if expiry > 0 {
@@ -278,16 +279,10 @@ func (ss *S3Storage) putObject(ctx context.Context, key string, body io.ReadSeek
 	return err
 }
 
-// putIndexObject writes a small index object unless it already exists,
-// mirroring writeIndexFile semantics on the filesystem.
+// putIndexObject writes a small index object. Unlike writeIndexFile it
+// overwrites unconditionally: any shard containing the chunk/file is a valid
+// mapping target, and skipping the existence probe halves the request count.
 func (ss *S3Storage) putIndexObject(ctx context.Context, key string, value []byte) error {
-	_, exists, err := ss.headObject(ctx, key)
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
 	return ss.putObject(ctx, key, bytes.NewReader(value))
 }
 
@@ -494,19 +489,10 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		return false, fmt.Errorf("upload shard: %w", err)
 	}
 
+	// The files/ index is written last: hasFile treats it as the commit
+	// marker, so a partial failure leaves a retryable shard instead of one
+	// that reports "already exists" with missing chunk/sha256 indexes.
 	shardHashData := []byte(shardHash)
-	ss.shardMut.Lock()
-	ss.shardIndex.Add(shardHash, s)
-	ss.shardMut.Unlock()
-	for _, file := range s.Files {
-		ss.fileMut.Lock()
-		ss.fileIndex.Add(file.FileHash, shardHash)
-		ss.fileMut.Unlock()
-		if err := ss.putIndexObject(ctx, ss.objectKey("files", file.FileHash.String()), shardHashData); err != nil {
-			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
-		}
-	}
-
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
 			if err := ss.putIndexObject(ctx, ss.objectKey("chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
@@ -518,6 +504,22 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		if err := ss.putIndexObject(ctx, ss.objectKey("sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
+	}
+	for _, file := range s.Files {
+		if err := ss.putIndexObject(ctx, ss.objectKey("files", file.FileHash.String()), shardHashData); err != nil {
+			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
+		}
+	}
+
+	// Populate caches only after everything is persisted; caching earlier
+	// would make a retry skip the objects that failed to write.
+	ss.shardMut.Lock()
+	ss.shardIndex.Add(shardHash, s)
+	ss.shardMut.Unlock()
+	for _, file := range s.Files {
+		ss.fileMut.Lock()
+		ss.fileIndex.Add(file.FileHash, shardHash)
+		ss.fileMut.Unlock()
 	}
 
 	return wasInserted, nil
@@ -624,7 +626,7 @@ func (ss *S3Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [
 func (ss *S3Storage) GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error) {
 	fileHash, err := ss.GetFileHashBySHA256(ctx, namespace, sha256)
 	if err != nil {
-		return nil, fmt.Errorf("get shard by sha256: %w", err)
+		return nil, fmt.Errorf("get file hash by sha256: %w", err)
 	}
 	sh, err := ss.GetShard(ctx, fileHash)
 	if err != nil {
@@ -635,23 +637,24 @@ func (ss *S3Storage) GetReconstructedFile(ctx context.Context, namespace string,
 
 // GetXorbURL generates a URL for accessing xorb data. By default it is a
 // presigned S3 GET URL so clients fetch xorb ranges straight from the object
-// store; with presigning disabled (or failing) the URL routes through the
-// CAS server's xorb endpoint like FileStorage.
-func (ss *S3Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
+// store; with presigning disabled the URL routes through the CAS server's
+// xorb endpoint like FileStorage.
+func (ss *S3Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error) {
 	if ss.presign {
 		req, err := ss.presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
 			Bucket: aws.String(ss.bucket),
 			Key:    aws.String(ss.objectKey("xorbs", xorbHash.String())),
 		}, s3.WithPresignExpires(ss.presignExpiry))
-		if err == nil {
-			return req.URL
+		if err != nil {
+			return "", fmt.Errorf("presign xorb URL: %w", err)
 		}
+		return req.URL, nil
 	}
 	if ss.baseURL == "" {
 		// If no base URL is configured, return a relative path
-		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String())
+		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String()), nil
 	}
-	return fmt.Sprintf("%s/v1/xorbs/%s/%s", ss.baseURL, namespace, xorbHash.String())
+	return fmt.Sprintf("%s/v1/xorbs/%s/%s", ss.baseURL, namespace, xorbHash.String()), nil
 }
 
 // s3ReadSeekCloser adapts an S3 object to io.ReadSeekCloser. Seeks are lazy:

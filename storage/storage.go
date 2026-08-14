@@ -24,7 +24,7 @@ type Storage interface {
 	PutXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash, r io.Reader) (bool, error)
 
 	// GetXorbURL generates a URL for accessing xorb data
-	GetXorbURL(namespace string, xorbHash xet.XorbHash) string
+	GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error)
 
 	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
 	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
@@ -655,12 +655,12 @@ func writeIndexFile(path string, value []byte) error {
 }
 
 // GetXorbURL generates a URL for accessing xorb data
-func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) string {
+func (fs *FileStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error) {
 	if fs.baseURL == "" {
 		// If no base URL is configured, return a relative path
-		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String())
+		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String()), nil
 	}
-	return fmt.Sprintf("%s/v1/xorbs/%s/%s", fs.baseURL, namespace, xorbHash.String())
+	return fmt.Sprintf("%s/v1/xorbs/%s/%s", fs.baseURL, namespace, xorbHash.String()), nil
 }
 
 // GetXorbDataRange returns the [start, end] byte range (inclusive) within
