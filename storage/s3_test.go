@@ -399,7 +399,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	// First attempt dies while writing SHA-256 indexes, after the shard
 	// object and chunk indexes are already stored.
 	fc.setFail(func(req *http.Request) bool {
-		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/sha256/")
+		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/index/sha256/")
 	})
 	if _, err := ss.PutShard(ctx, shardObj); err == nil {
 		t.Fatal("PutShard() succeeded despite injected failure")

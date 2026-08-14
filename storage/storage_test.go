@@ -55,7 +55,7 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	}
 
 	for _, hash := range []xet.FileHash{fileHash, secondFileHash} {
-		indexData, err := os.ReadFile(fs.objectPath("files", hash.String()))
+		indexData, err := os.ReadFile(fs.objectPath("index/files", hash.String()))
 		if err != nil {
 			t.Fatalf("read file index %s: %v", hash, err)
 		}
@@ -67,7 +67,7 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 		t.Fatalf("legacy shard-index directory exists: %v", err)
 	}
 
-	indexData, err := os.ReadFile(fs.objectPath("chunks", chunkHash.String()))
+	indexData, err := os.ReadFile(fs.objectPath("index/chunks", chunkHash.String()))
 	if err != nil {
 		t.Fatalf("read chunk index: %v", err)
 	}
