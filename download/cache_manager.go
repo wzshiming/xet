@@ -21,6 +21,13 @@ const DefaultCacheSize int64 = 10_000_000_000
 // hovering at capacity from re-scanning the tree on every published range.
 const reconcileInterval = time.Minute
 
+// evictBackoff pauses eviction after an attempt that could not get back
+// under capacity because every candidate was in use or flocked by another
+// process. Retrying sooner would drain the whole LRU and take one file lock
+// per entry again for nothing; a release that makes an entry evictable
+// lifts the pause immediately.
+const evictBackoff = time.Second
+
 // cacheEntry is the LRU bookkeeping for one published cache file.
 type cacheEntry struct {
 	size int64
@@ -58,6 +65,11 @@ type CacheManager struct {
 	// lastReconcile is when reconcileLocked last walked the directory; the
 	// zero value means the initial scan has not happened yet.
 	lastReconcile time.Time
+
+	// lastEvictFailed is when evictLocked last ended still over capacity
+	// with every candidate pinned or flocked; eviction is paused until
+	// evictBackoff elapses or a release frees a candidate.
+	lastEvictFailed time.Time
 
 	// evicted accumulates entries popped from the LRU via RemoveOldest;
 	// evictLocked drains it for eviction candidates and reconcileLocked
@@ -124,6 +136,10 @@ func (m *CacheManager) release(path string) {
 	if v, ok := m.lru.Get(path); ok {
 		if e := v.(*cacheEntry); e.refs > 0 {
 			e.refs--
+			if e.refs == 0 {
+				// A candidate became evictable; lift the eviction pause.
+				m.lastEvictFailed = time.Time{}
+			}
 		}
 	}
 }
@@ -154,6 +170,11 @@ func (m *CacheManager) evaluate() {
 // the bound stays directory-wide.
 func (m *CacheManager) evaluateLocked() {
 	if m.capacity <= 0 || m.total < m.capacity {
+		return
+	}
+	// The last attempt freed nothing and nothing has changed since; skip
+	// the rescan until the backoff elapses or a release lifts the pause.
+	if !m.lastEvictFailed.IsZero() && time.Since(m.lastEvictFailed) < evictBackoff {
 		return
 	}
 	if time.Since(m.lastReconcile) >= reconcileInterval {
@@ -191,6 +212,12 @@ func (m *CacheManager) evictLocked() {
 	}
 	for _, s := range skipped {
 		m.lru.Add(s.key, s.entry)
+	}
+	if m.total > m.capacity {
+		// Everything left is pinned or flocked elsewhere; pause eviction.
+		m.lastEvictFailed = time.Now()
+	} else {
+		m.lastEvictFailed = time.Time{}
 	}
 }
 

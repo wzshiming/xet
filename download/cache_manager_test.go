@@ -35,6 +35,14 @@ func setCapacity(m *CacheManager, capacity int64) {
 	m.mu.Unlock()
 }
 
+// rewindEvictBackoff fakes the passage of evictBackoff since the last
+// failed eviction attempt.
+func rewindEvictBackoff(m *CacheManager) {
+	m.mu.Lock()
+	m.lastEvictFailed = m.lastEvictFailed.Add(-evictBackoff)
+	m.mu.Unlock()
+}
+
 // cacheEntryFileSize is the on-disk size of a single-chunk entry: header
 // (numOffsets + 2 offsets) plus the payload and the crc32 trailer.
 func cacheEntryFileSize(payload string) int64 {
@@ -308,6 +316,13 @@ func TestCacheEvictionSkipsFlockedEntry(t *testing.T) {
 	if err := flock.Unlock(lockFile); err != nil {
 		t.Fatal(err)
 	}
+	// The failed attempt paused eviction: without a release, an immediate
+	// evaluate must not rescan even though the lock is gone.
+	m.evaluate()
+	if !entryExists(t, dir, testHashA) {
+		t.Fatal("evaluate during the eviction pause should not evict")
+	}
+	rewindEvictBackoff(m)
 	m.evaluate()
 	if entryExists(t, dir, testHashA) {
 		t.Fatal("unlocked entry was not evicted")
