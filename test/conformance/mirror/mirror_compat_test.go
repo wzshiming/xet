@@ -147,6 +147,10 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	if err != nil {
 		t.Fatal(err)
 	}
+	proxy, err := mirror.NewUpstreamProxy(upstream, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h, err := mirror.NewHandler(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
@@ -154,6 +158,7 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 			mirror.WithExternalURL(srv.URL),
 			mirror.WithCacheDir(cacheDir),
 			mirror.WithMintToken(issuer.Mint),
+			mirror.WithNext(proxy),
 		}, opts...)...,
 	)
 	if err != nil {
