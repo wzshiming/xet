@@ -136,7 +136,7 @@ func TestConcurrentTryLock(t *testing.T) {
 	}
 
 	// Multiple TryLock attempts on f2 should all return ErrLocked
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := TryLock(f2); err != ErrLocked {
 			t.Fatalf("TryLock attempt %d: expected ErrLocked, got: %v", i+1, err)
 		}
@@ -264,11 +264,9 @@ func TestLockConcurrent(t *testing.T) {
 	var overlaps atomic.Int32
 	var wg sync.WaitGroup
 
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
+	for range goroutines {
+		wg.Go(func() {
+			for range iterations {
 				f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 				if err != nil {
 					t.Errorf("OpenFile failed: %v", err)
@@ -291,7 +289,7 @@ func TestLockConcurrent(t *testing.T) {
 				}
 				f.Close()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

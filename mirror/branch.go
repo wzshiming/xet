@@ -132,8 +132,8 @@ func escapeSegment(s string) string {
 // with the "<rev>.json" mapping files living beside them.
 func escapeDirSegment(s string) string {
 	s = escapeSegment(s)
-	if strings.HasSuffix(s, ".json") {
-		s = strings.TrimSuffix(s, ".json") + "%2Ejson"
+	if before, ok := strings.CutSuffix(s, ".json"); ok {
+		s = before + "%2Ejson"
 	}
 	return s
 }

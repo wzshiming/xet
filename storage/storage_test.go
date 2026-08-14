@@ -171,7 +171,7 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			for start := uint32(0); start < numChunks; start++ {
+			for start := range numChunks {
 				for end := start + 1; end <= numChunks; end++ {
 					wantStart, wantEnd, err := xorb.ChunkDataRange(bytes.NewReader(reference), start, end)
 					if err != nil {

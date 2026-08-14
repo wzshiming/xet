@@ -39,7 +39,7 @@ func (h *Handler) fetchPlain(ctx context.Context, t *task, key string) error {
 
 func fetchWithRetries(ctx context.Context, operation string, fetch func() error) error {
 	var lastErr error
-	for attempt := 0; attempt < maxFetchAttempts; attempt++ {
+	for attempt := range maxFetchAttempts {
 		if err := sleepBackoff(ctx, attempt); err != nil {
 			return err
 		}

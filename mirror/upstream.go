@@ -61,7 +61,7 @@ func (h *Handler) probe(ctx context.Context, key string) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
 	cur := h.upstreamURL(key)
-	for hop := 0; hop < 8; hop++ {
+	for range 8 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create probe request: %w", err)

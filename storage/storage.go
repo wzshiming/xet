@@ -160,7 +160,7 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 	// Close evicted xorb handles when the LRU cache drops them. Blocking on
 	// the handle's own lock ensures we never close a file while another
 	// goroutine is reading through it.
-	fs.xorbIndex.OnEvicted = func(_ lru.Key, value interface{}) {
+	fs.xorbIndex.OnEvicted = func(_ lru.Key, value any) {
 		xf := value.(*xorbFile)
 		xf.mut.Lock()
 		defer xf.mut.Unlock()

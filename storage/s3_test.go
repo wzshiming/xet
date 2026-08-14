@@ -121,7 +121,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	// Chunk ranges must match those scanned from the raw chunk data.
 	reference, _ := encodeTestXorb(t, false, chunks...)
 	numChunks := uint32(len(chunks))
-	for start := uint32(0); start < numChunks; start++ {
+	for start := range numChunks {
 		for end := start + 1; end <= numChunks; end++ {
 			wantStart, wantEnd, err := xorb.ChunkDataRange(bytes.NewReader(reference), start, end)
 			if err != nil {

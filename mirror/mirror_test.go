@@ -251,8 +251,8 @@ func (u *plainUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.HasPrefix(r.URL.Path, "/cdn") {
-		data, ok := u.get(strings.TrimPrefix(r.URL.Path, "/cdn"))
+	if after, ok := strings.CutPrefix(r.URL.Path, "/cdn"); ok {
+		data, ok := u.get(after)
 		if !ok {
 			http.NotFound(w, r)
 			return
