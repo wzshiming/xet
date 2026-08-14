@@ -322,9 +322,7 @@ func TestMergeConcurrentReaders(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			buf := make([]byte, 64)
 			for range 25 {
 				cached, err := openCachedRange(m, testCacheHash, 0, 4)
@@ -349,7 +347,7 @@ func TestMergeConcurrentReaders(t *testing.T) {
 				}
 				cached.Done()
 			}
-		}()
+		})
 	}
 	if err := mergeHashDir(m, testCacheHash); err != nil {
 		t.Error(err)

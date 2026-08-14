@@ -20,6 +20,11 @@ jobs:
       with:
         go-version-file: go.mod
 
+    - name: Run go fix
+      run: |
+        go fix ./...
+        git diff --exit-code
+
     - name: Run Go tests
       run: go test ./...
 
