@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang/groupcache/lru"
 	"github.com/wzshiming/xet"
@@ -68,6 +69,8 @@ type FileStorage struct {
 	sha256Mut  sync.Mutex // guards sha256Index
 	xorbMut    sync.Mutex // guards xorbIndex
 	offsetsMut sync.Mutex // guards offsetsIndex
+
+	gcMut sync.RWMutex // held exclusively by Sweep to keep shard writes out of a collection cycle
 }
 
 // xorbFile wraps an open xorb handle with its own mutex so that only uses of
@@ -339,6 +342,9 @@ func (fs *FileStorage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 
 // PutShard stores a shard
 func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	fs.gcMut.RLock()
+	defer fs.gcMut.RUnlock()
+
 	if len(s.Files) == 0 {
 		return false, fmt.Errorf("shard has no file blocks")
 	}
@@ -581,7 +587,7 @@ func (fs *FileStorage) GetFileHashBySHA256(ctx context.Context, _ string, digest
 	b, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
+			return xet.FileHash{}, fmt.Errorf("SHA-256 not found: %w", os.ErrNotExist)
 		}
 		return xet.FileHash{}, fmt.Errorf("read SHA-256 index: %w", err)
 	}
@@ -676,4 +682,151 @@ func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash 
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
 	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
+}
+
+// GetShardByHash loads a shard by the hash of its serialized bytes.
+func (fs *FileStorage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	return fs.getShardByHash(shardHash)
+}
+
+func (fs *FileStorage) gcLock()   { fs.gcMut.Lock() }
+func (fs *FileStorage) gcUnlock() { fs.gcMut.Unlock() }
+
+// walkFanoutDir visits every object under basePath/<kind>/<xx>/<rest>,
+// passing the reassembled object name; temp files and stray entries are
+// skipped. Entries that vanish mid-walk are ignored.
+func (fs *FileStorage) walkFanoutDir(ctx context.Context, kind string, fn func(name string, size int64, modTime time.Time) error) error {
+	root := filepath.Join(fs.basePath, kind)
+	prefixes, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", root, err)
+	}
+	for _, p := range prefixes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !p.IsDir() {
+			continue // temp files live at the kind root
+		}
+		children, err := os.ReadDir(filepath.Join(root, p.Name()))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", filepath.Join(root, p.Name()), err)
+		}
+		for _, c := range children {
+			if c.IsDir() || strings.HasSuffix(c.Name(), ".tmp") {
+				continue
+			}
+			info, err := c.Info()
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			if err := fn(p.Name()+c.Name(), info.Size(), info.ModTime()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// walkIndexKind visits an index kind, resolving each entry's target value.
+func (fs *FileStorage) walkIndexKind(ctx context.Context, kind string, fn func(name, target string, modTime time.Time) error) error {
+	return fs.walkFanoutDir(ctx, kind, func(name string, _ int64, modTime time.Time) error {
+		data, err := os.ReadFile(fs.objectPath(kind, name))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("read %s index %s: %w", kind, name, err)
+		}
+		return fn(name, strings.TrimSpace(string(data)), modTime)
+	})
+}
+
+func (fs *FileStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error {
+	return fs.walkIndexKind(ctx, "index/files", fn)
+}
+
+func (fs *FileStorage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, fileHash string, modTime time.Time) error) error {
+	return fs.walkIndexKind(ctx, "index/sha256", fn)
+}
+
+func (fs *FileStorage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error {
+	return fs.walkIndexKind(ctx, "index/chunks", fn)
+}
+
+func (fs *FileStorage) WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error {
+	return fs.walkFanoutDir(ctx, "shards", fn)
+}
+
+func (fs *FileStorage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+	return fs.walkFanoutDir(ctx, "xorbs", fn)
+}
+
+// removeObjectFile deletes an object file, reporting whether it existed.
+func removeObjectFile(path string) (bool, error) {
+	err := os.Remove(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash string) (bool, error) {
+	if fh, err := xet.ParseFileHash(fileHash); err == nil {
+		fs.fileMut.Lock()
+		fs.fileIndex.Remove(fh)
+		fs.fileMut.Unlock()
+	}
+	return removeObjectFile(fs.objectPath("index/files", fileHash))
+}
+
+func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
+	if raw, err := hex.DecodeString(sha256Hex); err == nil && len(raw) == 32 {
+		var digest [32]byte
+		copy(digest[:], raw)
+		fs.sha256Mut.Lock()
+		fs.sha256Index.Remove(digest)
+		fs.sha256Mut.Unlock()
+	}
+	return removeObjectFile(fs.objectPath("index/sha256", sha256Hex))
+}
+
+func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) (bool, error) {
+	if ch, err := xet.ParseChunkHash(chunkHash); err == nil {
+		fs.chunkMut.Lock()
+		fs.chunkIndex.Remove(ch)
+		fs.chunkMut.Unlock()
+	}
+	return removeObjectFile(fs.objectPath("index/chunks", chunkHash))
+}
+
+func (fs *FileStorage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
+	fs.shardMut.Lock()
+	fs.shardIndex.Remove(shardHash)
+	fs.shardMut.Unlock()
+	return removeObjectFile(fs.objectPath("shards", shardHash))
+}
+
+func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash string) (bool, error) {
+	if xh, err := xet.ParseXorbHash(xorbHash); err == nil {
+		fs.xorbMut.Lock()
+		fs.xorbIndex.Remove(xh) // OnEvicted closes the cached handle
+		fs.xorbMut.Unlock()
+		fs.offsetsMut.Lock()
+		fs.offsetsIndex.Remove(xh)
+		fs.offsetsMut.Unlock()
+	}
+	return removeObjectFile(fs.objectPath("xorbs", xorbHash))
 }

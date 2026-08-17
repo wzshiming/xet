@@ -55,6 +55,8 @@ type S3Storage struct {
 	sha256Mut  sync.Mutex // guards sha256Index
 	offsetsMut sync.Mutex // guards offsetsIndex
 
+	gcMut sync.RWMutex // held exclusively by Sweep to keep shard writes out of a collection cycle
+
 	// endpoint, region and pathStyle configure the lazily created client
 	// when one is not injected directly.
 	endpoint  string
@@ -445,6 +447,9 @@ func (ss *S3Storage) computeFileSHA256(ctx context.Context, fileBlock *shard.Fil
 
 // PutShard stores a shard and its file/chunk/sha256 index objects.
 func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	ss.gcMut.RLock()
+	defer ss.gcMut.RUnlock()
+
 	if len(s.Files) == 0 {
 		return false, fmt.Errorf("shard has no file blocks")
 	}
@@ -619,7 +624,7 @@ func (ss *S3Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [
 	data, err := ss.getObject(ctx, ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
 		if isS3NotFound(err) {
-			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
+			return xet.FileHash{}, fmt.Errorf("SHA-256 not found: %w", os.ErrNotExist)
 		}
 		return xet.FileHash{}, fmt.Errorf("read SHA-256 index: %w", err)
 	}
@@ -748,6 +753,157 @@ func (r *s3ReadSeekCloser) Close() error {
 		return err
 	}
 	return nil
+}
+
+// GetShardByHash loads a shard by the hash of its serialized bytes.
+func (ss *S3Storage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	return ss.getShardByHash(ctx, shardHash)
+}
+
+func (ss *S3Storage) gcLock()   { ss.gcMut.Lock() }
+func (ss *S3Storage) gcUnlock() { ss.gcMut.Unlock() }
+
+// walkKind pages through every object under <prefix>/<kind>/ and passes the
+// reassembled fanout name; keys with an unexpected shape are skipped.
+func (ss *S3Storage) walkKind(ctx context.Context, kind string, fn func(name string, size int64, modTime time.Time) error) error {
+	prefix := kind + "/"
+	if ss.prefix != "" {
+		prefix = ss.prefix + "/" + prefix
+	}
+	var token *string
+	for {
+		out, err := ss.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(ss.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return fmt.Errorf("list %s: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			rest := strings.TrimPrefix(aws.ToString(obj.Key), prefix)
+			parts := strings.SplitN(rest, "/", 2)
+			name := parts[0]
+			if len(parts) == 2 {
+				if strings.Contains(parts[1], "/") {
+					continue
+				}
+				name = parts[0] + parts[1]
+			}
+			if name == "" || strings.HasSuffix(name, ".tmp") {
+				continue
+			}
+			var modTime time.Time
+			if obj.LastModified != nil {
+				modTime = *obj.LastModified
+			}
+			if err := fn(name, aws.ToInt64(obj.Size), modTime); err != nil {
+				return err
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return nil
+		}
+		token = out.NextContinuationToken
+	}
+}
+
+// walkIndexKind visits an index kind, resolving each entry's target value.
+func (ss *S3Storage) walkIndexKind(ctx context.Context, kind string, fn func(name, target string, modTime time.Time) error) error {
+	return ss.walkKind(ctx, kind, func(name string, _ int64, modTime time.Time) error {
+		data, err := ss.getObject(ctx, ss.objectKey(kind, name))
+		if err != nil {
+			if isS3NotFound(err) {
+				return nil // deleted mid-walk
+			}
+			return fmt.Errorf("read %s index %s: %w", kind, name, err)
+		}
+		return fn(name, strings.TrimSpace(string(data)), modTime)
+	})
+}
+
+func (ss *S3Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error {
+	return ss.walkIndexKind(ctx, "index/files", fn)
+}
+
+func (ss *S3Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, fileHash string, modTime time.Time) error) error {
+	return ss.walkIndexKind(ctx, "index/sha256", fn)
+}
+
+func (ss *S3Storage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error {
+	return ss.walkIndexKind(ctx, "index/chunks", fn)
+}
+
+func (ss *S3Storage) WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error {
+	return ss.walkKind(ctx, "shards", fn)
+}
+
+func (ss *S3Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+	return ss.walkKind(ctx, "xorbs", fn)
+}
+
+// deleteObjectKey removes one object, reporting whether it existed.
+func (ss *S3Storage) deleteObjectKey(ctx context.Context, key string) (bool, error) {
+	_, exists, err := ss.headObject(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	_, err = ss.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash string) (bool, error) {
+	if fh, err := xet.ParseFileHash(fileHash); err == nil {
+		ss.fileMut.Lock()
+		ss.fileIndex.Remove(fh)
+		ss.fileMut.Unlock()
+	}
+	return ss.deleteObjectKey(ctx, ss.objectKey("index/files", fileHash))
+}
+
+func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
+	if raw, err := hex.DecodeString(sha256Hex); err == nil && len(raw) == 32 {
+		var digest [32]byte
+		copy(digest[:], raw)
+		ss.sha256Mut.Lock()
+		ss.sha256Index.Remove(digest)
+		ss.sha256Mut.Unlock()
+	}
+	return ss.deleteObjectKey(ctx, ss.objectKey("index/sha256", sha256Hex))
+}
+
+func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) (bool, error) {
+	if ch, err := xet.ParseChunkHash(chunkHash); err == nil {
+		ss.chunkMut.Lock()
+		ss.chunkIndex.Remove(ch)
+		ss.chunkMut.Unlock()
+	}
+	return ss.deleteObjectKey(ctx, ss.objectKey("index/chunks", chunkHash))
+}
+
+func (ss *S3Storage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
+	ss.shardMut.Lock()
+	ss.shardIndex.Remove(shardHash)
+	ss.shardMut.Unlock()
+	return ss.deleteObjectKey(ctx, ss.objectKey("shards", shardHash))
+}
+
+func (ss *S3Storage) DeleteXorb(ctx context.Context, xorbHash string) (bool, error) {
+	if xh, err := xet.ParseXorbHash(xorbHash); err == nil {
+		ss.offsetsMut.Lock()
+		ss.offsetsIndex.Remove(xh)
+		ss.offsetsMut.Unlock()
+	}
+	return ss.deleteObjectKey(ctx, ss.objectKey("xorbs", xorbHash))
 }
 
 var _ Storage = (*S3Storage)(nil)

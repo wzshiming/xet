@@ -136,3 +136,30 @@ func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
 	}
 	return files, nil
 }
+
+// RemoveBySHA256 drops every ready entry whose content matches the given
+// SHA-256 hex, from memory and from the persisted index, so a file removed
+// from the CAS is no longer served from the mirror. It returns the number of
+// entries removed.
+func (h *Handler) RemoveBySHA256(sha256Hex string) (int, error) {
+	if sha256Hex == "" {
+		return 0, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	removed := 0
+	var firstErr error
+	for k, e := range h.entries {
+		if e.SHA256 != sha256Hex {
+			continue
+		}
+		delete(h.entries, k)
+		removed++
+		path := indexEntryPath(h.indexDir, e.Commit, e.Key)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return removed, firstErr
+}

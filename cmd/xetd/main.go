@@ -81,10 +81,11 @@ func main() {
 		}
 		fmt.Println("Authentication enabled")
 	} else {
-		fmt.Println("⚠️  WARNING: Authentication is disabled. Anyone can access this server.")
+		fmt.Println("⚠️  WARNING: Authentication is disabled. Anyone can access this server; GC endpoints are disabled.")
 	}
 
 	var next http.Handler
+	var mirrorHandler *mirror.Handler
 
 	if *upstream != "" {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
@@ -118,16 +119,25 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
 			os.Exit(1)
 		}
+		mirrorHandler = next.(*mirror.Handler)
 
 		fmt.Printf("Mirror mode enabled, upstream: %s\n", *upstream)
 	}
 
 	// Create server
-	next = server.NewHandler(
+	serverOpts := []server.Option{
 		server.WithStorage(stor),
 		server.WithAuthFunc(authFn),
 		server.WithNext(next),
-	)
+	}
+	if mirrorHandler != nil {
+		// Keep the mirror index consistent with GC file deletions.
+		serverOpts = append(serverOpts, server.WithFileRemovedHook(func(_ context.Context, sha256Hex, _ string) error {
+			_, err := mirrorHandler.RemoveBySHA256(sha256Hex)
+			return err
+		}))
+	}
+	next = server.NewHandler(serverOpts...)
 
 	next = handlers.CombinedLoggingHandler(os.Stdout, next)
 
