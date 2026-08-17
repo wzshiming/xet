@@ -1,4 +1,4 @@
-package server
+package admin
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -55,14 +56,20 @@ func putGCTestFile(t *testing.T, stor storage.Storage, data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// gcAuth configures the token auth the GC endpoints refuse to run without.
-func gcAuth() Option {
-	return WithAuthFunc(func(tok string) bool { return tok == "gc-secret" })
+// newTestHandler builds an admin handler in front of the CAS handler, with the
+// token auth the admin endpoints refuse to run without.
+func newTestHandler(stor storage.Storage, opts ...Option) *Handler {
+	opts = append([]Option{
+		WithStorage(stor),
+		WithAuthFunc(func(tok string) bool { return tok == "admin-secret" }),
+		WithNext(server.NewHandler(server.WithStorage(stor))),
+	}, opts...)
+	return NewHandler(opts...)
 }
 
-func gcRequest(method, target string) *http.Request {
+func adminRequest(method, target string) *http.Request {
 	req := httptest.NewRequest(method, target, nil)
-	req.Header.Set("Authorization", "Bearer gc-secret")
+	req.Header.Set("Authorization", "Bearer admin-secret")
 	return req
 }
 
@@ -72,11 +79,11 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	sha256Hex := putGCTestFile(t, stor, []byte("gc endpoint test data"))
-	handler := NewHandler(WithStorage(stor), gcAuth())
+	handler := newTestHandler(stor)
 
 	do := func(method, target string) *http.Response {
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, gcRequest(method, target))
+		handler.ServeHTTP(rec, adminRequest(method, target))
 		return rec.Result()
 	}
 
@@ -142,14 +149,14 @@ func TestGCDeleteFileCallsHookAndDistinguishesHashKinds(t *testing.T) {
 	sha256Hex := putGCTestFile(t, stor, []byte("hook test data"))
 
 	var hookSHA256, hookFileHash string
-	handler := NewHandler(WithStorage(stor), gcAuth(), WithFileRemovedHook(func(_ context.Context, sh, fh string) error {
+	handler := newTestHandler(stor, WithFileRemovedHook(func(_ context.Context, sh, fh string) error {
 		hookSHA256, hookFileHash = sh, fh
 		return nil
 	}))
 
 	// A SHA-256 sent to the xet-hash route must not resolve.
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, gcRequest(http.MethodDelete, "/internal/files/xet/"+sha256Hex))
+	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/xet/"+sha256Hex))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("delete via xet route = %d, want 404", rec.Code)
 	}
@@ -158,7 +165,7 @@ func TestGCDeleteFileCallsHookAndDistinguishesHashKinds(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, gcRequest(http.MethodDelete, "/internal/files/sha256/"+sha256Hex))
+	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/sha256/"+sha256Hex))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("delete via sha256 route = %d", rec.Code)
 	}
@@ -167,7 +174,7 @@ func TestGCDeleteFileCallsHookAndDistinguishesHashKinds(t *testing.T) {
 	}
 }
 
-func TestGCEndpointsRequireAuth(t *testing.T) {
+func TestAdminEndpointsRequireAuth(t *testing.T) {
 	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
@@ -211,11 +218,11 @@ func TestGCSweepSingleFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(WithStorage(stor), gcAuth())
+	handler := newTestHandler(stor)
 	handler.sweepActive.Store(true)
 
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, gcRequest(http.MethodPost, "/internal/gc/sweep"))
+	handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("concurrent sweep = %d, want 409", rec.Code)
 	}
@@ -224,8 +231,8 @@ func TestGCSweepSingleFlight(t *testing.T) {
 // nonCollectorStorage satisfies Storage without the GC primitives.
 type nonCollectorStorage struct{ storage.Storage }
 
-func TestGCEndpointsRejectNonCollectorStorage(t *testing.T) {
-	handler := NewHandler(WithStorage(nonCollectorStorage{}), gcAuth())
+func TestAdminEndpointsRejectNonCollectorStorage(t *testing.T) {
+	handler := newTestHandler(nonCollectorStorage{})
 
 	for _, target := range []struct{ method, path string }{
 		{http.MethodDelete, "/internal/files/sha256/" + hex.EncodeToString(make([]byte, 32))},
@@ -233,7 +240,7 @@ func TestGCEndpointsRejectNonCollectorStorage(t *testing.T) {
 		{http.MethodPost, "/internal/gc/sweep"},
 	} {
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, gcRequest(target.method, target.path))
+		handler.ServeHTTP(rec, adminRequest(target.method, target.path))
 		if rec.Code != http.StatusNotImplemented {
 			t.Fatalf("%s %s = %d, want 501", target.method, target.path, rec.Code)
 		}

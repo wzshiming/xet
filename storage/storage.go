@@ -366,13 +366,36 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		return false, nil // Already exists
 	}
 
+	_, wasInserted, err := fs.writeShard(ctx, s, false)
+	return wasInserted, err
+}
+
+// ReplaceShard persists s and repoints its files at it even when they already
+// resolve to another shard, returning the hash of the stored shard. Compaction
+// uses it to swap in a shard whose reconstruction terms were rewritten.
+func (fs *FileStorage) ReplaceShard(ctx context.Context, s *shard.Shard) (string, error) {
+	fs.gcMut.RLock()
+	defer fs.gcMut.RUnlock()
+
+	if len(s.Files) == 0 {
+		return "", fmt.Errorf("shard has no file blocks")
+	}
+
+	shardHash, _, err := fs.writeShard(ctx, s, true)
+	return shardHash, err
+}
+
+// writeShard persists the shard object and its index entries. When replace is
+// set the index entries are repointed at this shard instead of being left at
+// whatever shard claimed them first.
+func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard, replace bool) (string, bool, error) {
 	for i := range s.Files {
 		computed, err := fs.computeFileSHA256(ctx, &s.Files[i])
 		if err != nil {
-			return false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
+			return "", false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
 		if s.Files[i].MetadataExt != nil && s.Files[i].MetadataExt.SHA256Hash != shard.NewSHA256Hash(computed) {
-			return false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
+			return "", false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
 		}
 
 		s.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(computed)}
@@ -383,13 +406,13 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	// shard object is addressed by this hash rather than by any contained file.
 	r, err := s.Encode(true)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
 
 	shardsDir := filepath.Join(fs.basePath, "shards")
 	f, err := os.CreateTemp(shardsDir, ".shard-*")
 	if err != nil {
-		return false, fmt.Errorf("create shard file: %w", err)
+		return "", false, fmt.Errorf("create shard file: %w", err)
 	}
 	tmpPath := f.Name()
 	removeTemp := true
@@ -402,23 +425,23 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	_, err = io.Copy(f, r)
 	if err != nil {
 		f.Close()
-		return false, fmt.Errorf("write shard to disk: %w", err)
+		return "", false, fmt.Errorf("write shard to disk: %w", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		f.Close()
-		return false, fmt.Errorf("rewind shard file: %w", err)
+		return "", false, fmt.Errorf("rewind shard file: %w", err)
 	}
 	shardHash, err := computeShardHashFromReader(f)
 	if err != nil {
 		f.Close()
-		return false, fmt.Errorf("hash shard file: %w", err)
+		return "", false, fmt.Errorf("hash shard file: %w", err)
 	}
 	if err := f.Chmod(0644); err != nil {
 		f.Close()
-		return false, fmt.Errorf("set shard file permissions: %w", err)
+		return "", false, fmt.Errorf("set shard file permissions: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return false, fmt.Errorf("close shard file: %w", err)
+		return "", false, fmt.Errorf("close shard file: %w", err)
 	}
 
 	shardPath := fs.objectPath("shards", shardHash)
@@ -426,16 +449,20 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	if _, err := os.Stat(shardPath); err == nil {
 		wasInserted = false
 	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check shard file: %w", err)
+		return "", false, fmt.Errorf("check shard file: %w", err)
 	} else if err := os.MkdirAll(filepath.Dir(shardPath), 0755); err != nil {
-		return false, fmt.Errorf("create shard directory: %w", err)
+		return "", false, fmt.Errorf("create shard directory: %w", err)
 	} else if err := os.Rename(tmpPath, shardPath); err != nil {
-		return false, fmt.Errorf("finalize shard file: %w", err)
+		return "", false, fmt.Errorf("finalize shard file: %w", err)
 	} else {
 		removeTemp = false
 	}
 
 	shardHashData := []byte(shardHash)
+	writeIndex := writeIndexFile
+	if replace {
+		writeIndex = replaceIndexFile
+	}
 	fs.shardMut.Lock()
 	fs.shardIndex.Add(shardHash, s)
 	fs.shardMut.Unlock()
@@ -444,28 +471,33 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		fs.fileIndex.Add(file.FileHash, shardHash)
 		fs.fileMut.Unlock()
 		indexPath := fs.objectPath("index/files", file.FileHash.String())
-		if err := writeIndexFile(indexPath, shardHashData); err != nil {
-			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
+		if err := writeIndex(indexPath, shardHashData); err != nil {
+			return shardHash, wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
+			if replace {
+				fs.chunkMut.Lock()
+				fs.chunkIndex.Add(chunk.ChunkHash, shardHash)
+				fs.chunkMut.Unlock()
+			}
 			chunkPath := fs.objectPath("index/chunks", chunk.ChunkHash.String())
-			err := writeIndexFile(chunkPath, shardHashData)
+			err := writeIndex(chunkPath, shardHashData)
 			if err != nil {
-				return wasInserted, fmt.Errorf("write chunk index: %w", err)
+				return shardHash, wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
 		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
-		if err := writeIndexFile(sha256Path, []byte(file.FileHash.String())); err != nil {
-			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
+		if err := writeIndex(sha256Path, []byte(file.FileHash.String())); err != nil {
+			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
-	return wasInserted, nil
+	return shardHash, wasInserted, nil
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on
@@ -646,6 +678,11 @@ func writeIndexFile(path string, value []byte) error {
 	if err == nil {
 		return nil
 	}
+	return replaceIndexFile(path, value)
+}
+
+// replaceIndexFile writes an index entry, overwriting any existing value.
+func replaceIndexFile(path string, value []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -687,6 +724,15 @@ func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash 
 // GetShardByHash loads a shard by the hash of its serialized bytes.
 func (fs *FileStorage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	return fs.getShardByHash(shardHash)
+}
+
+// XorbChunkCount reports how many chunks a stored xorb holds.
+func (fs *FileStorage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error) {
+	offsets, err := fs.xorbChunkOffsets(xorbHash)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(len(offsets)), nil
 }
 
 func (fs *FileStorage) gcLock()   { fs.gcMut.Lock() }

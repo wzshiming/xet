@@ -465,13 +465,35 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		}
 	}
 
+	_, wasInserted, err := ss.writeShard(ctx, s, false)
+	return wasInserted, err
+}
+
+// ReplaceShard persists s and repoints its files at it even when they already
+// resolve to another shard, returning the hash of the stored shard. Compaction
+// uses it to swap in a shard whose reconstruction terms were rewritten.
+func (ss *S3Storage) ReplaceShard(ctx context.Context, s *shard.Shard) (string, error) {
+	ss.gcMut.RLock()
+	defer ss.gcMut.RUnlock()
+
+	if len(s.Files) == 0 {
+		return "", fmt.Errorf("shard has no file blocks")
+	}
+
+	shardHash, _, err := ss.writeShard(ctx, s, true)
+	return shardHash, err
+}
+
+// writeShard persists the shard object and its index objects. Index objects
+// are overwritten either way; replace only controls the in-memory caches.
+func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace bool) (string, bool, error) {
 	for i := range s.Files {
 		computed, err := ss.computeFileSHA256(ctx, &s.Files[i])
 		if err != nil {
-			return false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
+			return "", false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
 		if s.Files[i].MetadataExt != nil && s.Files[i].MetadataExt.SHA256Hash != shard.NewSHA256Hash(computed) {
-			return false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
+			return "", false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
 		}
 
 		s.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(computed)}
@@ -482,25 +504,25 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 	// shard object is addressed by this hash rather than by any contained file.
 	r, err := s.Encode(true)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
 	var encoded bytes.Buffer
 	if _, err := io.Copy(&encoded, r); err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
 	shardHash, err := computeShardHashFromReader(bytes.NewReader(encoded.Bytes()))
 	if err != nil {
-		return false, fmt.Errorf("hash shard: %w", err)
+		return "", false, fmt.Errorf("hash shard: %w", err)
 	}
 
 	shardKey := ss.objectKey("shards", shardHash)
 	wasInserted := true
 	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
-		return false, fmt.Errorf("check shard object: %w", err)
+		return "", false, fmt.Errorf("check shard object: %w", err)
 	} else if exists {
 		wasInserted = false
 	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded.Bytes())); err != nil {
-		return false, fmt.Errorf("upload shard: %w", err)
+		return "", false, fmt.Errorf("upload shard: %w", err)
 	}
 
 	// The index/files/ index is written last: hasFile treats it as the commit
@@ -509,19 +531,24 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
+			if replace {
+				ss.chunkMut.Lock()
+				ss.chunkIndex.Add(chunk.ChunkHash, shardHash)
+				ss.chunkMut.Unlock()
+			}
 			if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
-				return wasInserted, fmt.Errorf("write chunk index: %w", err)
+				return shardHash, wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
-			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
+			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
-			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
+			return shardHash, wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
@@ -536,7 +563,7 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		ss.fileMut.Unlock()
 	}
 
-	return wasInserted, nil
+	return shardHash, wasInserted, nil
 }
 
 func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -758,6 +785,15 @@ func (r *s3ReadSeekCloser) Close() error {
 // GetShardByHash loads a shard by the hash of its serialized bytes.
 func (ss *S3Storage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	return ss.getShardByHash(ctx, shardHash)
+}
+
+// XorbChunkCount reports how many chunks a stored xorb holds.
+func (ss *S3Storage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error) {
+	offsets, err := ss.xorbChunkOffsets(ctx, xorbHash)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(len(offsets)), nil
 }
 
 func (ss *S3Storage) gcLock()   { ss.gcMut.Lock() }

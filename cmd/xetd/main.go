@@ -13,6 +13,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/admin"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
 )
@@ -125,19 +126,26 @@ func main() {
 	}
 
 	// Create server
-	serverOpts := []server.Option{
+	next = server.NewHandler(
 		server.WithStorage(stor),
 		server.WithAuthFunc(authFn),
 		server.WithNext(next),
+	)
+
+	// Storage administration endpoints, registered in front of the CAS routes.
+	adminOpts := []admin.Option{
+		admin.WithStorage(stor),
+		admin.WithAuthFunc(admin.AuthFunc(authFn)),
+		admin.WithNext(next),
 	}
 	if mirrorHandler != nil {
 		// Keep the mirror index consistent with GC file deletions.
-		serverOpts = append(serverOpts, server.WithFileRemovedHook(func(_ context.Context, sha256Hex, _ string) error {
+		adminOpts = append(adminOpts, admin.WithFileRemovedHook(func(_ context.Context, sha256Hex, _ string) error {
 			_, err := mirrorHandler.RemoveBySHA256(sha256Hex)
 			return err
 		}))
 	}
-	next = server.NewHandler(serverOpts...)
+	next = admin.NewHandler(adminOpts...)
 
 	next = handlers.CombinedLoggingHandler(os.Stdout, next)
 

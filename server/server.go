@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -27,18 +25,11 @@ type Handler struct {
 	root    *mux.Router
 	next    http.Handler
 	authFn  AuthFunc
-
-	fileRemovedHook FileRemovedHook
-	sweepActive     atomic.Bool // single-flight guard for GC sweeps
 }
 
 // AuthFunc is a function that validates authentication tokens
 // It returns true if the token is valid
 type AuthFunc func(token string) bool
-
-// FileRemovedHook is called after a file's index entries are removed via the
-// GC delete endpoint, e.g. to drop matching mirror index entries.
-type FileRemovedHook func(ctx context.Context, sha256Hex, fileHash string) error
 
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
@@ -47,13 +38,6 @@ type Option func(*Handler)
 func WithAuthFunc(authFn AuthFunc) Option {
 	return func(h *Handler) {
 		h.authFn = authFn
-	}
-}
-
-// WithFileRemovedHook sets a callback invoked after a successful file delete.
-func WithFileRemovedHook(fn FileRemovedHook) Option {
-	return func(h *Handler) {
-		h.fileRemovedHook = fn
 	}
 }
 
@@ -108,11 +92,6 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/xet-bridge/{sha256}", s.handleXetBridge).Methods(http.MethodGet, http.MethodHead)
-
-	// Internal GC administration endpoints, not part of the xet protocol.
-	s.root.HandleFunc("/internal/files/sha256/{hash}", s.deleteFileHandler(storage.HashKindSHA256)).Methods(http.MethodDelete)
-	s.root.HandleFunc("/internal/files/xet/{hash}", s.deleteFileHandler(storage.HashKindFile)).Methods(http.MethodDelete)
-	s.root.HandleFunc("/internal/gc/sweep", s.handleGCSweep).Methods(http.MethodPost)
 
 	s.root.NotFoundHandler = s.next
 }

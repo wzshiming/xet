@@ -1,4 +1,4 @@
-package server
+package admin
 
 import (
 	"encoding/json"
@@ -11,44 +11,18 @@ import (
 	"github.com/wzshiming/xet/storage"
 )
 
-// gcCollector returns the storage's GC capabilities, or nil when the backend
-// does not support them.
-func (s *Handler) gcCollector() storage.Collector {
-	c, _ := s.storage.(storage.Collector)
-	return c
-}
-
 type deleteFileResponse struct {
 	*storage.UnlinkResult
 	HookError string `json:"hook_error,omitempty"`
-}
-
-// gcAuthorize gates the destructive GC endpoints: they stay disabled until an
-// AuthFunc is configured, and need a Collector-capable backend.
-func (s *Handler) gcAuthorize(w http.ResponseWriter, r *http.Request) (storage.Collector, bool) {
-	if s.authFn == nil {
-		http.Error(w, "GC endpoints are disabled without authentication", http.StatusForbidden)
-		return nil, false
-	}
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return nil, false
-	}
-	collector := s.gcCollector()
-	if collector == nil {
-		http.Error(w, "storage does not support GC", http.StatusNotImplemented)
-		return nil, false
-	}
-	return collector, true
 }
 
 // deleteFileHandler serves DELETE /internal/files/sha256/{hash} and
 // /internal/files/xet/{hash}; the path names the hash kind since both are 64
 // hex characters. It unlinks the file's index entries; space is reclaimed by
 // a later sweep.
-func (s *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
+func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		collector, ok := s.gcAuthorize(w, r)
+		collector, ok := h.authorize(w, r)
 		if !ok {
 			return
 		}
@@ -64,8 +38,8 @@ func (s *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 		}
 
 		resp := deleteFileResponse{UnlinkResult: res}
-		if s.fileRemovedHook != nil {
-			if err := s.fileRemovedHook(r.Context(), res.SHA256, res.FileHash); err != nil {
+		if h.fileRemovedHook != nil {
+			if err := h.fileRemovedHook(r.Context(), res.SHA256, res.FileHash); err != nil {
 				resp.HookError = err.Error()
 			}
 		}
@@ -75,11 +49,11 @@ func (s *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 	}
 }
 
-// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=. Only one
+// handleSweep handles POST /internal/gc/sweep?dry_run=&grace=. Only one
 // sweep runs at a time; concurrent requests get 409. grace=0 disables the
 // grace window; see SweepOptions.Grace for why that is unsafe during uploads.
-func (s *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
-	collector, ok := s.gcAuthorize(w, r)
+func (h *Handler) handleSweep(w http.ResponseWriter, r *http.Request) {
+	collector, ok := h.authorize(w, r)
 	if !ok {
 		return
 	}
@@ -106,11 +80,11 @@ func (s *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 		opts.Grace = grace
 	}
 
-	if !s.sweepActive.CompareAndSwap(false, true) {
+	if !h.sweepActive.CompareAndSwap(false, true) {
 		http.Error(w, "Sweep already in progress", http.StatusConflict)
 		return
 	}
-	defer s.sweepActive.Store(false)
+	defer h.sweepActive.Store(false)
 
 	report, err := storage.Sweep(r.Context(), collector, opts)
 	if err != nil {

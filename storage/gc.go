@@ -21,6 +21,13 @@ type Collector interface {
 	// GetShardByHash loads a shard by the hash of its serialized bytes.
 	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
 
+	// ReplaceShard stores a shard whose files may already be indexed,
+	// repointing them at it. Compaction uses it to swap in rewritten shards.
+	ReplaceShard(ctx context.Context, s *shard.Shard) (string, error)
+
+	// XorbChunkCount reports how many chunks a stored xorb holds.
+	XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error)
+
 	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error
 	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, fileHash string, modTime time.Time) error) error
 	WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error
