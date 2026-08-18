@@ -25,6 +25,7 @@ func (h *Handler) fetchXet(ctx context.Context, t *task, key string) error {
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
+		t.upstreamXetHash = fileHash.String()
 		return h.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, t.spool)
 	})
 }

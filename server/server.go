@@ -243,6 +243,12 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	// Get shard for this file
 	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
+		// A mirror deployment can answer for files it is still ingesting;
+		// hand the miss to the next handler when one exists.
+		if s.next != nil {
+			s.next.ServeHTTP(w, r)
+			return
+		}
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
@@ -328,6 +334,12 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	// Get shard for this file
 	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
+		// A mirror deployment can answer for files it is still ingesting;
+		// hand the miss to the next handler when one exists.
+		if s.next != nil {
+			s.next.ServeHTTP(w, r)
+			return
+		}
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}

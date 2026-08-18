@@ -43,6 +43,9 @@ type probeResult struct {
 	etag   string
 	sha256 string // set when the upstream etag looks like a SHA-256
 	commit string
+	// xetHash is the upstream's xet file hash from the resolve response;
+	// ingest verifies local chunking reproduces it.
+	xetHash string
 	// realCommit records that commit came from the upstream rather than
 	// being synthesized; only real commits may pin branch revisions.
 	realCommit bool
@@ -137,6 +140,9 @@ func (p *probeResult) collect(header http.Header) {
 	}
 	if p.commit == "" {
 		p.commit = header.Get("X-Repo-Commit")
+	}
+	if p.xetHash == "" {
+		p.xetHash = header.Get("X-Xet-Hash")
 	}
 	if !p.xet {
 		links := hf.ParseLinkHeaders(header.Values("Link"))

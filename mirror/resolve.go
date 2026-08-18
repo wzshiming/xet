@@ -112,6 +112,43 @@ func (h *Handler) serveFailed(w http.ResponseWriter, e *fileEntry) {
 	serveFetchError(w, e.notFound, e.lastErr)
 }
 
+// serveReconstructionWait parks a by-hash reconstruction request on the
+// in-flight ingest of that hash — the CAS server in front delegates misses
+// here — then redirects the client back so the server answers from storage,
+// which holds the hash because ingest verified it matches the upstream's.
+// It reports false when no in-flight ingest matches.
+func (h *Handler) serveReconstructionWait(w http.ResponseWriter, r *http.Request, hash string) bool {
+	h.mu.Lock()
+	key, ok := h.hashTasks[hash]
+	var t *task
+	if ok {
+		t = h.tasks[key]
+	}
+	h.mu.Unlock()
+	if t == nil {
+		return false
+	}
+
+	select {
+	case <-r.Context().Done():
+		return true // client gone; nothing to answer
+	case <-t.done:
+	}
+
+	h.mu.Lock()
+	e := h.entries[key]
+	h.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	if e.State != stateReady {
+		h.serveFailed(w, e)
+		return true
+	}
+	http.Redirect(w, r, r.URL.String(), http.StatusTemporaryRedirect)
+	return true
+}
+
 // serveFetchError maps a failed ingest to its HTTP response: 404 when the
 // upstream lacks the file, 502 with the underlying error otherwise.
 func serveFetchError(w http.ResponseWriter, notFound bool, err error) {

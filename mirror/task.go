@@ -28,6 +28,10 @@ type task struct {
 	notFound bool
 	probe    *probeResult
 	size     atomic.Int64 // final content length, -1 until known
+
+	// upstreamXetHash is the xet file hash the upstream resolve advertised;
+	// empty when the file was fetched plain or resumed from a full spool.
+	upstreamXetHash string
 }
 
 // setSize records the content length once known (first value wins) and
@@ -170,6 +174,23 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 	if pr.size >= 0 {
 		t.setSize(pr.size)
 	}
+	if pr.xetHash != "" {
+		// Ingest verifies the local hash against this, so by-hash requests
+		// parked on the task can be redirected to storage once it lands.
+		t.upstreamXetHash = pr.xetHash
+		h.mu.Lock()
+		h.hashTasks[pr.xetHash] = key
+		h.mu.Unlock()
+		defer func() {
+			h.mu.Lock()
+			// Another key with the same content may have re-registered the
+			// hash; only remove the mapping while it is still ours.
+			if h.hashTasks[pr.xetHash] == key {
+				delete(h.hashTasks, pr.xetHash)
+			}
+			h.mu.Unlock()
+		}()
+	}
 	close(t.probed)
 	defer t.setSize(-1) // unblock size waiters at the latest when the task ends
 
@@ -282,6 +303,12 @@ func (h *Handler) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fi
 			return nil, fmt.Errorf("ingest into storage: %w", err)
 		}
 		entry.FileHash = fileHash.String()
+		// Re-chunking must reproduce the upstream's hash, so a hash learned
+		// from upstream metadata keeps resolving on this mirror; a divergence
+		// is a chunking conformance bug and must not be served silently.
+		if t.upstreamXetHash != "" && entry.FileHash != t.upstreamXetHash {
+			return nil, fmt.Errorf("xet hash mismatch: local chunking produced %s, upstream advertised %s", entry.FileHash, t.upstreamXetHash)
+		}
 	}
 
 	if err := persistEntry(h.indexDir, entry); err != nil {

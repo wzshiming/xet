@@ -40,6 +40,10 @@ import (
 // treated as an opaque repo identity, so no platform-specific routing exists.
 var resolveRe = regexp.MustCompile(`^/(.+?)/resolve/([^/]+)/(.+)$`)
 
+// reconstructionRe matches CAS by-hash reconstruction paths; the CAS server
+// in front delegates misses on them to the mirror.
+var reconstructionRe = regexp.MustCompile(`^/v[12]/reconstructions/([0-9a-f]{64})$`)
+
 // apiTreeRe matches hub tree listing API paths. Their entries carry per-file
 // xet hashes that would steer downstream clients straight to the upstream CAS.
 var apiTreeRe = regexp.MustCompile(`^/api/(models|datasets|spaces)/(.+?)/tree/([^/]+)(/.*)?$`)
@@ -123,6 +127,9 @@ type Handler struct {
 	entries  map[resolveKey]*fileEntry
 	branches map[string]*branchEntry
 	tasks    map[resolveKey]*task
+	// hashTasks maps the upstream xet hash of each in-flight ingest to its
+	// key, so by-hash reconstruction requests can park on the ingest.
+	hashTasks map[string]resolveKey
 }
 
 // Option configures the Handler.
@@ -192,6 +199,7 @@ func NewHandler(opts ...Option) (*Handler, error) {
 		revalidateInterval: 5 * time.Minute,
 		entries:            map[resolveKey]*fileEntry{},
 		tasks:              map[resolveKey]*task{},
+		hashTasks:          map[string]resolveKey{},
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -283,6 +291,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && resolveRe.MatchString(p) {
 		h.handleResolve(w, r, p)
 		return
+	}
+	if r.Method == http.MethodGet {
+		if m := reconstructionRe.FindStringSubmatch(p); m != nil && h.serveReconstructionWait(w, r, m[1]) {
+			return
+		}
 	}
 	h.next.ServeHTTP(w, r)
 }

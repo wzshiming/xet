@@ -1225,3 +1225,147 @@ func TestMirrorIndexMigration(t *testing.T) {
 		t.Fatalf("migrated branch mapping not loaded: %+v", loadedBranch)
 	}
 }
+
+func TestIngestSpoolVerifiesUpstreamXetHash(t *testing.T) {
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{
+		localAdapter: &localCAS{storage: stor, namespace: "default"},
+		indexDir:     t.TempDir(),
+	}
+	data := []byte("upstream xet hash invariant test data")
+	sum := sha256.Sum256(data)
+	commit := strings.Repeat("cd", 20)
+	key, ok := parseResolveKey("/org/repo/resolve/" + commit + "/a.bin")
+	if !ok {
+		t.Fatal("parseResolveKey")
+	}
+
+	spoolTask := func() *task {
+		sp, err := openSpool(t.TempDir(), key.String(), `"etag-1"`, int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		return &task{
+			spool: sp,
+			probe: &probeResult{etag: "etag-1", sha256: hex.EncodeToString(sum[:]), commit: commit},
+		}
+	}
+
+	// Learn the hash local chunking produces.
+	entry, err := h.ingestSpool(context.Background(), spoolTask(), key)
+	if err != nil {
+		t.Fatalf("ingestSpool: %v", err)
+	}
+
+	// A matching upstream hash ingests fine.
+	tk := spoolTask()
+	tk.upstreamXetHash = entry.FileHash
+	if _, err := h.ingestSpool(context.Background(), tk, key); err != nil {
+		t.Fatalf("ingestSpool with matching upstream hash: %v", err)
+	}
+
+	// A diverging upstream hash must fail the ingest, not be served silently.
+	tk = spoolTask()
+	tk.upstreamXetHash = strings.Repeat("00", 32)
+	if _, err := h.ingestSpool(context.Background(), tk, key); err == nil || !strings.Contains(err.Error(), "xet hash mismatch") {
+		t.Fatalf("ingestSpool with diverging upstream hash = %v, want xet hash mismatch", err)
+	}
+}
+
+func TestMirrorReconstructionWaitsForInFlightIngest(t *testing.T) {
+	upstream := newXetUpstream(t)
+	upstream.gate = make(chan struct{})
+	upstream.gateHit = make(chan struct{})
+
+	data := make([]byte, 128*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	const resolvePath = "/org/repo/resolve/main/gated.bin"
+	upstream.add(t, resolvePath, data)
+	upstream.mu.Lock()
+	upstreamHash := upstream.files[resolvePath].fileHash
+	upstream.mu.Unlock()
+
+	fx := newMirrorFixture(t, upstream.hubURL, t.TempDir(), t.TempDir())
+
+	// Kick off the ingest; the gated upstream xorb GET keeps it in flight.
+	go func() {
+		resp, err := http.Get(fx.srv.URL + resolvePath)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	<-upstream.gateHit
+
+	tok, _ := fx.issuer.Mint(time.Now())
+	reconstruct := func() (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, fx.srv.URL+"/v1/reconstructions/"+upstreamHash, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+		return http.DefaultClient.Do(req) // follows the mirror's 307 back to the CAS server
+	}
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		resp, err := reconstruct()
+		resCh <- result{resp, err}
+	}()
+
+	// The by-hash request parks on the ingest instead of answering 404.
+	select {
+	case res := <-resCh:
+		if res.err == nil {
+			res.resp.Body.Close()
+			t.Fatalf("reconstruction answered while ingest in flight: %d", res.resp.StatusCode)
+		}
+		t.Fatalf("reconstruction failed while ingest in flight: %v", res.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(upstream.gate)
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("reconstruction after ingest: %v", res.err)
+		}
+		defer res.resp.Body.Close()
+		if res.resp.StatusCode != http.StatusOK {
+			t.Fatalf("reconstruction status = %d, want 200", res.resp.StatusCode)
+		}
+		var body struct {
+			Terms []json.RawMessage `json:"terms"`
+		}
+		if err := json.NewDecoder(res.resp.Body).Decode(&body); err != nil || len(body.Terms) == 0 {
+			t.Fatalf("reconstruction body: terms=%d err=%v", len(body.Terms), err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("reconstruction still parked after ingest finished")
+	}
+
+	// An unknown hash still falls through instead of parking forever.
+	req, _ := http.NewRequest(http.MethodGet, fx.srv.URL+"/v1/reconstructions/"+strings.Repeat("11", 32), nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("unknown hash reconstruction = 200")
+	}
+}
