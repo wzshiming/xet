@@ -92,3 +92,10 @@ func (g *GC) Compact(ctx context.Context, opts CompactOptions) (*CompactReport, 
 	defer g.active.Store(false)
 	return Compact(ctx, g.st, opts)
 }
+
+// ListFiles enumerates the store's files with their SHA-256 mappings and
+// sizes. It is read-only and, like Unlink, not serialized against Sweep or
+// Compact.
+func (g *GC) ListFiles(ctx context.Context) ([]FileListEntry, error) {
+	return ListFiles(ctx, g.st)
+}

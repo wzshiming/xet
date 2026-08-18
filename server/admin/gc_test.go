@@ -184,6 +184,7 @@ func TestAdminEndpointsRequireAuth(t *testing.T) {
 	targets := []struct{ method, path string }{
 		{http.MethodDelete, "/internal/files/sha256/" + sha256Hex},
 		{http.MethodPost, "/internal/gc/sweep"},
+		{http.MethodGet, "/internal/files"},
 	}
 
 	// Without an AuthFunc the destructive endpoints are disabled outright.
@@ -273,6 +274,7 @@ func TestAdminEndpointsRejectNonCollectorStorage(t *testing.T) {
 		{http.MethodDelete, "/internal/files/sha256/" + hex.EncodeToString(make([]byte, 32))},
 		{http.MethodDelete, "/internal/files/xet/" + hex.EncodeToString(make([]byte, 32))},
 		{http.MethodPost, "/internal/gc/sweep"},
+		{http.MethodGet, "/internal/files"},
 	} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, adminRequest(target.method, target.path))

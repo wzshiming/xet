@@ -91,6 +91,7 @@ func NewHandler(opts ...Option) *Handler {
 		}
 	}
 
+	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
 	h.root.HandleFunc("/internal/files/sha256/{hash}", h.deleteFileHandler(storage.HashKindSHA256)).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.deleteFileHandler(storage.HashKindFile)).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleSweep).Methods(http.MethodPost)
