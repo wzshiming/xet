@@ -6,7 +6,16 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"github.com/wzshiming/xet/shard"
 )
+
+// ListStore is the read-only storage surface ListFiles needs.
+type ListStore interface {
+	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
+	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error
+	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, fileHash string, modTime time.Time) error) error
+}
 
 // FileListEntry groups the file hashes sharing one content identity: several
 // xet hashes can carry the same SHA-256 when the same bytes were chunked
@@ -30,7 +39,7 @@ type FileListEntry struct {
 // and loading each shard once. It is read-only and takes no GC guard, so a
 // listing concurrent with a sweep or with uploads reflects a mid-flight
 // state.
-func ListFiles(ctx context.Context, st SweepStore) ([]*FileListEntry, error) {
+func ListFiles(ctx context.Context, st ListStore) ([]FileListEntry, error) {
 	// Index fallback for files whose shard is gone; the index holds at most
 	// one file hash per SHA-256, so shard metadata is joined first below.
 	sha256ByFile := map[string]string{}
@@ -43,69 +52,82 @@ func ListFiles(ctx context.Context, st SweepStore) ([]*FileListEntry, error) {
 	}
 
 	filesByShard := map[string][]string{}
+	totalFiles := 0
 	err = st.WalkFileIndex(ctx, func(fileHash, shardHash string, _ time.Time) error {
 		filesByShard[shardHash] = append(filesByShard[shardHash], fileHash)
+		totalFiles++
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	type fileInfo struct {
-		sha256 string
-		size   int64
-		found  bool
+	// bySHA256 holds indices into entries; index-based grouping avoids
+	// per-entry pointer allocations and a final copy into a value slice.
+	entries := make([]FileListEntry, 0, totalFiles)
+	bySHA256 := make(map[string]int, totalFiles)
+	addFile := func(fileHash, sha256 string, size int64, found bool) {
+		idx, ok := bySHA256[sha256]
+		if !ok {
+			entries = append(entries, FileListEntry{SHA256: sha256, Missing: true})
+			idx = len(entries) - 1
+			if sha256 != "" {
+				bySHA256[sha256] = idx
+			}
+		}
+		entry := &entries[idx]
+		entry.FileHashes = append(entry.FileHashes, fileHash)
+		if found && entry.Missing {
+			entry.Missing = false
+			entry.Size = size
+		}
 	}
-	infos := map[string]fileInfo{}
+
 	for shardHash, fileHashes := range filesByShard {
 		sh, err := st.GetShardByHash(ctx, shardHash)
 		if err != nil && !isNotExist(err) {
 			return nil, fmt.Errorf("load shard %s: %w", shardHash, err)
 		}
-		for _, fileHash := range fileHashes {
-			info := fileInfo{sha256: sha256ByFile[fileHash]}
-			if sh != nil {
-				for i := range sh.Files {
-					fb := &sh.Files[i]
-					if fb.FileHash.String() != fileHash {
-						continue
-					}
-					info.found = true
-					for _, entry := range fb.Entries {
-						info.size += int64(entry.UnpackedSegBytes)
-					}
-					if fb.MetadataExt != nil {
-						info.sha256 = fb.MetadataExt.SHA256Hash.String()
-					}
+		// One pass over the shard, hex-encoding each file hash once;
+		// matched hashes are swap-removed from the wanted list.
+		remaining := fileHashes
+		if sh != nil {
+			for i := range sh.Files {
+				if len(remaining) == 0 {
 					break
 				}
+				fb := &sh.Files[i]
+				fileHash := fb.FileHash.String()
+				j := slices.Index(remaining, fileHash)
+				if j < 0 {
+					continue
+				}
+				remaining[j] = remaining[len(remaining)-1]
+				remaining = remaining[:len(remaining)-1]
+
+				var size int64
+				for _, entry := range fb.Entries {
+					size += int64(entry.UnpackedSegBytes)
+				}
+				sha256 := sha256ByFile[fileHash]
+				if fb.MetadataExt != nil {
+					sha256 = fb.MetadataExt.SHA256Hash.String()
+				}
+				addFile(fileHash, sha256, size, true)
 			}
-			infos[fileHash] = info
+		}
+		for _, fileHash := range remaining {
+			addFile(fileHash, sha256ByFile[fileHash], 0, false)
 		}
 	}
 
-	bySHA256 := map[string]*FileListEntry{}
-	entries := make([]*FileListEntry, 0, len(infos))
-	for fileHash, info := range infos {
-		entry := bySHA256[info.sha256]
-		if entry == nil {
-			entry = &FileListEntry{SHA256: info.sha256, Missing: true}
-			entries = append(entries, entry)
-			if info.sha256 != "" {
-				bySHA256[info.sha256] = entry
-			}
-		}
-		entry.FileHashes = append(entry.FileHashes, fileHash)
-		if info.found && entry.Missing {
-			entry.Missing = false
-			entry.Size = info.size
+	for i := range entries {
+		fileHashs := entries[i].FileHashes
+		if len(fileHashs) > 1 {
+			slices.Sort(fileHashs)
 		}
 	}
-
-	for _, entry := range entries {
-		slices.Sort(entry.FileHashes)
-	}
-	slices.SortFunc(entries, func(a, b *FileListEntry) int {
+	slices.SortFunc(entries, func(a, b FileListEntry) int {
 		if c := cmp.Compare(a.Size, b.Size); c != 0 {
 			return c
 		}
