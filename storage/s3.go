@@ -46,7 +46,7 @@ type S3Storage struct {
 	fileIndex    *lru.Cache // bounded file hash -> shard hash
 	shardIndex   *lru.Cache // bounded shard hash -> shard cache
 	chunkIndex   *lru.Cache // bounded chunk hash -> shard hash
-	sha256Index  *lru.Cache // bounded SHA-256 -> file hash
+	sha256Index  *lru.Cache // bounded SHA-256 -> shard hash
 	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
 
 	fileMut    sync.Mutex // guards fileIndex
@@ -510,7 +510,7 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		}
 	}
 	for _, file := range s.Files {
-		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
+		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
@@ -607,38 +607,46 @@ func (ss *S3Storage) GetShardByChunkHash(ctx context.Context, _ string, chunkHas
 }
 
 // GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded
-// at ingest.
+// at ingest, loading the owning shard and matching its file metadata.
 func (ss *S3Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
+	sh, err := ss.getShardBySHA256(ctx, digest)
+	if err != nil {
+		return xet.FileHash{}, err
+	}
+	file := findFileBySHA256(sh, digest)
+	if file == nil {
+		return xet.FileHash{}, fmt.Errorf("SHA-256 is not present in shard")
+	}
+	return file.FileHash, nil
+}
+
+// getShardBySHA256 resolves a SHA-256 digest through index/sha256/<digest>,
+// whose contents are the hash of the owning shard, reading the index through
+// the bounded cache.
+func (ss *S3Storage) getShardBySHA256(ctx context.Context, digest [32]byte) (*shard.Shard, error) {
 	ss.sha256Mut.Lock()
 	value, exists := ss.sha256Index.Get(digest)
 	ss.sha256Mut.Unlock()
 	if exists {
-		return value.(xet.FileHash), nil
+		return ss.getShardByHash(ctx, value.(string))
 	}
 
 	data, err := ss.getObject(ctx, ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
 		if isS3NotFound(err) {
-			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
+			return nil, fmt.Errorf("SHA-256 not found")
 		}
-		return xet.FileHash{}, fmt.Errorf("read SHA-256 index: %w", err)
+		return nil, fmt.Errorf("read SHA-256 index: %w", err)
 	}
-	fileHash, err := xet.ParseFileHash(strings.TrimSpace(string(data)))
-	if err != nil {
-		return xet.FileHash{}, fmt.Errorf("invalid SHA-256 index: %w", err)
-	}
+	shardHash := strings.TrimSpace(string(data))
 	ss.sha256Mut.Lock()
-	ss.sha256Index.Add(digest, fileHash)
+	ss.sha256Index.Add(digest, shardHash)
 	ss.sha256Mut.Unlock()
-	return fileHash, nil
+	return ss.getShardByHash(ctx, shardHash)
 }
 
 func (ss *S3Storage) GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error) {
-	fileHash, err := ss.GetFileHashBySHA256(ctx, namespace, sha256)
-	if err != nil {
-		return nil, fmt.Errorf("get file hash by sha256: %w", err)
-	}
-	sh, err := ss.GetShard(ctx, fileHash)
+	sh, err := ss.getShardBySHA256(ctx, sha256)
 	if err != nil {
 		return nil, fmt.Errorf("get shard by sha256: %w", err)
 	}

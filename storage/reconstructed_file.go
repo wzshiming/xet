@@ -39,14 +39,20 @@ type reconstructedFile struct {
 	closed     bool
 }
 
-func newReconstructedFile(ctx context.Context, stor xorbRangeReader, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
-	var file *shard.FileBlock
+// findFileBySHA256 returns the shard file whose recorded SHA-256 matches
+// digest, or nil when the shard does not carry it.
+func findFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
+	want := shard.NewSHA256Hash(digest)
 	for i := range sh.Files {
-		if sh.Files[i].MetadataExt != nil && sh.Files[i].MetadataExt.SHA256Hash == shard.NewSHA256Hash(digest) {
-			file = &sh.Files[i]
-			break
+		if sh.Files[i].MetadataExt != nil && sh.Files[i].MetadataExt.SHA256Hash == want {
+			return &sh.Files[i]
 		}
 	}
+	return nil
+}
+
+func newReconstructedFile(ctx context.Context, stor xorbRangeReader, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
+	file := findFileBySHA256(sh, digest)
 	if file == nil {
 		return nil, fmt.Errorf("SHA-256 is not present in shard")
 	}
