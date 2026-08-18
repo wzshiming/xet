@@ -1155,9 +1155,9 @@ func TestMirrorIndexLayout(t *testing.T) {
 	}
 }
 
-// TestMirrorIndexMigration: entries persisted by older layouts (hashed branch
-// mapping names, flat file entries) move to their canonical locations on
-// startup and stay loaded.
+// TestMirrorIndexMigration: entries persisted by older layouts move to their
+// canonical locations — hashed branch mappings on startup, flat file entries
+// on their first lookup.
 func TestMirrorIndexMigration(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
@@ -1205,6 +1205,11 @@ func TestMirrorIndexMigration(t *testing.T) {
 		t.Fatalf("migrated branch mapping missing: %v", err)
 	}
 
+	// File entries migrate on first lookup, not at startup.
+	k, _ := parseResolveKey(key)
+	if fx.handler.entryForKey(context.Background(), k) == nil {
+		t.Fatal("legacy flat entry not found by lookup")
+	}
 	if _, err := os.Stat(flatEntry); !os.IsNotExist(err) {
 		t.Fatalf("legacy flat entry still present: %v", err)
 	}
@@ -1214,13 +1219,8 @@ func TestMirrorIndexMigration(t *testing.T) {
 	}
 
 	fx.handler.mu.Lock()
-	k, _ := parseResolveKey(key)
-	loadedEntry := fx.handler.entries[k]
 	loadedBranch := fx.handler.branches["org/repo\x00main"]
 	fx.handler.mu.Unlock()
-	if loadedEntry == nil {
-		t.Fatal("migrated file entry not loaded")
-	}
 	if loadedBranch == nil || loadedBranch.Commit != commit {
 		t.Fatalf("migrated branch mapping not loaded: %+v", loadedBranch)
 	}

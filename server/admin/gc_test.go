@@ -18,8 +18,9 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-// putGCTestFile stores a single-chunk file and returns its SHA-256 hex.
-func putGCTestFile(t *testing.T, stor storage.Storage, data []byte) string {
+// putGCTestFile stores a single-chunk file, returning its SHA-256 hex and xet
+// file hash.
+func putGCTestFile(t *testing.T, stor storage.Storage, data []byte) (sha256Hex, fileHash string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -37,9 +38,10 @@ func putGCTestFile(t *testing.T, stor storage.Storage, data []byte) string {
 	}
 
 	chunkHash := xet.ComputeChunkHash(data)
+	fh := xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(data))})
 	s := shard.NewShard()
 	s.AddFile(shard.FileBlock{
-		FileHash: xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(data))}),
+		FileHash: fh,
 		Entries: []shard.FileDataSequenceEntry{{
 			CASHash: xorbHash, UnpackedSegBytes: uint32(len(data)), ChunkIndexEnd: 1,
 		}},
@@ -54,7 +56,7 @@ func putGCTestFile(t *testing.T, stor storage.Storage, data []byte) string {
 	}
 
 	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:])
+	return hex.EncodeToString(digest[:]), fh.String()
 }
 
 // newTestHandler builds an admin handler in front of the CAS handler, with the
@@ -79,7 +81,7 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sha256Hex := putGCTestFile(t, stor, []byte("gc endpoint test data"))
+	sha256Hex, fileHash := putGCTestFile(t, stor, []byte("gc endpoint test data"))
 	handler := newTestHandler(stor)
 
 	do := func(method, target string) *http.Response {
@@ -93,7 +95,7 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 		t.Fatalf("bridge before delete = %d", resp.StatusCode)
 	}
 
-	resp := do(http.MethodDelete, "/internal/files/sha256/"+sha256Hex)
+	resp := do(http.MethodDelete, "/internal/files/xet/"+fileHash)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete status = %d", resp.StatusCode)
 	}
@@ -102,18 +104,19 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if res.SHA256 != sha256Hex || !res.RemovedFileIndex || !res.RemovedSHA256Index {
+	if res.SHA256 != sha256Hex || res.FileHash != fileHash || !res.RemovedFileIndex {
 		t.Fatalf("delete response = %+v", res)
 	}
 
 	if resp := do(http.MethodGet, "/xet-bridge/"+sha256Hex); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("bridge after delete = %d, want 404", resp.StatusCode)
 	}
-	if resp := do(http.MethodDelete, "/internal/files/sha256/"+sha256Hex); resp.StatusCode != http.StatusNotFound {
+	if resp := do(http.MethodDelete, "/internal/files/xet/"+fileHash); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("second delete = %d, want 404", resp.StatusCode)
 	}
 
 	// grace=0s disables the grace window so fresh objects are collectable.
+	// The SHA-256 index entry falls only here, together with the shard.
 	resp = do(http.MethodPost, "/internal/gc/sweep?grace=0s")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("sweep status = %d", resp.StatusCode)
@@ -123,7 +126,8 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if report.RemovedShards != 1 || report.RemovedXorbs != 1 || report.RemovedChunkIndexEntries != 1 {
+	if report.RemovedShards != 1 || report.RemovedXorbs != 1 ||
+		report.RemovedChunkIndexEntries != 1 || report.RemovedSHA256IndexEntries != 1 {
 		t.Fatalf("sweep report = %+v", report)
 	}
 
@@ -142,36 +146,33 @@ func TestGCDeleteFileThenSweep(t *testing.T) {
 	}
 }
 
-func TestGCDeleteFileCallsHookAndDistinguishesHashKinds(t *testing.T) {
+func TestGCDeleteFileHasNoSHA256Route(t *testing.T) {
 	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sha256Hex := putGCTestFile(t, stor, []byte("hook test data"))
-
-	var hookSHA256, hookFileHash string
-	handler := newTestHandler(stor, WithFileRemovedHook(func(_ context.Context, sh, fh string) error {
-		hookSHA256, hookFileHash = sh, fh
-		return nil
-	}))
+	sha256Hex, fileHash := putGCTestFile(t, stor, []byte("route test data"))
+	handler := newTestHandler(stor)
 
 	// A SHA-256 sent to the xet-hash route must not resolve.
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/xet/"+sha256Hex))
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("delete via xet route = %d, want 404", rec.Code)
+		t.Fatalf("delete via xet route with sha256 = %d, want 404", rec.Code)
 	}
-	if hookSHA256 != "" {
-		t.Fatal("hook called for failed delete")
+
+	// Deleting by SHA-256 is deliberately not offered: one SHA-256 can map to
+	// several xet hashes, so the route must not exist at all.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/sha256/"+sha256Hex))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("delete via sha256 route = %d, want non-200", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/sha256/"+sha256Hex))
+	handler.ServeHTTP(rec, adminRequest(http.MethodDelete, "/internal/files/xet/"+fileHash))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("delete via sha256 route = %d", rec.Code)
-	}
-	if hookSHA256 != sha256Hex || hookFileHash == "" {
-		t.Fatalf("hook got sha256 %q, fileHash %q", hookSHA256, hookFileHash)
+		t.Fatalf("delete via xet route = %d", rec.Code)
 	}
 }
 
@@ -180,9 +181,9 @@ func TestAdminEndpointsRequireAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sha256Hex := putGCTestFile(t, stor, []byte("auth test data"))
+	_, fileHash := putGCTestFile(t, stor, []byte("auth test data"))
 	targets := []struct{ method, path string }{
-		{http.MethodDelete, "/internal/files/sha256/" + sha256Hex},
+		{http.MethodDelete, "/internal/files/xet/" + fileHash},
 		{http.MethodPost, "/internal/gc/sweep"},
 		{http.MethodGet, "/internal/files"},
 	}
@@ -206,7 +207,7 @@ func TestAdminEndpointsRequireAuth(t *testing.T) {
 		}
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+sha256Hex, nil)
+	req := httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash, nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -215,28 +216,28 @@ func TestAdminEndpointsRequireAuth(t *testing.T) {
 	}
 }
 
-// blockingCollector parks WalkFileIndex until released, keeping a sweep in
+// blockingStore parks WalkFileIndex until released, keeping a sweep in
 // flight deterministically.
-type blockingCollector struct {
-	storage.Collector
+type blockingStore struct {
+	storage.SweepStore
 	entered chan struct{}
 	release chan struct{}
 }
 
-func (b *blockingCollector) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error {
+func (b *blockingStore) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error {
 	close(b.entered)
 	<-b.release
-	return b.Collector.WalkFileIndex(ctx, fn)
+	return b.SweepStore.WalkFileIndex(ctx, fn)
 }
 
-func TestGCOperationsShareSingleFlight(t *testing.T) {
+func TestGCSweepsShareSingleFlight(t *testing.T) {
 	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bc := &blockingCollector{Collector: stor, entered: make(chan struct{}), release: make(chan struct{})}
+	bs := &blockingStore{SweepStore: stor, entered: make(chan struct{}), release: make(chan struct{})}
 	handler := NewHandler(
-		WithGC(storage.NewGC(bc)),
+		WithGC(storage.NewGC(bs)),
 		WithAuthFunc(func(tok string) bool { return tok == "admin-secret" }),
 	)
 
@@ -246,32 +247,27 @@ func TestGCOperationsShareSingleFlight(t *testing.T) {
 		handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))
 		sweepDone <- rec.Code
 	}()
-	<-bc.entered
+	<-bs.entered
 
-	// Sweep and compaction share one guard, so both endpoints refuse while
-	// the sweep is in flight.
-	for _, target := range []string{"/internal/gc/sweep", "/internal/compact"} {
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, adminRequest(http.MethodPost, target))
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("POST %s during sweep = %d, want 409", target, rec.Code)
-		}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST sweep during sweep = %d, want 409", rec.Code)
 	}
 
-	close(bc.release)
+	close(bs.release)
 	if code := <-sweepDone; code != http.StatusOK {
 		t.Fatalf("blocked sweep finished with %d", code)
 	}
 }
 
-// nonCollectorStorage satisfies Storage without the GC primitives.
-type nonCollectorStorage struct{ storage.Storage }
+// nonSweepStorage satisfies Storage without the GC primitives.
+type nonSweepStorage struct{ storage.Storage }
 
-func TestAdminEndpointsRejectNonCollectorStorage(t *testing.T) {
-	handler := newTestHandler(nonCollectorStorage{})
+func TestAdminEndpointsRejectNonSweepStorage(t *testing.T) {
+	handler := newTestHandler(nonSweepStorage{})
 
 	for _, target := range []struct{ method, path string }{
-		{http.MethodDelete, "/internal/files/sha256/" + hex.EncodeToString(make([]byte, 32))},
 		{http.MethodDelete, "/internal/files/xet/" + hex.EncodeToString(make([]byte, 32))},
 		{http.MethodPost, "/internal/gc/sweep"},
 		{http.MethodGet, "/internal/files"},

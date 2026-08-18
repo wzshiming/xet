@@ -70,7 +70,7 @@ type FileStorage struct {
 	xorbMut    sync.Mutex // guards xorbIndex
 	offsetsMut sync.Mutex // guards offsetsIndex
 
-	gcMut sync.RWMutex // held exclusively by Sweep to keep shard writes out of a collection cycle
+	gcMut sync.RWMutex // gc guard: shard writes hold the read side, Sweep holds the write side
 }
 
 // xorbFile wraps an open xorb handle with its own mutex so that only uses of
@@ -364,29 +364,15 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		return false, nil // Already exists
 	}
 
-	_, wasInserted, err := fs.writeShard(ctx, s, false)
+	_, wasInserted, err := fs.writeShard(ctx, s)
 	return wasInserted, err
 }
 
-// ReplaceShard persists s and repoints its files at it even when they already
-// resolve to another shard, returning the hash of the stored shard. Compaction
-// uses it to swap in a shard whose reconstruction terms were rewritten.
-func (fs *FileStorage) ReplaceShard(ctx context.Context, s *shard.Shard) (string, error) {
-	fs.gcMut.RLock()
-	defer fs.gcMut.RUnlock()
+func (fs *FileStorage) gcLock()   { fs.gcMut.Lock() }
+func (fs *FileStorage) gcUnlock() { fs.gcMut.Unlock() }
 
-	if len(s.Files) == 0 {
-		return "", fmt.Errorf("shard has no file blocks")
-	}
-
-	shardHash, _, err := fs.writeShard(ctx, s, true)
-	return shardHash, err
-}
-
-// writeShard persists the shard object and its index entries. When replace is
-// set the index entries are repointed at this shard instead of being left at
-// whatever shard claimed them first.
-func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard, replace bool) (string, bool, error) {
+// writeShard persists the shard object and its index entries.
+func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	for i := range s.Files {
 		computed, err := fs.computeFileSHA256(ctx, &s.Files[i])
 		if err != nil {
@@ -457,57 +443,31 @@ func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard, replace b
 	}
 
 	shardHashData := []byte(shardHash)
-	writeIndex := writeIndexFile
-	skip := map[xet.FileHash]struct{}{}
-	if replace {
-		writeIndex = replaceIndexFile
-		// A file unlinked since the shard was loaded must stay unlinked:
-		// repointing its index entry would resurrect the file. A concurrent
-		// unlink between this check and the write is the remaining exposure.
-		for _, file := range s.Files {
-			if _, err := os.Stat(fs.objectPath("index/files", file.FileHash.String())); os.IsNotExist(err) {
-				skip[file.FileHash] = struct{}{}
-			} else if err != nil {
-				return shardHash, wasInserted, fmt.Errorf("check file index for file %s: %w", file.FileHash.String(), err)
-			}
-		}
-	}
 	fs.shardMut.Lock()
 	fs.shardIndex.Add(shardHash, s)
 	fs.shardMut.Unlock()
 	for _, file := range s.Files {
-		if _, ok := skip[file.FileHash]; ok {
-			continue
-		}
 		fs.fileMut.Lock()
 		fs.fileIndex.Add(file.FileHash, shardHash)
 		fs.fileMut.Unlock()
 		indexPath := fs.objectPath("index/files", file.FileHash.String())
-		if err := writeIndex(indexPath, shardHashData); err != nil {
+		if err := writeIndexFile(indexPath, shardHashData); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			if replace {
-				fs.chunkMut.Lock()
-				fs.chunkIndex.Add(chunk.ChunkHash, shardHash)
-				fs.chunkMut.Unlock()
-			}
 			chunkPath := fs.objectPath("index/chunks", chunk.ChunkHash.String())
-			err := writeIndex(chunkPath, shardHashData)
+			err := writeIndexFile(chunkPath, shardHashData)
 			if err != nil {
 				return shardHash, wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
-		if _, ok := skip[file.FileHash]; ok {
-			continue
-		}
 		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
-		if err := writeIndex(sha256Path, []byte(file.FileHash.String())); err != nil {
+		if err := writeIndexFile(sha256Path, []byte(file.FileHash.String())); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
@@ -741,28 +701,6 @@ func (fs *FileStorage) GetShardByHash(ctx context.Context, shardHash string) (*s
 	return fs.getShardByHash(shardHash)
 }
 
-// XorbChunkCount reports how many chunks a stored xorb holds.
-func (fs *FileStorage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error) {
-	offsets, err := fs.xorbChunkOffsets(xorbHash)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(len(offsets)), nil
-}
-
-// TouchXorb bumps the xorb's modification time so grace windows measure from
-// now. Missing xorbs are ignored.
-func (fs *FileStorage) TouchXorb(ctx context.Context, xorbHash string) error {
-	now := time.Now()
-	if err := os.Chtimes(fs.objectPath("xorbs", xorbHash), now, now); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-func (fs *FileStorage) gcLock()   { fs.gcMut.Lock() }
-func (fs *FileStorage) gcUnlock() { fs.gcMut.Unlock() }
-
 // walkFanoutDir visits every object under basePath/<kind>/<xx>/<rest>,
 // passing the reassembled object name; temp files and stray entries are
 // skipped. Entries that vanish mid-walk are ignored.
@@ -863,7 +801,7 @@ func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash string
 	return removeObjectFile(fs.objectPath("index/files", fileHash))
 }
 
-func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
+func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error {
 	if raw, err := hex.DecodeString(sha256Hex); err == nil && len(raw) == 32 {
 		var digest [32]byte
 		copy(digest[:], raw)
@@ -871,7 +809,8 @@ func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex str
 		fs.sha256Index.Remove(digest)
 		fs.sha256Mut.Unlock()
 	}
-	return removeObjectFile(fs.objectPath("index/sha256", sha256Hex))
+	_, err := removeObjectFile(fs.objectPath("index/sha256", sha256Hex))
+	return err
 }
 
 func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error {

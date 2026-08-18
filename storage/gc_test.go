@@ -18,14 +18,14 @@ import (
 // collectable in tests.
 var noGrace = SweepOptions{Grace: -1}
 
-// gcBackends returns a fresh Collector for each storage backend.
-func gcBackends(t *testing.T) map[string]Collector {
+// gcBackends returns a fresh SweepStore for each storage backend.
+func gcBackends(t *testing.T) map[string]SweepStore {
 	t.Helper()
 	fs, err := NewFileStorage(WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return map[string]Collector{
+	return map[string]SweepStore{
 		"file": fs,
 		"s3":   newTestS3Storage(t),
 	}
@@ -38,7 +38,7 @@ type gcTerm struct {
 }
 
 // putGCXorb encodes chunks into one xorb and stores it.
-func putGCXorb(t *testing.T, st Collector, chunks ...[]byte) xet.XorbHash {
+func putGCXorb(t *testing.T, st SweepStore, chunks ...[]byte) xet.XorbHash {
 	t.Helper()
 	encoded, xorbHash := encodeTestXorb(t, true, chunks...)
 	if _, err := st.PutXorb(context.Background(), "default", xorbHash, bytes.NewReader(encoded)); err != nil {
@@ -71,7 +71,7 @@ func gcCASBlock(xorbHash xet.XorbHash, chunkHashes ...xet.ChunkHash) shard.CASBl
 	return cb
 }
 
-func putGCShard(t *testing.T, st Collector, files []shard.FileBlock, cas []shard.CASBlock) {
+func putGCShard(t *testing.T, st SweepStore, files []shard.FileBlock, cas []shard.CASBlock) {
 	t.Helper()
 	s := shard.NewShard()
 	for _, fb := range files {
@@ -125,7 +125,7 @@ func countIndexWalk(t *testing.T, walk func(context.Context, func(string, string
 // gcCounts snapshots how many objects each kind holds.
 type gcCounts struct{ files, sha256s, chunks, shards, xorbs int }
 
-func snapshotCounts(t *testing.T, st Collector) gcCounts {
+func snapshotCounts(t *testing.T, st SweepStore) gcCounts {
 	t.Helper()
 	return gcCounts{
 		files:   countIndexWalk(t, st.WalkFileIndex),
@@ -166,18 +166,18 @@ func TestGCUnlinkAndSweepSharedXorb(t *testing.T) {
 			sha256A := gcSHA256(termsA...)
 			sha256B := gcSHA256(termsB...)
 
-			// Unlink file A by SHA-256.
-			res, err := Unlink(ctx, st, hex.EncodeToString(sha256A[:]), HashKindSHA256)
+			// Unlink file A; its SHA-256 entry stays until the shard falls.
+			res, err := Unlink(ctx, st, fileHashA.String())
 			if err != nil {
-				t.Fatalf("Unlink(sha256 A): %v", err)
+				t.Fatalf("Unlink(A): %v", err)
 			}
-			if res.FileHash != fileHashA.String() || !res.RemovedFileIndex || !res.RemovedSHA256Index {
-				t.Fatalf("Unlink(sha256 A) = %+v", res)
+			if res.SHA256 != hex.EncodeToString(sha256A[:]) || !res.RemovedFileIndex {
+				t.Fatalf("Unlink(A) = %+v", res)
 			}
-			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256A); err == nil {
-				t.Fatal("SHA-256 A still resolves after unlink")
+			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256A); err != nil {
+				t.Fatalf("SHA-256 A must resolve until its shard is swept: %v", err)
 			}
-			if _, err := Unlink(ctx, st, hex.EncodeToString(sha256A[:]), HashKindSHA256); !errors.Is(err, ErrFileNotFound) {
+			if _, err := Unlink(ctx, st, fileHashA.String()); !errors.Is(err, ErrFileNotFound) {
 				t.Fatalf("second Unlink error = %v, want ErrFileNotFound", err)
 			}
 
@@ -188,8 +188,11 @@ func TestGCUnlinkAndSweepSharedXorb(t *testing.T) {
 			if report.LiveFiles != 1 || report.LiveShards != 1 || report.LiveXorbs != 2 {
 				t.Fatalf("live counts = %+v", report)
 			}
-			if report.RemovedShards != 1 || report.RemovedXorbs != 1 || report.RemovedChunkIndexEntries != 2 {
+			if report.RemovedShards != 1 || report.RemovedXorbs != 1 || report.RemovedChunkIndexEntries != 2 || report.RemovedSHA256IndexEntries != 1 {
 				t.Fatalf("removed counts = %+v", report)
+			}
+			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256A); err == nil {
+				t.Fatal("SHA-256 A still resolves after its shard was swept")
 			}
 
 			// The shared xorb survives because live file B references it.
@@ -210,11 +213,11 @@ func TestGCUnlinkAndSweepSharedXorb(t *testing.T) {
 			}
 
 			// Unlink file B by file hash, then sweep everything away.
-			res, err = Unlink(ctx, st, fileHashB.String(), HashKindFile)
+			res, err = Unlink(ctx, st, fileHashB.String())
 			if err != nil {
 				t.Fatalf("Unlink(file B): %v", err)
 			}
-			if res.SHA256 != hex.EncodeToString(sha256B[:]) || !res.RemovedFileIndex || !res.RemovedSHA256Index {
+			if res.SHA256 != hex.EncodeToString(sha256B[:]) || !res.RemovedFileIndex {
 				t.Fatalf("Unlink(file B) = %+v", res)
 			}
 
@@ -222,7 +225,7 @@ func TestGCUnlinkAndSweepSharedXorb(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Sweep 2: %v", err)
 			}
-			if report.RemovedShards != 1 || report.RemovedXorbs != 2 || report.RemovedChunkIndexEntries != 1 {
+			if report.RemovedShards != 1 || report.RemovedXorbs != 2 || report.RemovedChunkIndexEntries != 1 || report.RemovedSHA256IndexEntries != 1 {
 				t.Fatalf("second sweep counts = %+v", report)
 			}
 			if counts := snapshotCounts(t, st); counts != (gcCounts{}) {
@@ -254,7 +257,7 @@ func TestGCSweepKeepsMultiFileShardUntilAllFilesUnlinked(t *testing.T) {
 			sha256C := gcSHA256(termC)
 			sha256D := gcSHA256(termD)
 
-			if _, err := Unlink(ctx, st, hex.EncodeToString(sha256C[:]), HashKindSHA256); err != nil {
+			if _, err := Unlink(ctx, st, fileHashC.String()); err != nil {
 				t.Fatalf("Unlink(C): %v", err)
 			}
 			report, err := Sweep(ctx, st, noGrace)
@@ -262,14 +265,16 @@ func TestGCSweepKeepsMultiFileShardUntilAllFilesUnlinked(t *testing.T) {
 				t.Fatalf("Sweep: %v", err)
 			}
 			// The shard still holds live file D, so nothing is reclaimed yet.
-			if report.RemovedShards != 0 || report.RemovedXorbs != 0 || report.RemovedChunkIndexEntries != 0 {
+			if report.RemovedShards != 0 || report.RemovedXorbs != 0 || report.RemovedChunkIndexEntries != 0 || report.RemovedSHA256IndexEntries != 0 {
 				t.Fatalf("sweep reclaimed shard with live file: %+v", report)
 			}
 			if ok, _ := st.HasXorb(ctx, "default", xorbC); !ok {
 				t.Fatal("xorbC removed while its shard is live")
 			}
-			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256C); err == nil {
-				t.Fatal("SHA-256 C still resolves after unlink")
+			// One SHA-256 can map to several xet hashes; the entry survives its
+			// unlinked file until the whole shard is swept.
+			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256C); err != nil {
+				t.Fatalf("SHA-256 C must survive while its shard is live: %v", err)
 			}
 			content, err := st.GetReconstructedFile(ctx, "default", sha256D)
 			if err != nil {
@@ -277,7 +282,7 @@ func TestGCSweepKeepsMultiFileShardUntilAllFilesUnlinked(t *testing.T) {
 			}
 			content.Close()
 
-			if _, err := Unlink(ctx, st, fileHashD.String(), HashKindFile); err != nil {
+			if _, err := Unlink(ctx, st, fileHashD.String()); err != nil {
 				t.Fatalf("Unlink(D): %v", err)
 			}
 			if _, err := Sweep(ctx, st, noGrace); err != nil {
@@ -303,7 +308,7 @@ func TestGCSweepGraceProtectsFreshObjects(t *testing.T) {
 				[]shard.FileBlock{gcFileBlock(fileHash, term)},
 				[]shard.CASBlock{gcCASBlock(xorbHash, xet.ChunkHash{6})})
 
-			if _, err := Unlink(ctx, st, fileHash.String(), HashKindFile); err != nil {
+			if _, err := Unlink(ctx, st, fileHash.String()); err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
 
@@ -345,7 +350,7 @@ func TestGCSweepDryRunDeletesNothing(t *testing.T) {
 				[]shard.FileBlock{gcFileBlock(fileHash, term)},
 				[]shard.CASBlock{gcCASBlock(xorbHash, xet.ChunkHash{7})})
 
-			if _, err := Unlink(ctx, st, fileHash.String(), HashKindFile); err != nil {
+			if _, err := Unlink(ctx, st, fileHash.String()); err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
 			before := snapshotCounts(t, st)
@@ -354,7 +359,7 @@ func TestGCSweepDryRunDeletesNothing(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Sweep(dry run): %v", err)
 			}
-			if !report.DryRun || report.RemovedShards != 1 || report.RemovedXorbs != 1 || report.RemovedChunkIndexEntries != 1 {
+			if !report.DryRun || report.RemovedShards != 1 || report.RemovedXorbs != 1 || report.RemovedChunkIndexEntries != 1 || report.RemovedSHA256IndexEntries != 1 {
 				t.Fatalf("dry-run counts = %+v", report)
 			}
 			if after := snapshotCounts(t, st); after != before {
@@ -419,7 +424,7 @@ func TestGCReuploadAfterUnlinkRestoresFile(t *testing.T) {
 			putGCShard(t, st, files, cas)
 
 			sha := gcSHA256(term)
-			if _, err := Unlink(ctx, st, hex.EncodeToString(sha[:]), HashKindSHA256); err != nil {
+			if _, err := Unlink(ctx, st, fileHash.String()); err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
 
@@ -438,6 +443,9 @@ func TestGCReuploadAfterUnlinkRestoresFile(t *testing.T) {
 			if _, err := st.GetFileHashBySHA256(ctx, "default", sha); err != nil {
 				t.Fatalf("SHA-256 does not resolve after re-upload: %v", err)
 			}
+			if _, err := st.GetShard(ctx, fileHash); err != nil {
+				t.Fatalf("file does not resolve after re-upload: %v", err)
+			}
 		})
 	}
 }
@@ -445,11 +453,11 @@ func TestGCReuploadAfterUnlinkRestoresFile(t *testing.T) {
 // agedXorbWalk reports every xorb as ancient, simulating a long-lived xorb
 // reused by a freshly landed shard.
 type agedXorbWalk struct {
-	Collector
+	SweepStore
 }
 
 func (a agedXorbWalk) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
-	return a.Collector.WalkXorbs(ctx, func(h string, size int64, _ time.Time) error {
+	return a.SweepStore.WalkXorbs(ctx, func(h string, size int64, _ time.Time) error {
 		return fn(h, size, time.Time{})
 	})
 }
@@ -491,58 +499,6 @@ func TestGCSweepGraceKeepsXorbsOfFreshShard(t *testing.T) {
 	}
 }
 
-func TestReplaceShardKeepsUnlinkedFilesUnlinked(t *testing.T) {
-	for name, st := range gcBackends(t) {
-		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
-
-			chunkA := []byte("replace-live-file-chunk")
-			chunkB := []byte("replace-unlinked-file-chunk")
-			xorbA := putGCXorb(t, st, chunkA)
-			xorbB := putGCXorb(t, st, chunkB)
-			fileA := xet.FileHash{0xD7}
-			fileB := xet.FileHash{0xE7}
-			termA := gcTerm{xorbA, [][]byte{chunkA}}
-			termB := gcTerm{xorbB, [][]byte{chunkB}}
-			files := []shard.FileBlock{
-				gcFileBlock(fileA, termA),
-				gcFileBlock(fileB, termB),
-			}
-			cas := []shard.CASBlock{
-				gcCASBlock(xorbA, xet.ChunkHash{11}),
-				gcCASBlock(xorbB, xet.ChunkHash{12}),
-			}
-			putGCShard(t, st, files, cas)
-
-			// Unlink one file, then replace the shard as compaction would.
-			if _, err := Unlink(ctx, st, fileB.String(), HashKindFile); err != nil {
-				t.Fatalf("Unlink: %v", err)
-			}
-			s := shard.NewShard()
-			for _, fb := range files {
-				s.AddFile(fb)
-			}
-			for _, cb := range cas {
-				s.AddCASBlock(cb)
-			}
-			s.SetFooter()
-			if _, err := st.ReplaceShard(ctx, s); err != nil {
-				t.Fatalf("ReplaceShard: %v", err)
-			}
-
-			if _, err := st.GetShard(ctx, fileA); err != nil {
-				t.Fatalf("live file lost its index entry: %v", err)
-			}
-			if _, err := st.GetShard(ctx, fileB); err == nil {
-				t.Fatal("ReplaceShard resurrected an unlinked file")
-			}
-			if _, err := st.GetFileHashBySHA256(ctx, "default", gcSHA256(termB)); err == nil {
-				t.Fatal("ReplaceShard resurrected an unlinked sha256 entry")
-			}
-		})
-	}
-}
-
 func TestShardLoadDoesNotRelinkUnlinkedFiles(t *testing.T) {
 	for name, st := range gcBackends(t) {
 		t.Run(name, func(t *testing.T) {
@@ -562,7 +518,7 @@ func TestShardLoadDoesNotRelinkUnlinkedFiles(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Unlink(ctx, st, fileHash.String(), HashKindFile); err != nil {
+			if _, err := Unlink(ctx, st, fileHash.String()); err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
 

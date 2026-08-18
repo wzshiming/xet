@@ -11,30 +11,28 @@ import (
 	"github.com/wzshiming/xet/storage"
 )
 
-// deleteFileHandler serves DELETE /internal/files/sha256/{hash} and
-// /internal/files/xet/{hash}; the path names the hash kind since both are 64
-// hex characters. It unlinks the file's index entries; space is reclaimed by
-// a later sweep. A hook failure is reported in the response's hook_error.
-func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		gc, ok := h.authorize(w, r)
-		if !ok {
-			return
-		}
-
-		res, err := gc.Unlink(r.Context(), mux.Vars(r)["hash"], kind)
-		if err != nil {
-			if errors.Is(err, storage.ErrFileNotFound) {
-				http.Error(w, "File not found", http.StatusNotFound)
-				return
-			}
-			http.Error(w, "Failed to delete file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(res)
+// handleDeleteFile serves DELETE /internal/files/xet/{hash}, taking the xet
+// file hash. It unlinks the file's index entry; space is reclaimed by a later
+// sweep. There is deliberately no SHA-256 variant: one SHA-256 can map to
+// several xet hashes, so resolving it could unlink the wrong file.
+func (h *Handler) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	gc, ok := h.authorize(w, r)
+	if !ok {
+		return
 	}
+
+	res, err := gc.Unlink(r.Context(), mux.Vars(r)["hash"])
+	if err != nil {
+		if errors.Is(err, storage.ErrFileNotFound) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to delete file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 // handleSweep handles POST /internal/gc/sweep?dry_run=&grace=. Only one GC

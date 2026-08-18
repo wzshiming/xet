@@ -15,32 +15,18 @@ import (
 // AuthFunc validates an authentication token, returning true when it is valid.
 type AuthFunc func(token string) bool
 
-// FileRemovedHook is called after a file's index entries are removed via the
-// delete endpoint, e.g. to drop matching mirror index entries.
-type FileRemovedHook = storage.FileRemovedHook
-
 // Handler serves the storage administration endpoints as a thin HTTP adapter
 // over a storage.GC coordinator.
 type Handler struct {
-	storage storage.Storage
 	gc      *storage.GC
+	storage storage.Storage
 	root    *mux.Router
 	next    http.Handler
 	authFn  AuthFunc
-
-	fileRemovedHook storage.FileRemovedHook
 }
 
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
-
-// WithStorage sets the storage backend to administer. It must implement
-// storage.Collector for the GC endpoints to be available.
-func WithStorage(st storage.Storage) Option {
-	return func(h *Handler) {
-		h.storage = st
-	}
-}
 
 // WithGC shares an existing coordinator with the endpoints, so its
 // single-flight guard spans in-process callers and these HTTP requests.
@@ -51,20 +37,19 @@ func WithGC(g *storage.GC) Option {
 	}
 }
 
+// WithStorage sets the storage backend to administer. It must implement
+// storage.SweepStore for the endpoints to be available.
+func WithStorage(st storage.Storage) Option {
+	return func(h *Handler) {
+		h.storage = st
+	}
+}
+
 // WithAuthFunc sets the authentication function guarding the endpoints.
 // Without one they stay disabled.
 func WithAuthFunc(authFn AuthFunc) Option {
 	return func(h *Handler) {
 		h.authFn = authFn
-	}
-}
-
-// WithFileRemovedHook sets a callback invoked after a successful file delete.
-// It applies to the handler-built coordinator; one injected with WithGC
-// carries its own hook.
-func WithFileRemovedHook(fn FileRemovedHook) Option {
-	return func(h *Handler) {
-		h.fileRemovedHook = fn
 	}
 }
 
@@ -86,16 +71,17 @@ func NewHandler(opts ...Option) *Handler {
 	}
 
 	if h.gc == nil {
-		if collector, ok := h.storage.(storage.Collector); ok {
-			h.gc = storage.NewGC(collector, storage.WithFileRemovedHook(h.fileRemovedHook))
+		if sweeper, ok := h.storage.(storage.SweepStore); ok {
+			h.gc = storage.NewGC(sweeper)
 		}
 	}
 
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
-	h.root.HandleFunc("/internal/files/sha256/{hash}", h.deleteFileHandler(storage.HashKindSHA256)).Methods(http.MethodDelete)
-	h.root.HandleFunc("/internal/files/xet/{hash}", h.deleteFileHandler(storage.HashKindFile)).Methods(http.MethodDelete)
+	// Deletion is by xet file hash only: one SHA-256 can map to several xet
+	// hashes, so a SHA-256 delete could unlink the wrong file. The SHA-256
+	// index entry falls with its shard during a sweep instead.
+	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleDeleteFile).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleSweep).Methods(http.MethodPost)
-	h.root.HandleFunc("/internal/compact", h.handleCompact).Methods(http.MethodPost)
 
 	if h.next != nil {
 		h.root.NotFoundHandler = h.next

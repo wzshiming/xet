@@ -111,9 +111,7 @@ func (h *Handler) ingest(key resolveKey) (*Entry, error) {
 	}
 	if t != nil {
 		<-t.done
-		h.mu.Lock()
-		e = h.entries[key]
-		h.mu.Unlock()
+		e = h.entryForKey(context.Background(), key)
 		if e == nil {
 			// Only possible when a concurrent revalidation found the fresh
 			// entry already stale; the same window the HTTP path answers

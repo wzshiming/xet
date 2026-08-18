@@ -47,9 +47,7 @@ func (h *Handler) serveTaskOrEntry(w http.ResponseWriter, r *http.Request, key r
 	if h.serveFromTask(w, r, t) {
 		return
 	}
-	h.mu.Lock()
-	e := h.entries[key]
-	h.mu.Unlock()
+	e := h.entryForKey(r.Context(), key)
 	if e == nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -78,12 +76,7 @@ func (h *Handler) revalidate(ctx context.Context, key resolveKey, e *fileEntry) 
 		_ = persistEntry(h.indexDir, e)
 		return e
 	}
-	h.mu.Lock()
-	if h.entries[key] == e {
-		delete(h.entries, key)
-	}
-	h.mu.Unlock()
-	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, e.Key))
+	_ = os.Remove(indexEntryPath(h.indexDir, e.Key))
 	return nil
 }
 
@@ -135,9 +128,7 @@ func (h *Handler) serveReconstructionWait(w http.ResponseWriter, r *http.Request
 	case <-t.done:
 	}
 
-	h.mu.Lock()
-	e := h.entries[key]
-	h.mu.Unlock()
+	e := h.entryForKey(r.Context(), key)
 	if e == nil {
 		return false
 	}

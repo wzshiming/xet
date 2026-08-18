@@ -54,12 +54,11 @@ func (h *Handler) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry
 		// ingest, between the caller's check and this one.
 		h.mu.Lock()
 		t := h.tasks[key]
-		e := h.entries[key]
 		h.mu.Unlock()
 		if t != nil {
 			return t, nil
 		}
-		if e != nil {
+		if e := h.entryForKey(context.Background(), key); e != nil {
 			if e.State == stateReady {
 				return e, nil
 			}
@@ -103,13 +102,11 @@ func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *tas
 
 	h.mu.Lock()
 	t := h.tasks[key]
-	e := h.entries[key]
 	h.mu.Unlock()
-
 	if t != nil {
 		return key, t, nil, nil
 	}
-	if e != nil {
+	if e := h.entryForKey(ctx, key); e != nil {
 		switch e.State {
 		case stateReady:
 			if h.needsRevalidate(e, key.rev) {
@@ -223,8 +220,7 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 	t.setSize(-1) // definitive size stored above; signal any waiters
 	t.spool.finish(nil)
 
-	entry, err := h.ingestSpool(ctx, t, key)
-	if err != nil {
+	if _, err := h.ingestSpool(ctx, t, key); err != nil {
 		if errors.Is(err, errSpoolCorrupt) {
 			t.spool.markRemove()
 		}
@@ -232,8 +228,10 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 		return
 	}
 
+	// The ready entry was persisted by ingestSpool; drop the failure record
+	// so lookups stop hitting the backoff.
 	h.mu.Lock()
-	h.entries[key] = entry
+	delete(h.failed, key)
 	delete(h.tasks, key)
 	h.mu.Unlock()
 	t.spool.markRemove() // bytes now live in storage; drop the spool when drained
@@ -244,12 +242,12 @@ func (h *Handler) failTask(key resolveKey, t *task, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	failures := 1
-	if prev := h.entries[key]; prev != nil && prev.State == stateFailed {
+	if prev := h.failed[key]; prev != nil {
 		failures = prev.failures + 1
 	}
 	shift := min(failures-1, maxFailureShift)
 	backoff := min(failureBackoffBase<<shift, failureBackoffCap)
-	h.entries[key] = &fileEntry{
+	h.failed[key] = &fileEntry{
 		Key:       key.String(),
 		State:     stateFailed,
 		failures:  failures,

@@ -1,13 +1,18 @@
 package mirror
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/wzshiming/xet"
 )
 
 type entryState string
@@ -38,13 +43,15 @@ type fileEntry struct {
 	notFound  bool
 }
 
-// indexEntryPath returns the on-disk location of an entry: grouped under its
-// commit directory when the commit is a 40-hex id, flat otherwise.
-func indexEntryPath(dir, commit, key string) string {
+// indexEntryPath returns the on-disk location of the entry for key: grouped
+// under the revision directory when the key pins a 40-hex commit, flat
+// otherwise. The location is a pure function of the key so lookups need no
+// in-memory state.
+func indexEntryPath(dir, key string) string {
 	sum := sha256.Sum256([]byte(key))
 	name := hex.EncodeToString(sum[:]) + ".json"
-	if commitRevRe.MatchString(commit) {
-		return filepath.Join(dir, commit, name)
+	if k, ok := parseResolveKey(key); ok && commitRevRe.MatchString(k.rev) {
+		return filepath.Join(dir, k.rev, name)
 	}
 	return filepath.Join(dir, name)
 }
@@ -55,7 +62,7 @@ func persistEntry(dir string, e *fileEntry) error {
 	if err != nil {
 		return fmt.Errorf("marshal index entry: %w", err)
 	}
-	path := indexEntryPath(dir, e.Commit, e.Key)
+	path := indexEntryPath(dir, e.Key)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create index dir: %w", err)
 	}
@@ -84,100 +91,58 @@ func readEntry(path string) *fileEntry {
 	return &e
 }
 
-// loadIndex reads all persisted entries from dir: entries grouped under
-// per-commit directories plus legacy flat files, which are moved under their
-// commit directory as they are seen.
-func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
-	files := make(map[resolveKey]*fileEntry)
-	dirEntries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return files, nil
-		}
-		return nil, fmt.Errorf("read index dir: %w", err)
-	}
-	for _, de := range dirEntries {
-		if de.IsDir() {
-			// Commit directories only; skips branches/ and strays.
-			if !commitRevRe.MatchString(de.Name()) {
-				continue
-			}
-			subEntries, err := os.ReadDir(filepath.Join(dir, de.Name()))
-			if err != nil {
-				continue
-			}
-			for _, se := range subEntries {
-				if se.IsDir() || filepath.Ext(se.Name()) != ".json" {
-					continue
-				}
-				if e := readEntry(filepath.Join(dir, de.Name(), se.Name())); e != nil {
-					if k, ok := parseResolveKey(e.Key); ok {
-						files[k] = e
-					}
-				}
-			}
-			continue
-		}
-		if filepath.Ext(de.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(dir, de.Name())
-		e := readEntry(path)
-		if e == nil {
-			continue
-		}
-		if k, ok := parseResolveKey(e.Key); ok {
-			files[k] = e
-		}
-		// Legacy flat entry: move it under its commit directory.
-		if indexEntryPath(dir, e.Commit, e.Key) != path && persistEntry(dir, e) == nil {
-			_ = os.Remove(path)
-		}
-	}
-	return files, nil
-}
-
-// removeEntries drops every ready entry the match reports, from memory and
-// from the persisted index, returning the number of entries removed. It
-// scans all entries: deletes are rare admin operations, not worth keeping a
-// reverse index in sync with every ingest.
-func (h *Handler) removeEntries(match func(*fileEntry) bool) (int, error) {
+// entryForKey returns the terminal state for key: the process-local failure
+// record, or the ready entry read from the persisted index file. Nothing is
+// cached in memory and a ready entry is served only while its file is still
+// in storage, so entries dropped or files unlinked behind the handler's back
+// (GC, manual cleanup) are honored on the next request.
+func (h *Handler) entryForKey(ctx context.Context, key resolveKey) *fileEntry {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	removed := 0
-	var firstErr error
-	for k, e := range h.entries {
-		if !match(e) {
-			continue
+	e := h.failed[key]
+	h.mu.Unlock()
+	if e != nil {
+		return e
+	}
+	path := indexEntryPath(h.indexDir, key.String())
+	e = readEntry(path)
+	if e == nil {
+		// Legacy flat entry from before commit grouping: move it to its
+		// canonical location as it is seen.
+		if !commitRevRe.MatchString(key.rev) {
+			return nil
 		}
-		delete(h.entries, k)
-		removed++
-		path := indexEntryPath(h.indexDir, e.Commit, e.Key)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
+		sum := sha256.Sum256([]byte(key.String()))
+		flat := filepath.Join(h.indexDir, hex.EncodeToString(sum[:])+".json")
+		if e = readEntry(flat); e == nil {
+			return nil
+		}
+		if persistEntry(h.indexDir, e) == nil {
+			_ = os.Remove(flat)
 		}
 	}
-	return removed, firstErr
+	// Storage is the source of truth: an entry whose file left the CAS is
+	// dropped so the next request re-ingests instead of redirecting to a
+	// dead bridge.
+	if !h.entryLive(ctx, e) {
+		_ = os.Remove(path)
+		return nil
+	}
+	return e
 }
 
-// RemoveBySHA256 drops every ready entry whose content matches the given
-// SHA-256 hex, so a file removed from the CAS is no longer served from the
-// mirror.
-func (h *Handler) RemoveBySHA256(sha256Hex string) (int, error) {
-	if sha256Hex == "" {
-		return 0, nil
+// entryLive reports whether the entry's content is still reachable in
+// storage. Empty files hold no CAS content and are always live. Transient
+// storage errors keep the entry: only a definite not-found drops it.
+func (h *Handler) entryLive(ctx context.Context, e *fileEntry) bool {
+	if e.FileHash == "" {
+		return true
 	}
-	return h.removeEntries(func(e *fileEntry) bool { return e.SHA256 == sha256Hex })
-}
-
-// RemoveByFileHash drops every ready entry recorded under the given xet file
-// hash. It is the fallback for deletions where no SHA-256 is known (the
-// file's shard was already gone); empty-file entries carry no file hash and
-// can only be matched by SHA-256.
-func (h *Handler) RemoveByFileHash(fileHash string) (int, error) {
-	if fileHash == "" {
-		return 0, nil
+	fileHash, err := xet.ParseFileHash(e.FileHash)
+	if err != nil {
+		return false
 	}
-	return h.removeEntries(func(e *fileEntry) bool { return e.FileHash == fileHash })
+	if _, err := h.storage.GetShard(ctx, fileHash); err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	return true
 }

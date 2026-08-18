@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	iofs "io/fs"
@@ -13,9 +12,11 @@ import (
 )
 
 // SweepStore is the storage surface Unlink and Sweep operate on: enumerate
-// everything, delete anything, and block shard writes for the duration of a
-// sweep. The unexported lock methods keep that contract internal to this
-// package.
+// everything, delete anything, and exclude shard writes for the duration of
+// a sweep. The unexported lock methods keep that contract internal to this
+// package: shard writes hold the read side, Sweep the write side. The guard
+// is process-local: with multiple instances sharing a backend, the grace
+// window is the only cross-instance protection.
 type SweepStore interface {
 	Storage
 
@@ -31,44 +32,31 @@ type SweepStore interface {
 	// The index-entry deletes report whether the entry existed, which Unlink
 	// needs for its not-found result.
 	DeleteFileIndexEntry(ctx context.Context, fileHash string) (bool, error)
-	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error)
 
 	// The object deletes are idempotent and report no prior existence, so S3
-	// can issue blind deletes without a HEAD per object.
+	// can issue blind deletes without a HEAD per object. The SHA-256 delete is
+	// only called by Sweep: one SHA-256 can map to several xet hashes, so the
+	// entry falls with its shard rather than with any single unlink.
+	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error
 	DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error
 	DeleteShard(ctx context.Context, shardHash string) error
 	DeleteXorb(ctx context.Context, xorbHash string) error
 
-	// gcLock blocks new shard writes for the duration of a sweep, so a
-	// concurrent upload cannot persist references to objects being deleted.
-	// The lock is process-local: with multiple instances sharing a backend,
-	// the grace window is the only cross-instance protection.
+	// gcLock blocks shard writes for the duration of a sweep.
 	gcLock()
 	gcUnlock()
 }
 
-// ErrFileNotFound reports that neither hash interpretation matched an entry.
+// ErrFileNotFound reports that no file index entry matched the given hash.
 var ErrFileNotFound = errors.New("file not found in storage")
 
-// HashKind selects how Unlink interprets the given hash string. SHA-256 and
-// xet hashes are both 64 hex characters, so callers must state which one
-// they hold.
-type HashKind string
-
-const (
-	HashKindSHA256 HashKind = "sha256"
-	HashKindFile   HashKind = "file"
-)
-
-// UnlinkResult reports which references a file removal dropped.
+// UnlinkResult reports what a file removal dropped and resolved.
 type UnlinkResult struct {
-	FileHash           string `json:"file_hash"`
-	SHA256             string `json:"sha256,omitempty"`
-	RemovedFileIndex   bool   `json:"removed_file_index"`
-	RemovedSHA256Index bool   `json:"removed_sha256_index"`
-	// HookError reports a file-removed hook failure after a successful
-	// unlink; set only by GC.Unlink.
-	HookError string `json:"hook_error,omitempty"`
+	FileHash string `json:"file_hash"`
+	// SHA256 is the digest recorded in the shard's metadata, reported for the
+	// caller's bookkeeping; the SHA-256 index entry itself is never unlinked.
+	SHA256           string `json:"sha256,omitempty"`
+	RemovedFileIndex bool   `json:"removed_file_index"`
 }
 
 // isNotExist recognizes missing-object errors from both backends.
@@ -76,47 +64,12 @@ func isNotExist(err error) bool {
 	return errors.Is(err, iofs.ErrNotExist) || isS3NotFound(err)
 }
 
-// Unlink removes the index entries that make a file reachable: its SHA-256
-// mapping and its file-hash mapping. The shard and xorbs stay in place until
-// a Sweep finds them unreferenced.
-func Unlink(ctx context.Context, st SweepStore, hashStr string, kind HashKind) (*UnlinkResult, error) {
-	switch kind {
-	case HashKindSHA256:
-		return unlinkBySHA256(ctx, st, hashStr)
-	case HashKindFile:
-		return unlinkByFileHash(ctx, st, hashStr)
-	default:
-		return nil, fmt.Errorf("unknown hash kind %q", kind)
-	}
-}
-
-func unlinkBySHA256(ctx context.Context, st SweepStore, sha256Hex string) (*UnlinkResult, error) {
-	raw, err := hex.DecodeString(sha256Hex)
-	if err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("%w: invalid SHA-256 %q", ErrFileNotFound, sha256Hex)
-	}
-	var digest [32]byte
-	copy(digest[:], raw)
-
-	fileHash, err := st.GetFileHashBySHA256(ctx, "default", digest)
-	if err != nil {
-		if isNotExist(err) {
-			return nil, fmt.Errorf("%w: SHA-256 %s", ErrFileNotFound, sha256Hex)
-		}
-		return nil, err
-	}
-
-	res := &UnlinkResult{FileHash: fileHash.String(), SHA256: hex.EncodeToString(digest[:])}
-	if res.RemovedSHA256Index, err = st.DeleteSHA256IndexEntry(ctx, res.SHA256); err != nil {
-		return res, err
-	}
-	if res.RemovedFileIndex, err = st.DeleteFileIndexEntry(ctx, res.FileHash); err != nil {
-		return res, err
-	}
-	return res, nil
-}
-
-func unlinkByFileHash(ctx context.Context, st SweepStore, fileHashStr string) (*UnlinkResult, error) {
+// Unlink removes the file index entry that makes the file reachable; shards,
+// xorbs and the SHA-256 index are left to Sweep. Unlink takes a xet file hash
+// only: one SHA-256 can map to several xet hashes (same bytes, different
+// chunking), so deleting by SHA-256 could unlink the wrong file, and the
+// SHA-256 entry itself falls only with its shard.
+func Unlink(ctx context.Context, st SweepStore, fileHashStr string) (*UnlinkResult, error) {
 	fileHash, err := xet.ParseFileHash(fileHashStr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid hash %q", ErrFileNotFound, fileHashStr)
@@ -138,15 +91,10 @@ func unlinkByFileHash(ctx context.Context, st SweepStore, fileHashStr string) (*
 		return res, err
 	}
 
-	if res.SHA256 != "" {
-		if res.RemovedSHA256Index, err = st.DeleteSHA256IndexEntry(ctx, res.SHA256); err != nil {
-			return res, err
-		}
-	}
 	if res.RemovedFileIndex, err = st.DeleteFileIndexEntry(ctx, res.FileHash); err != nil {
 		return res, err
 	}
-	if !res.RemovedFileIndex && !res.RemovedSHA256Index {
+	if !res.RemovedFileIndex {
 		return nil, fmt.Errorf("%w: %s", ErrFileNotFound, fileHashStr)
 	}
 	return res, nil
@@ -202,11 +150,9 @@ func markXorbs(sh *shard.Shard, liveXorbs map[string]struct{}) {
 // Sweep removes everything unreachable from the file index: shards no live
 // file maps to, xorbs no live shard references, and index entries pointing at
 // dead targets. Liveness is per shard, so a shard (and its xorbs) survives
-// until every file in it has been unlinked. Shard writes in this process are
-// blocked for the duration (see Collector.gcLock for the multi-instance
-// caveat); other operations proceed concurrently under Grace protection.
-// Sweep itself carries no concurrency guard; GC.Sweep adds the single-flight
-// guard shared with Compact.
+// until every file in it has been unlinked. It holds the write side of the
+// gc guard, so in-process shard writes wait for the duration while reads
+// proceed concurrently under Grace protection.
 func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport, error) {
 	grace := opts.Grace
 	if grace == 0 {
@@ -226,6 +172,9 @@ func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport,
 	liveFiles := map[string]struct{}{}
 	liveShards := map[string]struct{}{}
 	liveXorbs := map[string]struct{}{}
+	// liveShardFiles holds every file carried by a live shard, including
+	// unlinked ones: their SHA-256 entries stay until the shard falls.
+	liveShardFiles := map[string]struct{}{}
 	var danglingRoots []string
 
 	err := st.WalkFileIndex(ctx, func(fileHash, shardHash string, modTime time.Time) error {
@@ -248,6 +197,9 @@ func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport,
 		}
 		liveShards[shardHash] = struct{}{}
 		markXorbs(sh, liveXorbs)
+		for i := range sh.Files {
+			liveShardFiles[sh.Files[i].FileHash.String()] = struct{}{}
+		}
 		return nil
 	})
 	if err != nil {
@@ -269,9 +221,11 @@ func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport,
 	}
 
 	// Sweep index entries before objects so a crash cannot leave an index
-	// pointing at nothing.
+	// pointing at nothing. A SHA-256 entry is kept while any live shard still
+	// carries its file, even an unlinked one: it falls with the shard, once
+	// every file index entry into that shard is gone.
 	err = st.WalkSHA256Index(ctx, func(sha256Hex, fileHash string, modTime time.Time) error {
-		if _, ok := liveFiles[fileHash]; ok {
+		if _, ok := liveShardFiles[fileHash]; ok {
 			return nil
 		}
 		if modTime.After(cutoff) {
@@ -282,8 +236,7 @@ func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport,
 		if opts.DryRun {
 			return nil
 		}
-		_, err := st.DeleteSHA256IndexEntry(ctx, sha256Hex)
-		return err
+		return st.DeleteSHA256IndexEntry(ctx, sha256Hex)
 	})
 	if err != nil {
 		return report, err

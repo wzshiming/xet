@@ -15,7 +15,7 @@ func TestListFilesEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("list endpoint test data")
-	sha256Hex := putGCTestFile(t, stor, data)
+	sha256Hex, _ := putGCTestFile(t, stor, data)
 	handler := newTestHandler(stor)
 
 	rec := httptest.NewRecorder()

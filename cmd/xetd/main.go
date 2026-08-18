@@ -132,25 +132,14 @@ func main() {
 		server.WithNext(next),
 	)
 
-	// Storage administration endpoints, registered in front of the CAS routes.
-	adminOpts := []admin.Option{
+	// Storage administration endpoints, registered in front of the CAS
+	// routes. No mirror wiring is needed: the mirror validates its entries
+	// against storage on every lookup, so GC deletions surface on their own.
+	next = admin.NewHandler(
 		admin.WithStorage(stor),
 		admin.WithAuthFunc(admin.AuthFunc(authFn)),
 		admin.WithNext(next),
-	}
-	if mirrorHandler != nil {
-		// Keep the mirror index consistent with GC file deletions. The file
-		// hash covers unlinks where the shard is gone and no sha256 is known.
-		adminOpts = append(adminOpts, admin.WithFileRemovedHook(func(_ context.Context, sha256Hex, fileHash string) error {
-			if sha256Hex != "" {
-				_, err := mirrorHandler.RemoveBySHA256(sha256Hex)
-				return err
-			}
-			_, err := mirrorHandler.RemoveByFileHash(fileHash)
-			return err
-		}))
-	}
-	next = admin.NewHandler(adminOpts...)
+	)
 
 	next = handlers.CombinedLoggingHandler(os.Stdout, next)
 

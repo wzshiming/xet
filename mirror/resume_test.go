@@ -349,7 +349,7 @@ func (u *flakyUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func clearBackoff(h *Handler, key string) {
 	k, _ := parseResolveKey(key)
 	h.mu.Lock()
-	if e := h.entries[k]; e != nil && e.State == stateFailed {
+	if e := h.failed[k]; e != nil {
 		e.nextRetry = time.Time{}
 	}
 	h.mu.Unlock()
@@ -532,10 +532,10 @@ func waitFailed(t *testing.T, h *Handler, key string) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		h.mu.Lock()
-		e := h.entries[k]
+		e := h.failed[k]
 		_, running := h.tasks[k]
 		h.mu.Unlock()
-		if !running && e != nil && e.State == stateFailed {
+		if !running && e != nil {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

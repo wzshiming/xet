@@ -122,9 +122,12 @@ type Handler struct {
 	next         http.Handler
 	localAdapter *localCAS
 
-	mu       sync.Mutex
-	flight   singleflight.Group
-	entries  map[resolveKey]*fileEntry
+	mu     sync.Mutex
+	flight singleflight.Group
+	// failed holds the process-local failure records with their retry
+	// backoff; ready entries live only in the persisted index and are read
+	// from disk on every lookup.
+	failed   map[resolveKey]*fileEntry
 	branches map[string]*branchEntry
 	tasks    map[resolveKey]*task
 	// hashTasks maps the upstream xet hash of each in-flight ingest to its
@@ -197,7 +200,7 @@ func NewHandler(opts ...Option) (*Handler, error) {
 	h := &Handler{
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
-		entries:            map[resolveKey]*fileEntry{},
+		failed:             map[resolveKey]*fileEntry{},
 		tasks:              map[resolveKey]*task{},
 		hashTasks:          map[string]resolveKey{},
 	}
@@ -226,10 +229,6 @@ func NewHandler(opts ...Option) (*Handler, error) {
 		}
 	}
 
-	h.entries, err = loadIndex(h.indexDir)
-	if err != nil {
-		return nil, fmt.Errorf("mirror: load index: %w", err)
-	}
 	h.branches, err = loadBranches(branchDir)
 	if err != nil {
 		return nil, fmt.Errorf("mirror: load branches: %w", err)

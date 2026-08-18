@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -55,7 +56,7 @@ type S3Storage struct {
 	sha256Mut  sync.Mutex // guards sha256Index
 	offsetsMut sync.Mutex // guards offsetsIndex
 
-	gcMut sync.RWMutex // held exclusively by Sweep to keep shard writes out of a collection cycle
+	gcMut sync.RWMutex // gc guard: shard writes hold the read side, Sweep holds the write side
 
 	// endpoint, region and pathStyle configure the lazily created client
 	// when one is not injected directly.
@@ -465,28 +466,15 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		}
 	}
 
-	_, wasInserted, err := ss.writeShard(ctx, s, false)
+	_, wasInserted, err := ss.writeShard(ctx, s)
 	return wasInserted, err
 }
 
-// ReplaceShard persists s and repoints its files at it even when they already
-// resolve to another shard, returning the hash of the stored shard. Compaction
-// uses it to swap in a shard whose reconstruction terms were rewritten.
-func (ss *S3Storage) ReplaceShard(ctx context.Context, s *shard.Shard) (string, error) {
-	ss.gcMut.RLock()
-	defer ss.gcMut.RUnlock()
+func (ss *S3Storage) gcLock()   { ss.gcMut.Lock() }
+func (ss *S3Storage) gcUnlock() { ss.gcMut.Unlock() }
 
-	if len(s.Files) == 0 {
-		return "", fmt.Errorf("shard has no file blocks")
-	}
-
-	shardHash, _, err := ss.writeShard(ctx, s, true)
-	return shardHash, err
-}
-
-// writeShard persists the shard object and its index objects. Index objects
-// are overwritten either way; replace only controls the in-memory caches.
-func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace bool) (string, bool, error) {
+// writeShard persists the shard object and its index objects.
+func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	for i := range s.Files {
 		computed, err := ss.computeFileSHA256(ctx, &s.Files[i])
 		if err != nil {
@@ -529,43 +517,19 @@ func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace boo
 	// marker, so a partial failure leaves a retryable shard instead of one
 	// that reports "already exists" with missing chunk/sha256 indexes.
 	shardHashData := []byte(shardHash)
-	skip := map[xet.FileHash]struct{}{}
-	if replace {
-		// A file unlinked since the shard was loaded must stay unlinked:
-		// repointing its index entry would resurrect the file. A concurrent
-		// unlink between this check and the write is the remaining exposure.
-		for _, file := range s.Files {
-			if _, exists, err := ss.headObject(ctx, ss.objectKey("index/files", file.FileHash.String())); err != nil {
-				return shardHash, wasInserted, fmt.Errorf("check file index for file %s: %w", file.FileHash.String(), err)
-			} else if !exists {
-				skip[file.FileHash] = struct{}{}
-			}
-		}
-	}
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			if replace {
-				ss.chunkMut.Lock()
-				ss.chunkIndex.Add(chunk.ChunkHash, shardHash)
-				ss.chunkMut.Unlock()
-			}
 			if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
 				return shardHash, wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
-		if _, ok := skip[file.FileHash]; ok {
-			continue
-		}
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
-		if _, ok := skip[file.FileHash]; ok {
-			continue
-		}
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -577,9 +541,6 @@ func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace boo
 	ss.shardIndex.Add(shardHash, s)
 	ss.shardMut.Unlock()
 	for _, file := range s.Files {
-		if _, ok := skip[file.FileHash]; ok {
-			continue
-		}
 		ss.fileMut.Lock()
 		ss.fileIndex.Add(file.FileHash, shardHash)
 		ss.fileMut.Unlock()
@@ -598,6 +559,9 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 
 	body, err := ss.getObjectReader(ctx, ss.objectKey("shards", shardHash))
 	if err != nil {
+		if isS3NotFound(err) {
+			return nil, fmt.Errorf("read shard %s: %w", shardHash, iofs.ErrNotExist)
+		}
 		return nil, err
 	}
 	defer body.Close()
@@ -626,6 +590,9 @@ func (ss *S3Storage) GetShard(ctx context.Context, fileHash xet.FileHash) (*shar
 
 	data, err := ss.getObject(ctx, ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
+		if isS3NotFound(err) {
+			return nil, fmt.Errorf("read file index: %w", iofs.ErrNotExist)
+		}
 		return nil, fmt.Errorf("read file index: %w", err)
 	}
 	shardHash := strings.TrimSpace(string(data))
@@ -807,34 +774,6 @@ func (ss *S3Storage) GetShardByHash(ctx context.Context, shardHash string) (*sha
 	return ss.getShardByHash(ctx, shardHash)
 }
 
-// XorbChunkCount reports how many chunks a stored xorb holds.
-func (ss *S3Storage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error) {
-	offsets, err := ss.xorbChunkOffsets(ctx, xorbHash)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(len(offsets)), nil
-}
-
-// TouchXorb refreshes the xorb object's LastModified with a metadata
-// self-copy so grace windows measure from now. Missing xorbs are ignored.
-func (ss *S3Storage) TouchXorb(ctx context.Context, xorbHash string) error {
-	key := ss.objectKey("xorbs", xorbHash)
-	_, err := ss.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:            aws.String(ss.bucket),
-		Key:               aws.String(key),
-		CopySource:        aws.String(ss.bucket + "/" + key),
-		MetadataDirective: types.MetadataDirectiveReplace,
-	})
-	if err != nil && !isS3NotFound(err) {
-		return err
-	}
-	return nil
-}
-
-func (ss *S3Storage) gcLock()   { ss.gcMut.Lock() }
-func (ss *S3Storage) gcUnlock() { ss.gcMut.Unlock() }
-
 // walkKind pages through every object under <prefix>/<kind>/ and passes the
 // reassembled fanout name; keys with an unexpected shape are skipped.
 func (ss *S3Storage) walkKind(ctx context.Context, kind string, fn func(name string, size int64, modTime time.Time) error) error {
@@ -942,17 +881,6 @@ func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash string) 
 	return ss.deleteObjectKey(ctx, ss.objectKey("index/files", fileHash))
 }
 
-func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
-	if raw, err := hex.DecodeString(sha256Hex); err == nil && len(raw) == 32 {
-		var digest [32]byte
-		copy(digest[:], raw)
-		ss.sha256Mut.Lock()
-		ss.sha256Index.Remove(digest)
-		ss.sha256Mut.Unlock()
-	}
-	return ss.deleteObjectKey(ctx, ss.objectKey("index/sha256", sha256Hex))
-}
-
 // deleteObject blindly removes one object; S3 deletes are idempotent, so no
 // HEAD round trip is spent on reporting prior existence.
 func (ss *S3Storage) deleteObject(ctx context.Context, key string) error {
@@ -961,6 +889,17 @@ func (ss *S3Storage) deleteObject(ctx context.Context, key string) error {
 		Key:    aws.String(key),
 	})
 	return err
+}
+
+func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error {
+	if raw, err := hex.DecodeString(sha256Hex); err == nil && len(raw) == 32 {
+		var digest [32]byte
+		copy(digest[:], raw)
+		ss.sha256Mut.Lock()
+		ss.sha256Index.Remove(digest)
+		ss.sha256Mut.Unlock()
+	}
+	return ss.deleteObject(ctx, ss.objectKey("index/sha256", sha256Hex))
 }
 
 func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error {
