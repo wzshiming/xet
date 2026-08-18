@@ -261,11 +261,9 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 	fs.shardMut.Lock()
 	fs.shardIndex.Add(shardHash, s)
 	fs.shardMut.Unlock()
-	for _, fileBlock := range s.Files {
-		fs.fileMut.Lock()
-		fs.fileIndex.Add(fileBlock.FileHash, shardHash)
-		fs.fileMut.Unlock()
-	}
+	// The file index cache is deliberately not warmed here: a shard object
+	// can contain files that were since unlinked, and GC loads shards by
+	// hash while deciding what to sweep.
 	return s, nil
 }
 
@@ -460,13 +458,27 @@ func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard, replace b
 
 	shardHashData := []byte(shardHash)
 	writeIndex := writeIndexFile
+	skip := map[xet.FileHash]struct{}{}
 	if replace {
 		writeIndex = replaceIndexFile
+		// A file unlinked since the shard was loaded must stay unlinked:
+		// repointing its index entry would resurrect the file. A concurrent
+		// unlink between this check and the write is the remaining exposure.
+		for _, file := range s.Files {
+			if _, err := os.Stat(fs.objectPath("index/files", file.FileHash.String())); os.IsNotExist(err) {
+				skip[file.FileHash] = struct{}{}
+			} else if err != nil {
+				return shardHash, wasInserted, fmt.Errorf("check file index for file %s: %w", file.FileHash.String(), err)
+			}
+		}
 	}
 	fs.shardMut.Lock()
 	fs.shardIndex.Add(shardHash, s)
 	fs.shardMut.Unlock()
 	for _, file := range s.Files {
+		if _, ok := skip[file.FileHash]; ok {
+			continue
+		}
 		fs.fileMut.Lock()
 		fs.fileIndex.Add(file.FileHash, shardHash)
 		fs.fileMut.Unlock()
@@ -491,6 +503,9 @@ func (fs *FileStorage) writeShard(ctx context.Context, s *shard.Shard, replace b
 		}
 	}
 	for _, file := range s.Files {
+		if _, ok := skip[file.FileHash]; ok {
+			continue
+		}
 		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
 		if err := writeIndex(sha256Path, []byte(file.FileHash.String())); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)

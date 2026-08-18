@@ -202,7 +202,7 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 		}
 		// Keyed shards carry HMAC'd chunk hashes, so their CAS blocks cannot
 		// be rebuilt from chunk data.
-		if sh.Footer != nil && sh.Footer.ChunkHashKey != [32]byte{} {
+		if sh.Footer != nil && sh.Footer.IsKeyed() {
 			report.SkippedKeyed++
 			continue
 		}

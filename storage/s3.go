@@ -529,6 +529,19 @@ func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace boo
 	// marker, so a partial failure leaves a retryable shard instead of one
 	// that reports "already exists" with missing chunk/sha256 indexes.
 	shardHashData := []byte(shardHash)
+	skip := map[xet.FileHash]struct{}{}
+	if replace {
+		// A file unlinked since the shard was loaded must stay unlinked:
+		// repointing its index entry would resurrect the file. A concurrent
+		// unlink between this check and the write is the remaining exposure.
+		for _, file := range s.Files {
+			if _, exists, err := ss.headObject(ctx, ss.objectKey("index/files", file.FileHash.String())); err != nil {
+				return shardHash, wasInserted, fmt.Errorf("check file index for file %s: %w", file.FileHash.String(), err)
+			} else if !exists {
+				skip[file.FileHash] = struct{}{}
+			}
+		}
+	}
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
 			if replace {
@@ -542,11 +555,17 @@ func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace boo
 		}
 	}
 	for _, file := range s.Files {
+		if _, ok := skip[file.FileHash]; ok {
+			continue
+		}
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), []byte(file.FileHash.String())); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
+		if _, ok := skip[file.FileHash]; ok {
+			continue
+		}
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
 			return shardHash, wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
@@ -558,6 +577,9 @@ func (ss *S3Storage) writeShard(ctx context.Context, s *shard.Shard, replace boo
 	ss.shardIndex.Add(shardHash, s)
 	ss.shardMut.Unlock()
 	for _, file := range s.Files {
+		if _, ok := skip[file.FileHash]; ok {
+			continue
+		}
 		ss.fileMut.Lock()
 		ss.fileIndex.Add(file.FileHash, shardHash)
 		ss.fileMut.Unlock()
@@ -587,11 +609,9 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 	ss.shardMut.Lock()
 	ss.shardIndex.Add(shardHash, s)
 	ss.shardMut.Unlock()
-	for _, fileBlock := range s.Files {
-		ss.fileMut.Lock()
-		ss.fileIndex.Add(fileBlock.FileHash, shardHash)
-		ss.fileMut.Unlock()
-	}
+	// The file index cache is deliberately not warmed here: a shard object
+	// can contain files that were since unlinked, and GC loads shards by
+	// hash while deciding what to sweep.
 	return s, nil
 }
 

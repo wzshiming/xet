@@ -7,16 +7,17 @@ import (
 	"time"
 )
 
-func TestRemoveBySHA256(t *testing.T) {
+func TestRemoveEntries(t *testing.T) {
 	dir := t.TempDir()
 	commit := strings.Repeat("ab", 20)
 	shaTarget := strings.Repeat("11", 32)
 	shaOther := strings.Repeat("22", 32)
+	fileOther := strings.Repeat("33", 32)
 
 	entries := []*fileEntry{
 		{Key: "/org/repo/resolve/" + commit + "/a.bin", State: stateReady, SHA256: shaTarget, Commit: commit, CheckedAt: time.Now()},
 		{Key: "/org/repo/resolve/" + commit + "/copy-of-a.bin", State: stateReady, SHA256: shaTarget, Commit: commit, CheckedAt: time.Now()},
-		{Key: "/org/repo/resolve/" + commit + "/b.bin", State: stateReady, SHA256: shaOther, Commit: commit, CheckedAt: time.Now()},
+		{Key: "/org/repo/resolve/" + commit + "/b.bin", State: stateReady, SHA256: shaOther, FileHash: fileOther, Commit: commit, CheckedAt: time.Now()},
 	}
 
 	h := &Handler{indexDir: dir, entries: map[resolveKey]*fileEntry{}}
@@ -50,11 +51,22 @@ func TestRemoveBySHA256(t *testing.T) {
 		t.Fatalf("unrelated entry removed: %v", err)
 	}
 
-	// Removing again or with an empty hash is a no-op.
+	// Removing again or with no identifier is a no-op.
 	if removed, err := h.RemoveBySHA256(shaTarget); err != nil || removed != 0 {
 		t.Fatalf("second RemoveBySHA256 = %d, %v", removed, err)
 	}
 	if removed, err := h.RemoveBySHA256(""); err != nil || removed != 0 {
 		t.Fatalf("RemoveBySHA256(empty) = %d, %v", removed, err)
+	}
+	if removed, err := h.RemoveByFileHash(""); err != nil || removed != 0 {
+		t.Fatalf("RemoveByFileHash(empty) = %d, %v", removed, err)
+	}
+
+	// An unlink that could not resolve a sha256 still matches by file hash.
+	if removed, err := h.RemoveByFileHash(fileOther); err != nil || removed != 1 {
+		t.Fatalf("RemoveByFileHash = %d, %v", removed, err)
+	}
+	if len(h.entries) != 0 {
+		t.Fatalf("entries left = %d, want 0", len(h.entries))
 	}
 }

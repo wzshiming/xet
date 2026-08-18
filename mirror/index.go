@@ -137,21 +137,18 @@ func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
 	return files, nil
 }
 
-// RemoveBySHA256 drops every ready entry whose content matches the given
-// SHA-256 hex, from memory and from the persisted index, so a file removed
-// from the CAS is no longer served from the mirror. It returns the number of
-// entries removed.
-func (h *Handler) RemoveBySHA256(sha256Hex string) (int, error) {
-	if sha256Hex == "" {
-		return 0, nil
-	}
+// removeEntries drops every ready entry the match reports, from memory and
+// from the persisted index, returning the number of entries removed. It
+// scans all entries: deletes are rare admin operations, not worth keeping a
+// reverse index in sync with every ingest.
+func (h *Handler) removeEntries(match func(*fileEntry) bool) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	removed := 0
 	var firstErr error
 	for k, e := range h.entries {
-		if e.SHA256 != sha256Hex {
+		if !match(e) {
 			continue
 		}
 		delete(h.entries, k)
@@ -162,4 +159,25 @@ func (h *Handler) RemoveBySHA256(sha256Hex string) (int, error) {
 		}
 	}
 	return removed, firstErr
+}
+
+// RemoveBySHA256 drops every ready entry whose content matches the given
+// SHA-256 hex, so a file removed from the CAS is no longer served from the
+// mirror.
+func (h *Handler) RemoveBySHA256(sha256Hex string) (int, error) {
+	if sha256Hex == "" {
+		return 0, nil
+	}
+	return h.removeEntries(func(e *fileEntry) bool { return e.SHA256 == sha256Hex })
+}
+
+// RemoveByFileHash drops every ready entry recorded under the given xet file
+// hash. It is the fallback for deletions where no SHA-256 is known (the
+// file's shard was already gone); empty-file entries carry no file hash and
+// can only be matched by SHA-256.
+func (h *Handler) RemoveByFileHash(fileHash string) (int, error) {
+	if fileHash == "" {
+		return 0, nil
+	}
+	return h.removeEntries(func(e *fileEntry) bool { return e.FileHash == fileHash })
 }

@@ -22,7 +22,9 @@ type Collector interface {
 	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
 
 	// ReplaceShard stores a shard whose files may already be indexed,
-	// repointing them at it. Compaction uses it to swap in rewritten shards.
+	// repointing them at it. Files whose index entries were unlinked since
+	// the shard was loaded are left unlinked. Compaction uses it to swap in
+	// rewritten shards.
 	ReplaceShard(ctx context.Context, s *shard.Shard) (string, error)
 
 	// XorbChunkCount reports how many chunks a stored xorb holds.
@@ -171,7 +173,9 @@ type SweepOptions struct {
 	// uploads whose xorbs precede their shard. Zero means DefaultSweepGrace;
 	// negative disables the grace window. Sweeping without grace while
 	// uploads are running can delete a xorb whose shard arrives later,
-	// leaving that file permanently unreconstructable.
+	// leaving that file permanently unreconstructable. Uploads that take
+	// longer than the window are equally unprotected, so size Grace above
+	// the longest expected upload.
 	Grace time.Duration
 }
 

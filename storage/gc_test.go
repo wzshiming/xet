@@ -490,3 +490,102 @@ func TestGCSweepGraceKeepsXorbsOfFreshShard(t *testing.T) {
 		})
 	}
 }
+
+func TestReplaceShardKeepsUnlinkedFilesUnlinked(t *testing.T) {
+	for name, st := range gcBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+
+			chunkA := []byte("replace-live-file-chunk")
+			chunkB := []byte("replace-unlinked-file-chunk")
+			xorbA := putGCXorb(t, st, chunkA)
+			xorbB := putGCXorb(t, st, chunkB)
+			fileA := xet.FileHash{0xD7}
+			fileB := xet.FileHash{0xE7}
+			termA := gcTerm{xorbA, [][]byte{chunkA}}
+			termB := gcTerm{xorbB, [][]byte{chunkB}}
+			files := []shard.FileBlock{
+				gcFileBlock(fileA, termA),
+				gcFileBlock(fileB, termB),
+			}
+			cas := []shard.CASBlock{
+				gcCASBlock(xorbA, xet.ChunkHash{11}),
+				gcCASBlock(xorbB, xet.ChunkHash{12}),
+			}
+			putGCShard(t, st, files, cas)
+
+			// Unlink one file, then replace the shard as compaction would.
+			if _, err := Unlink(ctx, st, fileB.String(), HashKindFile); err != nil {
+				t.Fatalf("Unlink: %v", err)
+			}
+			s := shard.NewShard()
+			for _, fb := range files {
+				s.AddFile(fb)
+			}
+			for _, cb := range cas {
+				s.AddCASBlock(cb)
+			}
+			s.SetFooter()
+			if _, err := st.ReplaceShard(ctx, s); err != nil {
+				t.Fatalf("ReplaceShard: %v", err)
+			}
+
+			if _, err := st.GetShard(ctx, fileA); err != nil {
+				t.Fatalf("live file lost its index entry: %v", err)
+			}
+			if _, err := st.GetShard(ctx, fileB); err == nil {
+				t.Fatal("ReplaceShard resurrected an unlinked file")
+			}
+			if _, err := st.GetFileHashBySHA256(ctx, "default", gcSHA256(termB)); err == nil {
+				t.Fatal("ReplaceShard resurrected an unlinked sha256 entry")
+			}
+		})
+	}
+}
+
+func TestShardLoadDoesNotRelinkUnlinkedFiles(t *testing.T) {
+	for name, st := range gcBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+
+			chunk := []byte("relink-guard-chunk")
+			xorbHash := putGCXorb(t, st, chunk)
+			fileHash := xet.FileHash{0xF7}
+			putGCShard(t, st,
+				[]shard.FileBlock{gcFileBlock(fileHash, gcTerm{xorbHash, [][]byte{chunk}})},
+				[]shard.CASBlock{gcCASBlock(xorbHash, xet.ChunkHash{13})})
+
+			var shardHash string
+			if err := st.WalkFileIndex(ctx, func(_, sh string, _ time.Time) error {
+				shardHash = sh
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Unlink(ctx, st, fileHash.String(), HashKindFile); err != nil {
+				t.Fatalf("Unlink: %v", err)
+			}
+
+			// Evict the parsed shard so the next load takes the miss path.
+			switch b := st.(type) {
+			case *FileStorage:
+				b.shardMut.Lock()
+				b.shardIndex.Remove(shardHash)
+				b.shardMut.Unlock()
+			case *S3Storage:
+				b.shardMut.Lock()
+				b.shardIndex.Remove(shardHash)
+				b.shardMut.Unlock()
+			}
+
+			// A sweep's grace branch loads shards by hash; that load must not
+			// re-link the shard's files through the in-memory cache.
+			if _, err := st.GetShardByHash(ctx, shardHash); err != nil {
+				t.Fatalf("GetShardByHash: %v", err)
+			}
+			if _, err := st.GetShard(ctx, fileHash); err == nil {
+				t.Fatal("unlinked file resolvable after loading its shard by hash")
+			}
+		})
+	}
+}
