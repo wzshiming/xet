@@ -2,9 +2,11 @@ package storage
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -30,7 +32,8 @@ type CompactOptions struct {
 	// uploads are not repacked out from under their pending shard. Zero means
 	// DefaultSweepGrace; negative disables the grace window.
 	Grace time.Duration
-	// MaxXorbs caps how many sparse xorbs one pass repacks. Zero means no cap.
+	// MaxXorbs caps how many sparse xorbs one pass repacks; once reached the
+	// remaining xorbs are skipped unmeasured. Zero means no cap.
 	MaxXorbs int
 }
 
@@ -72,7 +75,10 @@ type xorbUsage struct {
 //
 // Unlike Sweep this never deletes, so it runs without blocking uploads. A
 // shard uploaded concurrently may still reference a superseded xorb, which
-// only means that xorb stays alive until it too becomes unreferenced.
+// only means that xorb stays alive until it too becomes unreferenced. Do not
+// run it concurrently with a no-grace Sweep, which could delete freshly
+// packed xorbs before their rewritten shard lands; the admin handler runs
+// the two one at a time.
 //
 // Repacking is per shard: chunks shared by two rewritten shards are copied
 // into each shard's new xorbs, so a heavily shared sparse xorb can cost more
@@ -93,8 +99,9 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 	report := &CompactReport{DryRun: opts.DryRun}
 
 	// Every file index entry is a root; its shard names the chunk ranges that
-	// must survive.
-	liveShards := map[string]*shard.Shard{}
+	// must survive. Only span usage is retained; the shards selected for
+	// rewriting are reloaded through the backend's bounded cache later.
+	liveShards := map[string]struct{}{}
 	usage := map[string]*xorbUsage{}
 	err := st.WalkFileIndex(ctx, func(fileHash, shardHash string, _ time.Time) error {
 		if _, ok := liveShards[shardHash]; ok {
@@ -107,7 +114,7 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 			}
 			return fmt.Errorf("load shard %s: %w", shardHash, err)
 		}
-		liveShards[shardHash] = sh
+		liveShards[shardHash] = struct{}{}
 		for i := range sh.Files {
 			for _, entry := range sh.Files[i].Entries {
 				key := entry.CASHash.String()
@@ -139,29 +146,33 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 			report.SkippedGrace++
 			return nil
 		}
+		if opts.MaxXorbs > 0 && len(candidates) >= opts.MaxXorbs {
+			report.SkippedCapped++ // skipped unmeasured once the cap is reached
+			return nil
+		}
 		hash, err := xet.ParseXorbHash(xorbHash)
 		if err != nil {
 			return nil
 		}
-		// Utilization is measured against the packed chunk bytes: the footer is
-		// part of the object but is rewritten with the xorb, not reclaimed.
 		chunkCount, err := st.XorbChunkCount(ctx, hash)
 		if err != nil {
 			return fmt.Errorf("count chunks of xorb %s: %w", xorbHash, err)
 		}
-		dataBytes, err := liveXorbBytes(ctx, st, hash, []chunkSpan{{0, chunkCount}})
+		live := mergeSpans(u.spans)
+		if len(live) == 1 && live[0].start == 0 && live[0].end >= chunkCount {
+			return nil // every chunk is referenced; utilization is 1
+		}
+		// Utilization is measured against the packed chunk bytes: the footer is
+		// part of the object but is rewritten with the xorb, not reclaimed.
+		dataBytes, err := spanBytes(ctx, st, hash, []chunkSpan{{0, chunkCount}})
 		if err != nil {
 			return fmt.Errorf("measure xorb %s: %w", xorbHash, err)
 		}
-		liveBytes, err := liveXorbBytes(ctx, st, hash, u.spans)
+		liveBytes, err := spanBytes(ctx, st, hash, live)
 		if err != nil {
 			return fmt.Errorf("measure xorb %s: %w", xorbHash, err)
 		}
 		if dataBytes <= 0 || float64(liveBytes) >= minUtilization*float64(dataBytes) {
-			return nil
-		}
-		if opts.MaxXorbs > 0 && len(candidates) >= opts.MaxXorbs {
-			report.SkippedCapped++
 			return nil
 		}
 		report.SparseXorbs++
@@ -182,7 +193,13 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 	}
 
 	for shardHash := range rewrite {
-		sh := liveShards[shardHash]
+		sh, err := st.GetShardByHash(ctx, shardHash)
+		if err != nil {
+			if isNotExist(err) {
+				continue // unlinked since the mark phase
+			}
+			return report, fmt.Errorf("load shard %s: %w", shardHash, err)
+		}
 		// Keyed shards carry HMAC'd chunk hashes, so their CAS blocks cannot
 		// be rebuilt from chunk data.
 		if sh.Footer != nil && sh.Footer.ChunkHashKey != [32]byte{} {
@@ -198,11 +215,10 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 	return report, nil
 }
 
-// liveXorbBytes sums the on-disk bytes of the given chunk ranges, counting
-// overlapping ranges once.
-func liveXorbBytes(ctx context.Context, st Storage, xorbHash xet.XorbHash, spans []chunkSpan) (int64, error) {
+// spanBytes sums the on-disk bytes of the given disjoint chunk ranges.
+func spanBytes(ctx context.Context, st Storage, xorbHash xet.XorbHash, spans []chunkSpan) (int64, error) {
 	var total int64
-	for _, span := range mergeSpans(spans) {
+	for _, span := range spans {
 		start, end, err := st.GetXorbDataRange(ctx, defaultNamespace, xorbHash, span.start, span.end)
 		if err != nil {
 			return 0, err
@@ -217,13 +233,8 @@ func mergeSpans(spans []chunkSpan) []chunkSpan {
 	if len(spans) < 2 {
 		return spans
 	}
-	sorted := make([]chunkSpan, len(spans))
-	copy(sorted, spans)
-	for i := 1; i < len(sorted); i++ {
-		for j := i; j > 0 && sorted[j].start < sorted[j-1].start; j-- {
-			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
-		}
-	}
+	sorted := slices.Clone(spans)
+	slices.SortFunc(sorted, func(a, b chunkSpan) int { return cmp.Compare(a.start, b.start) })
 	merged := sorted[:1]
 	for _, span := range sorted[1:] {
 		last := &merged[len(merged)-1]
@@ -242,6 +253,7 @@ func mergeSpans(spans []chunkSpan) []chunkSpan {
 // xorbs and stores the resulting shard, repointing the files at it.
 func rewriteShard(ctx context.Context, st Collector, sh *shard.Shard, candidates map[string]struct{}, report *CompactReport) error {
 	packer := &xorbPacker{st: st, report: report}
+	defer packer.closeSources()
 
 	rebuilt := shard.NewShard()
 	for i := range sh.Files {
@@ -296,6 +308,9 @@ type xorbPacker struct {
 	pending []*shard.FileDataSequenceEntry
 	packed  uint32 // unpacked bytes written to the open xorb
 
+	sources map[string]io.ReadSeekCloser // open source xorbs, reused across terms
+	readBuf []byte
+
 	blocks []shard.CASBlock
 }
 
@@ -314,7 +329,7 @@ func (p *xorbPacker) copyTerm(ctx context.Context, src shard.FileDataSequenceEnt
 
 	dst.ChunkIndexStart = uint32(len(p.chunks))
 	firstChunk := firstOfFile
-	err := readChunks(ctx, p.st, src.CASHash, src.ChunkIndexStart, src.ChunkIndexEnd, func(data []byte) error {
+	err := p.readChunks(ctx, src.CASHash, src.ChunkIndexStart, src.ChunkIndexEnd, func(data []byte) error {
 		if _, err := p.encoder.Write(data); err != nil {
 			return err
 		}
@@ -379,30 +394,56 @@ func (p *xorbPacker) flush(ctx context.Context) error {
 	return nil
 }
 
+// source returns an open handle for the given source xorb, reused across
+// terms until closeSources.
+func (p *xorbPacker) source(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+	key := xorbHash.String()
+	if rsc, ok := p.sources[key]; ok {
+		return rsc, nil
+	}
+	rsc, err := p.st.GetXorbReadSeekCloser(ctx, defaultNamespace, xorbHash)
+	if err != nil {
+		return nil, err
+	}
+	if p.sources == nil {
+		p.sources = map[string]io.ReadSeekCloser{}
+	}
+	p.sources[key] = rsc
+	return rsc, nil
+}
+
+func (p *xorbPacker) closeSources() {
+	for _, rsc := range p.sources {
+		_ = rsc.Close()
+	}
+	p.sources = nil
+}
+
 // readChunks decodes the chunks of [chunkStart, chunkEnd) one at a time.
-func readChunks(ctx context.Context, st Storage, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32, fn func(data []byte) error) error {
-	start, end, err := st.GetXorbDataRange(ctx, defaultNamespace, xorbHash, chunkStart, chunkEnd)
+func (p *xorbPacker) readChunks(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32, fn func(data []byte) error) error {
+	start, end, err := p.st.GetXorbDataRange(ctx, defaultNamespace, xorbHash, chunkStart, chunkEnd)
 	if err != nil {
 		return fmt.Errorf("locate xorb chunks: %w", err)
 	}
-	rsc, err := st.GetXorbReadSeekCloser(ctx, defaultNamespace, xorbHash)
+	rsc, err := p.source(ctx, xorbHash)
 	if err != nil {
 		return err
 	}
-	defer rsc.Close()
 	if _, err := rsc.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
+	if p.readBuf == nil {
+		p.readBuf = make([]byte, xet.MaxChunkSize)
+	}
 
 	decoder := xorb.NewDecoder(io.LimitReader(rsc, end-start+1), false)
-	buf := make([]byte, xet.MaxChunkSize)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, err := decoder.Read(buf)
+		n, err := decoder.Read(p.readBuf)
 		if n > 0 {
-			if err := fn(buf[:n]); err != nil {
+			if err := fn(p.readBuf[:n]); err != nil {
 				return err
 			}
 		}

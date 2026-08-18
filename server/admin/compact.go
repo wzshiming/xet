@@ -10,9 +10,9 @@ import (
 )
 
 // handleCompact handles POST /internal/compact?dry_run=&grace=&min_utilization=.
-// Only one compaction runs at a time; concurrent requests get 409. Repacking
-// changes xorb and shard hashes but not file hashes, so clients keep resolving
-// the same file ids.
+// Only one GC operation (sweep or compaction) runs at a time; concurrent
+// requests get 409. Repacking changes xorb and shard hashes but not file
+// hashes, so clients keep resolving the same file ids.
 func (h *Handler) handleCompact(w http.ResponseWriter, r *http.Request) {
 	collector, ok := h.authorize(w, r)
 	if !ok {
@@ -57,11 +57,11 @@ func (h *Handler) handleCompact(w http.ResponseWriter, r *http.Request) {
 		opts.MaxXorbs = maxXorbs
 	}
 
-	if !h.compactActive.CompareAndSwap(false, true) {
-		http.Error(w, "Compaction already in progress", http.StatusConflict)
+	if !h.gcActive.CompareAndSwap(false, true) {
+		http.Error(w, "Another GC operation is in progress", http.StatusConflict)
 		return
 	}
-	defer h.compactActive.Store(false)
+	defer h.gcActive.Store(false)
 
 	report, err := storage.Compact(r.Context(), collector, opts)
 	if err != nil {

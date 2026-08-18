@@ -849,23 +849,25 @@ func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex str
 	return removeObjectFile(fs.objectPath("index/sha256", sha256Hex))
 }
 
-func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) (bool, error) {
+func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error {
 	if ch, err := xet.ParseChunkHash(chunkHash); err == nil {
 		fs.chunkMut.Lock()
 		fs.chunkIndex.Remove(ch)
 		fs.chunkMut.Unlock()
 	}
-	return removeObjectFile(fs.objectPath("index/chunks", chunkHash))
+	_, err := removeObjectFile(fs.objectPath("index/chunks", chunkHash))
+	return err
 }
 
-func (fs *FileStorage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
+func (fs *FileStorage) DeleteShard(ctx context.Context, shardHash string) error {
 	fs.shardMut.Lock()
 	fs.shardIndex.Remove(shardHash)
 	fs.shardMut.Unlock()
-	return removeObjectFile(fs.objectPath("shards", shardHash))
+	_, err := removeObjectFile(fs.objectPath("shards", shardHash))
+	return err
 }
 
-func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash string) (bool, error) {
+func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash string) error {
 	if xh, err := xet.ParseXorbHash(xorbHash); err == nil {
 		fs.xorbMut.Lock()
 		fs.xorbIndex.Remove(xh) // OnEvicted closes the cached handle
@@ -874,5 +876,6 @@ func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash string) (bool, e
 		fs.offsetsIndex.Remove(xh)
 		fs.offsetsMut.Unlock()
 	}
-	return removeObjectFile(fs.objectPath("xorbs", xorbHash))
+	_, err := removeObjectFile(fs.objectPath("xorbs", xorbHash))
+	return err
 }

@@ -34,11 +34,16 @@ type Collector interface {
 	WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error
 	WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error
 
+	// The index-entry deletes report whether the entry existed, which Unlink
+	// needs for its not-found result.
 	DeleteFileIndexEntry(ctx context.Context, fileHash string) (bool, error)
 	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error)
-	DeleteChunkIndexEntry(ctx context.Context, chunkHash string) (bool, error)
-	DeleteShard(ctx context.Context, shardHash string) (bool, error)
-	DeleteXorb(ctx context.Context, xorbHash string) (bool, error)
+
+	// The object deletes are idempotent and report no prior existence, so S3
+	// can issue blind deletes without a HEAD per object.
+	DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error
+	DeleteShard(ctx context.Context, shardHash string) error
+	DeleteXorb(ctx context.Context, xorbHash string) error
 
 	// gcLock blocks new shard writes for the duration of a sweep, so a
 	// concurrent upload cannot persist references to objects being deleted.
@@ -302,8 +307,7 @@ func Sweep(ctx context.Context, st Collector, opts SweepOptions) (*SweepReport, 
 		if opts.DryRun {
 			return nil
 		}
-		_, err := st.DeleteChunkIndexEntry(ctx, chunkHash)
-		return err
+		return st.DeleteChunkIndexEntry(ctx, chunkHash)
 	})
 	if err != nil {
 		return report, err
@@ -332,8 +336,7 @@ func Sweep(ctx context.Context, st Collector, opts SweepOptions) (*SweepReport, 
 		if opts.DryRun {
 			return nil
 		}
-		_, err := st.DeleteShard(ctx, shardHash)
-		return err
+		return st.DeleteShard(ctx, shardHash)
 	})
 	if err != nil {
 		return report, err
@@ -352,8 +355,7 @@ func Sweep(ctx context.Context, st Collector, opts SweepOptions) (*SweepReport, 
 		if opts.DryRun {
 			return nil
 		}
-		_, err := st.DeleteXorb(ctx, xorbHash)
-		return err
+		return st.DeleteXorb(ctx, xorbHash)
 	})
 	if err != nil {
 		return report, err

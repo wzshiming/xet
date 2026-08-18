@@ -386,8 +386,8 @@ func TestGCSweepRepairsDanglingEntries(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if removed, err := st.DeleteShard(ctx, shardHash); err != nil || !removed {
-				t.Fatalf("DeleteShard() = %v, %v", removed, err)
+			if err := st.DeleteShard(ctx, shardHash); err != nil {
+				t.Fatalf("DeleteShard() = %v", err)
 			}
 
 			report, err := Sweep(ctx, st, noGrace)

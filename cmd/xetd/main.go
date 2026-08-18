@@ -106,7 +106,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		next, err = mirror.NewHandler(
+		mirrorHandler, err = mirror.NewHandler(
 			mirror.WithStorage(stor),
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
@@ -120,7 +120,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
 			os.Exit(1)
 		}
-		mirrorHandler = next.(*mirror.Handler)
+		next = mirrorHandler
 
 		fmt.Printf("Mirror mode enabled, upstream: %s\n", *upstream)
 	}

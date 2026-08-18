@@ -29,8 +29,10 @@ type Handler struct {
 	authFn  AuthFunc
 
 	fileRemovedHook FileRemovedHook
-	sweepActive     atomic.Bool // single-flight guard for GC sweeps
-	compactActive   atomic.Bool // single-flight guard for compaction
+	// gcActive is the single-flight guard shared by sweep and compaction: a
+	// no-grace sweep during a compaction could delete freshly packed xorbs
+	// before their rewritten shard lands.
+	gcActive atomic.Bool
 }
 
 // Option defines a functional option for configuring the Handler.

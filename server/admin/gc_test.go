@@ -219,7 +219,7 @@ func TestGCSweepSingleFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := newTestHandler(stor)
-	handler.sweepActive.Store(true)
+	handler.gcActive.Store(true)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))

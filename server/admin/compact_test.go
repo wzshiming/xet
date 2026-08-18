@@ -40,7 +40,7 @@ func TestCompactEndpoint(t *testing.T) {
 		t.Fatalf("invalid min_utilization = %d, want 400", rec.Code)
 	}
 
-	handler.compactActive.Store(true)
+	handler.gcActive.Store(true)
 	if rec := do("/internal/compact"); rec.Code != http.StatusConflict {
 		t.Fatalf("concurrent compaction = %d, want 409", rec.Code)
 	}

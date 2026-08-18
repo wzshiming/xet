@@ -49,9 +49,10 @@ func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 	}
 }
 
-// handleSweep handles POST /internal/gc/sweep?dry_run=&grace=. Only one
-// sweep runs at a time; concurrent requests get 409. grace=0 disables the
-// grace window; see SweepOptions.Grace for why that is unsafe during uploads.
+// handleSweep handles POST /internal/gc/sweep?dry_run=&grace=. Only one GC
+// operation (sweep or compaction) runs at a time; concurrent requests get
+// 409. grace=0 disables the grace window; see SweepOptions.Grace for why
+// that is unsafe during uploads.
 func (h *Handler) handleSweep(w http.ResponseWriter, r *http.Request) {
 	collector, ok := h.authorize(w, r)
 	if !ok {
@@ -80,11 +81,11 @@ func (h *Handler) handleSweep(w http.ResponseWriter, r *http.Request) {
 		opts.Grace = grace
 	}
 
-	if !h.sweepActive.CompareAndSwap(false, true) {
-		http.Error(w, "Sweep already in progress", http.StatusConflict)
+	if !h.gcActive.CompareAndSwap(false, true) {
+		http.Error(w, "Another GC operation is in progress", http.StatusConflict)
 		return
 	}
-	defer h.sweepActive.Store(false)
+	defer h.gcActive.Store(false)
 
 	report, err := storage.Sweep(r.Context(), collector, opts)
 	if err != nil {

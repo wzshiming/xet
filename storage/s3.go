@@ -917,29 +917,39 @@ func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex strin
 	return ss.deleteObjectKey(ctx, ss.objectKey("index/sha256", sha256Hex))
 }
 
-func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) (bool, error) {
+// deleteObject blindly removes one object; S3 deletes are idempotent, so no
+// HEAD round trip is spent on reporting prior existence.
+func (ss *S3Storage) deleteObject(ctx context.Context, key string) error {
+	_, err := ss.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(key),
+	})
+	return err
+}
+
+func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash string) error {
 	if ch, err := xet.ParseChunkHash(chunkHash); err == nil {
 		ss.chunkMut.Lock()
 		ss.chunkIndex.Remove(ch)
 		ss.chunkMut.Unlock()
 	}
-	return ss.deleteObjectKey(ctx, ss.objectKey("index/chunks", chunkHash))
+	return ss.deleteObject(ctx, ss.objectKey("index/chunks", chunkHash))
 }
 
-func (ss *S3Storage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
+func (ss *S3Storage) DeleteShard(ctx context.Context, shardHash string) error {
 	ss.shardMut.Lock()
 	ss.shardIndex.Remove(shardHash)
 	ss.shardMut.Unlock()
-	return ss.deleteObjectKey(ctx, ss.objectKey("shards", shardHash))
+	return ss.deleteObject(ctx, ss.objectKey("shards", shardHash))
 }
 
-func (ss *S3Storage) DeleteXorb(ctx context.Context, xorbHash string) (bool, error) {
+func (ss *S3Storage) DeleteXorb(ctx context.Context, xorbHash string) error {
 	if xh, err := xet.ParseXorbHash(xorbHash); err == nil {
 		ss.offsetsMut.Lock()
 		ss.offsetsIndex.Remove(xh)
 		ss.offsetsMut.Unlock()
 	}
-	return ss.deleteObjectKey(ctx, ss.objectKey("xorbs", xorbHash))
+	return ss.deleteObject(ctx, ss.objectKey("xorbs", xorbHash))
 }
 
 var _ Storage = (*S3Storage)(nil)
