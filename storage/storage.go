@@ -58,7 +58,7 @@ type FileStorage struct {
 	fileIndex    *lru.Cache // bounded file hash -> shard hash
 	shardIndex   *lru.Cache // bounded shard hash -> shard cache
 	chunkIndex   *lru.Cache // bounded chunk hash -> shard hash
-	sha256Index  *lru.Cache // bounded SHA-256 -> file hash
+	sha256Index  *lru.Cache // bounded SHA-256 -> shard hash
 	xorbIndex    *lru.Cache // bounded xorb hash -> *xorbFile
 	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
 
@@ -454,7 +454,7 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	}
 	for _, file := range s.Files {
 		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
-		if err := writeIndexFile(sha256Path, []byte(file.FileHash.String())); err != nil {
+		if err := writeIndexFile(sha256Path, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
@@ -568,43 +568,47 @@ func (fs *FileStorage) GetShard(ctx context.Context, fileHash xet.FileHash) (*sh
 }
 
 // GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded
-// at ingest, reading the sha256 index file through the bounded cache.
+// at ingest, loading the owning shard and matching its file metadata.
 func (fs *FileStorage) GetFileHashBySHA256(ctx context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
+	sh, err := fs.getShardBySHA256(digest)
+	if err != nil {
+		return xet.FileHash{}, err
+	}
+	file := findFileBySHA256(sh, digest)
+	if file == nil {
+		return xet.FileHash{}, fmt.Errorf("SHA-256 is not present in shard")
+	}
+	return file.FileHash, nil
+}
+
+// getShardBySHA256 resolves a SHA-256 digest through index/sha256/<digest>,
+// whose contents are the hash of the owning shard, reading the index through
+// the bounded cache.
+func (fs *FileStorage) getShardBySHA256(digest [32]byte) (*shard.Shard, error) {
 	fs.sha256Mut.Lock()
 	value, exists := fs.sha256Index.Get(digest)
 	fs.sha256Mut.Unlock()
 	if exists {
-		return value.(xet.FileHash), nil
+		return fs.getShardByHash(value.(string))
 	}
 
 	indexPath := fs.objectPath("index/sha256", hex.EncodeToString(digest[:]))
 	b, err := os.ReadFile(indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return xet.FileHash{}, fmt.Errorf("SHA-256 not found")
+			return nil, fmt.Errorf("SHA-256 not found")
 		}
-		return xet.FileHash{}, fmt.Errorf("read SHA-256 index: %w", err)
+		return nil, fmt.Errorf("read SHA-256 index: %w", err)
 	}
-	fileHash, err := xet.ParseFileHash(strings.TrimSpace(string(b)))
-	if err != nil {
-		return xet.FileHash{}, fmt.Errorf("invalid SHA-256 index: %w", err)
-	}
+	shardHash := strings.TrimSpace(string(b))
 	fs.sha256Mut.Lock()
-	fs.sha256Index.Add(digest, fileHash)
+	fs.sha256Index.Add(digest, shardHash)
 	fs.sha256Mut.Unlock()
-	return fileHash, nil
-}
-
-func (fs *FileStorage) getShardBySHA256(ctx context.Context, namespace string, digest [32]byte) (*shard.Shard, error) {
-	fileHash, err := fs.GetFileHashBySHA256(ctx, namespace, digest)
-	if err != nil {
-		return nil, err
-	}
-	return fs.GetShard(ctx, fileHash)
+	return fs.getShardByHash(shardHash)
 }
 
 func (fs *FileStorage) GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error) {
-	sh, err := fs.getShardBySHA256(ctx, namespace, sha256)
+	sh, err := fs.getShardBySHA256(sha256)
 	if err != nil {
 		return nil, fmt.Errorf("get shard by sha256: %w", err)
 	}
