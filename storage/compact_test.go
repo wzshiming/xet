@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/hex"
 	"io"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -251,5 +253,68 @@ func TestCompactRewritesMultiTermFile(t *testing.T) {
 	}
 	if _, err := Unlink(ctx, st, hex.EncodeToString(digest[:]), HashKindSHA256); err != nil {
 		t.Fatalf("Unlink after compact: %v", err)
+	}
+}
+
+func TestCompactTouchGivesSupersededXorbsGrace(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := incompressible(7, 4096)
+	chunks := [][]byte{live, incompressible(8, 65536), incompressible(9, 65536)}
+	sparse := putGCXorb(t, fs, chunks...)
+
+	fileHash := xet.FileHash{0xD1}
+	fb := shard.FileBlock{FileHash: fileHash}
+	fb.Entries = append(fb.Entries, partialTerm(sparse, chunks, 0, 1))
+	putGCShard(t, fs, []shard.FileBlock{fb},
+		[]shard.CASBlock{gcCASBlock(sparse, xet.ComputeChunkHash(live))})
+
+	// Age the xorb and its shard well past the grace window, as they would
+	// be in production when a compaction picks them up.
+	var shardHash string
+	if err := fs.WalkShards(ctx, func(h string, _ int64, _ time.Time) error {
+		shardHash = h
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * DefaultSweepGrace)
+	for _, path := range []string{
+		fs.objectPath("xorbs", sparse.String()),
+		fs.objectPath("shards", shardHash),
+	} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Compact(ctx, fs, CompactOptions{}); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// A default-grace sweep may take the superseded shard but must leave
+	// the touched xorb for in-flight reconstruction responses.
+	report, err := Sweep(ctx, fs, SweepOptions{})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if report.RemovedXorbs != 0 {
+		t.Fatalf("grace sweep removed a superseded xorb: %+v", report)
+	}
+	if ok, _ := fs.HasXorb(ctx, "default", sparse); !ok {
+		t.Fatal("superseded xorb gone within its grace window")
+	}
+
+	// Once the grace window no longer applies, the xorb is reclaimed.
+	report, err = Sweep(ctx, fs, noGrace)
+	if err != nil {
+		t.Fatalf("Sweep(no grace): %v", err)
+	}
+	if report.RemovedXorbs != 1 {
+		t.Fatalf("no-grace sweep report = %+v", report)
 	}
 }

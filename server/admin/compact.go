@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,7 +15,7 @@ import (
 // requests get 409. Repacking changes xorb and shard hashes but not file
 // hashes, so clients keep resolving the same file ids.
 func (h *Handler) handleCompact(w http.ResponseWriter, r *http.Request) {
-	collector, ok := h.authorize(w, r)
+	gc, ok := h.authorize(w, r)
 	if !ok {
 		return
 	}
@@ -57,14 +58,12 @@ func (h *Handler) handleCompact(w http.ResponseWriter, r *http.Request) {
 		opts.MaxXorbs = maxXorbs
 	}
 
-	if !h.gcActive.CompareAndSwap(false, true) {
-		http.Error(w, "Another GC operation is in progress", http.StatusConflict)
-		return
-	}
-	defer h.gcActive.Store(false)
-
-	report, err := storage.Compact(r.Context(), collector, opts)
+	report, err := gc.Compact(r.Context(), opts)
 	if err != nil {
+		if errors.Is(err, storage.ErrGCBusy) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, "Compaction failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

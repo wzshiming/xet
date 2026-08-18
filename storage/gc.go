@@ -12,23 +12,15 @@ import (
 	"github.com/wzshiming/xet/shard"
 )
 
-// Collector extends Storage with the enumeration and deletion primitives GC
-// needs. Both FileStorage and S3Storage implement it; the unexported lock
-// methods keep the contract internal to this package.
-type Collector interface {
+// SweepStore is the storage surface Unlink and Sweep operate on: enumerate
+// everything, delete anything, and block shard writes for the duration of a
+// sweep. The unexported lock methods keep that contract internal to this
+// package.
+type SweepStore interface {
 	Storage
 
 	// GetShardByHash loads a shard by the hash of its serialized bytes.
 	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
-
-	// ReplaceShard stores a shard whose files may already be indexed,
-	// repointing them at it. Files whose index entries were unlinked since
-	// the shard was loaded are left unlinked. Compaction uses it to swap in
-	// rewritten shards.
-	ReplaceShard(ctx context.Context, s *shard.Shard) (string, error)
-
-	// XorbChunkCount reports how many chunks a stored xorb holds.
-	XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error)
 
 	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error
 	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, fileHash string, modTime time.Time) error) error
@@ -55,11 +47,6 @@ type Collector interface {
 	gcUnlock()
 }
 
-var (
-	_ Collector = (*FileStorage)(nil)
-	_ Collector = (*S3Storage)(nil)
-)
-
 // ErrFileNotFound reports that neither hash interpretation matched an entry.
 var ErrFileNotFound = errors.New("file not found in storage")
 
@@ -79,6 +66,9 @@ type UnlinkResult struct {
 	SHA256             string `json:"sha256,omitempty"`
 	RemovedFileIndex   bool   `json:"removed_file_index"`
 	RemovedSHA256Index bool   `json:"removed_sha256_index"`
+	// HookError reports a file-removed hook failure after a successful
+	// unlink; set only by GC.Unlink.
+	HookError string `json:"hook_error,omitempty"`
 }
 
 // isNotExist recognizes missing-object errors from both backends.
@@ -89,7 +79,7 @@ func isNotExist(err error) bool {
 // Unlink removes the index entries that make a file reachable: its SHA-256
 // mapping and its file-hash mapping. The shard and xorbs stay in place until
 // a Sweep finds them unreferenced.
-func Unlink(ctx context.Context, st Collector, hashStr string, kind HashKind) (*UnlinkResult, error) {
+func Unlink(ctx context.Context, st SweepStore, hashStr string, kind HashKind) (*UnlinkResult, error) {
 	switch kind {
 	case HashKindSHA256:
 		return unlinkBySHA256(ctx, st, hashStr)
@@ -100,7 +90,7 @@ func Unlink(ctx context.Context, st Collector, hashStr string, kind HashKind) (*
 	}
 }
 
-func unlinkBySHA256(ctx context.Context, st Collector, sha256Hex string) (*UnlinkResult, error) {
+func unlinkBySHA256(ctx context.Context, st SweepStore, sha256Hex string) (*UnlinkResult, error) {
 	raw, err := hex.DecodeString(sha256Hex)
 	if err != nil || len(raw) != 32 {
 		return nil, fmt.Errorf("%w: invalid SHA-256 %q", ErrFileNotFound, sha256Hex)
@@ -126,7 +116,7 @@ func unlinkBySHA256(ctx context.Context, st Collector, sha256Hex string) (*Unlin
 	return res, nil
 }
 
-func unlinkByFileHash(ctx context.Context, st Collector, fileHashStr string) (*UnlinkResult, error) {
+func unlinkByFileHash(ctx context.Context, st SweepStore, fileHashStr string) (*UnlinkResult, error) {
 	fileHash, err := xet.ParseFileHash(fileHashStr)
 	if err != nil {
 		return nil, fmt.Errorf("%w: invalid hash %q", ErrFileNotFound, fileHashStr)
@@ -215,7 +205,9 @@ func markXorbs(sh *shard.Shard, liveXorbs map[string]struct{}) {
 // until every file in it has been unlinked. Shard writes in this process are
 // blocked for the duration (see Collector.gcLock for the multi-instance
 // caveat); other operations proceed concurrently under Grace protection.
-func Sweep(ctx context.Context, st Collector, opts SweepOptions) (*SweepReport, error) {
+// Sweep itself carries no concurrency guard; GC.Sweep adds the single-flight
+// guard shared with Compact.
+func Sweep(ctx context.Context, st SweepStore, opts SweepOptions) (*SweepReport, error) {
 	grace := opts.Grace
 	if grace == 0 {
 		grace = DefaultSweepGrace

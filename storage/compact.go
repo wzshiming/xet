@@ -21,6 +21,35 @@ const DefaultCompactUtilization = 0.5
 // defaultNamespace is the only namespace this storage addresses xorbs in.
 const defaultNamespace = "default"
 
+// CompactStore is the storage surface Compact operates on: enumerate files
+// and xorbs, read chunks, and swap in rewritten shards and repacked xorbs.
+// It deliberately grants no delete operations and no shard-write lock:
+// compaction only adds objects and repoints indexes, leaving removal to
+// Sweep.
+type CompactStore interface {
+	Storage
+
+	// GetShardByHash loads a shard by the hash of its serialized bytes.
+	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
+
+	// ReplaceShard stores a shard whose files may already be indexed,
+	// repointing them at it. Files whose index entries were unlinked since
+	// the shard was loaded are left unlinked.
+	ReplaceShard(ctx context.Context, s *shard.Shard) (string, error)
+
+	// XorbChunkCount reports how many chunks a stored xorb holds.
+	XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) (uint32, error)
+
+	// TouchXorb bumps the xorb's modification time so grace windows measure
+	// from now. Compaction touches superseded xorbs to keep a following
+	// sweep from deleting them while reconstruction responses issued before
+	// the rewrite still reference them. Missing xorbs are ignored.
+	TouchXorb(ctx context.Context, xorbHash string) error
+
+	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error
+	WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error
+}
+
 // CompactOptions configures a compaction pass.
 type CompactOptions struct {
 	// DryRun reports the candidates without writing anything.
@@ -71,19 +100,21 @@ type xorbUsage struct {
 // dense xorbs and rewrites the shards pointing at them. Chunk hashes, file
 // hashes and file SHA-256 digests are unchanged, so clients keep resolving the
 // same file ids; the xorb and shard hashes do change, and the superseded
-// objects are left for a later Sweep to delete.
+// objects are left for a later Sweep to delete. Superseded xorbs are touched
+// so that sweep leaves them one grace window for reconstruction responses
+// issued before the rewrite.
 //
 // Unlike Sweep this never deletes, so it runs without blocking uploads. A
 // shard uploaded concurrently may still reference a superseded xorb, which
 // only means that xorb stays alive until it too becomes unreferenced. Do not
 // run it concurrently with a no-grace Sweep, which could delete freshly
-// packed xorbs before their rewritten shard lands; the admin handler runs
-// the two one at a time.
+// packed xorbs before their rewritten shard lands; GC serializes the two for
+// callers that route through it.
 //
 // Repacking is per shard: chunks shared by two rewritten shards are copied
 // into each shard's new xorbs, so a heavily shared sparse xorb can cost more
 // space than it reclaims.
-func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactReport, error) {
+func Compact(ctx context.Context, st CompactStore, opts CompactOptions) (*CompactReport, error) {
 	minUtilization := opts.MinUtilization
 	if minUtilization == 0 {
 		minUtilization = DefaultCompactUtilization
@@ -212,6 +243,16 @@ func Compact(ctx context.Context, st Collector, opts CompactOptions) (*CompactRe
 		report.RewrittenShards++
 	}
 
+	// The superseded xorbs lost their references just now, but their
+	// modification times are old, so a sweep would take them immediately.
+	// Touch them so reconstruction responses issued before the rewrite
+	// (e.g. presigned URLs) get one grace window to drain.
+	for xorbHash := range candidates {
+		if err := st.TouchXorb(ctx, xorbHash); err != nil {
+			return report, fmt.Errorf("touch superseded xorb %s: %w", xorbHash, err)
+		}
+	}
+
 	return report, nil
 }
 
@@ -251,7 +292,7 @@ func mergeSpans(spans []chunkSpan) []chunkSpan {
 
 // rewriteShard copies the terms that point at candidate xorbs into fresh
 // xorbs and stores the resulting shard, repointing the files at it.
-func rewriteShard(ctx context.Context, st Collector, sh *shard.Shard, candidates map[string]struct{}, report *CompactReport) error {
+func rewriteShard(ctx context.Context, st CompactStore, sh *shard.Shard, candidates map[string]struct{}, report *CompactReport) error {
 	packer := &xorbPacker{st: st, report: report}
 	defer packer.closeSources()
 
@@ -299,7 +340,7 @@ func rewriteShard(ctx context.Context, st Collector, sh *shard.Shard, candidates
 // would not fit. Terms are never split, so each entry is patched with the
 // hash and chunk range of the single xorb that received it.
 type xorbPacker struct {
-	st     Collector
+	st     CompactStore
 	report *CompactReport
 
 	buf     bytes.Buffer

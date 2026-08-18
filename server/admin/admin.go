@@ -5,10 +5,8 @@
 package admin
 
 import (
-	"context"
 	"net/http"
 	"strings"
-	"sync/atomic"
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet/storage"
@@ -19,20 +17,18 @@ type AuthFunc func(token string) bool
 
 // FileRemovedHook is called after a file's index entries are removed via the
 // delete endpoint, e.g. to drop matching mirror index entries.
-type FileRemovedHook func(ctx context.Context, sha256Hex, fileHash string) error
+type FileRemovedHook = storage.FileRemovedHook
 
-// Handler serves the storage administration endpoints.
+// Handler serves the storage administration endpoints as a thin HTTP adapter
+// over a storage.GC coordinator.
 type Handler struct {
 	storage storage.Storage
+	gc      *storage.GC
 	root    *mux.Router
 	next    http.Handler
 	authFn  AuthFunc
 
-	fileRemovedHook FileRemovedHook
-	// gcActive is the single-flight guard shared by sweep and compaction: a
-	// no-grace sweep during a compaction could delete freshly packed xorbs
-	// before their rewritten shard lands.
-	gcActive atomic.Bool
+	fileRemovedHook storage.FileRemovedHook
 }
 
 // Option defines a functional option for configuring the Handler.
@@ -46,6 +42,15 @@ func WithStorage(st storage.Storage) Option {
 	}
 }
 
+// WithGC shares an existing coordinator with the endpoints, so its
+// single-flight guard spans in-process callers and these HTTP requests.
+// Without it, NewHandler builds a coordinator from the WithStorage backend.
+func WithGC(g *storage.GC) Option {
+	return func(h *Handler) {
+		h.gc = g
+	}
+}
+
 // WithAuthFunc sets the authentication function guarding the endpoints.
 // Without one they stay disabled.
 func WithAuthFunc(authFn AuthFunc) Option {
@@ -55,6 +60,8 @@ func WithAuthFunc(authFn AuthFunc) Option {
 }
 
 // WithFileRemovedHook sets a callback invoked after a successful file delete.
+// It applies to the handler-built coordinator; one injected with WithGC
+// carries its own hook.
 func WithFileRemovedHook(fn FileRemovedHook) Option {
 	return func(h *Handler) {
 		h.fileRemovedHook = fn
@@ -78,6 +85,12 @@ func NewHandler(opts ...Option) *Handler {
 		opt(h)
 	}
 
+	if h.gc == nil {
+		if collector, ok := h.storage.(storage.Collector); ok {
+			h.gc = storage.NewGC(collector, storage.WithFileRemovedHook(h.fileRemovedHook))
+		}
+	}
+
 	h.root.HandleFunc("/internal/files/sha256/{hash}", h.deleteFileHandler(storage.HashKindSHA256)).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.deleteFileHandler(storage.HashKindFile)).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleSweep).Methods(http.MethodPost)
@@ -96,7 +109,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // authorize gates the destructive endpoints: they stay disabled until an
 // AuthFunc is configured, and need a Collector-capable backend.
-func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (storage.Collector, bool) {
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (*storage.GC, bool) {
 	if h.authFn == nil {
 		http.Error(w, "Admin endpoints are disabled without authentication", http.StatusForbidden)
 		return nil, false
@@ -105,12 +118,11 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request) (storage.Col
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
-	collector, _ := h.storage.(storage.Collector)
-	if collector == nil {
+	if h.gc == nil {
 		http.Error(w, "storage does not support GC", http.StatusNotImplemented)
 		return nil, false
 	}
-	return collector, true
+	return h.gc, true
 }
 
 // authenticate validates the request's bearer token.

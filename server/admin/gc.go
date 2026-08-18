@@ -11,23 +11,18 @@ import (
 	"github.com/wzshiming/xet/storage"
 )
 
-type deleteFileResponse struct {
-	*storage.UnlinkResult
-	HookError string `json:"hook_error,omitempty"`
-}
-
 // deleteFileHandler serves DELETE /internal/files/sha256/{hash} and
 // /internal/files/xet/{hash}; the path names the hash kind since both are 64
 // hex characters. It unlinks the file's index entries; space is reclaimed by
-// a later sweep.
+// a later sweep. A hook failure is reported in the response's hook_error.
 func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		collector, ok := h.authorize(w, r)
+		gc, ok := h.authorize(w, r)
 		if !ok {
 			return
 		}
 
-		res, err := storage.Unlink(r.Context(), collector, mux.Vars(r)["hash"], kind)
+		res, err := gc.Unlink(r.Context(), mux.Vars(r)["hash"], kind)
 		if err != nil {
 			if errors.Is(err, storage.ErrFileNotFound) {
 				http.Error(w, "File not found", http.StatusNotFound)
@@ -37,15 +32,8 @@ func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 			return
 		}
 
-		resp := deleteFileResponse{UnlinkResult: res}
-		if h.fileRemovedHook != nil {
-			if err := h.fileRemovedHook(r.Context(), res.SHA256, res.FileHash); err != nil {
-				resp.HookError = err.Error()
-			}
-		}
-
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(res)
 	}
 }
 
@@ -54,7 +42,7 @@ func (h *Handler) deleteFileHandler(kind storage.HashKind) http.HandlerFunc {
 // 409. grace=0 disables the grace window; see SweepOptions.Grace for why
 // that is unsafe during uploads.
 func (h *Handler) handleSweep(w http.ResponseWriter, r *http.Request) {
-	collector, ok := h.authorize(w, r)
+	gc, ok := h.authorize(w, r)
 	if !ok {
 		return
 	}
@@ -81,14 +69,12 @@ func (h *Handler) handleSweep(w http.ResponseWriter, r *http.Request) {
 		opts.Grace = grace
 	}
 
-	if !h.gcActive.CompareAndSwap(false, true) {
-		http.Error(w, "Another GC operation is in progress", http.StatusConflict)
-		return
-	}
-	defer h.gcActive.Store(false)
-
-	report, err := storage.Sweep(r.Context(), collector, opts)
+	report, err := gc.Sweep(r.Context(), opts)
 	if err != nil {
+		if errors.Is(err, storage.ErrGCBusy) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

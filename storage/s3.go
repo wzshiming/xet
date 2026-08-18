@@ -816,6 +816,22 @@ func (ss *S3Storage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash) 
 	return uint32(len(offsets)), nil
 }
 
+// TouchXorb refreshes the xorb object's LastModified with a metadata
+// self-copy so grace windows measure from now. Missing xorbs are ignored.
+func (ss *S3Storage) TouchXorb(ctx context.Context, xorbHash string) error {
+	key := ss.objectKey("xorbs", xorbHash)
+	_, err := ss.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:            aws.String(ss.bucket),
+		Key:               aws.String(key),
+		CopySource:        aws.String(ss.bucket + "/" + key),
+		MetadataDirective: types.MetadataDirectiveReplace,
+	})
+	if err != nil && !isS3NotFound(err) {
+		return err
+	}
+	return nil
+}
+
 func (ss *S3Storage) gcLock()   { ss.gcMut.Lock() }
 func (ss *S3Storage) gcUnlock() { ss.gcMut.Unlock() }
 

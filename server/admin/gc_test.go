@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/server"
@@ -213,18 +214,52 @@ func TestAdminEndpointsRequireAuth(t *testing.T) {
 	}
 }
 
-func TestGCSweepSingleFlight(t *testing.T) {
+// blockingCollector parks WalkFileIndex until released, keeping a sweep in
+// flight deterministically.
+type blockingCollector struct {
+	storage.Collector
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingCollector) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string, modTime time.Time) error) error {
+	close(b.entered)
+	<-b.release
+	return b.Collector.WalkFileIndex(ctx, fn)
+}
+
+func TestGCOperationsShareSingleFlight(t *testing.T) {
 	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := newTestHandler(stor)
-	handler.gcActive.Store(true)
+	bc := &blockingCollector{Collector: stor, entered: make(chan struct{}), release: make(chan struct{})}
+	handler := NewHandler(
+		WithGC(storage.NewGC(bc)),
+		WithAuthFunc(func(tok string) bool { return tok == "admin-secret" }),
+	)
 
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("concurrent sweep = %d, want 409", rec.Code)
+	sweepDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, adminRequest(http.MethodPost, "/internal/gc/sweep"))
+		sweepDone <- rec.Code
+	}()
+	<-bc.entered
+
+	// Sweep and compaction share one guard, so both endpoints refuse while
+	// the sweep is in flight.
+	for _, target := range []string{"/internal/gc/sweep", "/internal/compact"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, adminRequest(http.MethodPost, target))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("POST %s during sweep = %d, want 409", target, rec.Code)
+		}
+	}
+
+	close(bc.release)
+	if code := <-sweepDone; code != http.StatusOK {
+		t.Fatalf("blocked sweep finished with %d", code)
 	}
 }
 

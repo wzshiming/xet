@@ -750,6 +750,16 @@ func (fs *FileStorage) XorbChunkCount(ctx context.Context, xorbHash xet.XorbHash
 	return uint32(len(offsets)), nil
 }
 
+// TouchXorb bumps the xorb's modification time so grace windows measure from
+// now. Missing xorbs are ignored.
+func (fs *FileStorage) TouchXorb(ctx context.Context, xorbHash string) error {
+	now := time.Now()
+	if err := os.Chtimes(fs.objectPath("xorbs", xorbHash), now, now); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (fs *FileStorage) gcLock()   { fs.gcMut.Lock() }
 func (fs *FileStorage) gcUnlock() { fs.gcMut.Unlock() }
 
