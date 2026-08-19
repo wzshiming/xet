@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -220,7 +221,7 @@ func buildDedupShardBytes(t *testing.T, key [32]byte, keyExpiry uint64, xorbHash
 		NumBytesInCAS:  offset,
 		NumBytesOnDisk: offset,
 	})
-	s.SetFooter()
+	s.SetFooter(time.Now())
 	s.Footer.ChunkHashKey = key
 	if keyExpiry != 0 {
 		s.Footer.ShardKeyExpiry = keyExpiry

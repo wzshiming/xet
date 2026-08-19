@@ -4,19 +4,26 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
-// Encode returns a streaming reader for the shard serialization.
+// Encode returns a streaming reader for the shard serialization. It does not
+// modify the shard, so a cached shard can be served concurrently.
 func (s *Shard) Encode(withFooter bool) (io.Reader, error) {
-	if withFooter {
-		if s.Footer == nil {
-			s.SetFooter()
-		}
-	}
-	return &shardReader{
+	r := &shardReader{
 		shard:      s,
 		withFooter: withFooter,
-	}, nil
+	}
+	if withFooter {
+		r.footerSize = 200
+		footer := s.Footer
+		if footer == nil {
+			footer = s.newFooter(time.Now())
+		}
+		local := *footer
+		r.footer = &local
+	}
+	return r, nil
 }
 
 // shardReader implements io.Reader for shard serialization.
@@ -26,6 +33,8 @@ func (s *Shard) Encode(withFooter bool) (io.Reader, error) {
 type shardReader struct {
 	shard         *Shard
 	withFooter    bool
+	footer        *Footer // private copy: encoding fills in its offsets
+	footerSize    uint64
 	sectionIdx    int
 	buffer        []byte
 	bufOffset     int
@@ -105,11 +114,6 @@ func (r *shardReader) loadSection(idx, numFiles, numCAS int) error {
 	switch {
 	case idx == 0:
 		// Header (48 bytes).
-		if r.withFooter {
-			r.shard.FooterSize = 200
-		} else {
-			r.shard.FooterSize = 0
-		}
 		r.buildHeader()
 
 	case idx >= 1 && idx <= numFiles:
@@ -136,7 +140,7 @@ func (r *shardReader) loadSection(idx, numFiles, numCAS int) error {
 }
 
 func (r *shardReader) buildFooterBuffer() {
-	f := r.shard.Footer
+	f := r.footer
 	f.FileInfoOffset = r.fileInfoOffset
 	f.CASInfoOffset = r.casInfoOffset
 	f.FooterOffset = r.footerOffset
@@ -180,7 +184,7 @@ func (r *shardReader) buildHeader() {
 	r.buffer = append(r.buffer, 0)
 	r.buffer = append(r.buffer, shardMagicSequence[:]...)
 	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, version)
-	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, r.shard.FooterSize)
+	r.buffer = binary.LittleEndian.AppendUint64(r.buffer, r.footerSize)
 }
 
 func (r *shardReader) buildFileBlock(fb FileBlock) {
