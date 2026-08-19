@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -35,7 +37,7 @@ type Storage interface {
 	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
 	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 
-	// PutShard stores a shard by its hash
+	// PutShard stores a shard, named by the SHA-256 of its stored bytes
 	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
 	// GetShard retrieves a shard by file hash
@@ -236,6 +238,24 @@ func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 	return fs.getShardByHash(shardHash)
 }
 
+// shardHeaderSize is the fixed shard header; its last 8 bytes carry FooterSize.
+const shardHeaderSize = 48
+
+// decodeStoredShard decodes a stored shard object, following the FooterSize its
+// header declares so objects written before shards went footerless still load.
+func decodeStoredShard(r io.Reader) (*shard.Shard, error) {
+	var header [shardHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, fmt.Errorf("read shard header: %w", err)
+	}
+	s := shard.NewShard()
+	withFooter := binary.LittleEndian.Uint64(header[40:]) != 0
+	if err := s.Decode(io.MultiReader(bytes.NewReader(header[:]), r), withFooter); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 	fs.shardMut.Lock()
 	value, exists := fs.shardIndex.Get(shardHash)
@@ -250,9 +270,18 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 		return nil, err
 	}
 	defer f.Close()
-	s := shard.NewShard()
-	if err := s.Decode(f, true); err != nil {
+	s, err := decodeStoredShard(f)
+	if err != nil {
 		return nil, err
+	}
+	if s.Footer == nil {
+		info, err := f.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat shard file: %w", err)
+		}
+		// xet-core prunes cached dedup shards oldest-first by the footer creation
+		// time, so pin it to the ingest time instead of the first-serve time.
+		s.SetFooter(info.ModTime())
 	}
 
 	fs.shardMut.Lock()
@@ -373,9 +402,10 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		s.Files[i].Flags |= shard.FileWithMetadataExt
 	}
 
-	// Serialize the shard first, then hash those exact persisted bytes. The
-	// shard object is addressed by this hash rather than by any contained file.
-	r, err := s.Encode(true)
+	// Serialize without the footer (it embeds a creation timestamp), so the
+	// stored bytes — and the sha256 hash addressing them — are deterministic
+	// for identical shard content.
+	r, err := s.Encode(false)
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}
@@ -429,14 +459,11 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		removeTemp = false
 	}
 
+	// Nothing is cached here: the read path populates the caches from the
+	// stored objects, so a warm process serves exactly what a restarted one
+	// would.
 	shardHashData := []byte(shardHash)
-	fs.shardMut.Lock()
-	fs.shardIndex.Add(shardHash, s)
-	fs.shardMut.Unlock()
 	for _, file := range s.Files {
-		fs.fileMut.Lock()
-		fs.fileIndex.Add(file.FileHash, shardHash)
-		fs.fileMut.Unlock()
 		indexPath := fs.objectPath("index/files", file.FileHash.String())
 		if err := writeIndexFile(indexPath, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)

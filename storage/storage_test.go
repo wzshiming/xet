@@ -3,15 +3,130 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
+
+// TestShardNameIsDeterministicContentHash proves the stored object name is the
+// SHA-256 of the exact stored bytes and does not vary with the creation time
+// embedded in the (unstored) footer.
+func TestShardNameIsDeterministicContentHash(t *testing.T) {
+	newIdenticalShard := func(creationTime uint64) *shard.Shard {
+		s := shard.NewShard()
+		s.AddFile(shard.FileBlock{FileHash: xet.FileHash{1}})
+		s.AddCASBlock(shard.CASBlock{
+			CASHash: xet.XorbHash{2},
+			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: xet.ChunkHash{3}}},
+		})
+		s.SetFooter(time.Unix(int64(creationTime), 0))
+		return s
+	}
+
+	var names []string
+	for _, creationTime := range []uint64{1, 1 << 30} {
+		basePath := t.TempDir()
+		st, err := NewFileStorage(WithBasePath(basePath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inserted, err := st.PutShard(context.Background(), newIdenticalShard(creationTime)); err != nil || !inserted {
+			t.Fatalf("PutShard() = %v, %v", inserted, err)
+		}
+		entries, err := fanoutEntries(filepath.Join(basePath, "shards"))
+		if err != nil {
+			t.Fatalf("read shards directory: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("shards directory contains %d entries, want 1", len(entries))
+		}
+		name := entries[0]
+		data, err := os.ReadFile(st.objectPath("shards", name))
+		if err != nil {
+			t.Fatalf("read stored shard: %v", err)
+		}
+		if footerSize := binary.LittleEndian.Uint64(data[40:48]); footerSize != 0 {
+			t.Fatalf("stored FooterSize = %d, want 0", footerSize)
+		}
+		sum := sha256.Sum256(data)
+		if want := hex.EncodeToString(sum[:]); name != want {
+			t.Fatalf("shard name %q != sha256 of stored bytes %q", name, want)
+		}
+		names = append(names, name)
+	}
+	if names[0] != names[1] {
+		t.Fatalf("identical content produced different names: %q vs %q", names[0], names[1])
+	}
+}
+
+// legacyShardBytes serializes a shard the way it was stored before shard
+// objects went footerless, and returns the bytes with their object name.
+func legacyShardBytes(t *testing.T, s *shard.Shard, creationTime uint64) ([]byte, string) {
+	t.Helper()
+	s.SetFooter(time.Unix(int64(creationTime), 0))
+	r, err := s.Encode(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	return data, hex.EncodeToString(sum[:])
+}
+
+// TestFooteredShardObjectStaysReadable covers objects written before shards
+// went footerless: they must keep resolving, with their stored footer intact.
+func TestFooteredShardObjectStaysReadable(t *testing.T) {
+	basePath := t.TempDir()
+	fs, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fileHash := xet.FileHash{7}
+	s := shard.NewShard()
+	s.AddFile(shard.FileBlock{FileHash: fileHash})
+	s.AddCASBlock(shard.CASBlock{
+		CASHash: xet.XorbHash{8},
+		Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: xet.ChunkHash{9}}},
+	})
+	const creationTime = 1700000000
+	data, name := legacyShardBytes(t, s, creationTime)
+
+	shardPath := fs.objectPath("shards", name)
+	if err := os.MkdirAll(filepath.Dir(shardPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shardPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(name)); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := fs.GetShard(context.Background(), fileHash)
+	if err != nil {
+		t.Fatalf("GetShard on a footered object: %v", err)
+	}
+	if loaded.Files[0].FileHash != fileHash {
+		t.Fatal("loaded the wrong shard")
+	}
+	if loaded.Footer == nil || loaded.Footer.ShardCreationTimestamp != creationTime {
+		t.Fatalf("stored footer was not preserved: %+v", loaded.Footer)
+	}
+}
 
 func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	basePath := t.TempDir()
@@ -30,7 +145,7 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 		CASHash: xet.XorbHash{10},
 		Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash}},
 	})
-	s.SetFooter()
+	s.SetFooter(time.Now())
 
 	inserted, err := fs.PutShard(context.Background(), s)
 	if err != nil || !inserted {
@@ -44,14 +159,13 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 		t.Fatalf("shards directory contains %d entries, want 1", len(shardHashes))
 	}
 	shardHash := shardHashes[0]
-	if cached, ok := fs.shardIndex.Get(shardHash); !ok || cached.(*shard.Shard) != s {
-		t.Fatal("shard was not added to the shard cache")
+	// Put warms no cache: the first read is what caches the shard, with the
+	// footer rebuilt from the stored object.
+	if _, ok := fs.shardIndex.Get(shardHash); ok {
+		t.Fatal("shard was added to the shard cache on put")
 	}
-	if cached, ok := fs.fileIndex.Get(secondFileHash); !ok || cached.(string) != shardHash {
-		t.Fatal("file mapping was not added to the file cache")
-	}
-	if _, ok := fs.shardIndex.Get(secondFileHash); ok {
-		t.Fatal("file hash was added to the shard cache")
+	if _, ok := fs.fileIndex.Get(secondFileHash); ok {
+		t.Fatal("file mapping was added to the file cache on put")
 	}
 
 	for _, hash := range []xet.FileHash{fileHash, secondFileHash} {
@@ -91,6 +205,13 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 	}
 	if got.Files[0].FileHash != fileHash {
 		t.Fatalf("loaded wrong shard: %s", got.Files[0].FileHash.String())
+	}
+	info, err := os.Stat(fs.objectPath("shards", shardHash))
+	if err != nil {
+		t.Fatalf("stat stored shard: %v", err)
+	}
+	if got.Footer == nil || got.Footer.ShardCreationTimestamp != uint64(info.ModTime().Unix()) {
+		t.Fatalf("reloaded footer creation time not pinned to mod time: %+v", got.Footer)
 	}
 	if cached, ok := fs.chunkIndex.Get(chunkHash); !ok || cached.(string) != shardHash {
 		t.Fatal("chunk index was not added to the LRU cache")

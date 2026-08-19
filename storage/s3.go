@@ -473,9 +473,10 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		s.Files[i].Flags |= shard.FileWithMetadataExt
 	}
 
-	// Serialize the shard first, then hash those exact persisted bytes. The
-	// shard object is addressed by this hash rather than by any contained file.
-	r, err := s.Encode(true)
+	// Serialize without the footer (it embeds a creation timestamp), so the
+	// stored bytes — and the sha256 hash addressing them — are deterministic
+	// for identical shard content.
+	r, err := s.Encode(false)
 	if err != nil {
 		return false, fmt.Errorf("serialize shard: %w", err)
 	}
@@ -500,7 +501,9 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 
 	// The index/files/ index is written last: hasFile treats it as the commit
 	// marker, so a partial failure leaves a retryable shard instead of one
-	// that reports "already exists" with missing chunk/sha256 indexes.
+	// that reports "already exists" with missing chunk/sha256 indexes. Nothing
+	// is cached here; the read path populates the caches from the stored
+	// objects, so a warm process serves exactly what a restarted one would.
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
@@ -520,17 +523,6 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		}
 	}
 
-	// Populate caches only after everything is persisted; caching earlier
-	// would make a retry skip the objects that failed to write.
-	ss.shardMut.Lock()
-	ss.shardIndex.Add(shardHash, s)
-	ss.shardMut.Unlock()
-	for _, file := range s.Files {
-		ss.fileMut.Lock()
-		ss.fileIndex.Add(file.FileHash, shardHash)
-		ss.fileMut.Unlock()
-	}
-
 	return wasInserted, nil
 }
 
@@ -542,14 +534,26 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 		return value.(*shard.Shard), nil
 	}
 
-	body, err := ss.getObjectReader(ctx, ss.objectKey("shards", shardHash))
+	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(ss.objectKey("shards", shardHash)),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
-	s := shard.NewShard()
-	if err := s.Decode(body, true); err != nil {
+	defer out.Body.Close()
+	s, err := decodeStoredShard(out.Body)
+	if err != nil {
 		return nil, err
+	}
+	if s.Footer == nil {
+		// xet-core prunes cached dedup shards oldest-first by the footer creation
+		// time, so pin it to the ingest time instead of the first-serve time.
+		creationTime := time.Now()
+		if out.LastModified != nil {
+			creationTime = *out.LastModified
+		}
+		s.SetFooter(creationTime)
 	}
 
 	ss.shardMut.Lock()

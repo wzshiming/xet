@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -178,6 +181,100 @@ func putTestShard(t *testing.T, ctx context.Context, ss *S3Storage, parts [][]by
 	fileBlock.FileHash = fileHash
 	shardObj.AddFile(fileBlock)
 	return shardObj, fileHash
+}
+
+// newIndexedShard returns a shard with one file and one CAS block.
+func newIndexedShard(fileHash xet.FileHash) *shard.Shard {
+	s := shard.NewShard()
+	s.AddFile(shard.FileBlock{FileHash: fileHash})
+	s.AddCASBlock(shard.CASBlock{
+		CASHash: xet.XorbHash{2},
+		Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: xet.ChunkHash{3}}},
+	})
+	return s
+}
+
+// shardObjectKey returns the single stored shard key.
+func shardObjectKey(t *testing.T, ss *S3Storage) string {
+	t.Helper()
+	var found string
+	for key := range listObjectKeys(t, ss) {
+		if !strings.Contains(key, "shards/") {
+			continue
+		}
+		if found != "" {
+			t.Fatalf("more than one shard object: %q and %q", found, key)
+		}
+		found = key
+	}
+	if found == "" {
+		t.Fatal("no shard object stored")
+	}
+	return found
+}
+
+// TestS3ShardNameIsDeterministicContentHash mirrors the FileStorage assertion:
+// the object name is the SHA-256 of the stored bytes and does not vary with the
+// creation time embedded in the (unstored) footer.
+func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
+	ctx := context.Background()
+
+	var names []string
+	for _, creationTime := range []uint64{1, 1 << 30} {
+		ss := newTestS3Storage(t)
+		s := newIndexedShard(xet.FileHash{1})
+		s.SetFooter(time.Unix(int64(creationTime), 0))
+		if inserted, err := ss.PutShard(ctx, s); err != nil || !inserted {
+			t.Fatalf("PutShard() = %v, %v", inserted, err)
+		}
+
+		key := shardObjectKey(t, ss)
+		data, err := ss.getObject(ctx, key)
+		if err != nil {
+			t.Fatalf("read stored shard: %v", err)
+		}
+		if footerSize := binary.LittleEndian.Uint64(data[40:48]); footerSize != 0 {
+			t.Fatalf("stored FooterSize = %d, want 0", footerSize)
+		}
+		name := strings.ReplaceAll(strings.TrimPrefix(key, "shards/"), "/", "")
+		sum := sha256.Sum256(data)
+		if want := hex.EncodeToString(sum[:]); name != want {
+			t.Fatalf("shard name %q != sha256 of stored bytes %q", name, want)
+		}
+		names = append(names, name)
+	}
+	if names[0] != names[1] {
+		t.Fatalf("identical content produced different names: %q vs %q", names[0], names[1])
+	}
+}
+
+// TestS3FooteredShardObjectStaysReadable covers objects written before shards
+// went footerless.
+func TestS3FooteredShardObjectStaysReadable(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+
+	fileHash := xet.FileHash{7}
+	const creationTime = 1700000000
+	data, name := legacyShardBytes(t, newIndexedShard(fileHash), creationTime)
+
+	if err := ss.putObject(ctx, ss.objectKey("shards", name), bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(name)); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := ss.GetShard(ctx, fileHash)
+	if err != nil {
+		t.Fatalf("GetShard on a footered object: %v", err)
+	}
+	if loaded.Files[0].FileHash != fileHash {
+		t.Fatal("loaded the wrong shard")
+	}
+	if loaded.Footer == nil || loaded.Footer.ShardCreationTimestamp != creationTime {
+		t.Fatalf("stored footer was not preserved: %+v", loaded.Footer)
+	}
 }
 
 func TestS3StorageShardRoundTrip(t *testing.T) {

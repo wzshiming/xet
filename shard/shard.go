@@ -226,11 +226,16 @@ func (s *Shard) EncodedSize(withFooter bool) int64 {
 	return size
 }
 
-// SetFooter creates a Footer for this shard, computing StoredBytesOnDisk,
-// StoredBytes, and MaterializedBytes from the current CAS and file data.
-// Offset fields (FileInfoOffset, CASInfoOffset, FooterOffset) are set
-// automatically during Encode and do not need to be supplied here.
-func (s *Shard) SetFooter() {
+// SetFooter creates a Footer for this shard, stamped with creationTime and
+// computing StoredBytesOnDisk, StoredBytes, and MaterializedBytes from the
+// current CAS and file data. Offset fields (FileInfoOffset, CASInfoOffset,
+// FooterOffset) are set automatically during Encode and do not need to be
+// supplied here.
+func (s *Shard) SetFooter(creationTime time.Time) {
+	s.Footer = s.newFooter(creationTime)
+}
+
+func (s *Shard) newFooter(creationTime time.Time) *Footer {
 	var storedBytesOnDisk, storedBytes, materializedBytes uint64
 	for _, cas := range s.CASInfos {
 		storedBytesOnDisk += uint64(cas.NumBytesOnDisk)
@@ -241,12 +246,12 @@ func (s *Shard) SetFooter() {
 			materializedBytes += uint64(entry.UnpackedSegBytes)
 		}
 	}
-	s.Footer = &Footer{
+	return &Footer{
 		Version:                1,
 		StoredBytesOnDisk:      storedBytesOnDisk,
 		StoredBytes:            storedBytes,
 		MaterializedBytes:      materializedBytes,
-		ShardCreationTimestamp: uint64(time.Now().Unix()),
+		ShardCreationTimestamp: uint64(creationTime.Unix()),
 		ShardKeyExpiry:         ^uint64(0),
 	}
 }
