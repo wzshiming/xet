@@ -226,6 +226,96 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 }
 
 // fanoutEntries returns the hash names reassembled from a fanout directory.
+// putFileTestShard uploads one single-chunk xorb per part and returns a shard
+// describing the concatenation of parts as one file.
+func putFileTestShard(t *testing.T, ctx context.Context, fs *FileStorage, parts [][]byte) (*shard.Shard, xet.FileHash) {
+	t.Helper()
+	shardObj := shard.NewShard()
+	fileBlock := shard.FileBlock{}
+	var chunkHashes []xet.ChunkHash
+	var chunkSizes []uint64
+	for _, part := range parts {
+		encoded, xorbHash := encodeTestXorb(t, true, part)
+		if _, err := fs.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+			t.Fatal(err)
+		}
+		chunkHash := xet.ComputeChunkHash(part)
+		chunkHashes = append(chunkHashes, chunkHash)
+		chunkSizes = append(chunkSizes, uint64(len(part)))
+		fileBlock.Entries = append(fileBlock.Entries, shard.FileDataSequenceEntry{
+			CASHash: xorbHash, UnpackedSegBytes: uint32(len(part)), ChunkIndexEnd: 1,
+		})
+		shardObj.AddCASBlock(shard.CASBlock{
+			CASHash: xorbHash,
+			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(part))}},
+		})
+	}
+	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
+	fileBlock.FileHash = fileHash
+	shardObj.AddFile(fileBlock)
+	return shardObj, fileHash
+}
+
+// TestPutShardRetryAfterPartialFailure kills PutShard midway through its index
+// writes and verifies a retry fully repairs the shard instead of reporting
+// "already exists" with indexes missing.
+func TestPutShardRetryAfterPartialFailure(t *testing.T) {
+	ctx := context.Background()
+	basePath := t.TempDir()
+	fs, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content := []byte("retry me")
+	shardObj, fileHash := putFileTestShard(t, ctx, fs, [][]byte{content})
+
+	// First attempt dies while writing SHA-256 indexes: a regular file where
+	// the index/sha256 directory belongs makes those writes fail.
+	blocker := filepath.Join(basePath, "index", "sha256")
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blocker, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.PutShard(ctx, shardObj); err == nil {
+		t.Fatal("PutShard() succeeded despite blocked sha256 index")
+	}
+
+	// The partial shard must not count as existing.
+	if exists, err := fs.hasFile(fileHash); err != nil || exists {
+		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	}
+
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.PutShard(ctx, shardObj); err != nil {
+		t.Fatalf("PutShard() retry: %v", err)
+	}
+
+	// A fresh storage must resolve every index written by the retry.
+	fresh, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, "default", digest)
+	if err != nil {
+		t.Fatalf("GetFileHashBySHA256 after retry: %v", err)
+	}
+	if gotFileHash != fileHash {
+		t.Fatal("SHA-256 index resolved wrong file hash")
+	}
+	if _, err := fresh.GetShard(ctx, fileHash); err != nil {
+		t.Fatalf("GetShard after retry: %v", err)
+	}
+	if _, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(content)); err != nil {
+		t.Fatalf("GetShardByChunkHash after retry: %v", err)
+	}
+}
+
 func fanoutEntries(dir string) ([]string, error) {
 	var names []string
 	buckets, err := os.ReadDir(dir)

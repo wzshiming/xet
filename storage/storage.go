@@ -459,17 +459,12 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		removeTemp = false
 	}
 
-	// Nothing is cached here: the read path populates the caches from the
-	// stored objects, so a warm process serves exactly what a restarted one
-	// would.
+	// The index/files/ index is written last: hasFile treats it as the commit
+	// marker, so a partial failure leaves a retryable shard instead of one
+	// that reports "already exists" with missing chunk/sha256 indexes. Nothing
+	// is cached here; the read path populates the caches from the stored
+	// objects, so a warm process serves exactly what a restarted one would.
 	shardHashData := []byte(shardHash)
-	for _, file := range s.Files {
-		indexPath := fs.objectPath("index/files", file.FileHash.String())
-		if err := writeIndexFile(indexPath, shardHashData); err != nil {
-			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
-		}
-	}
-
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
 			chunkPath := fs.objectPath("index/chunks", chunk.ChunkHash.String())
@@ -483,6 +478,12 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
 		if err := writeIndexFile(sha256Path, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
+		}
+	}
+	for _, file := range s.Files {
+		indexPath := fs.objectPath("index/files", file.FileHash.String())
+		if err := writeIndexFile(indexPath, shardHashData); err != nil {
+			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
