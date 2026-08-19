@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/golang/groupcache/lru"
+	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
@@ -340,7 +341,7 @@ func (ss *S3Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHa
 	if !exists {
 		return nil, fmt.Errorf("xorb not found")
 	}
-	return &s3ReadSeekCloser{ctx: ctx, storage: ss, key: key, size: size}, nil
+	return httpseek.NewOpenSeeker(&s3Opener{ctx: ctx, storage: ss, key: key, size: size}), nil
 }
 
 // HasXorb checks whether an xorb exists.
@@ -679,87 +680,52 @@ func (ss *S3Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string
 	return fmt.Sprintf("%s/v1/xorbs/%s/%s", ss.baseURL, namespace, xorbHash.String()), nil
 }
 
-// s3ReadSeekCloser adapts an S3 object to io.ReadSeekCloser. Seeks are lazy:
-// a range request is only issued when a read needs data at a new position.
-type s3ReadSeekCloser struct {
+// s3Opener adapts an S3 object to httpseek.Opener: each open is served with
+// an S3 range GET, and the ETag reported on every open lets the OpenSeeker
+// detect content changes across reopens.
+type s3Opener struct {
 	ctx     context.Context
 	storage *S3Storage
 	key     string
-	size    int64
-
-	pos     int64
-	body    io.ReadCloser
-	bodyPos int64
-	closed  bool
+	size    int64 // total object size from the open-time HEAD probe
 }
 
-func (r *s3ReadSeekCloser) Read(p []byte) (int, error) {
-	if r.closed {
-		return 0, fmt.Errorf("read s3 object: closed")
+var _ httpseek.Opener = (*s3Opener)(nil)
+
+func (o *s3Opener) OpenRange(_ string, start, end int64) (httpseek.OpenResult, error) {
+	if start < 0 {
+		// Suffix of length end, resolved against the known size.
+		start = max(o.size-end, 0)
+		end = o.size - 1
 	}
-	if r.pos >= r.size {
-		return 0, io.EOF
+	res := httpseek.OpenResult{Start: start, End: end, Size: o.size}
+
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(o.storage.bucket),
+		Key:    aws.String(o.key),
 	}
-	if r.body != nil && r.bodyPos != r.pos {
-		r.body.Close()
-		r.body = nil
+	switch {
+	case end >= 0:
+		in.Range = aws.String(fmt.Sprintf("bytes=%d-%d", start, end))
+	case start > 0:
+		in.Range = aws.String(fmt.Sprintf("bytes=%d-", start))
 	}
-	if r.body == nil {
-		body, err := r.storage.getObjectRange(r.ctx, r.key, r.pos, r.size-1)
-		if err != nil {
-			return 0, fmt.Errorf("read s3 object range: %w", err)
+	out, err := o.storage.client.GetObject(o.ctx, in)
+	if err != nil {
+		var respErr *awshttp.ResponseError
+		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+			return res, httpseek.ErrRangeNotSatisfiable
 		}
-		r.body = body
-		r.bodyPos = r.pos
+		return res, err
 	}
-	n, err := r.body.Read(p)
-	r.pos += int64(n)
-	r.bodyPos = r.pos
-	if err == io.EOF && r.pos < r.size {
-		// The range stream ended early; drop it so the next read reopens.
-		r.body.Close()
-		r.body = nil
-		if n > 0 {
-			return n, nil
-		}
-		return 0, io.ErrUnexpectedEOF
-	}
-	return n, err
+	res.Body = out.Body
+	res.Validator = aws.ToString(out.ETag)
+	return res, nil
 }
 
-func (r *s3ReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
-	if r.closed {
-		return 0, fmt.Errorf("seek s3 object: closed")
-	}
-	var next int64
-	switch whence {
-	case io.SeekStart:
-		next = offset
-	case io.SeekCurrent:
-		next = r.pos + offset
-	case io.SeekEnd:
-		next = r.size + offset
-	default:
-		return 0, fmt.Errorf("invalid seek whence %d", whence)
-	}
-	if next < 0 {
-		return 0, fmt.Errorf("negative seek position %d", next)
-	}
-	r.pos = next
-	return next, nil
-}
-
-func (r *s3ReadSeekCloser) Close() error {
-	if r.closed {
-		return nil
-	}
-	r.closed = true
-	if r.body != nil {
-		err := r.body.Close()
-		r.body = nil
-		return err
-	}
-	return nil
+// Size reports the size learned by the HEAD probe at construction time.
+func (o *s3Opener) Size(string) (httpseek.SizeResult, error) {
+	return httpseek.SizeResult{Size: o.size}, nil
 }
 
 var _ Storage = (*S3Storage)(nil)
