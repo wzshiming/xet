@@ -2,12 +2,16 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/wzshiming/xet"
 )
 
 // handleResolve serves GET/HEAD for hub-style download paths. The shared
@@ -78,6 +82,7 @@ func (h *Handler) revalidate(ctx context.Context, key resolveKey, e *fileEntry) 
 		_ = persistEntry(h.indexDir, e)
 		return e
 	}
+
 	h.mu.Lock()
 	if h.entries[key] == e {
 		delete(h.entries, key)
@@ -85,6 +90,33 @@ func (h *Handler) revalidate(ctx context.Context, key resolveKey, e *fileEntry) 
 	h.mu.Unlock()
 	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, e.Key))
 	return nil
+}
+
+// entryLive reports whether a ready entry's file is still in storage; an
+// unlinked file must be re-ingested. Empty files store no file hash and are
+// always live, and transient storage errors keep serving the cached copy.
+func (h *Handler) entryLive(ctx context.Context, e *fileEntry) bool {
+	if e.FileHash == "" {
+		return true
+	}
+	fileHash, err := xet.ParseFileHash(e.FileHash)
+	if err != nil {
+		return false
+	}
+	if _, err := h.storage.GetShard(ctx, fileHash); err != nil {
+		return !errors.Is(err, iofs.ErrNotExist)
+	}
+	return true
+}
+
+// dropEntry forgets a dead entry in memory and on disk.
+func (h *Handler) dropEntry(key resolveKey, e *fileEntry) {
+	h.mu.Lock()
+	if h.entries[key] == e {
+		delete(h.entries, key)
+	}
+	h.mu.Unlock()
+	_ = os.Remove(indexEntryPath(h.indexDir, e.Commit, e.Key))
 }
 
 // serveReady answers a resolve request for a fully cached file: metadata plus

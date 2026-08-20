@@ -3,16 +3,22 @@
 package internalapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/storage"
 )
 
 // Handler serves the internal management endpoints.
 type Handler struct {
 	storage storage.Storage
+	gc      *storage.GC
 	root    *mux.Router
 	next    http.Handler
 }
@@ -44,6 +50,10 @@ func NewHandler(opts ...Option) *Handler {
 		opt(h)
 	}
 
+	if gcs, ok := h.storage.(storage.GCStore); ok {
+		h.gc = storage.NewGC(gcs)
+	}
+
 	h.registerRoutes()
 	return h
 }
@@ -51,6 +61,8 @@ func NewHandler(opts ...Option) *Handler {
 // registerRoutes sets up all internal HTTP routes.
 func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
+	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
+	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
 
 	h.root.NotFoundHandler = h.next
 }
@@ -75,4 +87,75 @@ func (h *Handler) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(entries)
+}
+
+// handleUnlinkFile handles DELETE /internal/files/xet/{hash}: it drops the
+// file-index entry only; the shard and its data are collected by the next
+// sweep once nothing references them.
+func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+	fileHash, err := xet.ParseFileHash(mux.Vars(r)["hash"])
+	if err != nil {
+		http.Error(w, "Invalid file hash", http.StatusBadRequest)
+		return
+	}
+	removed, err := h.gc.Unlink(r.Context(), fileHash)
+	if err != nil {
+		http.Error(w, "Failed to unlink file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"file_hash": fileHash.String(),
+		"removed":   true,
+	})
+}
+
+// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=: it removes
+// (or, with dry_run, reports) shards and xorbs no file-index entry keeps
+// alive. An omitted grace uses the default window; zero or negative disables it.
+func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+
+	var dryRun bool
+	var grace time.Duration
+	var err error
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		dryRun, err = strconv.ParseBool(v)
+		if err != nil {
+			http.Error(w, "Invalid dry_run value", http.StatusBadRequest)
+			return
+		}
+	}
+	if v := r.URL.Query().Get("grace"); v != "" {
+		grace, err = time.ParseDuration(v)
+		if err != nil {
+			http.Error(w, "Invalid grace value", http.StatusBadRequest)
+			return
+		}
+		if grace <= 0 {
+			grace = -1 // explicit zero disables the window; zero means default
+		}
+	}
+	result, err := h.gc.Sweep(context.Background(), grace, dryRun)
+	if err != nil {
+		if errors.Is(err, storage.ErrGCBusy) {
+			http.Error(w, "GC already running", http.StatusConflict)
+			return
+		}
+		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
 }
