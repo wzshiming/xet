@@ -71,7 +71,7 @@ func (d *Decoder) Read(p []byte) (int, error) {
 
 		tmp := pool.GetChunkBuf()
 		defer pool.PutChunkBuf(tmp)
-		err := validateWithFooter(d.r, tmp[:], headerBuf, d.SummoryHash(), d.chunkHashes)
+		err := validateWithFooter(d.r, tmp[:], headerBuf, d.SummoryHash(), d.chunkHashes, d.chunkSizes)
 		if err != nil {
 			d.err = fmt.Errorf("validate footer: %w", err)
 			return 0, d.err

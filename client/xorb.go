@@ -108,17 +108,36 @@ func (c *Client) UploadXorbWithAuthProvider(ctx context.Context, provider AuthPr
 	req.GetBody = makeBody
 	req.ContentLength = contentLength - startOffset
 	req.Header.Set("Content-Type", "application/octet-stream")
+	// Advertise redirect support; servers only send 307 to clients that opt in.
+	req.Header.Set(upload.HeaderDirectUpload, upload.DirectUploadAccept)
+	// Wait for the server's verdict before transmitting the body: direct-upload
+	// servers answer with a redirect to the object store instead of reading it.
+	req.Header.Set("Expect", "100-continue")
 	if token, err := c.getToken(ctx, provider); err != nil {
 		return nil, fmt.Errorf("get token: %w", err)
 	} else if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.doWithNetworkRetry(req)
+	// The redirect must not be auto-followed: Go would re-POST while the
+	// presigned target URL only accepts PUT.
+	resp, err := c.doWithNetworkRetryClient(c.noRedirectClient, req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location, err := resp.Location()
+		if err != nil {
+			return nil, fmt.Errorf("xorb upload redirect: %w", err)
+		}
+		inserted, err := c.uploadXorbDirect(ctx, location.String(), makeBody, contentLength-startOffset)
+		if err != nil {
+			return nil, err
+		}
+		return &upload.XorbUploadResponse{WasInserted: inserted}, nil
+	}
 
 	if err := reqError(req, resp); err != nil {
 		return nil, err
@@ -130,6 +149,46 @@ func (c *Client) UploadXorbWithAuthProvider(ctx context.Context, provider AuthPr
 	}
 
 	return &uploadResp, nil
+}
+
+// uploadXorbDirect PUTs the raw xorb bytes to a direct upload URL handed out
+// by the server. The URL embeds its own authorization (e.g. a presigned S3
+// PUT URL), so no Authorization header is sent. It reports whether the PUT
+// created the object: a 412 means another uploader stored the same
+// content-addressed xorb first, which is equivalent to success.
+func (c *Client) uploadXorbDirect(ctx context.Context, url string, makeBody func() (io.ReadCloser, error), contentLength int64) (bool, error) {
+	body, err := makeBody()
+	if err != nil {
+		return false, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
+	if err != nil {
+		return false, fmt.Errorf("create request: %w", err)
+	}
+	req.GetBody = makeBody
+	req.ContentLength = contentLength
+	// Create-only: matches the presigned signature and keeps a replayed URL
+	// from overwriting an already stored xorb.
+	req.Header.Set("If-None-Match", "*")
+
+	resp, err := c.doWithNetworkRetry(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return false, nil
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		// Strip the query: presigned URLs carry credential-equivalent signatures.
+		bare := *req.URL
+		bare.RawQuery = ""
+		return false, fmt.Errorf("url %s: direct xorb upload error (status %s): %s", bare.String(), resp.Status, string(respBody))
+	}
+	return true, nil
 }
 
 // DownloadXorb fetches the raw xorb bytes for the given hash directly

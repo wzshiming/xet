@@ -18,18 +18,20 @@ import (
 )
 
 // startGoServerS3 starts the Go server backed by S3Storage so the matrix also
-// covers the S3 read/write paths. Xorb downloads are presigned S3 URLs that
-// bypass the recording proxy for both clients alike, so wire comparisons stay
-// symmetric.
+// covers the S3 read/write paths. Presigning is disabled: presigned transfers
+// go straight to the object store and would bypass the recording proxy. This
+// keeps every request on the recorded wire for both clients alike, so
+// comparisons stay symmetric; the presigned paths are covered by
+// TestCompatibilityS3PresignedDownload.
 func startGoServerS3(t *testing.T) runningServer {
 	t.Helper()
-	running, _ := newS3BackedServer(t)
+	running, _ := newS3BackedServer(t, false)
 	return running
 }
 
 // newS3BackedServer returns a recording Go server over an in-process gofakes3
-// plus the fake S3 endpoint that presigned fetch-info URLs must point at.
-func newS3BackedServer(t *testing.T) (runningServer, string) {
+// plus the fake S3 endpoint that presigned URLs must point at.
+func newS3BackedServer(t *testing.T, presign bool) (runningServer, string) {
 	t.Helper()
 
 	const bucket = "conformance"
@@ -52,6 +54,7 @@ func newS3BackedServer(t *testing.T) (runningServer, string) {
 	stor, err := storage.NewS3Storage(context.Background(),
 		storage.WithS3Client(s3Client),
 		storage.WithS3Bucket(bucket),
+		storage.WithS3Presign(presign),
 	)
 	if err != nil {
 		t.Fatalf("create S3 storage: %v", err)
@@ -65,15 +68,14 @@ func newS3BackedServer(t *testing.T) (runningServer, string) {
 
 // TestCompatibilityS3PresignedDownload proves the xet-core client follows the
 // presigned S3 fetch-info URLs the S3-backed Go server hands out: uploads go
-// through the Go client, the reconstruction is asserted to reference only
-// presigned object-store URLs, and the download runs with the reference
-// client for both protocol versions.
+// through the Go client (which handles the direct-upload redirect to S3), the
+// reconstruction is asserted to reference only presigned object-store URLs,
+// and the download runs with the reference client for both protocol versions.
 func TestCompatibilityS3PresignedDownload(t *testing.T) {
 	fixtures := wireFixtures()
 	for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
 		t.Run(protocol.String(), func(t *testing.T) {
-			running, s3Endpoint := newS3BackedServer(t)
-
+			running, s3Endpoint := newS3BackedServer(t, true)
 			hashes := upload(t, goClient, protocol, running.endpoint, fixtures)
 			if len(hashes) != len(fixtures) {
 				t.Fatalf("uploaded %d files, want %d", len(hashes), len(fixtures))

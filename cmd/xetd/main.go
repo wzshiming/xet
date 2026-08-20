@@ -32,7 +32,7 @@ func main() {
 	s3Endpoint := flag.String("s3-endpoint", "", "Custom S3 endpoint URL, e.g. for MinIO (optional)")
 	s3Region := flag.String("s3-region", "", "S3 region (optional, falls back to AWS config chain)")
 	s3PathStyle := flag.Bool("s3-path-style", false, "Use path-style S3 addressing (required by MinIO and most self-hosted stores)")
-	s3Presign := flag.Bool("s3-presign", true, "Serve xorb downloads as presigned S3 GET URLs; disable when clients cannot reach the S3 endpoint")
+	s3Presign := flag.Bool("s3-presign", true, "Serve xorb downloads as presigned S3 GET URLs and redirect xorb uploads from clients that advertise direct-upload support to presigned S3 PUT URLs (verified at shard upload time); disable when clients cannot reach the S3 endpoint")
 	s3PresignExpiry := flag.Duration("s3-presign-expiry", time.Hour, "Validity of presigned xorb URLs")
 	s3PresignEndpoint := flag.String("s3-presign-endpoint", "", "Endpoint used in presigned xorb URLs when clients reach the object store at a different address than the server (optional, defaults to -s3-endpoint)")
 	flag.Parse()

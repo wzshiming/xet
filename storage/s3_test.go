@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -142,6 +143,227 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 
 	if _, err := ss.GetXorbReadSeekCloser(ctx, "default", xet.XorbHash{9}); err == nil {
 		t.Fatal("GetXorbReadSeekCloser() found a missing xorb")
+	}
+}
+
+// putToPresignedURL PUTs raw bytes to a presigned URL like a redirected
+// client would: plain HTTP, no SDK, no extra headers.
+func putToPresignedURL(t *testing.T, url string, data []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("direct PUT status %s: %s", resp.Status, body)
+	}
+}
+
+func TestS3StorageDirectXorbUploadAndValidate(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+
+	encoded, xorbHash := encodeTestXorb(t, true, []byte("direct upload chunk"))
+
+	uploadURL, err := ss.XorbUploadURL(ctx, "default", xorbHash, int64(len(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploadURL == "" {
+		t.Fatal("XorbUploadURL returned no URL with presign enabled")
+	}
+	// Plain PUT clients (and gofakes3/MinIO) cannot supply SDK checksum
+	// headers, so none may be folded into the signature.
+	if strings.Contains(strings.ToLower(uploadURL), "checksum") {
+		t.Fatalf("presigned PUT URL requires checksum headers: %s", uploadURL)
+	}
+
+	if err := ss.ValidateXorb(ctx, "default", xorbHash); !errors.Is(err, ErrXorbNotFound) {
+		t.Fatalf("ValidateXorb before upload = %v, want ErrXorbNotFound", err)
+	}
+
+	putToPresignedURL(t, uploadURL, encoded)
+
+	if ok, err := ss.HasXorb(ctx, "default", xorbHash); err != nil || !ok {
+		t.Fatalf("HasXorb after direct PUT = %v, %v", ok, err)
+	}
+	if err := ss.ValidateXorb(ctx, "default", xorbHash); err != nil {
+		t.Fatalf("ValidateXorb after direct PUT: %v", err)
+	}
+
+	// Corrupt bytes are only caught at validation time.
+	bad := append([]byte(nil), encoded...)
+	bad[10] ^= 0xff
+	badHash := xet.XorbHash{42}
+	badURL, err := ss.XorbUploadURL(ctx, "default", badHash, int64(len(bad)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putToPresignedURL(t, badURL, bad)
+	if err := ss.ValidateXorb(ctx, "default", badHash); !errors.Is(err, ErrXorbInvalid) {
+		t.Fatalf("ValidateXorb of corrupt xorb = %v, want ErrXorbInvalid", err)
+	}
+	// Invalid bytes are deleted so the key is not poisoned: the next upload
+	// attempt sees the xorb as absent instead of skipping it as stored.
+	if ok, err := ss.HasXorb(ctx, "default", badHash); err != nil || ok {
+		t.Fatalf("HasXorb after failed validation = %v, %v; want false", ok, err)
+	}
+
+	// Validated hashes are cached, so a shard retry does not re-read the
+	// object. gofakes3 ignores the signed If-None-Match condition, so this
+	// replay overwrite succeeds here; real S3 rejects it with 412.
+	putToPresignedURL(t, uploadURL, bad)
+	if err := ss.ValidateXorb(ctx, "default", xorbHash); err != nil {
+		t.Fatalf("ValidateXorb after successful validation = %v, want nil (cached)", err)
+	}
+}
+
+func TestS3StoragePutXorbMarksValidated(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+
+	encoded, xorbHash := encodeTestXorb(t, true, []byte("validated by put"))
+	if inserted, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil || !inserted {
+		t.Fatalf("PutXorb() = %v, %v", inserted, err)
+	}
+
+	// PutXorb already validated the stream; ValidateXorb must not re-read,
+	// so corrupting the object behind the storage's back goes unnoticed.
+	if err := ss.putObject(ctx, ss.objectKey("xorbs", xorbHash.String()), bytes.NewReader([]byte("garbage"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.ValidateXorb(ctx, "default", xorbHash); err != nil {
+		t.Fatalf("ValidateXorb after PutXorb = %v, want nil (cached)", err)
+	}
+}
+
+func TestS3StorageXorbUploadURLDisabledWithoutPresign(t *testing.T) {
+	ss := newTestS3Storage(t, WithS3Presign(false))
+	url, err := ss.XorbUploadURL(context.Background(), "default", xet.XorbHash{1}, 1)
+	if err != nil || url != "" {
+		t.Fatalf("XorbUploadURL with presign off = %q, %v; want empty", url, err)
+	}
+}
+
+// With presigning disabled nothing reaches the store unvalidated, so
+// shard-time verification degrades to an existence check instead of a full
+// object read.
+func TestS3StorageValidateXorbWithoutPresignChecksExistenceOnly(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t, WithS3Presign(false))
+
+	if err := ss.ValidateXorb(ctx, "default", xet.XorbHash{1}); !errors.Is(err, ErrXorbNotFound) {
+		t.Fatalf("ValidateXorb missing = %v, want ErrXorbNotFound", err)
+	}
+
+	// Bytes that would fail content validation pass: they can only have been
+	// stored through PutXorb, which validated them on ingress.
+	xorbHash := xet.XorbHash{2}
+	if err := ss.putObject(ctx, ss.objectKey("xorbs", xorbHash.String()), bytes.NewReader([]byte("garbage"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.ValidateXorb(ctx, "default", xorbHash); err != nil {
+		t.Fatalf("ValidateXorb = %v, want nil (existence only)", err)
+	}
+}
+
+// deleteObjectIfMatch must fall back to an unconditional delete when the
+// store rejects the conditional request (leaving the object would poison the
+// key), but must respect a failed condition: 412 means the object changed.
+func TestS3StorageDeleteObjectIfMatchFallback(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		condStatus  int
+		wantIfMatch []string
+	}{
+		{name: "unsupported falls back", condStatus: http.StatusNotImplemented, wantIfMatch: []string{`"etag"`, ""}},
+		{name: "changed object is kept", condStatus: http.StatusPreconditionFailed, wantIfMatch: []string{`"etag"`}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var gotIfMatch []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete {
+					t.Errorf("unexpected %s request", r.Method)
+					http.Error(w, "unexpected method", http.StatusBadRequest)
+					return
+				}
+				mu.Lock()
+				gotIfMatch = append(gotIfMatch, r.Header.Get("If-Match"))
+				mu.Unlock()
+				if r.Header.Get("If-Match") != "" {
+					w.WriteHeader(test.condStatus)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(srv.Close)
+
+			client := s3.New(s3.Options{
+				BaseEndpoint:               aws.String(srv.URL),
+				Region:                     "us-east-1",
+				Credentials:                credentials.NewStaticCredentialsProvider("test", "test", ""),
+				UsePathStyle:               true,
+				RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+				ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+			})
+			ss, err := NewS3Storage(context.Background(), WithS3Client(client), WithS3Bucket("test-bucket"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ss.deleteObjectIfMatch(context.Background(), "xorbs/ab/cd", `"etag"`)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(gotIfMatch) != len(test.wantIfMatch) {
+				t.Fatalf("DELETE If-Match sequence = %q, want %q", gotIfMatch, test.wantIfMatch)
+			}
+			for i, want := range test.wantIfMatch {
+				if gotIfMatch[i] != want {
+					t.Fatalf("DELETE If-Match sequence = %q, want %q", gotIfMatch, test.wantIfMatch)
+				}
+			}
+		})
+	}
+}
+
+// A transfer that dies mid-stream must not be reported as invalid content:
+// invalid is terminal for the shard upload while transport errors retry.
+func TestS3StorageValidateXorbTransientReadErrorIsRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Promise more bytes than are sent, then close the connection.
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{0})
+	}))
+	t.Cleanup(srv.Close)
+
+	client := s3.New(s3.Options{
+		BaseEndpoint:               aws.String(srv.URL),
+		Region:                     "us-east-1",
+		Credentials:                credentials.NewStaticCredentialsProvider("test", "test", ""),
+		UsePathStyle:               true,
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	})
+	ss, err := NewS3Storage(context.Background(), WithS3Client(client), WithS3Bucket("test-bucket"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = ss.ValidateXorb(context.Background(), "default", xet.XorbHash{1})
+	if err == nil {
+		t.Fatal("ValidateXorb succeeded on a truncated transfer")
+	}
+	if errors.Is(err, ErrXorbInvalid) || errors.Is(err, ErrXorbNotFound) {
+		t.Fatalf("ValidateXorb = %v, want a retryable transport error", err)
 	}
 }
 

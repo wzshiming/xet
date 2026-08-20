@@ -132,6 +132,40 @@ func TestEncoderEnforcesDraft05XorbLimits(t *testing.T) {
 	})
 }
 
+func TestValidateBindsContentToExpectedHash(t *testing.T) {
+	var chunkOnly bytes.Buffer
+	encoder := NewEncoder(&chunkOnly, false)
+	if _, err := encoder.Write([]byte("chunk-only content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Validate(bytes.NewReader(chunkOnly.Bytes()), encoder.SummoryHash()); err != nil {
+		t.Fatalf("Validate() with correct hash: %v", err)
+	}
+	err := Validate(bytes.NewReader(chunkOnly.Bytes()), xet.XorbHash{42})
+	if err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+		t.Fatalf("Validate() chunk-only wrong hash error = %v, want hash mismatch", err)
+	}
+}
+
+func TestValidateRejectsForgedFooterHash(t *testing.T) {
+	// An internally consistent footer claiming the wrong xorb hash must not
+	// validate: the hash has to be recomputed from the chunks themselves.
+	data, _ := encodeXorbForTest(t, [4]byte{}, []byte("first"), []byte("second"))
+	claimed := xet.XorbHash{7}
+	footerLen := binary.LittleEndian.Uint32(data[len(data)-4:])
+	footerStart := len(data) - int(footerLen) - 4
+	copy(data[footerStart+8:footerStart+40], claimed[:])
+
+	err := Validate(bytes.NewReader(data), claimed)
+	if err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+		t.Fatalf("Validate() forged footer error = %v, want hash mismatch", err)
+	}
+}
+
 func encodeXorbForTest(t *testing.T, nonce [4]byte, chunks ...[]byte) ([]byte, xet.XorbHash) {
 	t.Helper()
 

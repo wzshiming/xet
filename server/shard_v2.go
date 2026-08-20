@@ -9,7 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
+	"golang.org/x/sync/errgroup"
 )
 
 const shardUploadHeartbeatInterval = 20 * time.Second
@@ -162,37 +165,80 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 
 	body := io.LimitReader(r.Body, r.ContentLength)
 	shardObj := shard.NewShard()
+
+	// Referenced xorbs are verified with bounded concurrency while the shard
+	// is still streaming in; every verified xorb advances the progress frames.
+	verify, verifyCtx := errgroup.WithContext(r.Context())
+	verify.SetLimit(xorbVerifyConcurrency)
+	errVerifyAborted := errors.New("xorb verification failed")
+	seen := make(map[xet.XorbHash]struct{})
+	var progressMut sync.Mutex
 	var verified, total uint64
-	var callbackMessage string
-	var callbackRetryable bool
-	if err := shardObj.DecodeWithCASBlockCallback(body, false, func(casBlock shard.CASBlock) error {
+
+	enqueueVerify := func(casHash xet.XorbHash) error {
+		progressMut.Lock()
+		if _, ok := seen[casHash]; ok {
+			progressMut.Unlock()
+			return nil
+		}
+		seen[casHash] = struct{}{}
 		total++
-		if err := stream.validating(verified, total); err != nil {
-			return err
-		}
-
-		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
+		err := stream.validating(verified, total)
+		progressMut.Unlock()
 		if err != nil {
-			callbackMessage = "failed to check referenced xorb"
-			callbackRetryable = true
-			return errors.New(callbackMessage)
-		}
-		if !exists {
-			callbackMessage = "invalid shard: referenced xorb not uploaded"
-			return errors.New(callbackMessage)
-		}
-
-		verified++
-		if err := stream.validating(verified, total); err != nil {
 			return err
 		}
+		verify.Go(func() error {
+			if err := s.verifyShardXorb(verifyCtx, "default", casHash); err != nil {
+				return err
+			}
+			progressMut.Lock()
+			defer progressMut.Unlock()
+			verified++
+			return stream.validating(verified, total)
+		})
 		return nil
-	}); err != nil {
-		if callbackMessage != "" {
-			finishWithError(callbackMessage, callbackRetryable)
+	}
+
+	decodeErr := shardObj.DecodeWithCASBlockCallback(body, false, func(casBlock shard.CASBlock) error {
+		if verifyCtx.Err() != nil {
+			// A verification already failed; stop decoding early. The real
+			// error is reported from verify.Wait below.
+			return errVerifyAborted
+		}
+		return enqueueVerify(casBlock.CASHash)
+	})
+	if decodeErr == nil {
+		// File entries may reference xorbs outside the shard's CAS blocks
+		// (previously uploaded data); they need the same verification.
+	enqueueFileRefs:
+		for _, fileBlock := range shardObj.Files {
+			for _, entry := range fileBlock.Entries {
+				if verifyCtx.Err() != nil || enqueueVerify(entry.CASHash) != nil {
+					break enqueueFileRefs
+				}
+			}
+		}
+	}
+	if verifyErr := verify.Wait(); verifyErr != nil {
+		switch {
+		case errors.Is(verifyErr, storage.ErrXorbNotFound):
+			finishWithError("invalid shard: referenced xorb not uploaded", false)
+		case errors.Is(verifyErr, storage.ErrXorbInvalid):
+			finishWithError(fmt.Sprintf("invalid shard: %v", verifyErr), false)
+		default:
+			finishWithError("failed to verify referenced xorb", true)
+		}
+		return
+	}
+	if decodeErr != nil {
+		if errors.Is(decodeErr, errVerifyAborted) {
+			// Verification succeeded (Wait returned nil), so the early stop
+			// came from the request context being canceled while decoding.
+			finishWithError("request canceled", true)
 			return
 		}
-		finishWithError(fmt.Sprintf("invalid shard format: %v", err), false)
+		finishWithError(fmt.Sprintf("invalid shard format: %v", decodeErr), false)
 		return
 	}
 

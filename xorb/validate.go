@@ -29,7 +29,11 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	for {
 		n, err := io.ReadFull(r, headerBuf[:])
 		if err == io.EOF {
-			// Chunk-only format: structural validation passed.
+			// Chunk-only format: no trusted footer, so bind the decoded
+			// content to the expected hash directly.
+			if computed := xet.ComputeXorbHash(chunkHashes, chunkSizes); computed != xorbHash {
+				return fmt.Errorf("xorb hash mismatch: computed %x, expected %x", computed, xorbHash)
+			}
 			return nil
 		}
 		if err == io.ErrUnexpectedEOF {
@@ -40,7 +44,7 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		}
 
 		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
-			return validateWithFooter(r, tmp[:], headerBuf, xorbHash, chunkHashes)
+			return validateWithFooter(r, tmp[:], headerBuf, xorbHash, chunkHashes, chunkSizes)
 		}
 
 		version := headerBuf[0]
@@ -85,6 +89,7 @@ func validateWithFooter(
 	r io.Reader, buf []byte, headerBuf [8]byte,
 	xorbHash xet.XorbHash,
 	chunkHashes []xet.ChunkHash,
+	chunkSizes []uint64,
 ) error {
 	// Validate main header version.
 	if headerBuf[7] != 1 {
@@ -136,6 +141,12 @@ func validateWithFooter(
 
 	if numChunks != uint32(len(chunkHashes)) {
 		return fmt.Errorf("chunk count mismatch: footer has %d, stream has %d", numChunks, len(chunkHashes))
+	}
+
+	// The footer's claimed hashes are writer-controlled (direct uploads bypass
+	// the server), so recompute the xorb hash from the decoded chunks.
+	if computed := xet.ComputeXorbHash(chunkHashes, chunkSizes); computed != xorbHash {
+		return fmt.Errorf("xorb hash mismatch: computed %x, expected %x", computed, xorbHash)
 	}
 
 	// Parse per-chunk hashes from the hash section (first 32*N bytes of remaining).

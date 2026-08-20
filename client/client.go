@@ -21,17 +21,18 @@ type AuthProvider interface {
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL       string
-	token         string
-	httpClient    *http.Client
-	getHttpClient *http.Client
-	namespace     string
-	concurrency   int
-	retries       int
-	progressFunc  progress.ProgressFunc
-	cacheDir      string
-	cacheSize     int64
-	cacheManager  *download.CacheManager
+	baseURL          string
+	token            string
+	httpClient       *http.Client
+	getHttpClient    *http.Client
+	noRedirectClient *http.Client
+	namespace        string
+	concurrency      int
+	retries          int
+	progressFunc     progress.ProgressFunc
+	cacheDir         string
+	cacheSize        int64
+	cacheManager     *download.CacheManager
 }
 
 type Options func(*Client)
@@ -143,6 +144,16 @@ func NewClient(opts ...Options) (*Client, error) {
 			}),
 	}
 
+	// The xorb upload POST must observe direct-upload redirects itself: an
+	// auto-followed 307 would re-POST the body while the redirect target
+	// (a presigned S3 URL) only accepts PUT.
+	c.noRedirectClient = &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Jar:           c.httpClient.Jar,
+		Timeout:       c.httpClient.Timeout,
+		Transport:     c.httpClient.Transport,
+	}
+
 	return c, nil
 }
 
@@ -240,6 +251,10 @@ func resetRequestBody(req *http.Request) error {
 }
 
 func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
+	return c.doWithNetworkRetryClient(c.httpClient, req)
+}
+
+func (c *Client) doWithNetworkRetryClient(client *http.Client, req *http.Request) (*http.Response, error) {
 	attempts := c.retryAttempts()
 
 	var lastErr error
@@ -250,7 +265,7 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 			}
 		}
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err == nil {
 			if isServerError(resp.StatusCode) {
 				lastErr = fmt.Errorf("server error status %s", resp.Status)

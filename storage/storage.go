@@ -54,6 +54,33 @@ type Storage interface {
 	GetFileHashBySHA256(ctx context.Context, namespace string, sha256 [32]byte) (xet.FileHash, error)
 }
 
+// ErrXorbNotFound reports a referenced xorb that has not been uploaded.
+var ErrXorbNotFound = errors.New("xorb not found")
+
+// ErrXorbInvalid reports stored xorb bytes that fail content validation.
+var ErrXorbInvalid = errors.New("invalid xorb content")
+
+// XorbUploadRedirector is implemented by storages that can accept xorb
+// uploads directly at a client-reachable URL, bypassing the CAS server.
+type XorbUploadRedirector interface {
+	// XorbUploadURL returns a URL that accepts exactly size bytes of raw
+	// xorb data via HTTP PUT, or "" when direct upload is currently
+	// unavailable.
+	XorbUploadURL(ctx context.Context, namespace string, xorbHash xet.XorbHash, size int64) (string, error)
+}
+
+// XorbValidator is implemented by storages whose data may arrive without
+// passing through PutXorb validation (direct uploads). Servers use it at
+// shard upload time to verify referenced xorbs; storages where every write
+// is validated on ingress should not implement it, an existence check is
+// cheaper and sufficient for them.
+type XorbValidator interface {
+	// ValidateXorb streams the stored xorb through full content validation.
+	// It returns ErrXorbNotFound when the xorb does not exist and an error
+	// wrapping ErrXorbInvalid when the content does not match the hash.
+	ValidateXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) error
+}
+
 // FileStorage implements Storage using the filesystem
 type FileStorage struct {
 	basePath     string
@@ -87,6 +114,7 @@ const defaultChunkCacheSize = 4096
 const defaultSHA256CacheSize = 4096
 const defaultXorbCacheSize = 512
 const defaultOffsetsCacheSize = 512
+const defaultValidatedCacheSize = 4096
 
 type Option func(*FileStorage)
 

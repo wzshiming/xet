@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
+	"golang.org/x/sync/errgroup"
 )
 
 // Handler represents an XET CAS server
@@ -351,11 +354,6 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.ContentLength <= 0 {
-		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
-		return
-	}
-
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
@@ -366,6 +364,45 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
 		return
+	}
+
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return
+	}
+	if r.ContentLength > maxXorbUploadBytes {
+		http.Error(w, "Xorb too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Direct-upload storages answer before any body bytes are read: existing
+	// xorbs short-circuit, everything else is redirected to the object store.
+	// Only clients that advertise redirect support are redirected (xet-core
+	// auto-follows 307 as a re-POST, which presigned PUT URLs reject); others
+	// fall through to the streaming path below. Content verification happens
+	// at shard upload time instead.
+	if redirector, ok := s.storage.(storage.XorbUploadRedirector); ok &&
+		r.Header.Get(upload.HeaderDirectUpload) != "" {
+		exists, err := s.storage.HasXorb(r.Context(), namespace, xorbHash)
+		if err != nil {
+			http.Error(w, "Failed to check xorb", http.StatusInternalServerError)
+			return
+		}
+		if exists {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(upload.XorbUploadResponse{WasInserted: false})
+			return
+		}
+		uploadURL, err := redirector.XorbUploadURL(r.Context(), namespace, xorbHash, r.ContentLength)
+		if err != nil {
+			http.Error(w, "Failed to prepare xorb upload", http.StatusInternalServerError)
+			return
+		}
+		if uploadURL != "" {
+			w.Header().Set("Location", uploadURL)
+			w.WriteHeader(http.StatusTemporaryRedirect)
+			return
+		}
 	}
 
 	var body io.Reader = r.Body
@@ -458,10 +495,22 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 	if err := shardObj.Validate(); err != nil {
 		return false, http.StatusBadRequest, fmt.Errorf("invalid shard: %w", err)
 	}
-	for _, casBlock := range shardObj.CASInfos {
-		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
-		if err != nil || !exists {
+
+	g, gctx := errgroup.WithContext(r.Context())
+	g.SetLimit(xorbVerifyConcurrency)
+	for _, casHash := range referencedXorbs(shardObj) {
+		g.Go(func() error {
+			return s.verifyShardXorb(gctx, "default", casHash)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		switch {
+		case errors.Is(err, storage.ErrXorbNotFound):
 			return false, http.StatusBadRequest, fmt.Errorf("invalid shard: referenced xorb not uploaded")
+		case errors.Is(err, storage.ErrXorbInvalid):
+			return false, http.StatusBadRequest, fmt.Errorf("invalid shard: %w", err)
+		default:
+			return false, http.StatusInternalServerError, fmt.Errorf("failed to verify referenced xorb")
 		}
 	}
 
@@ -470,6 +519,58 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 		return false, http.StatusInternalServerError, fmt.Errorf("failed to store shard")
 	}
 	return wasInserted, http.StatusOK, nil
+}
+
+// xorbVerifyConcurrency bounds how many referenced xorbs a single shard
+// upload verifies in parallel.
+const xorbVerifyConcurrency = 4
+
+// maxXorbUploadBytes bounds a serialized xorb upload: MaxXorbSize of chunk
+// payload (compression never grows a chunk) plus 8 header and 40 footer
+// bytes per chunk, plus fixed footer overhead.
+const maxXorbUploadBytes = xet.MaxXorbSize + xet.MaxChunksPerXorb*48 + 1024
+
+// referencedXorbs returns every xorb hash the shard depends on, deduped:
+// CAS blocks plus file entries whose xorb is not in the shard (references
+// to previously uploaded data). Skipping the latter would let a shard
+// commit against an unverified direct-upload object.
+func referencedXorbs(shardObj *shard.Shard) []xet.XorbHash {
+	seen := make(map[xet.XorbHash]struct{}, len(shardObj.CASInfos))
+	var hashes []xet.XorbHash
+	add := func(h xet.XorbHash) {
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		hashes = append(hashes, h)
+	}
+	for _, casBlock := range shardObj.CASInfos {
+		add(casBlock.CASHash)
+	}
+	for _, fileBlock := range shardObj.Files {
+		for _, entry := range fileBlock.Entries {
+			add(entry.CASHash)
+		}
+	}
+	return hashes
+}
+
+// verifyShardXorb ensures a CAS-referenced xorb has been uploaded. Storages
+// that accept unverified direct uploads validate the full content; for the
+// rest an existence check suffices since their PutXorb already validated the
+// bytes.
+func (s *Handler) verifyShardXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) error {
+	if validator, ok := s.storage.(storage.XorbValidator); ok {
+		return validator.ValidateXorb(ctx, namespace, xorbHash)
+	}
+	exists, err := s.storage.HasXorb(ctx, namespace, xorbHash)
+	if err != nil {
+		return fmt.Errorf("check xorb: %w", err)
+	}
+	if !exists {
+		return storage.ErrXorbNotFound
+	}
+	return nil
 }
 
 // handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}

@@ -46,17 +46,19 @@ type S3Storage struct {
 	presignExpiry   time.Duration
 	presignEndpoint string
 
-	fileIndex    *lru.Cache // bounded file hash -> shard hash
-	shardIndex   *lru.Cache // bounded shard hash -> shard cache
-	chunkIndex   *lru.Cache // bounded chunk hash -> shard hash
-	sha256Index  *lru.Cache // bounded SHA-256 -> shard hash
-	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
+	fileIndex      *lru.Cache // bounded file hash -> shard hash
+	shardIndex     *lru.Cache // bounded shard hash -> shard cache
+	chunkIndex     *lru.Cache // bounded chunk hash -> shard hash
+	sha256Index    *lru.Cache // bounded SHA-256 -> shard hash
+	offsetsIndex   *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
+	validatedIndex *lru.Cache // bounded xorb hash -> content-validated marker
 
-	fileMut    sync.Mutex // guards fileIndex
-	shardMut   sync.Mutex // guards shardIndex
-	chunkMut   sync.Mutex // guards chunkIndex
-	sha256Mut  sync.Mutex // guards sha256Index
-	offsetsMut sync.Mutex // guards offsetsIndex
+	fileMut      sync.Mutex // guards fileIndex
+	shardMut     sync.Mutex // guards shardIndex
+	chunkMut     sync.Mutex // guards chunkIndex
+	sha256Mut    sync.Mutex // guards sha256Index
+	offsetsMut   sync.Mutex // guards offsetsIndex
+	validatedMut sync.Mutex // guards validatedIndex
 
 	// endpoint, region and pathStyle configure the lazily created client
 	// when one is not injected directly.
@@ -120,9 +122,12 @@ func WithS3PathStyle(pathStyle bool) S3Option {
 	}
 }
 
-// WithS3Presign controls whether xorb download URLs are presigned S3 GET
-// URLs (default) or relative paths served through the CAS server. Disable
-// it when clients cannot reach the S3 endpoint directly.
+// WithS3Presign controls whether xorb transfers go straight to the object
+// store (default): downloads use presigned S3 GET URLs and uploads from
+// clients that advertise direct-upload support are redirected to presigned
+// S3 PUT URLs, verified at shard upload time. When disabled, transfers
+// stream through the CAS server; use this when clients cannot reach the S3
+// endpoint directly.
 func WithS3Presign(presign bool) S3Option {
 	return func(ss *S3Storage) {
 		ss.presign = presign
@@ -155,13 +160,14 @@ func WithS3PresignEndpoint(endpoint string) S3Option {
 // shared config, IAM roles) unless a client is injected with WithS3Client.
 func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 	ss := &S3Storage{
-		presign:       true,
-		presignExpiry: defaultPresignExpiry,
-		fileIndex:     lru.New(defaultFileCacheSize),
-		shardIndex:    lru.New(defaultShardCacheSize),
-		chunkIndex:    lru.New(defaultChunkCacheSize),
-		sha256Index:   lru.New(defaultSHA256CacheSize),
-		offsetsIndex:  lru.New(defaultOffsetsCacheSize),
+		presign:        true,
+		presignExpiry:  defaultPresignExpiry,
+		fileIndex:      lru.New(defaultFileCacheSize),
+		shardIndex:     lru.New(defaultShardCacheSize),
+		chunkIndex:     lru.New(defaultChunkCacheSize),
+		sha256Index:    lru.New(defaultSHA256CacheSize),
+		offsetsIndex:   lru.New(defaultOffsetsCacheSize),
+		validatedIndex: lru.New(defaultValidatedCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -188,15 +194,18 @@ func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 			o.UsePathStyle = ss.pathStyle
 		})
 	}
+	// The presign client never sends requests; it only shapes and signs
+	// URLs, so a client copy is enough. Checksum calculation must be
+	// when_required: the default folds x-amz-checksum-* headers into
+	// presigned PUT signatures, which plain HTTP clients and most
+	// S3-compatible stores do not handle.
+	presignOpts := ss.client.Options()
 	if ss.presignEndpoint != "" {
-		// The presign client never sends requests; it only shapes and signs
-		// the URL, so a client copy with the public endpoint is enough.
-		presignOpts := ss.client.Options()
+		// Presign against the public endpoint clients actually reach.
 		presignOpts.BaseEndpoint = aws.String(ss.presignEndpoint)
-		ss.presignClient = s3.NewPresignClient(s3.New(presignOpts))
-	} else {
-		ss.presignClient = s3.NewPresignClient(ss.client)
 	}
+	presignOpts.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	ss.presignClient = s3.NewPresignClient(s3.New(presignOpts))
 
 	return ss, nil
 }
@@ -329,7 +338,119 @@ func (ss *S3Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHas
 	if err := ss.putObject(ctx, key, f); err != nil {
 		return false, fmt.Errorf("upload xorb: %w", err)
 	}
+	ss.markXorbValidated(xorbHash)
 	return true, nil
+}
+
+// xorbValidated reports whether this process already validated the xorb's
+// content, via PutXorb or an earlier ValidateXorb.
+func (ss *S3Storage) xorbValidated(xorbHash xet.XorbHash) bool {
+	ss.validatedMut.Lock()
+	defer ss.validatedMut.Unlock()
+	_, ok := ss.validatedIndex.Get(xorbHash)
+	return ok
+}
+
+func (ss *S3Storage) markXorbValidated(xorbHash xet.XorbHash) {
+	ss.validatedMut.Lock()
+	defer ss.validatedMut.Unlock()
+	ss.validatedIndex.Add(xorbHash, struct{}{})
+}
+
+// errTrackingReader records the first error the underlying reader returns so
+// a failed validation can be told apart from a failed transfer.
+type errTrackingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (t *errTrackingReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && err != io.EOF && t.err == nil {
+		t.err = err
+	}
+	return n, err
+}
+
+// ValidateXorb streams the stored xorb back from S3 through full content
+// validation, covering xorbs uploaded directly with presigned PUT URLs.
+// With presigning disabled there is no direct-upload ingress (every object
+// passed PutXorb validation), so only existence is checked. Hashes already
+// validated by this process are skipped, so shard retries do not re-read
+// the bytes. Invalid content is deleted: it has never validated, so nothing
+// references it, and leaving it would poison the key (existence checks make
+// clients skip re-uploading the valid bytes).
+func (ss *S3Storage) ValidateXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) error {
+	if ss.xorbValidated(xorbHash) {
+		return nil
+	}
+
+	key := ss.objectKey("xorbs", xorbHash.String())
+	if !ss.presign {
+		_, exists, err := ss.headObject(ctx, key)
+		if err != nil {
+			return fmt.Errorf("check xorb object: %w", err)
+		}
+		if !exists {
+			return ErrXorbNotFound
+		}
+		return nil
+	}
+
+	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return ErrXorbNotFound
+		}
+		return fmt.Errorf("read xorb object: %w", err)
+	}
+	defer out.Body.Close()
+
+	body := &errTrackingReader{r: out.Body}
+	if err := xorb.Validate(body, xorbHash); err != nil {
+		// A failed read is a transport problem, not proof of bad content;
+		// report it as retryable instead of rejecting the shard for good.
+		if body.err != nil {
+			return fmt.Errorf("read xorb object: %w", err)
+		}
+		ss.deleteObjectIfMatch(ctx, key, aws.ToString(out.ETag))
+		return fmt.Errorf("%w: %v", ErrXorbInvalid, err)
+	}
+
+	ss.markXorbValidated(xorbHash)
+	return nil
+}
+
+// deleteObjectIfMatch best-effort deletes an object; the ETag condition keeps
+// a concurrent valid re-upload from being deleted along with the bad bytes.
+// Stores without conditional-delete support get an unconditional retry:
+// leaving the object would poison the key for good, while the delete race is
+// only the narrow window after another deletion of the same bad bytes.
+func (ss *S3Storage) deleteObjectIfMatch(ctx context.Context, key, etag string) {
+	in := &s3.DeleteObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(key),
+	}
+	if etag != "" {
+		in.IfMatch = aws.String(etag)
+	}
+	_, err := ss.client.DeleteObject(ctx, in)
+	if err == nil || in.IfMatch == nil || isS3PreconditionFailed(err) {
+		return
+	}
+	in.IfMatch = nil
+	_, _ = ss.client.DeleteObject(ctx, in)
+}
+
+// isS3PreconditionFailed reports a failed If-Match/If-None-Match condition:
+// the object changed, as opposed to the store rejecting the conditional
+// request itself.
+func isS3PreconditionFailed(err error) bool {
+	var respErr *awshttp.ResponseError
+	return errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusPreconditionFailed
 }
 
 // GetXorbReadSeekCloser returns a ReadSeekCloser over the xorb object; reads
@@ -762,6 +883,28 @@ func (ss *S3Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string
 	return fmt.Sprintf("%s/v1/xorbs/%s/%s", ss.baseURL, namespace, xorbHash.String()), nil
 }
 
+// XorbUploadURL returns a presigned PUT URL so clients upload xorb bytes
+// straight to the object store, or "" when presigning is disabled. Bytes
+// accepted this way are unverified until ValidateXorb runs at shard time.
+// Content-Length and If-None-Match: * are folded into the signature, so the
+// URL creates an object of exactly size bytes and cannot overwrite an
+// existing one (e.g. a replayed URL after the xorb was committed).
+func (ss *S3Storage) XorbUploadURL(ctx context.Context, _ string, xorbHash xet.XorbHash, size int64) (string, error) {
+	if !ss.presign {
+		return "", nil
+	}
+	req, err := ss.presignClient.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(ss.bucket),
+		Key:           aws.String(ss.objectKey("xorbs", xorbHash.String())),
+		ContentLength: aws.Int64(size),
+		IfNoneMatch:   aws.String("*"),
+	}, s3.WithPresignExpires(ss.presignExpiry))
+	if err != nil {
+		return "", fmt.Errorf("presign xorb upload URL: %w", err)
+	}
+	return req.URL, nil
+}
+
 // s3Opener adapts an S3 object to httpseek.Opener: each open is served with
 // an S3 range GET, and the ETag reported on every open lets the OpenSeeker
 // detect content changes across reopens.
@@ -811,3 +954,5 @@ func (o *s3Opener) Size(string) (httpseek.SizeResult, error) {
 }
 
 var _ Storage = (*S3Storage)(nil)
+var _ XorbUploadRedirector = (*S3Storage)(nil)
+var _ XorbValidator = (*S3Storage)(nil)
