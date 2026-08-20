@@ -13,6 +13,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
 )
@@ -23,6 +24,7 @@ func main() {
 	storageDir := flag.String("storage", "./xet-data", "Storage directory for xorbs and shards")
 	baseURL := flag.String("base-url", "", "Base URL for serving xorb data (optional)")
 	authToken := flag.String("token", "", "Authentication token; also the secret for minted short-lived tokens (optional, if set, clients must provide this token or a minted one)")
+	internalAPI := flag.Bool("internal", false, "Enable unauthenticated internal management endpoints under /internal/ (use only on trusted networks)")
 	upstream := flag.String("upstream", "", "Upstream hub URL to mirror, e.g. https://huggingface.co (enables mirror mode)")
 	upstreamToken := flag.String("upstream-token", "", "Bearer token the mirror uses against the upstream hub")
 	s3Bucket := flag.String("s3-bucket", "", "S3 bucket for xorbs and shards (enables S3 storage; credentials come from the standard AWS config chain)")
@@ -128,6 +130,16 @@ func main() {
 		server.WithAuthFunc(authFn),
 		server.WithNext(next),
 	)
+
+	if *internalAPI {
+		// Internal management endpoints sit in front of the CAS routes and
+		// bypass authentication.
+		next = internalapi.NewHandler(
+			internalapi.WithStorage(stor),
+			internalapi.WithNext(next),
+		)
+		fmt.Println("Internal management endpoints enabled at /internal/")
+	}
 
 	next = handlers.CombinedLoggingHandler(os.Stdout, next)
 

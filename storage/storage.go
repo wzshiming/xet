@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,6 +294,52 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 		fs.fileMut.Unlock()
 	}
 	return s, nil
+}
+
+// GetShardByHash loads a stored shard by the hash of its serialized bytes.
+// The returned error wraps fs.ErrNotExist when the shard is absent.
+func (fs *FileStorage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	return fs.getShardByHash(shardHash)
+}
+
+// WalkFileIndex calls fn for every committed index/files entry.
+func (fs *FileStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	root := filepath.Join(fs.basePath, "index", "files")
+	return filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			// Tolerate concurrent deletion anywhere under the index.
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		fileHash := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
+		// Skip in-flight .tmp files and anything that is not a hash name.
+		if len(fileHash) != 64 {
+			return nil
+		}
+		if _, err := hex.DecodeString(fileHash); err != nil {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		return fn(fileHash, strings.TrimSpace(string(data)))
+	})
 }
 
 // PutXorb stores an xorb
@@ -708,4 +755,10 @@ func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash 
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
 	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
+}
+
+// GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
+// the first read.
+func (fs *FileStorage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+	return fs.xorbChunkOffsets(xorbHash)
 }

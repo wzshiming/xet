@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
+	"golang.org/x/sync/errgroup"
 )
 
 // defaultPresignExpiry keeps presigned xorb URLs valid long enough for
@@ -393,6 +395,12 @@ func (ss *S3Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xe
 	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
 }
 
+// GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
+// the first read.
+func (ss *S3Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+	return ss.xorbChunkOffsets(ctx, xorbHash)
+}
+
 // hasFile checks whether a file hash already has a shard mapping.
 func (ss *S3Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	ss.fileMut.Lock()
@@ -566,6 +574,80 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 		ss.fileMut.Unlock()
 	}
 	return s, nil
+}
+
+// GetShardByHash loads a stored shard by the hash of its serialized bytes.
+// The returned error wraps fs.ErrNotExist when the shard is absent.
+func (ss *S3Storage) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	s, err := ss.getShardByHash(ctx, shardHash)
+	if err != nil && isS3NotFound(err) {
+		return nil, fmt.Errorf("shard %s: %w", shardHash, iofs.ErrNotExist)
+	}
+	return s, err
+}
+
+// fileIndexWalkConcurrency bounds parallel index-object reads during walks.
+const fileIndexWalkConcurrency = 4
+
+// WalkFileIndex calls fn for every committed index/files entry.
+func (ss *S3Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	base := "index/files/"
+	if ss.prefix != "" {
+		base = ss.prefix + "/" + base
+	}
+	paginator := s3.NewListObjectsV2Paginator(ss.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(ss.bucket),
+		Prefix: aws.String(base),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list file index: %w", err)
+		}
+		var keys, hashes []string
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			fileHash := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
+			if len(fileHash) != 64 {
+				continue
+			}
+			if _, err := hex.DecodeString(fileHash); err != nil {
+				continue
+			}
+			keys = append(keys, key)
+			hashes = append(hashes, fileHash)
+		}
+		// Read the page's index objects in parallel; fn stays sequential.
+		bodies := make([][]byte, len(keys))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(fileIndexWalkConcurrency)
+		for i, key := range keys {
+			g.Go(func() error {
+				data, err := ss.getObject(gctx, key)
+				if err != nil {
+					// Deleted between list and read: leave the slot nil.
+					if isS3NotFound(err) {
+						return nil
+					}
+					return fmt.Errorf("read file index %s: %w", key, err)
+				}
+				bodies[i] = data
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+		for i, fileHash := range hashes {
+			if bodies[i] == nil {
+				continue
+			}
+			if err := fn(fileHash, strings.TrimSpace(string(bodies[i]))); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // GetShard retrieves a shard by file hash
