@@ -1,8 +1,12 @@
 use std::io::{Cursor, Read, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use xet_client::cas_client::LocalTestServerBuilder;
+use xet_client::cas_client::auth::{DirectRefreshRouteTokenRefresher, TokenRefresher};
+use xet_client::cas_client::build_http_client;
+use xet_client::cas_client::exports::reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use xet_core_structures::merklehash::{MerkleHash, compute_data_hash, file_hash, xorb_hash};
 use xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks;
 use xet_core_structures::xorb_object::{
@@ -27,6 +31,8 @@ struct UploadRequest {
     sha256s: Option<Vec<String>>,
     skip_sha256: bool,
     api_version: Option<u32>,
+    token_refresh_url: Option<String>,
+    hub_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +41,8 @@ struct DownloadRequest {
     endpoint: String,
     token: Option<TokenInfo>,
     api_version: Option<u32>,
+    token_refresh_url: Option<String>,
+    hub_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,17 +104,23 @@ fn run() -> Result<()> {
         "upload-files" => {
             let request: UploadRequest = read_json()?;
             let policies = sha256_policies(&request)?;
-            let token = request.token.map(|value| (value.token, value.expiry));
+            let mut token = request.token.map(|value| (value.token, value.expiry));
             let context = context_for_api_version(request.api_version)?;
+            let mut endpoint = (!request.endpoint.is_empty()).then(|| request.endpoint.clone());
+            let mut refresher: Option<Arc<dyn TokenRefresher>> = None;
+            if let Some(refresh_url) = request.token_refresh_url.as_deref() {
+                (endpoint, token, refresher) =
+                    resolve_hub_auth(&context, refresh_url, request.hub_token.as_deref(), endpoint, token)?;
+            }
             let runtime = context.runtime.clone();
             let result = runtime.bridge_sync(async move {
                 data_client::upload_async(
                     &context,
                     request.file_paths,
                     policies,
-                    Some(request.endpoint),
+                    endpoint,
                     token,
-                    None,
+                    refresher,
                     None,
                     None,
                 )
@@ -128,16 +142,22 @@ fn run() -> Result<()> {
                     (info, value.destination_path)
                 })
                 .collect();
-            let token = request.token.map(|value| (value.token, value.expiry));
+            let mut token = request.token.map(|value| (value.token, value.expiry));
             let context = context_for_api_version(request.api_version)?;
+            let mut endpoint = (!request.endpoint.is_empty()).then(|| request.endpoint.clone());
+            let mut refresher: Option<Arc<dyn TokenRefresher>> = None;
+            if let Some(refresh_url) = request.token_refresh_url.as_deref() {
+                (endpoint, token, refresher) =
+                    resolve_hub_auth(&context, refresh_url, request.hub_token.as_deref(), endpoint, token)?;
+            }
             let runtime = context.runtime.clone();
             let result = runtime.bridge_sync(async move {
                 data_client::download_async(
                     &context,
                     files,
-                    Some(request.endpoint),
+                    endpoint,
                     token,
-                    None,
+                    refresher,
                     None,
                     None,
                 )
@@ -190,6 +210,41 @@ fn context_for_api_version(api_version: Option<u32>) -> Result<XetContext> {
     config.client.reconstruction_api_version = api_version;
     config.client.shard_api_version = api_version;
     Ok(XetContext::with_config(config)?)
+}
+
+/// Hub-style auth: build a `DirectRefreshRouteTokenRefresher` for the
+/// (possibly redirected) token route and, when no endpoint is given, resolve
+/// the CAS endpoint and initial token from it, mirroring xet-core's real
+/// Hugging Face upload/download flow.
+fn resolve_hub_auth(
+    context: &XetContext,
+    refresh_url: &str,
+    hub_token: Option<&str>,
+    endpoint: Option<String>,
+    token: Option<(String, u64)>,
+) -> Result<(Option<String>, Option<(String, u64)>, Option<Arc<dyn TokenRefresher>>)> {
+    let mut headers = HeaderMap::new();
+    if let Some(hub_token) = hub_token {
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {hub_token}"))?);
+    }
+    let client = build_http_client(context, "", None, Some(Arc::new(headers)))?;
+    let refresher = Arc::new(DirectRefreshRouteTokenRefresher::new(
+        context.clone(),
+        refresh_url.to_owned(),
+        client,
+        None,
+    ));
+
+    let (endpoint, token) = if let Some(endpoint) = endpoint {
+        (endpoint, token)
+    } else {
+        let eager = refresher.clone();
+        let runtime = context.runtime.clone();
+        let jwt = runtime.bridge_sync(async move { eager.get_cas_jwt().await })??;
+        (jwt.cas_url, token.or(Some((jwt.access_token, jwt.exp))))
+    };
+
+    Ok((Some(endpoint), token, Some(refresher)))
 }
 
 fn read_stdin() -> Result<Vec<u8>> {

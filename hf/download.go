@@ -19,8 +19,11 @@ import (
 // CAS TokenProvider. The provider pre-populates the first token from the
 // response headers so no extra round-trip is needed on first use.
 func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL string) (xet.FileHash, client.AuthProvider, error) {
-	if httpClient == nil {
-		httpClient = &http.Client{
+	// The resolve HEAD must surface the hub's first response: the 302 itself
+	// carries the xet Link headers, so redirects are never followed here.
+	headClient := httpClient
+	if headClient == nil {
+		headClient = &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -33,7 +36,7 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 		return xet.FileHash{}, nil, fmt.Errorf("create resolve request: %w", err)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := headClient.Do(req)
 	if err != nil {
 		return xet.FileHash{}, nil, fmt.Errorf("resolve request: %w", err)
 	}
@@ -41,6 +44,8 @@ func ResolveDownload(ctx context.Context, httpClient *http.Client, resolveURL st
 		_ = resp.Body.Close()
 	}()
 
+	// Token fetches use the caller's client as-is; when none was provided the
+	// redirect-following token default applies instead of the HEAD client.
 	return ResolveResponse(ctx, httpClient, resp)
 }
 
@@ -148,6 +153,33 @@ type tokenResp struct {
 	Exp    int64  `json:"exp"`
 }
 
+// defaultTokenClient fetches CAS tokens the way xet-core's reqwest client
+// does: the hub may answer the xet token routes with a redirect (e.g. for a
+// moved or renamed repo) and it must be followed instead of failing.
+var defaultTokenClient = &http.Client{
+	Timeout:       30 * time.Second,
+	CheckRedirect: checkTokenRedirect,
+}
+
+// checkTokenRedirect mirrors reqwest's default redirect policy used by
+// xet-core: follow 10 hops and fail on the 11th, and drop credentials as soon
+// as the chain leaves the original host so the hub token cannot leak to other
+// hosts.
+func checkTokenRedirect(req *http.Request, via []*http.Request) error {
+	// via holds the requests already sent (initial plus followed hops).
+	if len(via) > 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	for _, prev := range via {
+		if prev.URL.Host != req.URL.Host {
+			req.Header.Del("Authorization")
+			req.Header.Del("Cookie")
+			break
+		}
+	}
+	return nil
+}
+
 func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL string, token string) (*tokenData, error) {
 	// Avoid caching issues by adding a timestamp query parameter
 	tokenURL += "?" + fmt.Sprint(time.Now().Unix())
@@ -162,12 +194,7 @@ func fetchXETAuthToken(ctx context.Context, httpClient *http.Client, tokenURL st
 	}
 
 	if httpClient == nil {
-		httpClient = &http.Client{
-			Timeout: 30 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		httpClient = defaultTokenClient
 	}
 
 	resp, err := httpClient.Do(req)

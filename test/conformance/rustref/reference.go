@@ -52,19 +52,23 @@ func (v ProtocolVersion) String() string {
 }
 
 type uploadRequest struct {
-	FilePaths  []string         `json:"file_paths"`
-	Endpoint   string           `json:"endpoint"`
-	Token      *TokenInfo       `json:"token,omitempty"`
-	SHA256s    []string         `json:"sha256s,omitempty"`
-	SkipSHA256 bool             `json:"skip_sha256"`
-	APIVersion *ProtocolVersion `json:"api_version,omitempty"`
+	FilePaths       []string         `json:"file_paths"`
+	Endpoint        string           `json:"endpoint"`
+	Token           *TokenInfo       `json:"token,omitempty"`
+	SHA256s         []string         `json:"sha256s,omitempty"`
+	SkipSHA256      bool             `json:"skip_sha256"`
+	APIVersion      *ProtocolVersion `json:"api_version,omitempty"`
+	TokenRefreshURL string           `json:"token_refresh_url,omitempty"`
+	HubToken        string           `json:"hub_token,omitempty"`
 }
 
 type downloadRequest struct {
-	Files      []DownloadRequest `json:"files"`
-	Endpoint   string            `json:"endpoint"`
-	Token      *TokenInfo        `json:"token,omitempty"`
-	APIVersion *ProtocolVersion  `json:"api_version,omitempty"`
+	Files           []DownloadRequest `json:"files"`
+	Endpoint        string            `json:"endpoint"`
+	Token           *TokenInfo        `json:"token,omitempty"`
+	APIVersion      *ProtocolVersion  `json:"api_version,omitempty"`
+	TokenRefreshURL string            `json:"token_refresh_url,omitempty"`
+	HubToken        string            `json:"hub_token,omitempty"`
 }
 
 var (
@@ -291,6 +295,40 @@ func downloadFiles(files []DownloadRequest, endpoint string, token *TokenInfo, v
 		Endpoint:   endpoint,
 		Token:      token,
 		APIVersion: version,
+	}, &result)
+	return result, err
+}
+
+// UploadFilesViaTokenRefresh uploads through xet-core's Hugging Face hub
+// flow: the CAS endpoint and access token are resolved by an authenticated
+// GET to refreshURL (following any redirects the hub answers with), exactly
+// as a real hf upload does.
+func UploadFilesViaTokenRefresh(filePaths []string, refreshURL, hubToken string, version ProtocolVersion) ([]UploadResult, error) {
+	if err := validateProtocolVersion(version); err != nil {
+		return nil, err
+	}
+	var result []UploadResult
+	err := runJSON("upload-files", uploadRequest{
+		FilePaths:       filePaths,
+		APIVersion:      &version,
+		TokenRefreshURL: refreshURL,
+		HubToken:        hubToken,
+	}, &result)
+	return result, err
+}
+
+// DownloadFilesViaTokenRefresh downloads through the same hub token-refresh
+// flow as UploadFilesViaTokenRefresh, using the read token route.
+func DownloadFilesViaTokenRefresh(files []DownloadRequest, refreshURL, hubToken string, version ProtocolVersion) ([]string, error) {
+	if err := validateProtocolVersion(version); err != nil {
+		return nil, err
+	}
+	var result []string
+	err := runJSON("download-files", downloadRequest{
+		Files:           files,
+		APIVersion:      &version,
+		TokenRefreshURL: refreshURL,
+		HubToken:        hubToken,
 	}, &result)
 	return result, err
 }
