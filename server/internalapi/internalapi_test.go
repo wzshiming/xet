@@ -208,6 +208,13 @@ func TestGCSweepEndpoint(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bogus grace status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
+
+	// A negative grace is rejected rather than silently disabling the window.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=-5m", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("negative grace status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
 }
 
 func TestGCEndpointsNotImplemented(t *testing.T) {

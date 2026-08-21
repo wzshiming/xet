@@ -345,6 +345,9 @@ func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 
 	// Check if xorb already exists
 	if _, err := os.Stat(xorbPath); err == nil {
+		// Refresh the mtime so deduplicated reuse stays inside the GC grace window.
+		now := time.Now()
+		_ = os.Chtimes(xorbPath, now, now)
 		return false, nil // Already exists
 	}
 	if err := os.MkdirAll(filepath.Dir(xorbPath), 0755); err != nil {
@@ -716,6 +719,12 @@ func writeIndexFile(path string, value []byte) error {
 	if err == nil {
 		return nil
 	}
+	return overwriteIndexFile(path, value)
+}
+
+// overwriteIndexFile writes an index entry unconditionally, replacing any
+// existing value through an atomic rename.
+func overwriteIndexFile(path string, value []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
@@ -783,7 +792,7 @@ func (fs *FileStorage) WalkXorbs(ctx context.Context, fn func(xorbHash string, s
 // whether it existed.
 func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	err := os.Remove(fs.objectPath("index/files", fileHash.String()))
-	// Evict after the delete so a concurrent read cannot re-cache the removed mapping.
+	// Evicting after the delete narrows but does not close the re-cache window.
 	fs.fileMut.Lock()
 	fs.fileIndex.Remove(fileHash)
 	fs.fileMut.Unlock()
@@ -863,6 +872,17 @@ func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.
 	return nil
 }
 
+// SetChunkIndexEntry force-writes the index/chunks entry for chunkHash.
+func (fs *FileStorage) SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
+	if err := overwriteIndexFile(fs.objectPath("index/chunks", chunkHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write chunk index: %w", err)
+	}
+	fs.chunkMut.Lock()
+	fs.chunkIndex.Remove(chunkHash)
+	fs.chunkMut.Unlock()
+	return nil
+}
+
 // evictSHA256 drops the cached mapping for a hex SHA-256 digest.
 func (fs *FileStorage) evictSHA256(sha256Hex string) {
 	raw, err := hex.DecodeString(sha256Hex)
@@ -896,6 +916,15 @@ func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex str
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete SHA-256 index: %w", err)
 	}
+	return nil
+}
+
+// SetSHA256IndexEntry force-writes the index/sha256 entry.
+func (fs *FileStorage) SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error {
+	if err := overwriteIndexFile(fs.objectPath("index/sha256", sha256Hex), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write SHA-256 index: %w", err)
+	}
+	fs.evictSHA256(sha256Hex)
 	return nil
 }
 

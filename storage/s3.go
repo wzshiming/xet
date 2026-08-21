@@ -10,6 +10,7 @@ import (
 	"io"
 	iofs "io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -307,6 +308,14 @@ func (ss *S3Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHas
 	if _, exists, err := ss.headObject(ctx, key); err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
 	} else if exists {
+		// Best-effort self-copy refreshes LastModified so deduplicated reuse
+		// stays inside the GC grace window.
+		_, _ = ss.client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:            aws.String(ss.bucket),
+			Key:               aws.String(key),
+			CopySource:        aws.String(url.PathEscape(ss.bucket + "/" + key)),
+			MetadataDirective: types.MetadataDirectiveReplace,
+		})
 		return false, nil // Already exists
 	}
 
@@ -718,7 +727,7 @@ func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.File
 			return false, fmt.Errorf("delete file index: %w", err)
 		}
 	}
-	// Evict after the delete so a concurrent read cannot re-cache the removed mapping.
+	// Evicting after the delete narrows but does not close the re-cache window.
 	ss.fileMut.Lock()
 	ss.fileIndex.Remove(fileHash)
 	ss.fileMut.Unlock()
@@ -787,6 +796,17 @@ func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.Ch
 	return nil
 }
 
+// SetChunkIndexEntry force-writes the index/chunks entry for chunkHash.
+func (ss *S3Storage) SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunkHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write chunk index: %w", err)
+	}
+	ss.chunkMut.Lock()
+	ss.chunkIndex.Remove(chunkHash)
+	ss.chunkMut.Unlock()
+	return nil
+}
+
 // evictSHA256 drops the cached mapping for a hex SHA-256 digest.
 func (ss *S3Storage) evictSHA256(sha256Hex string) {
 	raw, err := hex.DecodeString(sha256Hex)
@@ -820,6 +840,15 @@ func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex strin
 	if err != nil {
 		return fmt.Errorf("delete SHA-256 index: %w", err)
 	}
+	return nil
+}
+
+// SetSHA256IndexEntry force-writes the index/sha256 entry.
+func (ss *S3Storage) SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", sha256Hex), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write SHA-256 index: %w", err)
+	}
+	ss.evictSHA256(sha256Hex)
 	return nil
 }
 

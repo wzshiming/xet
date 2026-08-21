@@ -3,7 +3,6 @@
 package internalapi
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -120,7 +119,8 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 
 // handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=: it removes
 // (or, with dry_run, reports) shards and xorbs no file-index entry keeps
-// alive. An omitted grace uses the default window; zero or negative disables it.
+// alive. An omitted grace uses the default window; an explicit zero disables
+// it; negative values are rejected.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -139,15 +139,15 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := r.URL.Query().Get("grace"); v != "" {
 		grace, err = time.ParseDuration(v)
-		if err != nil {
+		if err != nil || grace < 0 {
 			http.Error(w, "Invalid grace value", http.StatusBadRequest)
 			return
 		}
-		if grace <= 0 {
-			grace = -1 // explicit zero disables the window; zero means default
+		if grace == 0 {
+			grace = -1 // explicit zero disables the window; zero means default in Sweep
 		}
 	}
-	result, err := h.gc.Sweep(context.Background(), grace, dryRun)
+	result, err := h.gc.Sweep(r.Context(), grace, dryRun)
 	if err != nil {
 		if errors.Is(err, storage.ErrGCBusy) {
 			http.Error(w, "GC already running", http.StatusConflict)

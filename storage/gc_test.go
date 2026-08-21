@@ -332,12 +332,11 @@ func TestSweepGraceWindow(t *testing.T) {
 	}
 }
 
-// TestSweepSharedSHA256FollowsOwner stores identical content under two
-// chunkings, so two shards share one sha256 entry. Sweep never rewrites the
-// entry: it survives only when owned by the surviving shard and falls with
-// the dead one (the accepted quirk; the live file stays reachable by file
-// hash and a re-ingest restores the lookup).
-func TestSweepSharedSHA256FollowsOwner(t *testing.T) {
+// TestSweepRepointsSharedSHA256 stores identical content under two
+// chunkings, so two shards share one sha256 entry. When the sweep removes
+// the shard owning the entry while the other still lives, the entry is
+// repointed to the live shard and the SHA-256 lookup keeps working.
+func TestSweepRepointsSharedSHA256(t *testing.T) {
 	content := []byte("same content, two different chunkings")
 	for _, backend := range listBackends() {
 		for _, unlinkSecond := range []bool{false, true} {
@@ -377,47 +376,109 @@ func TestSweepSharedSHA256FollowsOwner(t *testing.T) {
 					t.Fatalf("Sweep: %v", err)
 				}
 
+				wantRepointed := 0
 				if owner == dead.shardHash {
-					if res.DeletedSHA256Entries != 1 {
-						t.Fatalf("DeletedSHA256Entries = %d, want 1", res.DeletedSHA256Entries)
-					}
-					if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != "" {
-						t.Fatalf("sha256 entry = %q, %v; want removed", got, err)
-					}
-					if _, err := st.GetFileHashBySHA256(ctx, "default", sha256Digest(live.sha256Hex)); err == nil {
-						t.Fatal("GetFileHashBySHA256 still resolves after its entry was swept")
-					}
-				} else {
-					if res.DeletedSHA256Entries != 0 {
-						t.Fatalf("DeletedSHA256Entries = %d, want 0", res.DeletedSHA256Entries)
-					}
-					if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != live.shardHash {
-						t.Fatalf("sha256 entry = %q, %v; want %q", got, err, live.shardHash)
-					}
-					gotHash, err := st.GetFileHashBySHA256(ctx, "default", sha256Digest(live.sha256Hex))
-					if err != nil {
-						t.Fatalf("GetFileHashBySHA256: %v", err)
-					}
-					if gotHash != live.fileHash {
-						t.Fatalf("GetFileHashBySHA256 = %s, want %s", gotHash.String(), live.fileHash.String())
-					}
-					rc, err := st.GetReconstructedFile(ctx, "default", sha256Digest(live.sha256Hex))
-					if err != nil {
-						t.Fatalf("GetReconstructedFile: %v", err)
-					}
-					data, err := io.ReadAll(rc)
-					_ = rc.Close()
-					if err != nil || !bytes.Equal(data, content) {
-						t.Fatalf("reconstruction after sweep corrupted: %v", err)
-					}
+					wantRepointed = 1
+				}
+				if res.RepointedSHA256Entries != wantRepointed {
+					t.Fatalf("RepointedSHA256Entries = %d, want %d", res.RepointedSHA256Entries, wantRepointed)
+				}
+				if res.DeletedSHA256Entries != 0 {
+					t.Fatalf("DeletedSHA256Entries = %d, want 0", res.DeletedSHA256Entries)
 				}
 
-				// Either way the live file stays reachable by file hash.
+				// The entry now points at the live shard either way and the
+				// SHA-256 read path resolves through it.
+				if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != live.shardHash {
+					t.Fatalf("sha256 entry = %q, %v; want %q", got, err, live.shardHash)
+				}
+				gotHash, err := st.GetFileHashBySHA256(ctx, "default", sha256Digest(live.sha256Hex))
+				if err != nil {
+					t.Fatalf("GetFileHashBySHA256: %v", err)
+				}
+				if gotHash != live.fileHash {
+					t.Fatalf("GetFileHashBySHA256 = %s, want %s", gotHash.String(), live.fileHash.String())
+				}
+				rc, err := st.GetReconstructedFile(ctx, "default", sha256Digest(live.sha256Hex))
+				if err != nil {
+					t.Fatalf("GetReconstructedFile: %v", err)
+				}
+				data, err := io.ReadAll(rc)
+				_ = rc.Close()
+				if err != nil || !bytes.Equal(data, content) {
+					t.Fatalf("reconstruction after sweep corrupted: %v", err)
+				}
+
+				// The live file stays reachable by file hash too.
 				if _, err := st.GetShard(ctx, live.fileHash); err != nil {
 					t.Fatalf("GetShard(live): %v", err)
 				}
 			})
 		}
+	}
+}
+
+// TestSweepRepointsSharedChunks: two files share chunk A while each also has
+// its own chunk; sweeping one must repoint A's entry to the live shard when
+// the dead shard owned it, and delete the dead shard's exclusive entry.
+func TestSweepRepointsSharedChunks(t *testing.T) {
+	partA := []byte("chunk shared by both shards")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f1 := putGCFile(t, ctx, st, [][]byte{partA, []byte("unique to file one")})
+			f2 := putGCFile(t, ctx, st, [][]byte{partA, []byte("unique to file two")})
+			if f1.chunkHashes[0] != f2.chunkHashes[0] {
+				t.Fatal("test setup: shared part must map to one chunk hash")
+			}
+			// FileStorage keeps the first writer (f1), S3 the last (f2); unlink
+			// the owner so the repoint path runs on both backends.
+			owner, err := gcs.GetChunkIndexEntry(ctx, f1.chunkHashes[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			dead, live := f1, f2
+			if owner == f2.shardHash {
+				dead, live = f2, f1
+			} else if owner != f1.shardHash {
+				t.Fatalf("chunk entry owner = %q, want one of the two shards", owner)
+			}
+			// Warm the chunk cache so a repoint must evict it.
+			if _, err := st.GetShardByChunkHash(ctx, "default", f1.chunkHashes[0]); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Unlink(ctx, gcs, dead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Sweep(ctx, gcs, noGrace, false)
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+
+			if res.RepointedChunkEntries != 1 {
+				t.Fatalf("RepointedChunkEntries = %d, want 1", res.RepointedChunkEntries)
+			}
+
+			// The shared chunk entry now points at the surviving shard.
+			if got, err := gcs.GetChunkIndexEntry(ctx, live.chunkHashes[0]); err != nil || got != live.shardHash {
+				t.Fatalf("shared chunk entry = %q, %v; want %q", got, err, live.shardHash)
+			}
+			if _, err := st.GetShardByChunkHash(ctx, "default", live.chunkHashes[0]); err != nil {
+				t.Fatalf("GetShardByChunkHash(shared): %v", err)
+			}
+			// The dead shard's exclusive chunk entry is deleted, not repointed.
+			if got, err := gcs.GetChunkIndexEntry(ctx, dead.chunkHashes[1]); err != nil || got != "" {
+				t.Fatalf("exclusive chunk entry = %q, %v; want removed", got, err)
+			}
+			if res.DeletedChunkEntries != 1 {
+				t.Fatalf("DeletedChunkEntries = %d, want 1", res.DeletedChunkEntries)
+			}
+			assertFileIntact(t, ctx, st, live)
+		})
 	}
 }
 
@@ -623,6 +684,60 @@ func TestSweepSkipsReuploadCommittedBeforeDelete(t *testing.T) {
 	assertFileIntact(t, ctx, st, f)
 }
 
+// TestSweepShieldsCommitDuringShardDeletePhase: an upload sharing a doomed
+// xorb commits during the shard-delete phase, after the file-index re-check;
+// the final re-shield before the xorb deletes must keep the shared xorb.
+func TestSweepShieldsCommitDuringShardDeletePhase(t *testing.T) {
+	partA := []byte("shared payload the sweep must keep")
+	partB := []byte("unique to the late upload")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f1 := putGCFile(t, ctx, st, [][]byte{partA})
+			if _, err := Unlink(ctx, gcs, f1.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			// The hook fires inside sweepShard for the dead shard, i.e. after
+			// the recommitted re-check; file2 dedup-hits file1's only xorb.
+			var f2 gcFile
+			hooked := &hookedGCStore{GCStore: gcs}
+			hooked.beforeFileEntryGet = func() {
+				f2 = putGCFile(t, ctx, st, [][]byte{partA, partB})
+			}
+			res, err := Sweep(ctx, hooked, noGrace, false)
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if f2.shardHash == "" {
+				t.Fatal("hook did not run")
+			}
+
+			if got, want := sweptHashes(res.SweptShards), []string{f1.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if len(res.SweptXorbs) != 0 {
+				t.Fatalf("SweptXorbs = %v, want none", sweptHashes(res.SweptXorbs))
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f1.xorbHashes[0]); !ok {
+				t.Fatal("xorb shared with the late upload was swept")
+			}
+			assertFileIntact(t, ctx, st, f2)
+
+			// file1 itself stays swept.
+			if _, err := st.GetShard(ctx, f1.fileHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("GetShard(file1) = %v, want ErrNotExist", err)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f1.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("dead shard load = %v, want ErrNotExist", err)
+			}
+		})
+	}
+}
+
 // TestSweepShardVanishedBeforeDelete: the shard object disappears between
 // the walk and its delete; the sweep counts nothing for it and still sweeps
 // the now-unreferenced xorb.
@@ -724,5 +839,50 @@ func TestSweepGraceShieldsDedupedXorbs(t *testing.T) {
 	}
 	if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 		t.Fatal("shielded xorb removed")
+	}
+}
+
+// TestPutXorbDedupHitRefreshesModTime: a dedup-hit PutXorb must refresh the
+// stored xorb's mtime so reuse keeps it inside the GC grace window.
+func TestPutXorbDedupHitRefreshesModTime(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	part := []byte("dedup touch payload")
+	var encoded bytes.Buffer
+	encoder := xorb.NewEncoder(&encoded, true)
+	if _, err := encoder.Write(part); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	xorbHash := encoder.SummoryHash()
+	if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+
+	xorbPath := st.objectPath("xorbs", xorbHash.String())
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(xorbPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	inserted, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("second PutXorb reported an insert")
+	}
+	info, err := os.Stat(xorbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age := time.Since(info.ModTime()); age > time.Minute {
+		t.Fatalf("mtime not refreshed on dedup hit: age %v", age)
 	}
 }

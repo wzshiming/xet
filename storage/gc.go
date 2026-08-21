@@ -17,7 +17,10 @@ import (
 // Sweep to leave it alone even when unreferenced. PutShard commits the
 // index/files entry last, so an upload that has stored its shard and xorbs
 // but not yet committed looks unreferenced; the grace window keeps such
-// in-flight uploads out of a concurrent sweep's reach.
+// in-flight uploads out of a concurrent sweep's reach. PutXorb refreshes
+// timestamps on dedup hits, keeping reused xorbs inside the window; reused
+// shards are instead protected by the per-shard file-entry re-read right
+// before deletion.
 const DefaultSweepGrace = time.Hour
 
 // ErrGCBusy is returned when a sweep is already running on the same GC.
@@ -55,6 +58,11 @@ type GCStore interface {
 	GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error)
 	// DeleteSHA256IndexEntry removes the index/sha256 entry.
 	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error
+
+	// SetChunkIndexEntry force-writes the index/chunks entry for chunkHash.
+	SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error
+	// SetSHA256IndexEntry force-writes the index/sha256 entry.
+	SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error
 }
 
 // Unlink removes the file-index entry for fileHash, reporting whether it
@@ -82,6 +90,11 @@ type SweepResult struct {
 
 	DeletedChunkEntries  int `json:"deleted_chunk_entries"`
 	DeletedSHA256Entries int `json:"deleted_sha256_entries"`
+
+	// Repointed*Entries count dead-shard index entries redirected to a live
+	// shard that carries the same chunk or SHA-256.
+	RepointedChunkEntries  int `json:"repointed_chunk_entries"`
+	RepointedSHA256Entries int `json:"repointed_sha256_entries"`
 
 	// DanglingFileEntries are index/files entries whose shard object is
 	// missing; they are reported for repair, never deleted.
@@ -127,22 +140,24 @@ func (g *GC) Sweep(ctx context.Context, grace time.Duration, dryRun bool) (*Swee
 // any index/files entry points at it, and a xorb is live while any live
 // shard references it through reconstruction terms or CAS blocks. Dead
 // shards take their chunk and sha256 index entries with them; an entry is
-// only removed when it still points at the dead shard. Sweep only deletes,
-// never writes: when identical content stored under two chunkings has its
-// sha256 entry owned by the dead shard, the SHA-256 lookup is lost until a
-// re-ingest or a compaction rewrite restores it; the content itself stays
-// reachable through the surviving file hash.
+// only touched when it still points at the dead shard, and when some live
+// shard carries the same chunk or SHA-256 the entry is repointed to that
+// shard instead of deleted, so global dedup and SHA-256 lookups keep
+// working for the surviving content.
 //
 // Sweep does not lock out writers: work owned by someone else is skipped
 // instead. Unreferenced shards inside the grace window are treated as
 // uploads mid-commit and shield every xorb they reference (dedup may have
 // reused xorbs far older than the window), the dead sets are re-checked
-// against the file index once the walks finish, and each dead shard's own
-// file entries are read once more right before it is deleted. A commit
-// landing inside the remaining per-object window can still lose objects,
-// and an upload committed after the mark may see the chunk/sha256 entries
-// it reused from a dead shard removed (a dedup miss or a broken SHA-256
-// lookup, never lost file data); those residual races are accepted.
+// against the file index once the walks finish, each dead shard's own file
+// entries are read once more right before it is deleted, and once the
+// shard deletes finish every shard object still stored re-shields its
+// xorbs, covering commits that landed during that phase. A commit landing
+// between the final re-shield and an individual xorb delete can still lose
+// that xorb, and an upload committed after the mark may see the
+// chunk/sha256 entries it reused from a dead shard removed or repointed (a
+// dedup miss or a broken SHA-256 lookup, never lost file data); those
+// residual races are accepted.
 func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*SweepResult, error) {
 
 	if grace == 0 {
@@ -171,7 +186,9 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 
 	liveShards := map[string]bool{}
 	liveXorbs := map[string]bool{}
-	graceXorbs := map[string]bool{} // shielded by in-grace uncommitted shards
+	graceXorbs := map[string]bool{}    // shielded by in-grace uncommitted shards
+	chunkOwners := map[string]string{} // chunk hex -> live shard hash
+	shaOwners := map[string]string{}   // sha256 hex -> live shard hash
 	for shardHash, fileHashes := range liveFiles {
 		sh, err := st.GetShardByHash(ctx, shardHash)
 		if err != nil {
@@ -183,6 +200,7 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 		}
 		liveShards[shardHash] = true
 		markShardXorbs(sh, liveXorbs)
+		markShardOwners(sh, shardHash, chunkOwners, shaOwners)
 	}
 	slices.Sort(res.DanglingFileEntries)
 
@@ -249,6 +267,7 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
 		}
 		markShardXorbs(sh, liveXorbs)
+		markShardOwners(sh, shardHash, chunkOwners, shaOwners)
 	}
 	deadShards = slices.DeleteFunc(deadShards, func(obj SweptObject) bool {
 		return liveShards[obj.Hash]
@@ -263,7 +282,7 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 			res.ReclaimedBytes += obj.Size
 			continue
 		}
-		swept, err := sweepShard(ctx, st, obj.Hash, liveXorbs, res)
+		swept, err := sweepShard(ctx, st, obj.Hash, liveXorbs, chunkOwners, shaOwners, res)
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +291,30 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 		}
 		res.SweptShards = append(res.SweptShards, obj)
 		res.ReclaimedBytes += obj.Size
+	}
+	// Final re-shield: the shard-delete phase above can take long, so any
+	// shard object stored at this point (late commits, in-grace uploads,
+	// skipped shards) shields its xorbs from the delete loop below. Skipped
+	// in dry runs, where the undeleted dead shards would shield their own
+	// xorbs and empty the report.
+	if !dryRun {
+		err = st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
+			if liveShards[hash] {
+				return nil
+			}
+			sh, err := st.GetShardByHash(ctx, hash)
+			if err != nil {
+				if errors.Is(err, iofs.ErrNotExist) {
+					return nil
+				}
+				return fmt.Errorf("load shard %s: %w", hash, err)
+			}
+			markShardXorbs(sh, liveXorbs)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, obj := range deadXorbs {
 		// A shard skipped as re-committed shields its xorbs.
@@ -297,12 +340,13 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 // sweepShard removes one dead shard together with the chunk and sha256 index
 // entries it owns, reporting whether it did. A file entry pointing back at
 // the shard means a re-upload committed it after the mark: it is skipped and
-// its xorbs are shielded through liveXorbs. An entry is only removed while
-// it still points at the dead shard, which stays safe under either index
-// write discipline (FileStorage keeps the first writer, S3 overwrites).
-// Entries go first: a crash mid-way leaves a re-sweepable shard, never
-// entries pointing into nothing.
-func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map[string]bool, res *SweepResult) (bool, error) {
+// its xorbs are shielded through liveXorbs. An entry is only touched while
+// it still points at the dead shard: when a live shard carries the same
+// chunk or SHA-256 the entry is repointed to it, keeping dedup and SHA-256
+// lookups alive on backends whose index keeps the first writer; otherwise
+// it is deleted. Entries go first: a crash mid-way leaves a re-sweepable
+// shard, never entries pointing into nothing.
+func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map[string]bool, chunkOwners, shaOwners map[string]string, res *SweepResult) (bool, error) {
 	sh, err := st.GetShardByHash(ctx, shardHash)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
@@ -320,6 +364,7 @@ func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map
 		}
 		if current == shardHash {
 			markShardXorbs(sh, liveXorbs)
+			markShardOwners(sh, shardHash, chunkOwners, shaOwners)
 			return false, nil
 		}
 	}
@@ -331,6 +376,13 @@ func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map
 				return false, err
 			}
 			if current != shardHash {
+				continue
+			}
+			if owner, ok := chunkOwners[chunk.ChunkHash.String()]; ok {
+				if err := st.SetChunkIndexEntry(ctx, chunk.ChunkHash, owner); err != nil {
+					return false, err
+				}
+				res.RepointedChunkEntries++
 				continue
 			}
 			if err := st.DeleteChunkIndexEntry(ctx, chunk.ChunkHash); err != nil {
@@ -352,6 +404,13 @@ func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map
 		if current != shardHash {
 			continue
 		}
+		if owner, ok := shaOwners[key]; ok {
+			if err := st.SetSHA256IndexEntry(ctx, key, owner); err != nil {
+				return false, err
+			}
+			res.RepointedSHA256Entries++
+			continue
+		}
 		if err := st.DeleteSHA256IndexEntry(ctx, key); err != nil {
 			return false, err
 		}
@@ -370,5 +429,21 @@ func markShardXorbs(sh *shard.Shard, xorbs map[string]bool) {
 	}
 	for i := range sh.CASInfos {
 		xorbs[sh.CASInfos[i].CASHash.String()] = true
+	}
+}
+
+// markShardOwners records the live shard as a repoint target for every chunk
+// and SHA-256 it carries.
+func markShardOwners(sh *shard.Shard, shardHash string, chunkOwners, shaOwners map[string]string) {
+	for i := range sh.CASInfos {
+		for _, chunk := range sh.CASInfos[i].Chunks {
+			chunkOwners[chunk.ChunkHash.String()] = shardHash
+		}
+	}
+	for i := range sh.Files {
+		if sh.Files[i].MetadataExt == nil {
+			continue
+		}
+		shaOwners[sh.Files[i].MetadataExt.SHA256Hash.String()] = shardHash
 	}
 }
