@@ -343,11 +343,9 @@ func (fs *FileStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shar
 func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
-	// Check if xorb already exists
+	// Check if xorb already exists. Dedup hits leave the stored object,
+	// including its mod time, untouched.
 	if _, err := os.Stat(xorbPath); err == nil {
-		// Refresh the mtime so deduplicated reuse stays inside the GC grace window.
-		now := time.Now()
-		_ = os.Chtimes(xorbPath, now, now)
 		return false, nil // Already exists
 	}
 	if err := os.MkdirAll(filepath.Dir(xorbPath), 0755); err != nil {

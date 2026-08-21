@@ -17,10 +17,10 @@ import (
 // Sweep to leave it alone even when unreferenced. PutShard commits the
 // index/files entry last, so an upload that has stored its shard and xorbs
 // but not yet committed looks unreferenced; the grace window keeps such
-// in-flight uploads out of a concurrent sweep's reach. PutXorb refreshes
-// timestamps on dedup hits, keeping reused xorbs inside the window; reused
-// shards are instead protected by the per-shard file-entry re-read right
-// before deletion.
+// in-flight uploads out of a concurrent sweep's reach. Dedup hits do not
+// refresh object timestamps, so reused old xorbs are protected by the
+// re-checks against the file index and stored shards, not by the window;
+// reused shards by the per-shard file-entry re-read right before deletion.
 const DefaultSweepGrace = time.Hour
 
 // ErrGCBusy is returned when a sweep is already running on the same GC.

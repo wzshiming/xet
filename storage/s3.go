@@ -10,7 +10,6 @@ import (
 	"io"
 	iofs "io/fs"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -308,14 +307,7 @@ func (ss *S3Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHas
 	if _, exists, err := ss.headObject(ctx, key); err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
 	} else if exists {
-		// Best-effort self-copy refreshes LastModified so deduplicated reuse
-		// stays inside the GC grace window.
-		_, _ = ss.client.CopyObject(ctx, &s3.CopyObjectInput{
-			Bucket:            aws.String(ss.bucket),
-			Key:               aws.String(key),
-			CopySource:        aws.String(url.PathEscape(ss.bucket + "/" + key)),
-			MetadataDirective: types.MetadataDirectiveReplace,
-		})
+		// Dedup hits leave the stored object, including LastModified, untouched.
 		return false, nil // Already exists
 	}
 
