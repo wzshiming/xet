@@ -62,6 +62,7 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
+	h.root.HandleFunc("/internal/gc/compact", h.handleGCCompact).Methods(http.MethodPost)
 
 	h.root.NotFoundHandler = h.next
 }
@@ -154,6 +155,35 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// handleGCCompact handles POST /internal/gc/compact?dry_run=: it repacks (or, with dry_run, plans) all live chunks into dense xorbs; superseded objects are left for the next sweep.
+func (h *Handler) handleGCCompact(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+
+	var dryRun bool
+	var err error
+	if v := r.URL.Query().Get("dry_run"); v != "" {
+		dryRun, err = strconv.ParseBool(v)
+		if err != nil {
+			http.Error(w, "Invalid dry_run value", http.StatusBadRequest)
+			return
+		}
+	}
+	result, err := h.gc.Compact(r.Context(), dryRun)
+	if err != nil {
+		if errors.Is(err, storage.ErrGCBusy) {
+			http.Error(w, "GC already running", http.StatusConflict)
+			return
+		}
+		http.Error(w, "Compact failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

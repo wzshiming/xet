@@ -91,6 +91,42 @@ func ScanChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
 	}
 }
 
+// ScanChunkUnpackedSizes scans every chunk header and returns each chunk's
+// uncompressed byte size. It rewinds to the stream start first and stops at
+// EOF (chunk-only format) or at the footer.
+func ScanChunkUnpackedSizes(r io.ReadSeeker) ([]uint32, error) {
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind xorb: %w", err)
+	}
+
+	var sizes []uint32
+	var headerBuf [8]byte
+
+	for {
+		n, err := io.ReadFull(r, headerBuf[:])
+		if err == io.EOF {
+			return sizes, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read chunk header: %w", err)
+		}
+
+		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
+			return sizes, nil
+		}
+
+		if len(sizes) >= xet.MaxChunksPerXorb {
+			return nil, fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
+		}
+
+		compressedSize := int64(headerBuf[1]) | int64(headerBuf[2])<<8 | int64(headerBuf[3])<<16
+		if _, err := r.Seek(compressedSize, io.SeekCurrent); err != nil {
+			return nil, fmt.Errorf("seek past chunk data: %w", err)
+		}
+		sizes = append(sizes, uint32(headerBuf[5])|uint32(headerBuf[6])<<8|uint32(headerBuf[7])<<16)
+	}
+}
+
 // ChunkDataRangeFromOffsets computes the same inclusive [startByte, endByte]
 // range as ChunkDataRange from cumulative packed end-offsets, without stream
 // access.

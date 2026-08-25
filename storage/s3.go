@@ -51,12 +51,16 @@ type S3Storage struct {
 	chunkIndex   *lru.Cache // bounded chunk hash -> shard hash
 	sha256Index  *lru.Cache // bounded SHA-256 -> shard hash
 	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
+	sizesIndex   *lru.Cache // bounded xorb hash -> []uint32 unpacked chunk sizes
 
 	fileMut    sync.Mutex // guards fileIndex
 	shardMut   sync.Mutex // guards shardIndex
 	chunkMut   sync.Mutex // guards chunkIndex
 	sha256Mut  sync.Mutex // guards sha256Index
 	offsetsMut sync.Mutex // guards offsetsIndex
+	sizesMut   sync.Mutex // guards sizesIndex
+
+	fileGen uint64 // guarded by fileMut; bumped on eviction so stale cache fills are dropped
 
 	// endpoint, region and pathStyle configure the lazily created client
 	// when one is not injected directly.
@@ -162,6 +166,7 @@ func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 		chunkIndex:    lru.New(defaultChunkCacheSize),
 		sha256Index:   lru.New(defaultSHA256CacheSize),
 		offsetsIndex:  lru.New(defaultOffsetsCacheSize),
+		sizesIndex:    lru.New(defaultOffsetsCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -342,7 +347,7 @@ func (ss *S3Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHa
 		return nil, fmt.Errorf("check xorb object: %w", err)
 	}
 	if !exists {
-		return nil, fmt.Errorf("xorb not found")
+		return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
 	}
 	return httpseek.NewOpenSeeker(&s3Opener{ctx: ctx, storage: ss, key: key, size: size}), nil
 }
@@ -400,6 +405,37 @@ func (ss *S3Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xe
 // the first read.
 func (ss *S3Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
 	return ss.xorbChunkOffsets(ctx, xorbHash)
+}
+
+// GetXorbChunkUnpackedSizes returns each chunk's unpacked size in the xorb,
+// from the in-memory cache, the xorb footer, or a header scan for footer-less
+// xorbs; cached after the first read. The returned slice is shared; callers
+// must not mutate it.
+func (ss *S3Storage) GetXorbChunkUnpackedSizes(ctx context.Context, xorbHash xet.XorbHash) ([]uint32, error) {
+	ss.sizesMut.Lock()
+	if v, ok := ss.sizesIndex.Get(xorbHash); ok {
+		ss.sizesMut.Unlock()
+		return v.([]uint32), nil
+	}
+	ss.sizesMut.Unlock()
+
+	f, err := ss.GetXorbReadSeekCloser(ctx, "", xorbHash)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sizes, err := xorb.ReadChunkUnpackedSizes(f)
+	if errors.Is(err, xorb.ErrNoFooter) {
+		sizes, err = xorb.ScanChunkUnpackedSizes(f)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read xorb chunk sizes: %w", err)
+	}
+
+	ss.sizesMut.Lock()
+	ss.sizesIndex.Add(xorbHash, sizes)
+	ss.sizesMut.Unlock()
+	return sizes, nil
 }
 
 // hasFile checks whether a file hash already has a shard mapping.
@@ -483,30 +519,9 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		s.Files[i].Flags |= shard.FileWithMetadataExt
 	}
 
-	// Serialize without the footer (it embeds a creation timestamp), so the
-	// stored bytes — and the sha256 hash addressing them — are deterministic
-	// for identical shard content.
-	r, err := s.Encode(false)
+	shardHash, wasInserted, err := ss.putShardObject(ctx, s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-	var encoded bytes.Buffer
-	if _, err := io.Copy(&encoded, r); err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-	shardHash, err := computeShardHashFromReader(bytes.NewReader(encoded.Bytes()))
-	if err != nil {
-		return false, fmt.Errorf("hash shard: %w", err)
-	}
-
-	shardKey := ss.objectKey("shards", shardHash)
-	wasInserted := true
-	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
-		return false, fmt.Errorf("check shard object: %w", err)
-	} else if exists {
-		wasInserted = false
-	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded.Bytes())); err != nil {
-		return false, fmt.Errorf("upload shard: %w", err)
+		return false, err
 	}
 
 	// The index/files/ index is written last: hasFile treats it as the commit
@@ -531,9 +546,51 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
+		// The commit is an index mutation: drop any racing stale cache fill.
+		ss.fileMut.Lock()
+		ss.fileIndex.Remove(file.FileHash)
+		ss.fileGen++
+		ss.fileMut.Unlock()
 	}
 
 	return wasInserted, nil
+}
+
+// putShardObject stores s's footer-less bytes under their content hash, skipping existing objects, and returns that hash.
+func (ss *S3Storage) putShardObject(ctx context.Context, s *shard.Shard) (string, bool, error) {
+	// Serialize without the footer (it embeds a creation timestamp), so the
+	// stored bytes — and the sha256 hash addressing them — are deterministic
+	// for identical shard content.
+	r, err := s.Encode(false)
+	if err != nil {
+		return "", false, fmt.Errorf("serialize shard: %w", err)
+	}
+	var encoded bytes.Buffer
+	if _, err := io.Copy(&encoded, r); err != nil {
+		return "", false, fmt.Errorf("serialize shard: %w", err)
+	}
+	shardHash, err := computeShardHashFromReader(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		return "", false, fmt.Errorf("hash shard: %w", err)
+	}
+
+	shardKey := ss.objectKey("shards", shardHash)
+	wasInserted := true
+	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
+		return "", false, fmt.Errorf("check shard object: %w", err)
+	} else if exists {
+		wasInserted = false
+	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded.Bytes())); err != nil {
+		return "", false, fmt.Errorf("upload shard: %w", err)
+	}
+
+	return shardHash, wasInserted, nil
+}
+
+// PutShardObject stores the shard object by content hash without touching any index, returning the stored shard hash.
+func (ss *S3Storage) PutShardObject(ctx context.Context, s *shard.Shard) (string, error) {
+	shardHash, _, err := ss.putShardObject(ctx, s)
+	return shardHash, err
 }
 
 func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -719,9 +776,10 @@ func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.File
 			return false, fmt.Errorf("delete file index: %w", err)
 		}
 	}
-	// Evicting after the delete narrows but does not close the re-cache window.
+	// The generation bump drops any concurrent cache fill that read the old entry.
 	ss.fileMut.Lock()
 	ss.fileIndex.Remove(fileHash)
+	ss.fileGen++
 	ss.fileMut.Unlock()
 	return exists, nil
 }
@@ -737,6 +795,18 @@ func (ss *S3Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHas
 		return "", fmt.Errorf("read file index: %w", err)
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+// SetFileIndexEntry force-writes the index/files entry for fileHash.
+func (ss *S3Storage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write file index: %w", err)
+	}
+	ss.fileMut.Lock()
+	ss.fileIndex.Remove(fileHash)
+	ss.fileGen++
+	ss.fileMut.Unlock()
+	return nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -757,6 +827,9 @@ func (ss *S3Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) erro
 	ss.offsetsMut.Lock()
 	ss.offsetsIndex.Remove(xorbHash)
 	ss.offsetsMut.Unlock()
+	ss.sizesMut.Lock()
+	ss.sizesIndex.Remove(xorbHash)
+	ss.sizesMut.Unlock()
 	if err != nil {
 		return fmt.Errorf("delete xorb: %w", err)
 	}
@@ -857,6 +930,7 @@ func (ss *S3Storage) GetShard(ctx context.Context, fileHash xet.FileHash) (*shar
 func (ss *S3Storage) getShardByFileHash(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error) {
 	ss.fileMut.Lock()
 	value, exists := ss.fileIndex.Get(fileHash)
+	gen := ss.fileGen
 	ss.fileMut.Unlock()
 	if exists {
 		return ss.getShardByHash(ctx, value.(string))
@@ -867,10 +941,18 @@ func (ss *S3Storage) getShardByFileHash(ctx context.Context, fileHash xet.FileHa
 		return nil, fmt.Errorf("read file index: %w", err)
 	}
 	shardHash := strings.TrimSpace(string(data))
-	ss.fileMut.Lock()
-	ss.fileIndex.Add(fileHash, shardHash)
-	ss.fileMut.Unlock()
+	ss.fillFileIndex(fileHash, shardHash, gen)
 	return ss.getShardByHash(ctx, shardHash)
+}
+
+// fillFileIndex caches a file->shard mapping read at generation gen, unless a
+// concurrent eviction made that read stale.
+func (ss *S3Storage) fillFileIndex(fileHash xet.FileHash, shardHash string, gen uint64) {
+	ss.fileMut.Lock()
+	if ss.fileGen == gen {
+		ss.fileIndex.Add(fileHash, shardHash)
+	}
+	ss.fileMut.Unlock()
 }
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)

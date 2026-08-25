@@ -20,11 +20,21 @@ var ErrNoFooter = errors.New("xorb has no footer")
 // length field (4).
 const minFooterSize = 96
 
-// ReadChunkOffsets extracts the cumulative packed end-offset (including the
-// 8-byte per-chunk header) of every chunk from the footer of a full-format
-// xorb, without scanning chunk data. The reader may be at any position.
-// Returns ErrNoFooter when the stream does not end in a parseable footer.
-func ReadChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
+// xorbFooter is a located and structurally validated footer: its raw bytes
+// plus the offsets of the per-chunk sections inside them.
+type xorbFooter struct {
+	buf          []byte
+	numChunks    int
+	hashBase     int   // first chunk hash (32 bytes each)
+	packedBase   int   // first cumulative packed end-offset (4 bytes each)
+	unpackedBase int   // first cumulative unpacked end-offset (4 bytes each)
+	footerStart  int64 // stream offset where the footer begins
+}
+
+// readFooter reads and validates the trailing footer of a full-format xorb.
+// The reader may be at any position. Returns ErrNoFooter when the stream does
+// not end in a parseable footer.
+func readFooter(r io.ReadSeeker) (*xorbFooter, error) {
 	size, err := r.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, fmt.Errorf("seek xorb end: %w", err)
@@ -84,11 +94,29 @@ func ReadChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
 		return nil, ErrNoFooter
 	}
 
-	packedBase := bOff + 12
-	offsets := make([]uint64, numChunks)
+	return &xorbFooter{
+		buf:          buf,
+		numChunks:    numChunks,
+		hashBase:     hOff + 12,
+		packedBase:   bOff + 12,
+		unpackedBase: bOff + 12 + numChunks*4,
+		footerStart:  footerStart,
+	}, nil
+}
+
+// ReadChunkOffsets extracts the cumulative packed end-offset (including the
+// 8-byte per-chunk header) of every chunk from the footer of a full-format
+// xorb, without scanning chunk data. The reader may be at any position.
+// Returns ErrNoFooter when the stream does not end in a parseable footer.
+func ReadChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
+	f, err := readFooter(r)
+	if err != nil {
+		return nil, err
+	}
+	offsets := make([]uint64, f.numChunks)
 	prev := uint64(0)
 	for i := range offsets {
-		off := uint64(binary.LittleEndian.Uint32(buf[packedBase+i*4:]))
+		off := uint64(binary.LittleEndian.Uint32(f.buf[f.packedBase+i*4:]))
 		// Each chunk contributes at least its 8-byte header.
 		if off < prev+8 {
 			return nil, ErrNoFooter
@@ -97,8 +125,44 @@ func ReadChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
 		prev = off
 	}
 	// The final offset must equal the size of the chunk-data region.
-	if numChunks > 0 && int64(prev) != footerStart {
+	if f.numChunks > 0 && int64(prev) != f.footerStart {
 		return nil, ErrNoFooter
 	}
 	return offsets, nil
+}
+
+// ReadChunkUnpackedSizes extracts every chunk's uncompressed byte size from
+// the footer's cumulative unpacked offsets. The reader may be at any position.
+// Returns ErrNoFooter when the stream does not end in a parseable footer.
+func ReadChunkUnpackedSizes(r io.ReadSeeker) ([]uint32, error) {
+	f, err := readFooter(r)
+	if err != nil {
+		return nil, err
+	}
+	sizes := make([]uint32, f.numChunks)
+	prev := uint64(0)
+	for i := range sizes {
+		off := uint64(binary.LittleEndian.Uint32(f.buf[f.unpackedBase+i*4:]))
+		if off < prev || off-prev > xet.MaxChunkSize {
+			return nil, ErrNoFooter
+		}
+		sizes[i] = uint32(off - prev)
+		prev = off
+	}
+	return sizes, nil
+}
+
+// ReadChunkHashes extracts every chunk's hash from the footer's XBLBHSH
+// section. The reader may be at any position. Returns ErrNoFooter when the
+// stream does not end in a parseable footer.
+func ReadChunkHashes(r io.ReadSeeker) ([]xet.ChunkHash, error) {
+	f, err := readFooter(r)
+	if err != nil {
+		return nil, err
+	}
+	hashes := make([]xet.ChunkHash, f.numChunks)
+	for i := range hashes {
+		hashes[i] = *(*xet.ChunkHash)(f.buf[f.hashBase+i*32:])
+	}
+	return hashes, nil
 }

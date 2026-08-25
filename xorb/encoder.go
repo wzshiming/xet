@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
@@ -142,6 +143,16 @@ func (e *Encoder) SummoryHash() xet.XorbHash {
 		e.xorbHash = &hash
 	}
 	return *e.xorbHash
+}
+
+// ChunkHashes returns a copy of the hashes of the chunks written so far.
+func (e *Encoder) ChunkHashes() []xet.ChunkHash {
+	return slices.Clone(e.chunkHashes)
+}
+
+// ChunkSizes returns a copy of the unpacked sizes of the chunks written so far.
+func (e *Encoder) ChunkSizes() []uint64 {
+	return slices.Clone(e.chunkSizes)
 }
 
 // writeFooter serializes and writes the full CasObjectInfo footer.

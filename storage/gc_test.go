@@ -841,3 +841,131 @@ func TestSweepGraceShieldsDedupedXorbs(t *testing.T) {
 		t.Fatal("shielded xorb removed")
 	}
 }
+
+func TestSetFileIndexEntryOverwritesAndEvictsCache(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			fileA := putGCFile(t, ctx, st, [][]byte{[]byte("set file index entry a")})
+			fileB := putGCFile(t, ctx, st, [][]byte{[]byte("set file index entry b")})
+
+			// Warm the file index cache so the overwrite must evict it.
+			if _, err := st.GetShard(ctx, fileA.fileHash); err != nil {
+				t.Fatalf("GetShard before overwrite: %v", err)
+			}
+
+			if err := gcs.SetFileIndexEntry(ctx, fileA.fileHash, fileB.shardHash); err != nil {
+				t.Fatalf("SetFileIndexEntry: %v", err)
+			}
+
+			if got, err := gcs.GetFileIndexEntry(ctx, fileA.fileHash); err != nil || got != fileB.shardHash {
+				t.Fatalf("GetFileIndexEntry = %q, %v; want %q", got, err, fileB.shardHash)
+			}
+
+			// The cached read path must observe the new mapping.
+			sh, err := st.GetShard(ctx, fileA.fileHash)
+			if err != nil {
+				t.Fatalf("GetShard after overwrite: %v", err)
+			}
+			if len(sh.Files) != 1 {
+				t.Fatalf("shard after overwrite has %d files, want 1", len(sh.Files))
+			}
+			if sh.Files[0].FileHash != fileB.fileHash {
+				t.Fatalf("GetShard after overwrite returned shard for %s, want %s",
+					sh.Files[0].FileHash.String(), fileB.fileHash.String())
+			}
+		})
+	}
+}
+
+func TestPutShardObjectWritesOnlyShardObject(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			part := []byte("put shard object payload")
+			var encoded bytes.Buffer
+			encoder := xorb.NewEncoder(&encoded, true)
+			if _, err := encoder.Write(part); err != nil {
+				t.Fatal(err)
+			}
+			if err := encoder.Close(); err != nil {
+				t.Fatal(err)
+			}
+			xorbHash := encoder.SummoryHash()
+			chunkHash := xet.ComputeChunkHash(part)
+			fileHash := xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(part))})
+
+			shardObj := shard.NewShard()
+			shardObj.AddCASBlock(shard.CASBlock{
+				CASHash: xorbHash,
+				Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(part))}},
+			})
+			shardObj.AddFile(shard.FileBlock{
+				FileHash: fileHash,
+				Entries: []shard.FileDataSequenceEntry{{
+					CASHash: xorbHash, UnpackedSegBytes: uint32(len(part)), ChunkIndexEnd: 1,
+				}},
+			})
+
+			// PutShard into a separate store to learn the hash it assigns to this exact content (it fills in MetadataExt).
+			ref := backend.newStore(t)
+			if _, err := ref.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+				t.Fatal(err)
+			}
+			if inserted, err := ref.PutShard(ctx, shardObj); err != nil || !inserted {
+				t.Fatalf("PutShard = %v, %v", inserted, err)
+			}
+			wantHash, err := ref.(GCStore).GetFileIndexEntry(ctx, fileHash)
+			if err != nil || wantHash == "" {
+				t.Fatalf("stored shard hash = %q, %v", wantHash, err)
+			}
+
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+			gotHash, err := gcs.PutShardObject(ctx, shardObj)
+			if err != nil {
+				t.Fatalf("PutShardObject: %v", err)
+			}
+			if gotHash != wantHash {
+				t.Fatalf("PutShardObject hash = %q, want PutShard's %q", gotHash, wantHash)
+			}
+
+			again, err := gcs.PutShardObject(ctx, shardObj)
+			if err != nil || again != gotHash {
+				t.Fatalf("second PutShardObject = %q, %v; want %q", again, err, gotHash)
+			}
+
+			loaded, err := gcs.GetShardByHash(ctx, gotHash)
+			if err != nil {
+				t.Fatalf("GetShardByHash: %v", err)
+			}
+			r, err := loaded.Encode(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reHash, err := computeShardHashFromReader(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reHash != gotHash {
+				t.Fatalf("stored shard re-encodes to %q, want %q", reHash, gotHash)
+			}
+
+			// No index side effects.
+			if got, err := gcs.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+				t.Fatalf("file index entry = %q, %v; want empty", got, err)
+			}
+			if got, err := gcs.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != "" {
+				t.Fatalf("chunk index entry = %q, %v; want empty", got, err)
+			}
+			digest := sha256.Sum256(part)
+			if got, err := gcs.GetSHA256IndexEntry(ctx, hex.EncodeToString(digest[:])); err != nil || got != "" {
+				t.Fatalf("sha256 index entry = %q, %v; want empty", got, err)
+			}
+		})
+	}
+}

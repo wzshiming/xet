@@ -20,6 +20,15 @@ Implemented in this repository:
 - Hugging Face token/LFS based integration helpers
 - Conformance and unit tests for key protocol paths
 
+## Internal Management Endpoints
+
+Started with `-internal`, `xetd` serves unauthenticated management endpoints alongside the CAS API (use only on trusted networks):
+
+- `GET /internal/files` — list stored files grouped by content SHA-256.
+- `DELETE /internal/files/xet/{hash}` — unlink one file-index entry; its objects are reclaimed by the next sweep.
+- `POST /internal/gc/sweep?dry_run=&grace=` — remove shards and xorbs no file-index entry keeps alive. `dry_run=true` only reports what would be removed. `grace` protects recently written objects: omitted defaults to 1h, `0` disables the window, malformed or negative values return `400`.
+- `POST /internal/gc/compact?dry_run=` — aggregate live chunks into dense xorbs; superseded objects are reclaimed by the next sweep. Runs single-flight with sweep (`409` while one is running), and a pass should complete within the sweep grace window.
+
 ## Compatibility Notes
 
 - This project aims to follow the draft spec where possible.

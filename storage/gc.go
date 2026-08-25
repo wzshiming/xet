@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"slices"
 	"sync"
@@ -23,7 +24,8 @@ import (
 // reused shards by the per-shard file-entry re-read right before deletion.
 const DefaultSweepGrace = time.Hour
 
-// ErrGCBusy is returned when a sweep is already running on the same GC.
+// ErrGCBusy is returned when a sweep or compaction is already running on
+// the same GC.
 var ErrGCBusy = errors.New("gc already running")
 
 // GCStore is the per-backend surface needed to unlink files and sweep
@@ -40,7 +42,8 @@ type GCStore interface {
 	// "" when the entry is absent, bypassing caches.
 	GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error)
 	// DeleteFileIndexEntry removes the index/files entry for fileHash,
-	// reporting whether it existed.
+	// reporting whether it existed. Callers racing a compact cutover must
+	// hold GC.entryMu (use GC.Unlink).
 	DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error)
 	// DeleteShard removes a stored shard object.
 	DeleteShard(ctx context.Context, shardHash string) error
@@ -63,6 +66,20 @@ type GCStore interface {
 	SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error
 	// SetSHA256IndexEntry force-writes the index/sha256 entry.
 	SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error
+	// SetFileIndexEntry force-writes the index/files entry for fileHash.
+	// Callers racing a compact cutover must hold GC.entryMu.
+	SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error
+
+	// PutShardObject stores the shard object by content hash without touching any index, returning the stored shard hash.
+	PutShardObject(ctx context.Context, s *shard.Shard) (string, error)
+	// PutXorb stores an xorb by its hash, skipping existing objects.
+	PutXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash, r io.Reader) (bool, error)
+	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data.
+	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
+	// GetXorbChunkUnpackedSizes returns each chunk's unpacked byte size in
+	// the xorb; cached after the first read. The returned slice is shared;
+	// callers must not mutate it.
+	GetXorbChunkUnpackedSizes(ctx context.Context, xorbHash xet.XorbHash) ([]uint32, error)
 }
 
 // Unlink removes the file-index entry for fileHash, reporting whether it
@@ -71,6 +88,8 @@ type GCStore interface {
 // stay until a Sweep proves the shard unreferenced. Until then the content
 // remains reconstructable through its SHA-256 whenever another file keeps
 // the shard alive.
+// When compaction may run concurrently, unlink through GC.Unlink instead:
+// file-index mutations must hold its entryMu.
 func Unlink(ctx context.Context, st GCStore, fileHash xet.FileHash) (bool, error) {
 	return st.DeleteFileIndexEntry(ctx, fileHash)
 }
@@ -107,13 +126,18 @@ type SweepResult struct {
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 }
 
-// GC serializes sweeps over one store within a single process: concurrent
-// Sweep calls fail fast with ErrGCBusy instead of queueing. Nothing
-// serializes sweepers across processes; deployments sharing a store must
-// run at most one sweeper.
+// GC serializes sweeps and compactions over one store within a single
+// process: concurrent Sweep and Compact calls fail fast with ErrGCBusy
+// instead of queueing. Nothing serializes sweepers across processes;
+// deployments sharing a store must run at most one sweeper.
 type GC struct {
 	st GCStore
 	mu sync.Mutex
+	// entryMu serializes index/files writes between Unlink and a compact
+	// cutover so a repoint can never resurrect a just-unlinked file.
+	// Two writers bypass it: PutShard's index/files commit (harmless: new
+	// files or identical re-commits) and package Unlink (use GC.Unlink when compaction may run).
+	entryMu sync.Mutex
 }
 
 // NewGC creates a GC coordinator over st.
@@ -122,7 +146,10 @@ func NewGC(st GCStore) *GC {
 }
 
 // Unlink removes the file-index entry for fileHash; see the package Unlink.
+// Holding entryMu closes the compact-cutover resurrection race in-process.
 func (g *GC) Unlink(ctx context.Context, fileHash xet.FileHash) (bool, error) {
+	g.entryMu.Lock()
+	defer g.entryMu.Unlock()
 	return Unlink(ctx, g.st, fileHash)
 }
 
@@ -134,6 +161,41 @@ func (g *GC) Sweep(ctx context.Context, grace time.Duration, dryRun bool) (*Swee
 	}
 	defer g.mu.Unlock()
 	return Sweep(ctx, g.st, grace, dryRun)
+}
+
+// Compact runs one whole-store compaction pass under the same single-flight
+// lock as Sweep: all live chunks are repacked into fresh dense xorbs and
+// every live shard is rewritten by pure term remapping and repointed.
+// Nothing is deleted and the chunk/sha256 indexes stay untouched; superseded
+// objects are left for a later Sweep. A dry run stops after planning.
+func (g *GC) Compact(ctx context.Context, dryRun bool) (*CompactResult, error) {
+	if !g.mu.TryLock() {
+		return nil, ErrGCBusy
+	}
+	defer g.mu.Unlock()
+
+	plan, err := planCompact(ctx, g.st)
+	if err != nil {
+		return nil, err
+	}
+	if dryRun {
+		return plan.dryRunResult(), nil
+	}
+	result := plan.dryRunResult()
+	result.DryRun = false
+	pack, err := packXorbs(ctx, g.st, plan)
+	if err != nil {
+		return nil, err
+	}
+	result.XorbsWritten = pack.xorbsWritten
+	result.XorbBytesWritten = pack.xorbBytesWritten
+	result.UnverifiedChunks = pack.unverifiedChunks
+	// Duplicate-content bins collapse to one stored object; report the distinct count.
+	result.EstimatedNewXorbs = len(pack.xorbs)
+	if err := cutover(ctx, g.st, &g.entryMu, plan, pack, result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // Sweep is a mark-and-sweep pass at shard granularity: a shard is live while

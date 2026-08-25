@@ -6,10 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -230,5 +234,151 @@ func TestGCEndpointsNotImplemented(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("sweep status = %d, want %d", rec.Code, http.StatusNotImplemented)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("compact status = %d, want %d", rec.Code, http.StatusNotImplemented)
+	}
+}
+
+// snapshotStore captures every stored shard, xorb, and file-index entry.
+func snapshotStore(t *testing.T, ctx context.Context, gcs storage.GCStore) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := gcs.WalkShards(ctx, func(hash string, size int64, modTime time.Time) error {
+		snap["shard/"+hash] = fmt.Sprintf("%d@%d", size, modTime.UnixNano())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gcs.WalkXorbs(ctx, func(hash string, size int64, modTime time.Time) error {
+		snap["xorb/"+hash] = fmt.Sprintf("%d@%d", size, modTime.UnixNano())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = gcs.WalkFileIndex(ctx, func(fileHash, shardHash string) error {
+		snap["file/"+fileHash] = shardHash
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+func TestGCCompactEndpoint(t *testing.T) {
+	ctx := context.Background()
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileA := putTestFile(t, ctx, stor, []byte("compact endpoint content a"))
+	fileB := putTestFile(t, ctx, stor, []byte("compact endpoint content b"))
+	handler := NewHandler(WithStorage(stor))
+
+	// Dry run reports the plan but writes nothing.
+	before := snapshotStore(t, ctx, stor)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact?dry_run=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dry run status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	var result storage.CompactResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode dry run: %v", err)
+	}
+	if !result.DryRun || result.SourceXorbs != 2 || result.EstimatedNewXorbs != 1 || result.XorbsWritten != 0 {
+		t.Fatalf("dry run result = %+v", result)
+	}
+	if after := snapshotStore(t, ctx, stor); !reflect.DeepEqual(before, after) {
+		t.Fatalf("store changed across a dry run:\nbefore: %v\nafter:  %v", before, after)
+	}
+
+	// The real run merges the two single-chunk xorbs into one dense xorb.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compact status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.CompactResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode compact: %v", err)
+	}
+	if result.DryRun || result.XorbsWritten != 1 || result.ShardsRewritten != 2 || result.FilesRepointed != 2 {
+		t.Fatalf("compact result = %+v", result)
+	}
+	for _, fileHash := range []xet.FileHash{fileA, fileB} {
+		if _, err := stor.GetShard(ctx, fileHash); err != nil {
+			t.Fatalf("GetShard(%s) after compact: %v", fileHash.String(), err)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact?dry_run=bogus", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bogus dry_run status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// blockingStore stalls the first WalkFileIndex until released, keeping the handler's GC single-flight lock held.
+type blockingStore struct {
+	*storage.FileStorage
+	enterOnce sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (b *blockingStore) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	b.enterOnce.Do(func() { close(b.entered) })
+	<-b.release
+	return b.FileStorage.WalkFileIndex(ctx, fn)
+}
+
+func TestGCCompactEndpointBusy(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putTestFile(t, ctx, fs, []byte("busy compact content"))
+	bs := &blockingStore{FileStorage: fs, entered: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(bs.release) }) }
+	t.Cleanup(release)
+	handler := NewHandler(WithStorage(bs))
+
+	// A sweep stalls inside its first walk, holding the GC lock.
+	sweepDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+		sweepDone <- rec
+	}()
+	<-bs.entered
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("compact while sweeping status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+
+	release()
+	if rec := <-sweepDone; rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The lock is free again: the same request now succeeds.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/compact", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("compact after sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
 }

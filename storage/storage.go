@@ -65,6 +65,7 @@ type FileStorage struct {
 	sha256Index  *lru.Cache // bounded SHA-256 -> shard hash
 	xorbIndex    *lru.Cache // bounded xorb hash -> *xorbFile
 	offsetsIndex *lru.Cache // bounded xorb hash -> []uint64 packed chunk end-offsets
+	sizesIndex   *lru.Cache // bounded xorb hash -> []uint32 unpacked chunk sizes
 
 	fileMut    sync.Mutex // guards fileIndex
 	shardMut   sync.Mutex // guards shardIndex
@@ -72,6 +73,9 @@ type FileStorage struct {
 	sha256Mut  sync.Mutex // guards sha256Index
 	xorbMut    sync.Mutex // guards xorbIndex
 	offsetsMut sync.Mutex // guards offsetsIndex
+	sizesMut   sync.Mutex // guards sizesIndex
+
+	fileGen uint64 // guarded by fileMut; bumped on eviction so stale cache fills are dropped
 }
 
 // xorbFile wraps an open xorb handle with its own mutex so that only uses of
@@ -155,6 +159,7 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 		sha256Index:  lru.New(defaultSHA256CacheSize),
 		xorbIndex:    lru.New(defaultXorbCacheSize),
 		offsetsIndex: lru.New(defaultOffsetsCacheSize),
+		sizesIndex:   lru.New(defaultOffsetsCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -223,6 +228,7 @@ func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
 func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 	fs.fileMut.Lock()
 	value, exists := fs.fileIndex.Get(fileHash)
+	gen := fs.fileGen
 	fs.fileMut.Unlock()
 	if exists {
 		return fs.getShardByHash(value.(string))
@@ -234,10 +240,18 @@ func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
 		return nil, fmt.Errorf("read file index: %w", err)
 	}
 	shardHash := strings.TrimSpace(string(indexData))
-	fs.fileMut.Lock()
-	fs.fileIndex.Add(fileHash, shardHash)
-	fs.fileMut.Unlock()
+	fs.fillFileIndex(fileHash, shardHash, gen)
 	return fs.getShardByHash(shardHash)
+}
+
+// fillFileIndex caches a file->shard mapping read at generation gen, unless a
+// concurrent eviction made that read stale.
+func (fs *FileStorage) fillFileIndex(fileHash xet.FileHash, shardHash string, gen uint64) {
+	fs.fileMut.Lock()
+	if fs.fileGen == gen {
+		fs.fileIndex.Add(fileHash, shardHash)
+	}
+	fs.fileMut.Unlock()
 }
 
 // shardHeaderSize is the fixed shard header; its last 8 bytes carry FooterSize.
@@ -381,7 +395,7 @@ func (fs *FileStorage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorb
 	f, err := os.Open(xorbPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("xorb not found")
+			return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
 		}
 		return nil, fmt.Errorf("open xorb file: %w", err)
 	}
@@ -447,61 +461,9 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		s.Files[i].Flags |= shard.FileWithMetadataExt
 	}
 
-	// Serialize without the footer (it embeds a creation timestamp), so the
-	// stored bytes — and the sha256 hash addressing them — are deterministic
-	// for identical shard content.
-	r, err := s.Encode(false)
+	shardHash, wasInserted, err := fs.putShardObject(ctx, s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-
-	shardsDir := filepath.Join(fs.basePath, "shards")
-	f, err := os.CreateTemp(shardsDir, ".shard-*")
-	if err != nil {
-		return false, fmt.Errorf("create shard file: %w", err)
-	}
-	tmpPath := f.Name()
-	removeTemp := true
-	defer func() {
-		if removeTemp {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-
-	_, err = io.Copy(f, r)
-	if err != nil {
-		f.Close()
-		return false, fmt.Errorf("write shard to disk: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		f.Close()
-		return false, fmt.Errorf("rewind shard file: %w", err)
-	}
-	shardHash, err := computeShardHashFromReader(f)
-	if err != nil {
-		f.Close()
-		return false, fmt.Errorf("hash shard file: %w", err)
-	}
-	if err := f.Chmod(0644); err != nil {
-		f.Close()
-		return false, fmt.Errorf("set shard file permissions: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return false, fmt.Errorf("close shard file: %w", err)
-	}
-
-	shardPath := fs.objectPath("shards", shardHash)
-	wasInserted := true
-	if _, err := os.Stat(shardPath); err == nil {
-		wasInserted = false
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check shard file: %w", err)
-	} else if err := os.MkdirAll(filepath.Dir(shardPath), 0755); err != nil {
-		return false, fmt.Errorf("create shard directory: %w", err)
-	} else if err := os.Rename(tmpPath, shardPath); err != nil {
-		return false, fmt.Errorf("finalize shard file: %w", err)
-	} else {
-		removeTemp = false
+		return false, err
 	}
 
 	// The index/files/ index is written last: hasFile treats it as the commit
@@ -530,9 +492,82 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		if err := writeIndexFile(indexPath, shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
+		// The commit is an index mutation: drop any racing stale cache fill.
+		fs.fileMut.Lock()
+		fs.fileIndex.Remove(file.FileHash)
+		fs.fileGen++
+		fs.fileMut.Unlock()
 	}
 
 	return wasInserted, nil
+}
+
+// putShardObject stores s's footer-less bytes under their content hash, skipping existing objects, and returns that hash.
+func (fs *FileStorage) putShardObject(ctx context.Context, s *shard.Shard) (string, bool, error) {
+	// Serialize without the footer (it embeds a creation timestamp), so the
+	// stored bytes — and the sha256 hash addressing them — are deterministic
+	// for identical shard content.
+	r, err := s.Encode(false)
+	if err != nil {
+		return "", false, fmt.Errorf("serialize shard: %w", err)
+	}
+
+	shardsDir := filepath.Join(fs.basePath, "shards")
+	f, err := os.CreateTemp(shardsDir, ".shard-*")
+	if err != nil {
+		return "", false, fmt.Errorf("create shard file: %w", err)
+	}
+	tmpPath := f.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	_, err = io.Copy(f, r)
+	if err != nil {
+		f.Close()
+		return "", false, fmt.Errorf("write shard to disk: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return "", false, fmt.Errorf("rewind shard file: %w", err)
+	}
+	shardHash, err := computeShardHashFromReader(f)
+	if err != nil {
+		f.Close()
+		return "", false, fmt.Errorf("hash shard file: %w", err)
+	}
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		return "", false, fmt.Errorf("set shard file permissions: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", false, fmt.Errorf("close shard file: %w", err)
+	}
+
+	shardPath := fs.objectPath("shards", shardHash)
+	wasInserted := true
+	if _, err := os.Stat(shardPath); err == nil {
+		wasInserted = false
+	} else if !os.IsNotExist(err) {
+		return "", false, fmt.Errorf("check shard file: %w", err)
+	} else if err := os.MkdirAll(filepath.Dir(shardPath), 0755); err != nil {
+		return "", false, fmt.Errorf("create shard directory: %w", err)
+	} else if err := os.Rename(tmpPath, shardPath); err != nil {
+		return "", false, fmt.Errorf("finalize shard file: %w", err)
+	} else {
+		removeTemp = false
+	}
+
+	return shardHash, wasInserted, nil
+}
+
+// PutShardObject stores the shard object by content hash without touching any index, returning the stored shard hash.
+func (fs *FileStorage) PutShardObject(ctx context.Context, s *shard.Shard) (string, error) {
+	shardHash, _, err := fs.putShardObject(ctx, s)
+	return shardHash, err
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on
@@ -591,6 +626,37 @@ func (fs *FileStorage) xorbChunkOffsets(xorbHash xet.XorbHash) ([]uint64, error)
 	fs.offsetsIndex.Add(xorbHash, offsets)
 	fs.offsetsMut.Unlock()
 	return offsets, nil
+}
+
+// xorbChunkUnpackedSizes returns each chunk's uncompressed size in the xorb,
+// from the in-memory cache, the xorb footer, or a header scan for footer-less
+// xorbs.
+func (fs *FileStorage) xorbChunkUnpackedSizes(xorbHash xet.XorbHash) ([]uint32, error) {
+	fs.sizesMut.Lock()
+	if v, ok := fs.sizesIndex.Get(xorbHash); ok {
+		fs.sizesMut.Unlock()
+		return v.([]uint32), nil
+	}
+	fs.sizesMut.Unlock()
+
+	xf, err := fs.openXorb(xorbHash)
+	if err != nil {
+		return nil, err
+	}
+	xf.mut.Lock()
+	sizes, err := xorb.ReadChunkUnpackedSizes(xf.f)
+	if errors.Is(err, xorb.ErrNoFooter) {
+		sizes, err = xorb.ScanChunkUnpackedSizes(xf.f)
+	}
+	xf.mut.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("read xorb chunk sizes: %w", err)
+	}
+
+	fs.sizesMut.Lock()
+	fs.sizesIndex.Add(xorbHash, sizes)
+	fs.sizesMut.Unlock()
+	return sizes, nil
 }
 
 func (fs *FileStorage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
@@ -790,9 +856,10 @@ func (fs *FileStorage) WalkXorbs(ctx context.Context, fn func(xorbHash string, s
 // whether it existed.
 func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	err := os.Remove(fs.objectPath("index/files", fileHash.String()))
-	// Evicting after the delete narrows but does not close the re-cache window.
+	// The generation bump drops any concurrent cache fill that read the old entry.
 	fs.fileMut.Lock()
 	fs.fileIndex.Remove(fileHash)
+	fs.fileGen++
 	fs.fileMut.Unlock()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -814,6 +881,18 @@ func (fs *FileStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileH
 		return "", fmt.Errorf("read file index: %w", err)
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// SetFileIndexEntry force-writes the index/files entry for fileHash.
+func (fs *FileStorage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	if err := overwriteIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write file index: %w", err)
+	}
+	fs.fileMut.Lock()
+	fs.fileIndex.Remove(fileHash)
+	fs.fileGen++
+	fs.fileMut.Unlock()
+	return nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -839,6 +918,9 @@ func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) er
 	fs.offsetsMut.Lock()
 	fs.offsetsIndex.Remove(xorbHash)
 	fs.offsetsMut.Unlock()
+	fs.sizesMut.Lock()
+	fs.sizesIndex.Remove(xorbHash)
+	fs.sizesMut.Unlock()
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete xorb: %w", err)
 	}
@@ -954,4 +1036,11 @@ func (fs *FileStorage) GetXorbDataRange(ctx context.Context, _ string, xorbHash 
 // the first read.
 func (fs *FileStorage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
 	return fs.xorbChunkOffsets(xorbHash)
+}
+
+// GetXorbChunkUnpackedSizes returns each chunk's unpacked size in the xorb;
+// cached after the first read. The returned slice is shared; callers must
+// not mutate it.
+func (fs *FileStorage) GetXorbChunkUnpackedSizes(_ context.Context, xorbHash xet.XorbHash) ([]uint32, error) {
+	return fs.xorbChunkUnpackedSizes(xorbHash)
 }

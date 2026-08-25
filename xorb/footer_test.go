@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"reflect"
 	"testing"
+
+	"github.com/wzshiming/xet"
 )
 
 // testFooterChunks returns deterministic chunks with mixed compressibility.
@@ -128,7 +130,70 @@ func TestReadChunkOffsetsRejectsUnparseableFooters(t *testing.T) {
 			if _, err := ReadChunkOffsets(bytes.NewReader(tt.data)); !errors.Is(err, ErrNoFooter) {
 				t.Fatalf("ReadChunkOffsets() error = %v, want ErrNoFooter", err)
 			}
+			if _, err := ReadChunkUnpackedSizes(bytes.NewReader(tt.data)); !errors.Is(err, ErrNoFooter) {
+				t.Fatalf("ReadChunkUnpackedSizes() error = %v, want ErrNoFooter", err)
+			}
+			if _, err := ReadChunkHashes(bytes.NewReader(tt.data)); !errors.Is(err, ErrNoFooter) {
+				t.Fatalf("ReadChunkHashes() error = %v, want ErrNoFooter", err)
+			}
 		})
+	}
+}
+
+func TestReadChunkUnpackedSizesAndHashesMatchEncoder(t *testing.T) {
+	chunks := testFooterChunks(9)
+	data, _ := encodeXorbForTest(t, [4]byte{}, chunks...)
+
+	sizes, err := ReadChunkUnpackedSizes(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadChunkUnpackedSizes() failed: %v", err)
+	}
+	scanned, err := ScanChunkUnpackedSizes(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ScanChunkUnpackedSizes() failed: %v", err)
+	}
+	hashes, err := ReadChunkHashes(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadChunkHashes() failed: %v", err)
+	}
+	if len(sizes) != len(chunks) || len(hashes) != len(chunks) {
+		t.Fatalf("got %d sizes, %d hashes; want %d each", len(sizes), len(hashes), len(chunks))
+	}
+	if !reflect.DeepEqual(sizes, scanned) {
+		t.Fatalf("footer sizes %v != scanned sizes %v", sizes, scanned)
+	}
+	for i, chunk := range chunks {
+		if sizes[i] != uint32(len(chunk)) {
+			t.Fatalf("chunk %d size = %d, want %d", i, sizes[i], len(chunk))
+		}
+		if want := xet.ComputeChunkHash(chunk); hashes[i] != want {
+			t.Fatalf("chunk %d hash = %s, want %s", i, hashes[i].String(), want.String())
+		}
+	}
+}
+
+func TestScanChunkUnpackedSizesChunkOnlyFormat(t *testing.T) {
+	chunks := testFooterChunks(5)
+	data := encodeChunkOnlyXorbForTest(t, chunks...)
+
+	if _, err := ReadChunkUnpackedSizes(bytes.NewReader(data)); !errors.Is(err, ErrNoFooter) {
+		t.Fatalf("ReadChunkUnpackedSizes() error = %v, want ErrNoFooter", err)
+	}
+	if _, err := ReadChunkHashes(bytes.NewReader(data)); !errors.Is(err, ErrNoFooter) {
+		t.Fatalf("ReadChunkHashes() error = %v, want ErrNoFooter", err)
+	}
+
+	sizes, err := ScanChunkUnpackedSizes(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ScanChunkUnpackedSizes() failed: %v", err)
+	}
+	if len(sizes) != len(chunks) {
+		t.Fatalf("got %d sizes, want %d", len(sizes), len(chunks))
+	}
+	for i, chunk := range chunks {
+		if sizes[i] != uint32(len(chunk)) {
+			t.Fatalf("chunk %d size = %d, want %d", i, sizes[i], len(chunk))
+		}
 	}
 }
 
