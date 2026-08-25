@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/hf"
 	"github.com/wzshiming/xet/server"
@@ -473,6 +474,63 @@ func TestMirrorPlainUpstream(t *testing.T) {
 			t.Fatalf("restart refetched upstream: %d -> %d", before, got)
 		}
 	})
+}
+
+// TestMirrorReingestsAfterStorageUnlink covers the self-healing resolve: a
+// ready entry whose file was unlinked from storage is dropped and the next
+// resolve re-ingests from upstream.
+func TestMirrorReingestsAfterStorageUnlink(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	data := make([]byte, 128*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	const resolvePath = "/org/repo/resolve/main/model.bin"
+	upstream.set(resolvePath, data)
+
+	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	resolveURL := fx.srv.URL + resolvePath
+
+	resp := waitReady(t, resolveURL)
+	fileHash, err := xet.ParseFileHash(resp.Header.Get("X-Xet-Hash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream data GETs = %d, want 1", got)
+	}
+
+	removed, err := storage.Unlink(context.Background(), fx.stor.(storage.GCStore), fileHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed {
+		t.Fatal("unlink removed nothing")
+	}
+
+	resp = waitReady(t, resolveURL)
+	if resp.Header.Get("X-Xet-Hash") == "" {
+		t.Fatal("missing X-Xet-Hash after re-ingest")
+	}
+	if got := upstream.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs after unlink = %d, want 2", got)
+	}
+
+	body, err := http.Get(resolveURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Body.Close()
+	got, err := io.ReadAll(body.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("re-ingested body mismatch")
+	}
 }
 
 func TestMirrorRangeWhileIngesting(t *testing.T) {

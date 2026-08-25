@@ -111,10 +111,14 @@ func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *tas
 			if h.needsRevalidate(e, key.rev) {
 				e = h.revalidate(ctx, key, e)
 			}
+			if e != nil && !h.entryLive(ctx, e) {
+				h.dropEntry(key, e)
+				e = nil
+			}
 			if e != nil {
 				return key, nil, e, nil
 			}
-			// stale: fall through and re-ingest
+			// stale or unlinked: fall through and re-ingest
 		case stateFailed:
 			if time.Now().Before(e.nextRetry) {
 				return key, nil, e, nil
