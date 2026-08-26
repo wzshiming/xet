@@ -71,9 +71,7 @@ func TestEncodeIsConcurrencySafe(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make([][]byte, 8)
 	for i := range results {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			r, err := s.Encode(true)
 			if err != nil {
 				t.Error(err)
@@ -85,7 +83,7 @@ func TestEncodeIsConcurrencySafe(t *testing.T) {
 				return
 			}
 			results[i] = data
-		}()
+		})
 	}
 	wg.Wait()
 
