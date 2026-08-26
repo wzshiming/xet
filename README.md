@@ -14,8 +14,9 @@ The Rust implementation in xet-core is currently ahead of the draft in several a
 Implemented in this repository:
 - Core hash / gearhash / merkle primitives
 - Shard and xorb encode/decode paths
-- Upload and download client workflows
+- Upload and download client workflows with streaming wrappers (upload from any `io.ReadSeeker`, download to an `io.WriteSeeker` or as `io.ReadCloser` streams)
 - CAS server implementation for local or self-hosted usage
+- Server storage backends: local filesystem or S3-compatible object stores (MinIO etc.), with optional presigned xorb download URLs
 - Mirror mode: full-cache middle layer bridging xet and plain hubs
 - Hugging Face token/LFS based integration helpers
 - Conformance and unit tests for key protocol paths
