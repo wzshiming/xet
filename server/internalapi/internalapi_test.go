@@ -54,15 +54,15 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 
 func TestListFilesEndpoint(t *testing.T) {
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	content := []byte("internal file listing content")
-	fileHash := putTestFile(t, ctx, stor, content)
+	fileHash := putTestFile(t, ctx, fs, content)
 
-	handler := NewHandler(WithStorage(stor))
+	handler := NewHandler(WithStorage(fs))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/files", nil))
 	if rec.Code != http.StatusOK {
@@ -114,12 +114,12 @@ func TestHandlerFallsThroughToNext(t *testing.T) {
 
 func TestUnlinkFileEndpoint(t *testing.T) {
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileHash := putTestFile(t, ctx, stor, []byte("unlink endpoint content"))
-	handler := NewHandler(WithStorage(stor))
+	fileHash := putTestFile(t, ctx, fs, []byte("unlink endpoint content"))
+	handler := NewHandler(WithStorage(fs))
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
@@ -133,7 +133,7 @@ func TestUnlinkFileEndpoint(t *testing.T) {
 	if resp["file_hash"] != fileHash.String() || resp["removed"] != true {
 		t.Fatalf("response = %v", resp)
 	}
-	if _, err := stor.GetShard(ctx, fileHash); err == nil {
+	if _, err := fs.GetShard(ctx, fileHash); err == nil {
 		t.Fatal("file still resolves after unlink")
 	}
 
@@ -152,12 +152,12 @@ func TestUnlinkFileEndpoint(t *testing.T) {
 
 func TestGCSweepEndpoint(t *testing.T) {
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileHash := putTestFile(t, ctx, stor, []byte("sweep endpoint content"))
-	handler := NewHandler(WithStorage(stor))
+	fileHash := putTestFile(t, ctx, fs, []byte("sweep endpoint content"))
+	handler := NewHandler(WithStorage(fs))
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
@@ -214,6 +214,160 @@ func TestGCSweepEndpoint(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=-5m", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("negative grace status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// TestGCSweepEndpointStepped drains a two-file store one dead object per
+// request and checks the cumulative progress reporting.
+func TestGCSweepEndpointStepped(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+	for i, content := range [][]byte{[]byte("stepped sweep one"), []byte("stepped sweep two")} {
+		fileHash := putTestFile(t, ctx, fs, content)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unlink %d status = %d", i, rec.Code)
+		}
+	}
+
+	var result storage.SweepResult
+	steps := 0
+	remaining := -1
+	for {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&max=1", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("step %d status = %d: %s", steps, rec.Code, rec.Body.String())
+		}
+		result = storage.SweepResult{}
+		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+			t.Fatalf("decode step %d: %v", steps, err)
+		}
+		steps++
+		if got := result.RemainingShards + result.RemainingXorbs; remaining >= 0 && got >= remaining {
+			t.Fatalf("step %d remaining = %d, want < %d", steps, got, remaining)
+		} else {
+			remaining = got
+		}
+		if result.Done {
+			break
+		}
+		if steps > 10 {
+			t.Fatalf("cycle not done after %d steps: %+v", steps, result)
+		}
+	}
+	if steps < 2 {
+		t.Fatalf("steps = %d, want >= 2", steps)
+	}
+	// The final step reports the whole cycle's work.
+	if len(result.SweptShards) != 2 || len(result.SweptXorbs) != 2 || result.RemainingShards != 0 || result.RemainingXorbs != 0 {
+		t.Fatalf("final result = %+v", result)
+	}
+
+	// Nothing is left for a full pass.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode full pass: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("full pass after drain = %+v", result)
+	}
+}
+
+func TestGCSweepEndpointRejectsInvalidStepParams(t *testing.T) {
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+	for _, query := range []string{
+		"max=bogus", "max=-1",
+		"budget=bogus", "budget=-5s",
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?"+query, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d", query, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+// TestGCSweepEndpointServerGrace: WithGCGrace supplies the window for
+// requests omitting grace; an explicit parameter still overrides it.
+func TestGCSweepEndpointServerGrace(t *testing.T) {
+	ctx := context.Background()
+
+	// Disabled server default: a plain request reclaims fresh objects.
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithGCGrace(-1))
+	fileHash := putTestFile(t, ctx, fs, []byte("server grace content"))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode sweep: %v", err)
+	}
+	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
+		t.Fatalf("sweep with disabled server grace = %+v", result)
+	}
+
+	// Unset option: a plain request keeps the default window and shields
+	// the fresh objects.
+	fs2, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler = NewHandler(WithStorage(fs2))
+	fileHash = putTestFile(t, ctx, fs2, []byte("server grace default"))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode default sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("default-window sweep = %+v", result)
+	}
+
+	// An explicit parameter overrides the disabled server default.
+	handler = NewHandler(WithStorage(fs2), WithGCGrace(-1))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=1h", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("override sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode override sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("override sweep = %+v", result)
 	}
 }
 
