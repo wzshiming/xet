@@ -5,8 +5,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
-	"github.com/wzshiming/xet/hf"
 )
 
 func NewCommand() *cobra.Command {
