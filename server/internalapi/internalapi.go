@@ -3,6 +3,7 @@
 package internalapi
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,11 +17,12 @@ import (
 
 // Handler serves the internal management endpoints.
 type Handler struct {
-	storage storage.Storage
-	gc      *storage.GC
-	gcGrace time.Duration
-	root    *mux.Router
-	next    http.Handler
+	storage  storage.Storage
+	gc       *storage.GC
+	gcGrace  time.Duration
+	gcAnchor storage.SweepAnchor
+	root     *mux.Router
+	next     http.Handler
 }
 
 // Option defines a functional option for configuring the Handler.
@@ -39,6 +41,14 @@ func WithStorage(storage storage.Storage) Option {
 func WithGCGrace(grace time.Duration) Option {
 	return func(h *Handler) {
 		h.gcGrace = grace
+	}
+}
+
+// WithGCAnchor sets the sweep anchor used when a request omits the anchor
+// parameter; the zero value is storage.AnchorBoth.
+func WithGCAnchor(anchor storage.SweepAnchor) Option {
+	return func(h *Handler) {
+		h.gcAnchor = anchor
 	}
 }
 
@@ -71,6 +81,7 @@ func NewHandler(opts ...Option) *Handler {
 func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
+	h.root.HandleFunc("/internal/files/sha256/{hash}", h.handleUnlinkSHA256).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
 
 	h.root.NotFoundHandler = h.next
@@ -127,11 +138,51 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=:
-// it removes (or, with dry_run, reports) shards and xorbs no file-index entry
-// keeps alive. An omitted grace uses the server-configured window (the
-// default when none was configured); an explicit zero disables it; negative
-// values are rejected. Every request consumes one step of a resumable cycle;
+// handleUnlinkSHA256 handles DELETE /internal/files/sha256/{hash}: it drops
+// the index/sha256 entry only; the content stays reachable by file hash, and
+// space is reclaimed by a later sweep once, per its anchor, nothing
+// references the shard.
+func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+	raw, err := hex.DecodeString(mux.Vars(r)["hash"])
+	if err != nil || len(raw) != 32 {
+		http.Error(w, "Invalid SHA-256 digest", http.StatusBadRequest)
+		return
+	}
+	digest := [32]byte(raw)
+	if digest == [32]byte{} {
+		// Mirrors the storage rule: the all-zero digest is the shared
+		// empty-file marker, never a deletable entry.
+		http.Error(w, "Invalid SHA-256 digest: all-zero empty-file marker", http.StatusBadRequest)
+		return
+	}
+	removed, err := h.gc.UnlinkSHA256(r.Context(), digest)
+	if err != nil {
+		http.Error(w, "Failed to unlink SHA-256: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !removed {
+		http.Error(w, "SHA-256 not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"sha256":  hex.EncodeToString(digest[:]),
+		"removed": true,
+	})
+}
+
+// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=&anchor=:
+// it removes (or, with dry_run, reports) shards and xorbs nothing keeps
+// alive under the chosen anchor: "both" (default; any file or sha256 entry
+// anchors), "files" (file entries only), or "sha256" (sha256 entries only).
+// An omitted anchor uses the server-configured default. An omitted grace
+// uses the server-configured window (the default when none was configured);
+// an explicit zero disables it; negative values are rejected. Every request
+// consumes one step of a resumable cycle;
 // without max or budget the step is unbounded, so a plain request runs a
 // full pass. A request matching a half-consumed cycle's window resumes it
 // instead of re-marking. The response's done and remaining_* fields report
@@ -178,12 +229,27 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	anchor := h.gcAnchor
+	if v := r.URL.Query().Get("anchor"); v != "" {
+		switch v {
+		case "both":
+			anchor = storage.AnchorBoth
+		case "files":
+			anchor = storage.AnchorFiles
+		case "sha256":
+			anchor = storage.AnchorSHA256
+		default:
+			http.Error(w, "Invalid anchor value", http.StatusBadRequest)
+			return
+		}
+	}
 
 	result, err := h.gc.SweepStep(r.Context(), storage.SweepOptions{
 		Grace:      grace,
 		DryRun:     dryRun,
 		MaxDeletes: maxDeletes,
 		Budget:     budget,
+		Anchor:     anchor,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrGCBusy) {

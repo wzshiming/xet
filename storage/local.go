@@ -753,6 +753,46 @@ func (fs *FileStorage) WalkXorbs(ctx context.Context, fn func(xorbHash string, s
 	return fs.walkHashedObjects(ctx, "xorbs", fn)
 }
 
+// WalkSHA256Index calls fn for every committed index/sha256 entry.
+func (fs *FileStorage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
+	root := filepath.Join(fs.basePath, "index", "sha256")
+	return filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			// Tolerate concurrent deletion anywhere under the index.
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		sha256Hex := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
+		// Skip in-flight .tmp files and anything that is not a hash name.
+		if len(sha256Hex) != 64 {
+			return nil
+		}
+		if _, err := hex.DecodeString(sha256Hex); err != nil {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		return fn(sha256Hex, strings.TrimSpace(string(data)))
+	})
+}
+
 // DeleteFileIndexEntry removes the index/files entry for fileHash, reporting
 // whether it existed.
 func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error) {
@@ -771,16 +811,37 @@ func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.Fi
 }
 
 // GetFileIndexEntry returns the shard hash recorded for fileHash, or ""
-// when the entry is absent, bypassing the cache so sweeps see stored state.
-func (fs *FileStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
-	b, err := os.ReadFile(fs.objectPath("index/files", fileHash.String()))
+// when the entry is absent, bypassing the cache so sweeps see stored state,
+// together with the entry's modification time (the zero time when absent).
+func (fs *FileStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {
+	path := fs.objectPath("index/files", fileHash.String())
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", time.Time{}, nil
 		}
-		return "", fmt.Errorf("read file index: %w", err)
+		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	info, err := os.Stat(path)
+	if err != nil {
+		// Deleted between the read and the stat: report absent.
+		if os.IsNotExist(err) {
+			return "", time.Time{}, nil
+		}
+		return "", time.Time{}, fmt.Errorf("stat file index: %w", err)
+	}
+	return strings.TrimSpace(string(b)), info.ModTime(), nil
+}
+
+// SetFileIndexEntry force-writes the index/files entry for fileHash.
+func (fs *FileStorage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	if err := overwriteIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write file index: %w", err)
+	}
+	fs.fileMut.Lock()
+	fs.fileIndex.Remove(fileHash)
+	fs.fileMut.Unlock()
+	return nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -874,14 +935,18 @@ func (fs *FileStorage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string
 	return strings.TrimSpace(string(b)), nil
 }
 
-// DeleteSHA256IndexEntry removes the index/sha256 entry.
-func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error {
+// DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether
+// it existed.
+func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
 	err := os.Remove(fs.objectPath("index/sha256", sha256Hex))
 	fs.evictSHA256(sha256Hex)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("delete SHA-256 index: %w", err)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("delete SHA-256 index: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // SetSHA256IndexEntry force-writes the index/sha256 entry.

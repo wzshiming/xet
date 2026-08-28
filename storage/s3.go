@@ -694,6 +694,67 @@ func (ss *S3Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, siz
 	return ss.walkHashedObjects(ctx, "xorbs", fn)
 }
 
+// WalkSHA256Index calls fn for every committed index/sha256 entry.
+func (ss *S3Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
+	base := "index/sha256/"
+	if ss.prefix != "" {
+		base = ss.prefix + "/" + base
+	}
+	paginator := s3.NewListObjectsV2Paginator(ss.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(ss.bucket),
+		Prefix: aws.String(base),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list SHA-256 index: %w", err)
+		}
+		var keys, hashes []string
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			sha256Hex := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
+			if len(sha256Hex) != 64 {
+				continue
+			}
+			if _, err := hex.DecodeString(sha256Hex); err != nil {
+				continue
+			}
+			keys = append(keys, key)
+			hashes = append(hashes, sha256Hex)
+		}
+		// Read the page's index objects in parallel; fn stays sequential.
+		bodies := make([][]byte, len(keys))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(fileIndexWalkConcurrency)
+		for i, key := range keys {
+			g.Go(func() error {
+				data, err := ss.getObject(gctx, key)
+				if err != nil {
+					// Deleted between list and read: leave the slot nil.
+					if isS3NotFound(err) {
+						return nil
+					}
+					return fmt.Errorf("read SHA-256 index %s: %w", key, err)
+				}
+				bodies[i] = data
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+		for i, sha256Hex := range hashes {
+			if bodies[i] == nil {
+				continue
+			}
+			if err := fn(sha256Hex, strings.TrimSpace(string(bodies[i]))); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // deleteObject removes one object; missing keys are not an error.
 func (ss *S3Storage) deleteObject(ctx context.Context, key string) error {
 	_, err := ss.client.DeleteObject(ctx, &s3.DeleteObjectInput{
@@ -727,16 +788,36 @@ func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.File
 }
 
 // GetFileIndexEntry returns the shard hash recorded for fileHash, or ""
-// when the entry is absent, bypassing the cache so sweeps see stored state.
-func (ss *S3Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
-	data, err := ss.getObject(ctx, ss.objectKey("index/files", fileHash.String()))
+// when the entry is absent, bypassing the cache so sweeps see stored state,
+// together with the object's LastModified time (the zero time when absent).
+func (ss *S3Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {
+	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(ss.bucket),
+		Key:    aws.String(ss.objectKey("index/files", fileHash.String())),
+	})
 	if err != nil {
 		if isS3NotFound(err) {
-			return "", nil
+			return "", time.Time{}, nil
 		}
-		return "", fmt.Errorf("read file index: %w", err)
+		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
 	}
-	return strings.TrimSpace(string(data)), nil
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
+	}
+	return strings.TrimSpace(string(data)), aws.ToTime(out.LastModified), nil
+}
+
+// SetFileIndexEntry force-writes the index/files entry for fileHash.
+func (ss *S3Storage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(shardHash)); err != nil {
+		return fmt.Errorf("write file index: %w", err)
+	}
+	ss.fileMut.Lock()
+	ss.fileIndex.Remove(fileHash)
+	ss.fileMut.Unlock()
+	return nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -825,14 +906,22 @@ func (ss *S3Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) 
 	return strings.TrimSpace(string(data)), nil
 }
 
-// DeleteSHA256IndexEntry removes the index/sha256 entry.
-func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) error {
-	err := ss.deleteObject(ctx, ss.objectKey("index/sha256", sha256Hex))
-	ss.evictSHA256(sha256Hex)
+// DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether
+// it existed.
+func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
+	key := ss.objectKey("index/sha256", sha256Hex)
+	_, exists, err := ss.headObject(ctx, key)
 	if err != nil {
-		return fmt.Errorf("delete SHA-256 index: %w", err)
+		return false, fmt.Errorf("check SHA-256 index: %w", err)
 	}
-	return nil
+	if exists {
+		if err := ss.deleteObject(ctx, key); err != nil {
+			return false, fmt.Errorf("delete SHA-256 index: %w", err)
+		}
+	}
+	// Evicting after the delete narrows but does not close the re-cache window.
+	ss.evictSHA256(sha256Hex)
+	return exists, nil
 }
 
 // SetSHA256IndexEntry force-writes the index/sha256 entry.

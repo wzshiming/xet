@@ -137,6 +137,7 @@ func main() {
 		next = internalapi.NewHandler(
 			internalapi.WithStorage(stor),
 			internalapi.WithGCGrace(1*time.Hour),
+			internalapi.WithGCAnchor(storage.AnchorBoth),
 			internalapi.WithNext(next),
 		)
 		fmt.Println("Internal management endpoints enabled at /internal/")
