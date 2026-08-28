@@ -764,9 +764,11 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 // is only touched while it still points at the dead shard: when a live
 // shard carries the same file, chunk, or SHA-256 the entry is repointed to
 // it, keeping lookups alive on backends whose index keeps the first writer;
-// otherwise it is deleted. Entries go first — files, then chunks, then
-// sha256, then the shard object — so a crash mid-way leaves a re-sweepable
-// shard, never entries pointing into nothing. A racing commit whose entries
+// otherwise it is deleted. Entries go first — files, then sha256, then
+// chunks, the exact reverse of PutShard's commit order, then the shard
+// object — so a crash mid-way leaves a re-sweepable shard, never entries
+// pointing into nothing, and both abort guards fire before any chunk entry
+// a racing commit has reused is destroyed. A racing commit whose entries
 // become visible to the delete loops aborts the deletion: an anchoring
 // entry found pointing back at the shard contradicts the re-read, so the
 // shard is re-marked live instead. A commit whose file entry lands only
@@ -870,29 +872,6 @@ func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string
 		c.res.DeletedFileEntries++
 	}
 
-	for i := range sh.CASInfos {
-		for _, chunk := range sh.CASInfos[i].Chunks {
-			current, err := st.GetChunkIndexEntry(ctx, chunk.ChunkHash)
-			if err != nil {
-				return false, err
-			}
-			if current != shardHash {
-				continue
-			}
-			if owner, ok := c.chunkOwners[chunk.ChunkHash.String()]; ok {
-				if err := st.SetChunkIndexEntry(ctx, chunk.ChunkHash, owner); err != nil {
-					return false, err
-				}
-				c.res.RepointedChunkEntries++
-				continue
-			}
-			if err := st.DeleteChunkIndexEntry(ctx, chunk.ChunkHash); err != nil {
-				return false, err
-			}
-			c.res.DeletedChunkEntries++
-		}
-	}
-
 	for i := range sh.Files {
 		if sh.Files[i].MetadataExt == nil {
 			continue
@@ -925,6 +904,32 @@ func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string
 			return false, err
 		}
 		c.res.DeletedSHA256Entries++
+	}
+
+	// Chunk entries go last: they never abort, so a racing commit caught by
+	// the file or sha256 guard above keeps them — deleting them earlier left
+	// the revived shard with a permanent dedup gap nothing rewrites.
+	for i := range sh.CASInfos {
+		for _, chunk := range sh.CASInfos[i].Chunks {
+			current, err := st.GetChunkIndexEntry(ctx, chunk.ChunkHash)
+			if err != nil {
+				return false, err
+			}
+			if current != shardHash {
+				continue
+			}
+			if owner, ok := c.chunkOwners[chunk.ChunkHash.String()]; ok {
+				if err := st.SetChunkIndexEntry(ctx, chunk.ChunkHash, owner); err != nil {
+					return false, err
+				}
+				c.res.RepointedChunkEntries++
+				continue
+			}
+			if err := st.DeleteChunkIndexEntry(ctx, chunk.ChunkHash); err != nil {
+				return false, err
+			}
+			c.res.DeletedChunkEntries++
+		}
 	}
 
 	return true, st.DeleteShard(ctx, shardHash)

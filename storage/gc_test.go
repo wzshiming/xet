@@ -752,6 +752,20 @@ func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*
 	return h.GCStore.GetShardByHash(ctx, shardHash)
 }
 
+// assertChunkEntriesIntact fails when an aborted shard deletion touched the
+// chunk entries a racing commit relies on for dedup.
+func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs GCStore, f gcFile, res *SweepResult) {
+	t.Helper()
+	if res.DeletedChunkEntries != 0 || res.RepointedChunkEntries != 0 {
+		t.Fatalf("racing commit's chunk entries touched: %+v", res)
+	}
+	for _, chunkHash := range f.chunkHashes {
+		if got, err := gcs.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != f.shardHash {
+			t.Fatalf("chunk entry = %q, %v; want %q", got, err, f.shardHash)
+		}
+	}
+}
+
 func assertFileIntact(t *testing.T, ctx context.Context, st Storage, f gcFile) {
 	t.Helper()
 	if _, err := st.GetShard(ctx, f.fileHash); err != nil {
@@ -2356,6 +2370,7 @@ func TestSweepDeleteLoopAbortsOnRacingFileEntry(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the racing commit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
@@ -2414,6 +2429,7 @@ func TestSweepAnchorSHA256DeleteLoopSparesFreshRecommit(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the fresh recommit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
@@ -2474,6 +2490,7 @@ func TestSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the racing commit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
