@@ -343,6 +343,37 @@ func TestSweepGraceWindow(t *testing.T) {
 	}
 }
 
+// TestSweepNegativeGraceSentinelSweepsFreshObjects: a negative grace (the
+// HTTP "window disabled" sentinel) puts the cutoff just past now; the
+// object walks must compare against it untruncated — flooring a future
+// cutoff to the whole second would wrongly shield objects written in the
+// current second, re-enabling a window the caller disabled.
+func TestSweepNegativeGraceSentinelSweepsFreshObjects(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := putGCFile(t, ctx, st, [][]byte{[]byte("fresh but window disabled")})
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Sweep(ctx, st, SweepOptions{Grace: -time.Nanosecond, Anchor: AnchorFiles})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := sweptHashes(res.SweptShards), []string{f.shardHash}; !slices.Equal(got, want) {
+		t.Fatalf("SweptShards = %v, want %v", got, want)
+	}
+	if got, want := sweptHashes(res.SweptXorbs), []string{f.xorbHashes[0].String()}; !slices.Equal(got, want) {
+		t.Fatalf("SweptXorbs = %v, want %v", got, want)
+	}
+	if res.SkippedInGrace != 0 {
+		t.Fatalf("SkippedInGrace = %d, want 0", res.SkippedInGrace)
+	}
+}
+
 // TestSweepRepointsSharedSHA256 stores identical content under two
 // chunkings, so two shards share one sha256 entry. When the sweep removes
 // the shard owning the entry while the other still lives, the entry is
@@ -523,6 +554,48 @@ func TestSweepReportsDanglingFileEntries(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("dangling file entry was deleted")
+			}
+		})
+	}
+}
+
+// TestSweepReportsDanglingSHA256Entries: sha256 entries whose shard object
+// is missing are reported — sorted, in dry runs and real sweeps alike —
+// and never deleted, mirroring DanglingFileEntries.
+func TestSweepReportsDanglingSHA256Entries(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			shaA := strings.Repeat("aa", 32)
+			shaB := strings.Repeat("bb", 32)
+			missingA := strings.Repeat("d1", 32)
+			missingB := strings.Repeat("e2", 32)
+			if err := gcs.SetSHA256IndexEntry(ctx, shaB, missingB); err != nil {
+				t.Fatal(err)
+			}
+			if err := gcs.SetSHA256IndexEntry(ctx, shaA, missingA); err != nil {
+				t.Fatal(err)
+			}
+
+			want := []string{shaA, shaB}
+			for _, dryRun := range []bool{true, false} {
+				res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, DryRun: dryRun})
+				if err != nil {
+					t.Fatalf("Sweep(dryRun=%v): %v", dryRun, err)
+				}
+				if !slices.Equal(res.DanglingSHA256Entries, want) {
+					t.Fatalf("DanglingSHA256Entries(dryRun=%v) = %v, want %v", dryRun, res.DanglingSHA256Entries, want)
+				}
+			}
+
+			// The entries are reported, never deleted.
+			for sha, missing := range map[string]string{shaA: missingA, shaB: missingB} {
+				if got, err := gcs.GetSHA256IndexEntry(ctx, sha); err != nil || got != missing {
+					t.Fatalf("sha256 entry %s = %q, %v; want %q", sha, got, err, missing)
+				}
 			}
 		})
 	}

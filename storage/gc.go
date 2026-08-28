@@ -102,9 +102,13 @@ type SweepResult struct {
 	// DanglingFileEntries are index/files entries whose shard object is
 	// missing; they are reported for repair, never deleted.
 	DanglingFileEntries []string `json:"dangling_file_entries"`
+	// DanglingSHA256Entries are index/sha256 entries whose shard object is
+	// missing; they are reported for repair, never deleted.
+	DanglingSHA256Entries []string `json:"dangling_sha256_entries"`
 
 	// SkippedInGrace counts unreferenced objects left alone because they
-	// were written within the grace window.
+	// were written within the grace window or shielded by an in-grace
+	// shard's references.
 	SkippedInGrace int `json:"skipped_in_grace"`
 	// ReclaimedBytes sums the sizes of swept shards and xorbs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
@@ -138,6 +142,9 @@ func NewGC(st GCStore) *GC {
 // which itself keeps the shard alive: full removal takes Unlink plus
 // UnlinkSHA256, or an AnchorFiles sweep. Empty files are the exception —
 // their all-zero sha256 entry never anchors, so Unlink alone suffices.
+// An unlink racing a concurrent sweep's repoint of the same entry can be
+// overwritten by it (the entry resurfaces pointing at a live shard);
+// re-issue the unlink if it must win against a running sweep.
 func (g *GC) Unlink(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	return g.st.DeleteFileIndexEntry(ctx, fileHash)
 }
@@ -149,7 +156,10 @@ func (g *GC) Unlink(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 // reachable by file hash. Space is reclaimed by a later Sweep once, per its
 // anchor mode, nothing references the shard; a dedup re-upload of the same
 // content rewrites the entry. The all-zero digest is rejected: it is the
-// empty-file marker shared by every empty file.
+// empty-file marker shared by every empty file. An unlink racing a
+// concurrent sweep's repoint of the same entry can be overwritten by it
+// (the entry resurfaces pointing at a live shard); re-issue the unlink if
+// it must win against a running sweep.
 func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 	if digest == [32]byte{} {
 		return false, errors.New("all-zero SHA-256 digest is the shared empty-file marker")
@@ -287,6 +297,11 @@ func (o SweepOptions) window() time.Duration {
 // aged unreferenced shard can race its delete (dedup hits do not refresh
 // mtimes). Those residual races are accepted.
 //
+// Any shard object that exists but cannot be loaded (a decode failure or a
+// transient backend error) fails the sweep at that point — nothing is
+// deleted for it, and the sweep must be re-run once the object is repaired
+// or removed; sweeps are fail-stop, not skip-and-continue.
+//
 // Under AnchorSHA256 one more race matters: a dead shard's file entries can
 // be unlinked and the identical shard recommitted while the sweep runs,
 // recreating byte-identical entry→shard pairs that neither the second look
@@ -384,6 +399,7 @@ func (c *sweepCycle) snapshot() *SweepResult {
 	res.SweptShards = slices.Clone(res.SweptShards)
 	res.SweptXorbs = slices.Clone(res.SweptXorbs)
 	res.DanglingFileEntries = slices.Clone(res.DanglingFileEntries)
+	res.DanglingSHA256Entries = slices.Clone(res.DanglingSHA256Entries)
 	res.Done = c.phase == sweepPhaseDone
 	res.RemainingShards = len(c.deadShards)
 	res.RemainingXorbs = len(c.deadXorbs)
@@ -410,10 +426,11 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		cutoff:      cutoff,
 		freshCutoff: cutoff.Truncate(time.Second),
 		res: &SweepResult{
-			DryRun:              opts.DryRun,
-			SweptShards:         []SweptObject{},
-			SweptXorbs:          []SweptObject{},
-			DanglingFileEntries: []string{},
+			DryRun:                opts.DryRun,
+			SweptShards:           []SweptObject{},
+			SweptXorbs:            []SweptObject{},
+			DanglingFileEntries:   []string{},
+			DanglingSHA256Entries: []string{},
 		},
 		liveShards:  map[string]bool{},
 		liveXorbs:   map[string]bool{},
@@ -437,12 +454,14 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 	if err != nil {
 		return nil, err
 	}
-	shaRefs := map[string]bool{}     // shards referenced by non-zero sha256 entries
-	seenShaRefs := map[string]bool{} // sha256Hex+shardHash pairs of the first walk
+	shaRefs := map[string]bool{}         // shards referenced by non-zero sha256 entries
+	shaRefHexes := map[string][]string{} // shard hash -> referencing sha256 hexes
+	seenShaRefs := map[string]bool{}     // sha256Hex+shardHash pairs of the first walk
 	if opts.Anchor != AnchorFiles {
 		err := st.WalkSHA256Index(ctx, func(sha256Hex, shardHash string) error {
 			if sha256Hex != zeroSHA256Hex {
 				shaRefs[shardHash] = true
+				shaRefHexes[shardHash] = append(shaRefHexes[shardHash], sha256Hex)
 				seenShaRefs[sha256Hex+shardHash] = true
 			}
 			return nil
@@ -490,11 +509,24 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		sh, err := st.GetShardByHash(ctx, shardHash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
-				continue // dangling sha256 entry; nothing to keep alive
+				// Dangling sha256 entries: reported for repair, never deleted.
+				c.res.DanglingSHA256Entries = append(c.res.DanglingSHA256Entries, shaRefHexes[shardHash]...)
+				continue
 			}
 			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
 		}
 		c.markLive(sh, shardHash)
+	}
+	slices.Sort(c.res.DanglingSHA256Entries)
+
+	// Objects are judged against the cutoff truncated like freshCutoff: S3
+	// reports LastModified at second precision, so the flooring could cost an
+	// in-flight upload up to a second of shield. A non-positive grace puts
+	// the cutoff at or past now, and truncating that down would wrongly
+	// shield objects written in the current second, so it keeps the raw one.
+	objCutoff := cutoff
+	if grace > 0 {
+		objCutoff = c.freshCutoff
 	}
 
 	// Collect dead objects first so nothing is deleted mid-walk.
@@ -502,7 +534,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		if c.liveShards[hash] {
 			return nil
 		}
-		if !modTime.Before(cutoff) {
+		if !modTime.Before(objCutoff) {
 			c.res.SkippedInGrace++
 			// Likely an upload that has not committed its file entry yet:
 			// shield the xorbs it references, dedup may have reused old ones.
@@ -526,7 +558,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		if c.liveXorbs[hash] {
 			return nil
 		}
-		if graceXorbs[hash] || !modTime.Before(cutoff) {
+		if graceXorbs[hash] || !modTime.Before(objCutoff) {
 			c.res.SkippedInGrace++
 			return nil
 		}

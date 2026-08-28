@@ -512,25 +512,33 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 	// The index/files/ index is written last: hasFile treats it as the commit
 	// marker, so a partial failure leaves a retryable shard instead of one
 	// that reports "already exists" with missing chunk/sha256 indexes. Nothing
-	// is cached here; the read path populates the caches from the stored
-	// objects, so a warm process serves exactly what a restarted one would.
+	// is cached here, but putIndexObject overwrites entries the caches may
+	// still hold, so each written key is evicted to keep warm reads from
+	// resolving a mapping the store no longer has.
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
 			if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunk.ChunkHash.String()), shardHashData); err != nil {
 				return wasInserted, fmt.Errorf("write chunk index: %w", err)
 			}
+			ss.chunkMut.Lock()
+			ss.chunkIndex.Remove(chunk.ChunkHash)
+			ss.chunkMut.Unlock()
 		}
 	}
 	for _, file := range s.Files {
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
+		ss.evictSHA256(file.MetadataExt.SHA256Hash.String())
 	}
 	for _, file := range s.Files {
 		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
+		ss.fileMut.Lock()
+		ss.fileIndex.Remove(file.FileHash)
+		ss.fileMut.Unlock()
 	}
 
 	return wasInserted, nil

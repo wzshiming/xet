@@ -688,13 +688,30 @@ func writeIndexFile(path string, value []byte) error {
 }
 
 // overwriteIndexFile writes an index entry unconditionally, replacing any
-// existing value through an atomic rename.
+// existing value through an atomic rename. Each writer renames its own
+// unique temp file, so concurrent same-key writers cannot steal each
+// other's temp; the last rename wins.
 func overwriteIndexFile(path string, value []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, value, 0644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".idx-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	if _, err := f.Write(value); err != nil {
+		f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
@@ -858,15 +875,16 @@ func (fs *FileStorage) DeleteShard(ctx context.Context, shardHash string) error 
 
 // DeleteXorb removes a stored xorb object.
 func (fs *FileStorage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
-	err := os.Remove(fs.objectPath("xorbs", xorbHash.String()))
-	// Evicting the handle closes it via the cache's OnEvicted callback; open
-	// handles keep serving in-flight reads until then.
+	// Evict before removing: OnEvicted closes the cached handle once any
+	// in-flight read through it finishes, and Windows cannot delete a file
+	// that still has an open handle.
 	fs.xorbMut.Lock()
 	fs.xorbIndex.Remove(xorbHash)
 	fs.xorbMut.Unlock()
 	fs.offsetsMut.Lock()
 	fs.offsetsIndex.Remove(xorbHash)
 	fs.offsetsMut.Unlock()
+	err := os.Remove(fs.objectPath("xorbs", xorbHash.String()))
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete xorb: %w", err)
 	}
