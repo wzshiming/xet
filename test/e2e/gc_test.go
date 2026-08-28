@@ -25,12 +25,36 @@ import (
 // stack wired like cmd/xetd (internal endpoints in front of the CAS routes):
 // upload with the xet client, unlink, sweep with and without the grace
 // window, verify the survivors byte for byte, and re-upload the swept
-// content.
+// content. Its sweeps pin anchor=files (legacy file-entry rooting) so
+// unlinking the file hash alone frees the shard; the default anchor is
+// covered by TestGCSweepDefaultAnchorLifecycle.
 func TestGCUnlinkSweepLifecycle(t *testing.T) {
-	backends := []struct {
-		name     string
-		newStore func(t *testing.T) storage.Storage
-	}{
+	for _, backend := range gcBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			runGCLifecycle(t, backend.newStore(t))
+		})
+	}
+}
+
+// TestGCSweepDefaultAnchorLifecycle covers the default-anchor ("both")
+// contract over HTTP: after DELETE /internal/files/xet/{hash} the sha256
+// entry alone keeps the shard alive through a graceless sweep, and only
+// DELETE /internal/files/sha256/{hash} lets the next sweep reclaim it.
+func TestGCSweepDefaultAnchorLifecycle(t *testing.T) {
+	for _, backend := range gcBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			runGCDefaultAnchorLifecycle(t, backend.newStore(t))
+		})
+	}
+}
+
+type gcBackend struct {
+	name     string
+	newStore func(t *testing.T) storage.Storage
+}
+
+func gcBackends() []gcBackend {
+	return []gcBackend{
 		{name: "file", newStore: func(t *testing.T) storage.Storage {
 			stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
 			if err != nil {
@@ -39,11 +63,6 @@ func TestGCUnlinkSweepLifecycle(t *testing.T) {
 			return stor
 		}},
 		{name: "s3", newStore: newGofakeS3Storage},
-	}
-	for _, backend := range backends {
-		t.Run(backend.name, func(t *testing.T) {
-			runGCLifecycle(t, backend.newStore(t))
-		})
 	}
 }
 
@@ -96,7 +115,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	}
 
 	// The default grace window shields the freshly written objects.
-	res := gcSweep(t, srv.URL, "")
+	res := gcSweep(t, srv.URL, "?anchor=files")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
 		t.Fatalf("in-grace sweep removed objects: %+v", res)
 	}
@@ -106,7 +125,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	assertBridge(t, srv.URL, dropData, http.StatusOK)
 
 	// A sweep without grace reclaims the dead shard and its xorbs.
-	res = gcSweep(t, srv.URL, "?grace=0")
+	res = gcSweep(t, srv.URL, "?grace=0&anchor=files")
 	if len(res.SweptShards) != 1 || len(res.SweptXorbs) < 1 || res.ReclaimedBytes <= 0 {
 		t.Fatalf("sweep result = %+v, want 1 shard, >= 1 xorbs, bytes > 0", res)
 	}
@@ -130,7 +149,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	assertDownload(t, ctx, srv.URL, small, smallData)
 
 	// A second sweep converges to nothing.
-	res = gcSweep(t, srv.URL, "?grace=0")
+	res = gcSweep(t, srv.URL, "?grace=0&anchor=files")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
 		t.Fatalf("second sweep found leftovers: %+v", res)
 	}
@@ -147,6 +166,81 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	assertBridge(t, srv.URL, dropData, http.StatusOK)
 	if got := len(gcListFiles(t, srv.URL)); got != 3 {
 		t.Fatalf("listed %d files after re-upload, want 3", got)
+	}
+}
+
+func runGCDefaultAnchorLifecycle(t *testing.T, stor storage.Storage) {
+	ctx := context.Background()
+	srv := httptest.NewServer(internalapi.NewHandler(
+		internalapi.WithStorage(stor),
+		internalapi.WithNext(server.NewHandler(server.WithStorage(stor))),
+	))
+	defer srv.Close()
+
+	content := deterministicData(2*128*1024 + 4099)
+	digest := sha256.Sum256(content)
+	shaHex := hex.EncodeToString(digest[:])
+
+	fileHash, err := newGCClient(t, srv.URL).UploadFile(ctx, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	assertDownload(t, ctx, srv.URL, fileHash, content)
+	assertBridge(t, srv.URL, content, http.StatusOK)
+	if got := len(gcListFiles(t, srv.URL)); got != 1 {
+		t.Fatalf("listed %d files, want 1", got)
+	}
+
+	// Unlinking the file hash leaves the sha256 entry in place.
+	resp := doRequest(t, http.MethodDelete, srv.URL+"/internal/files/xet/"+fileHash.String(), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unlink status = %d", resp.StatusCode)
+	}
+	assertReconstructionStatus(t, srv.URL, fileHash, http.StatusNotFound)
+	if got := len(gcListFiles(t, srv.URL)); got != 0 {
+		t.Fatalf("listed %d files after unlink, want 0", got)
+	}
+
+	// Under the default anchor the sha256 entry alone keeps the shard
+	// alive even without the grace window, and the content keeps serving
+	// over the SHA-256 bridge.
+	res := gcSweep(t, srv.URL, "?grace=0")
+	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+		t.Fatalf("default-anchor sweep removed sha-anchored objects: %+v", res)
+	}
+	assertBridge(t, srv.URL, content, http.StatusOK)
+
+	// The first sha256 unlink hits, the second 404s.
+	resp = doRequest(t, http.MethodDelete, srv.URL+"/internal/files/sha256/"+shaHex, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sha256 unlink status = %d", resp.StatusCode)
+	}
+	resp = doRequest(t, http.MethodDelete, srv.URL+"/internal/files/sha256/"+shaHex, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("second sha256 unlink status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+	assertBridge(t, srv.URL, content, http.StatusNotFound)
+
+	// With both anchors gone the same sweep reclaims the shard and xorbs.
+	res = gcSweep(t, srv.URL, "?grace=0")
+	if len(res.SweptShards) != 1 || len(res.SweptXorbs) < 1 || res.ReclaimedBytes <= 0 {
+		t.Fatalf("sweep result = %+v, want 1 shard, >= 1 xorbs, bytes > 0", res)
+	}
+	assertBridge(t, srv.URL, content, http.StatusNotFound)
+	if _, err := tryDownload(t, ctx, srv.URL, fileHash); err == nil {
+		t.Fatal("swept file still downloads")
+	}
+	if got := len(gcListFiles(t, srv.URL)); got != 0 {
+		t.Fatalf("listed %d files after sweep, want 0", got)
+	}
+
+	// A repeat sweep converges to nothing.
+	res = gcSweep(t, srv.URL, "?grace=0")
+	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+		t.Fatalf("repeat sweep found leftovers: %+v", res)
 	}
 }
 

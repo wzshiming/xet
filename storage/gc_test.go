@@ -34,13 +34,13 @@ type gcFile struct {
 	content     []byte
 }
 
-// putGCFile stores one file chunked as parts (one single-chunk xorb per
-// part). Identical parts across files share the same xorb.
-func putGCFile(t *testing.T, ctx context.Context, st Storage, parts [][]byte) gcFile {
+// addGCFileBlock stores one single-chunk xorb per part and appends the
+// matching file and CAS blocks to shardObj, returning the file's hashes.
+func addGCFileBlock(t *testing.T, ctx context.Context, st Storage, shardObj *shard.Shard, parts [][]byte) (xet.FileHash, []xet.XorbHash, []xet.ChunkHash) {
 	t.Helper()
-	shardObj := shard.NewShard()
 	fileBlock := shard.FileBlock{}
-	var f gcFile
+	var xorbHashes []xet.XorbHash
+	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
 	for _, part := range parts {
 		var encoded bytes.Buffer
@@ -56,10 +56,9 @@ func putGCFile(t *testing.T, ctx context.Context, st Storage, parts [][]byte) gc
 			t.Fatal(err)
 		}
 		chunkHash := xet.ComputeChunkHash(part)
-		f.xorbHashes = append(f.xorbHashes, xorbHash)
-		f.chunkHashes = append(f.chunkHashes, chunkHash)
+		xorbHashes = append(xorbHashes, xorbHash)
+		chunkHashes = append(chunkHashes, chunkHash)
 		chunkSizes = append(chunkSizes, uint64(len(part)))
-		f.content = append(f.content, part...)
 		fileBlock.Entries = append(fileBlock.Entries, shard.FileDataSequenceEntry{
 			CASHash: xorbHash, UnpackedSegBytes: uint32(len(part)), ChunkIndexEnd: 1,
 		})
@@ -68,9 +67,21 @@ func putGCFile(t *testing.T, ctx context.Context, st Storage, parts [][]byte) gc
 			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(part))}},
 		})
 	}
-	f.fileHash = xet.ComputeFileHash(f.chunkHashes, chunkSizes)
-	fileBlock.FileHash = f.fileHash
+	fileBlock.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 	shardObj.AddFile(fileBlock)
+	return fileBlock.FileHash, xorbHashes, chunkHashes
+}
+
+// putGCFile stores one file chunked as parts (one single-chunk xorb per
+// part). Identical parts across files share the same xorb.
+func putGCFile(t *testing.T, ctx context.Context, st Storage, parts [][]byte) gcFile {
+	t.Helper()
+	shardObj := shard.NewShard()
+	var f gcFile
+	f.fileHash, f.xorbHashes, f.chunkHashes = addGCFileBlock(t, ctx, st, shardObj, parts)
+	for _, part := range parts {
+		f.content = append(f.content, part...)
+	}
 	if _, err := st.PutShard(ctx, shardObj); err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +133,7 @@ func TestUnlinkRemovesFileIndexEntry(t *testing.T) {
 				t.Fatalf("GetShard before unlink: %v", err)
 			}
 
-			removed, err := Unlink(ctx, gcs, f.fileHash)
+			removed, err := NewGC(gcs).Unlink(ctx, f.fileHash)
 			if err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
@@ -134,7 +145,7 @@ func TestUnlinkRemovesFileIndexEntry(t *testing.T) {
 				t.Fatalf("GetShard after unlink = %v, want ErrNotExist", err)
 			}
 
-			removed, err = Unlink(ctx, gcs, f.fileHash)
+			removed, err = NewGC(gcs).Unlink(ctx, f.fileHash)
 			if err != nil {
 				t.Fatalf("second Unlink: %v", err)
 			}
@@ -183,10 +194,10 @@ func TestSweepRemovesOrphanedObjects(t *testing.T) {
 			}
 			_ = rc.Close()
 
-			if _, err := Unlink(ctx, gcs, fileA.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, fileA.fileHash); err != nil {
 				t.Fatalf("Unlink: %v", err)
 			}
-			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -260,11 +271,11 @@ func TestSweepDryRunDeletesNothing(t *testing.T) {
 			gcs := st.(GCStore)
 
 			f := putGCFile(t, ctx, st, [][]byte{[]byte("dry run target")})
-			if _, err := Unlink(ctx, gcs, f.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
 				t.Fatal(err)
 			}
 
-			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, DryRun: true})
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, DryRun: true, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -306,11 +317,11 @@ func TestSweepGraceWindow(t *testing.T) {
 			gcs := st.(GCStore)
 
 			f := putGCFile(t, ctx, st, [][]byte{[]byte("fresh object")})
-			if _, err := Unlink(ctx, gcs, f.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
 				t.Fatal(err)
 			}
 
-			res, err := Sweep(ctx, gcs, SweepOptions{Grace: time.Hour})
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -321,7 +332,7 @@ func TestSweepGraceWindow(t *testing.T) {
 				t.Fatalf("SkippedInGrace = %d, want 2", res.SkippedInGrace)
 			}
 
-			res, err = Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			res, err = Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep without grace: %v", err)
 			}
@@ -368,10 +379,10 @@ func TestSweepRepointsSharedSHA256(t *testing.T) {
 				if unlinkSecond {
 					dead, live = f2, f1
 				}
-				if _, err := Unlink(ctx, gcs, dead.fileHash); err != nil {
+				if _, err := NewGC(gcs).Unlink(ctx, dead.fileHash); err != nil {
 					t.Fatal(err)
 				}
-				res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+				res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 				if err != nil {
 					t.Fatalf("Sweep: %v", err)
 				}
@@ -451,10 +462,10 @@ func TestSweepRepointsSharedChunks(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if _, err := Unlink(ctx, gcs, dead.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, dead.fileHash); err != nil {
 				t.Fatal(err)
 			}
-			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -526,10 +537,10 @@ func TestSweepThenReuploadResurrects(t *testing.T) {
 
 			parts := [][]byte{[]byte("sweep, then upload again")}
 			f := putGCFile(t, ctx, st, parts)
-			if _, err := Unlink(ctx, gcs, f.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace}); err != nil {
+			if _, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorFiles}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -573,11 +584,13 @@ func TestGCSweepStepSingleFlight(t *testing.T) {
 
 // hookedGCStore wraps a GCStore with callbacks fired at sweep-visible points,
 // simulating uploads that commit while a sweep is running. A non-zero age
-// backdates every modTime the walks report, simulating aged objects on
-// backends whose timestamps cannot be set (S3).
+// backdates every modTime the walks and file-entry reads report, simulating
+// aged objects on backends whose timestamps cannot be set (S3); file hashes
+// in freshFileEntries are exempt and keep their true entry mtimes.
 type hookedGCStore struct {
 	GCStore
 	age                time.Duration
+	freshFileEntries   map[string]bool
 	afterWalkXorbs     func()
 	beforeFileEntryGet func()
 	beforeShardLoad    func()
@@ -614,13 +627,22 @@ func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, 
 	return err
 }
 
-func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
+func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {
 	if h.beforeFileEntryGet != nil {
 		cb := h.beforeFileEntryGet
 		h.beforeFileEntryGet = nil
 		cb()
 	}
-	return h.GCStore.GetFileIndexEntry(ctx, fileHash)
+	shardHash, modTime, err := h.GCStore.GetFileIndexEntry(ctx, fileHash)
+	if err == nil && shardHash != "" {
+		if h.freshFileEntries[fileHash.String()] {
+			// True entry time at S3's second precision.
+			modTime = modTime.Truncate(time.Second)
+		} else {
+			modTime = h.walkTime(modTime)
+		}
+	}
+	return shardHash, modTime, err
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -659,13 +681,13 @@ func TestSweepSkipsReuploadCommittedDuringMark(t *testing.T) {
 	}
 	parts := [][]byte{[]byte("committed during the sweep walks")}
 	f := putGCFile(t, ctx, st, parts)
-	if _, err := Unlink(ctx, st, f.fileHash); err != nil {
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
 		t.Fatal(err)
 	}
 
 	hooked := &hookedGCStore{GCStore: st}
 	hooked.afterWalkXorbs = func() { putGCFile(t, ctx, st, parts) }
-	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace})
+	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -692,13 +714,13 @@ func TestSweepSkipsReuploadCommittedBeforeDelete(t *testing.T) {
 	}
 	parts := [][]byte{[]byte("committed right before the delete")}
 	f := putGCFile(t, ctx, st, parts)
-	if _, err := Unlink(ctx, st, f.fileHash); err != nil {
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
 		t.Fatal(err)
 	}
 
 	hooked := &hookedGCStore{GCStore: st}
 	hooked.beforeFileEntryGet = func() { putGCFile(t, ctx, writer, parts) }
-	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace})
+	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -727,7 +749,7 @@ func TestSweepShieldsCommitDuringShardDeletePhase(t *testing.T) {
 			gcs := st.(GCStore)
 
 			f1 := putGCFile(t, ctx, st, [][]byte{partA})
-			if _, err := Unlink(ctx, gcs, f1.fileHash); err != nil {
+			if _, err := NewGC(gcs).Unlink(ctx, f1.fileHash); err != nil {
 				t.Fatal(err)
 			}
 
@@ -738,7 +760,7 @@ func TestSweepShieldsCommitDuringShardDeletePhase(t *testing.T) {
 			hooked.beforeFileEntryGet = func() {
 				f2 = putGCFile(t, ctx, st, [][]byte{partA, partB})
 			}
-			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace})
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -778,7 +800,7 @@ func TestSweepShardVanishedBeforeDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := putGCFile(t, ctx, st, [][]byte{[]byte("vanishes before the delete")})
-	if _, err := Unlink(ctx, st, f.fileHash); err != nil {
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
 		t.Fatal(err)
 	}
 
@@ -788,7 +810,7 @@ func TestSweepShardVanishedBeforeDelete(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace})
+	res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -813,7 +835,7 @@ func TestSweepGraceShieldsDedupedXorbs(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := putGCFile(t, ctx, st, [][]byte{[]byte("deduplicated old payload")})
-	if _, err := Unlink(ctx, st, f.fileHash); err != nil {
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
 		t.Fatal(err)
 	}
 
@@ -857,7 +879,7 @@ func TestSweepGraceShieldsDedupedXorbs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := Sweep(ctx, st, SweepOptions{Grace: time.Hour})
+	res, err := Sweep(ctx, st, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -886,7 +908,7 @@ func putUnlinkedGCFiles(t *testing.T, ctx context.Context, st Storage, contents 
 	files := make([]gcFile, 0, len(contents))
 	for _, content := range contents {
 		f := putGCFile(t, ctx, st, [][]byte{[]byte(content)})
-		if _, err := Unlink(ctx, gcs, f.fileHash); err != nil {
+		if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
 			t.Fatal(err)
 		}
 		files = append(files, f)
@@ -906,7 +928,7 @@ func TestSweepStepDrainsInBatches(t *testing.T) {
 			putUnlinkedGCFiles(t, ctx, st, contents...)
 
 			g := NewGC(st.(GCStore))
-			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1}
+			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 			var res *SweepResult
 			steps := 0
 			remaining := len(contents) * 2 // one shard and one xorb per file
@@ -942,7 +964,7 @@ func TestSweepStepDrainsInBatches(t *testing.T) {
 			// Walk order differs per backend, so compare the results as sets.
 			st2 := backend.newStore(t)
 			putUnlinkedGCFiles(t, ctx, st2, contents...)
-			full, err := Sweep(ctx, st2.(GCStore), SweepOptions{Grace: noGrace})
+			full, err := Sweep(ctx, st2.(GCStore), SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("Sweep: %v", err)
 			}
@@ -985,7 +1007,7 @@ func TestSweepStepMidCycleCommitSurvives(t *testing.T) {
 
 			// Aged mtimes leave the re-checks as the only shield.
 			g := NewGC(agedStore(gcs))
-			opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1}
+			opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1, Anchor: AnchorFiles}
 			res, err := g.SweepStep(ctx, opts)
 			if err != nil {
 				t.Fatalf("SweepStep: %v", err)
@@ -1052,7 +1074,7 @@ func TestSweepStepOptionChangeRestarts(t *testing.T) {
 
 			putUnlinkedGCFiles(t, ctx, st, "restart file one", "restart file two")
 			g := NewGC(gcs)
-			res, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, MaxDeletes: 1})
+			res, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("SweepStep: %v", err)
 			}
@@ -1064,7 +1086,7 @@ func TestSweepStepOptionChangeRestarts(t *testing.T) {
 			putUnlinkedGCFiles(t, ctx, st, "restart file three")
 
 			// A different Grace: the old cycle is discarded and re-marked.
-			res, err = g.SweepStep(ctx, SweepOptions{Grace: -2 * time.Hour, MaxDeletes: 1})
+			res, err = g.SweepStep(ctx, SweepOptions{Grace: -2 * time.Hour, MaxDeletes: 1, Anchor: AnchorFiles})
 			if err != nil {
 				t.Fatalf("SweepStep: %v", err)
 			}
@@ -1089,7 +1111,7 @@ func TestSweepStepDryRunLeavesCycle(t *testing.T) {
 
 			files := putUnlinkedGCFiles(t, ctx, st, "dry step file one", "dry step file two")
 			g := NewGC(gcs)
-			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1}
+			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 			res, err := g.SweepStep(ctx, opts)
 			if err != nil {
 				t.Fatalf("SweepStep: %v", err)
@@ -1147,7 +1169,7 @@ func TestSweepStepBudgetProgress(t *testing.T) {
 	putUnlinkedGCFiles(t, ctx, st, "budget file one", "budget file two")
 
 	g := NewGC(st)
-	opts := SweepOptions{Grace: noGrace, Budget: time.Nanosecond}
+	opts := SweepOptions{Grace: noGrace, Budget: time.Nanosecond, Anchor: AnchorFiles}
 	res, err := g.SweepStep(ctx, opts)
 	if err != nil {
 		t.Fatalf("SweepStep: %v", err)
@@ -1182,7 +1204,7 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 
 	// Aged mtimes make the objects sweepable despite the window.
 	g := NewGC(agedStore(st))
-	opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1}
+	opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1, Anchor: AnchorFiles}
 	res, err := g.SweepStep(ctx, opts)
 	if err != nil {
 		t.Fatalf("SweepStep: %v", err)
@@ -1210,7 +1232,7 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	}
 	putUnlinkedGCFiles(t, ctx, st2, "immortal cycle one", "immortal cycle two")
 	g2 := NewGC(st2)
-	opts = SweepOptions{Grace: noGrace, MaxDeletes: 1}
+	opts = SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 	res, err = g2.SweepStep(ctx, opts)
 	if err != nil {
 		t.Fatalf("SweepStep: %v", err)
@@ -1228,5 +1250,823 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	}
 	if len(res.SweptShards) != 2 {
 		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed under a non-positive grace)", len(res.SweptShards))
+	}
+}
+
+// putShardObject stores an encoded shard object directly, bypassing PutShard
+// and its index writes, and returns its hash.
+func putShardObject(t *testing.T, ctx context.Context, st Storage, sh *shard.Shard) string {
+	t.Helper()
+	r, err := sh.Encode(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := computeShardHashFromReader(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch b := st.(type) {
+	case *FileStorage:
+		path := b.objectPath("shards", hash)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, encoded, 0644); err != nil {
+			t.Fatal(err)
+		}
+	case *S3Storage:
+		if err := b.putObject(ctx, b.objectKey("shards", hash), bytes.NewReader(encoded)); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported backend %T", st)
+	}
+	return hash
+}
+
+// TestUnlinkSHA256RemovesEntry: UnlinkSHA256 drops only the index/sha256
+// entry — SHA-256 lookups stop resolving at once while file-hash access
+// keeps working — and reports existence like Unlink; the all-zero digest is
+// rejected.
+func TestUnlinkSHA256RemovesEntry(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("unlink my sha256")})
+
+			// Warm the sha256 cache so the unlink must evict it.
+			rc, err := st.GetReconstructedFile(ctx, "default", sha256Digest(f.sha256Hex))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadAll(rc); err != nil {
+				t.Fatal(err)
+			}
+			_ = rc.Close()
+
+			removed, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex))
+			if err != nil {
+				t.Fatalf("UnlinkSHA256: %v", err)
+			}
+			if !removed {
+				t.Fatal("UnlinkSHA256 reported the entry missing")
+			}
+
+			if got, err := gcs.GetSHA256IndexEntry(ctx, f.sha256Hex); err != nil || got != "" {
+				t.Fatalf("sha256 entry after unlink = %q, %v; want removed", got, err)
+			}
+			if _, err := st.GetReconstructedFile(ctx, "default", sha256Digest(f.sha256Hex)); err == nil {
+				t.Fatal("sha256 reconstruction still resolves")
+			}
+			if _, err := st.GetFileHashBySHA256(ctx, "default", sha256Digest(f.sha256Hex)); err == nil {
+				t.Fatal("GetFileHashBySHA256 still resolves")
+			}
+
+			// File-hash paths keep working; nothing else was touched.
+			if _, err := st.GetShard(ctx, f.fileHash); err != nil {
+				t.Fatalf("GetShard after UnlinkSHA256: %v", err)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("shard should survive UnlinkSHA256: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb removed by UnlinkSHA256")
+			}
+
+			// Second unlink through the GC delegate reports the entry gone.
+			removed, err = NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex))
+			if err != nil {
+				t.Fatalf("second UnlinkSHA256: %v", err)
+			}
+			if removed {
+				t.Fatal("second UnlinkSHA256 reported an entry")
+			}
+
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, [32]byte{}); err == nil {
+				t.Fatal("all-zero digest accepted")
+			}
+		})
+	}
+}
+
+// TestSweepDefaultAnchorNeedsBothUnlinks: under the default anchor a shard
+// stays live while either its file entry or its sha256 entry remains; only
+// unlinking both lets a sweep reclaim it.
+func TestSweepDefaultAnchorNeedsBothUnlinks(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name+"/file-unlink-only", func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("file entry unlinked only")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("sha-anchored shard swept: %+v", res)
+			}
+			// The content stays resolvable through its SHA-256.
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("shard should survive: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb swept")
+			}
+			rc, err := st.GetReconstructedFile(ctx, "default", sha256Digest(f.sha256Hex))
+			if err != nil {
+				t.Fatalf("GetReconstructedFile: %v", err)
+			}
+			data, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil || !bytes.Equal(data, f.content) {
+				t.Fatalf("reconstruction corrupted: %v", err)
+			}
+		})
+		t.Run(backend.name+"/sha-unlink-only", func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("sha entry unlinked only")})
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("file-anchored shard swept: %+v", res)
+			}
+			// File-hash access keeps working.
+			if _, err := st.GetShard(ctx, f.fileHash); err != nil {
+				t.Fatalf("GetShard: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb swept")
+			}
+		})
+		t.Run(backend.name+"/both-unlinked", func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("both entries unlinked")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{f.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if got, want := sweptHashes(res.SweptXorbs), []string{f.xorbHashes[0].String()}; !slices.Equal(got, want) {
+				t.Fatalf("SweptXorbs = %v, want %v", got, want)
+			}
+			if res.DeletedChunkEntries != 1 {
+				t.Fatalf("DeletedChunkEntries = %d, want 1", res.DeletedChunkEntries)
+			}
+			// Both entries were unlinked up front, so the reverse-clean finds
+			// nothing left to remove.
+			if res.DeletedFileEntries != 0 || res.RepointedFileEntries != 0 || res.DeletedSHA256Entries != 0 {
+				t.Fatalf("reverse-clean counters nonzero: %+v", res)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("dead shard load = %v, want ErrNotExist", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); ok {
+				t.Fatal("xorb still stored")
+			}
+			if got, _ := gcs.GetChunkIndexEntry(ctx, f.chunkHashes[0]); got != "" {
+				t.Fatalf("chunk entry = %q, want removed", got)
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256ReclaimsDespiteFileEntry: under AnchorSHA256 a live
+// file entry does not anchor; once the sha256 entry is unlinked the shard
+// falls and the reverse-clean removes its file entry with it.
+func TestSweepAnchorSHA256ReclaimsDespiteFileEntry(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("sha-anchored only")})
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{f.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if got, want := sweptHashes(res.SweptXorbs), []string{f.xorbHashes[0].String()}; !slices.Equal(got, want) {
+				t.Fatalf("SweptXorbs = %v, want %v", got, want)
+			}
+			if res.DeletedFileEntries != 1 {
+				t.Fatalf("DeletedFileEntries = %d, want 1", res.DeletedFileEntries)
+			}
+			if res.RepointedFileEntries != 0 {
+				t.Fatalf("RepointedFileEntries = %d, want 0", res.RepointedFileEntries)
+			}
+
+			// Unreachable both ways.
+			if got, _, err := gcs.GetFileIndexEntry(ctx, f.fileHash); err != nil || got != "" {
+				t.Fatalf("file entry = %q, %v; want removed", got, err)
+			}
+			if _, err := st.GetShard(ctx, f.fileHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("GetShard = %v, want ErrNotExist", err)
+			}
+			if _, err := st.GetReconstructedFile(ctx, "default", sha256Digest(f.sha256Hex)); err == nil {
+				t.Fatal("sha256 reconstruction still resolves")
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); ok {
+				t.Fatal("xorb still stored")
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256CollapsesDuplicateChunkings: identical content stored
+// under two chunkings shares one sha256 entry; an AnchorSHA256 sweep keeps
+// only the shard the entry points at and removes the loser's file entry,
+// while the SHA-256 lookup keeps resolving.
+func TestSweepAnchorSHA256CollapsesDuplicateChunkings(t *testing.T) {
+	content := []byte("duplicate content stored under two chunkings")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f1 := putGCFile(t, ctx, st, [][]byte{content})
+			f2 := putGCFile(t, ctx, st, [][]byte{content[:13], content[13:]})
+			if f1.sha256Hex != f2.sha256Hex {
+				t.Fatal("test setup: contents must share a SHA-256")
+			}
+			// FileStorage keeps the first writer, S3 the last: read the entry
+			// to learn which shard won.
+			ownerHash, err := gcs.GetSHA256IndexEntry(ctx, f1.sha256Hex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			winner, loser := f1, f2
+			if ownerHash == f2.shardHash {
+				winner, loser = f2, f1
+			} else if ownerHash != f1.shardHash {
+				t.Fatalf("sha256 entry owner = %q, want one of the two shards", ownerHash)
+			}
+
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{loser.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+
+			// The loser collapsed: chunkings differ, so the winner does not
+			// carry its file hash and the entry is deleted, not repointed.
+			if got, _, err := gcs.GetFileIndexEntry(ctx, loser.fileHash); err != nil || got != "" {
+				t.Fatalf("loser file entry = %q, %v; want removed", got, err)
+			}
+			if _, err := st.GetShard(ctx, loser.fileHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("GetShard(loser) = %v, want ErrNotExist", err)
+			}
+			for _, xh := range loser.xorbHashes {
+				if ok, _ := st.HasXorb(ctx, "default", xh); ok {
+					t.Fatalf("loser xorb %s still stored", xh.String())
+				}
+			}
+
+			// The winner survives with the shared SHA-256 lookup intact.
+			assertFileIntact(t, ctx, st, winner)
+			gotHash, err := st.GetFileHashBySHA256(ctx, "default", sha256Digest(winner.sha256Hex))
+			if err != nil || gotHash != winner.fileHash {
+				t.Fatalf("GetFileHashBySHA256 = %s, %v; want %s", gotHash.String(), err, winner.fileHash.String())
+			}
+			for _, xh := range winner.xorbHashes {
+				if ok, _ := st.HasXorb(ctx, "default", xh); !ok {
+					t.Fatalf("winner xorb %s swept", xh.String())
+				}
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256RepointsFileEntry: two stored shard objects carry the
+// same file block; the file entry points at the doomed one while the live
+// one is sha-anchored. The sweep repoints the entry to the live owner
+// instead of deleting it.
+func TestSweepAnchorSHA256RepointsFileEntry(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("repoint my file entry")})
+
+			// A second shard object carrying the same file block, minus the
+			// CAS info so it hashes differently. PutShard would no-op on the
+			// existing file entry, so store the object directly and point
+			// the file entry at it.
+			twin := shard.NewShard()
+			twin.AddFile(shard.FileBlock{
+				FileHash: f.fileHash,
+				Flags:    shard.FileWithMetadataExt,
+				Entries: []shard.FileDataSequenceEntry{
+					{CASHash: f.xorbHashes[0], UnpackedSegBytes: uint32(len(f.content)), ChunkIndexEnd: 1},
+				},
+				MetadataExt: &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(sha256Digest(f.sha256Hex))},
+			})
+			twinHash := putShardObject(t, ctx, st, twin)
+			if twinHash == f.shardHash {
+				t.Fatal("test setup: twin must be a distinct shard object")
+			}
+			if err := gcs.SetFileIndexEntry(ctx, f.fileHash, twinHash); err != nil {
+				t.Fatal(err)
+			}
+
+			// The twin holds the file entry but no sha ref; the original is
+			// sha-anchored and carries the same file: repoint, don't delete.
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{twinHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if res.RepointedFileEntries != 1 {
+				t.Fatalf("RepointedFileEntries = %d, want 1", res.RepointedFileEntries)
+			}
+			if res.DeletedFileEntries != 0 {
+				t.Fatalf("DeletedFileEntries = %d, want 0", res.DeletedFileEntries)
+			}
+			if len(res.SweptXorbs) != 0 {
+				t.Fatalf("SweptXorbs = %v, want none (the xorb serves the live shard)", sweptHashes(res.SweptXorbs))
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, f.fileHash); err != nil || got != f.shardHash {
+				t.Fatalf("file entry = %q, %v; want repointed to %q", got, err, f.shardHash)
+			}
+			assertFileIntact(t, ctx, st, f)
+		})
+	}
+}
+
+// TestSweepAnchorSHA256ExemptsZeroDigestFiles: empty files store all-zero
+// SHA-256 metadata and their shared index/sha256 entry never anchors, so
+// under AnchorSHA256 a live file entry must exempt such a shard from
+// collection; once the file entry is unlinked too, the shard falls and
+// takes the zero entry with it.
+func TestSweepAnchorSHA256ExemptsZeroDigestFiles(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			// An empty file: PutShard computes and stores the all-zero
+			// SHA-256 metadata and the shared zero sha256 index entry.
+			f := putGCFile(t, ctx, st, nil)
+			if got, err := gcs.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != f.shardHash {
+				t.Fatalf("zero sha256 entry = %q, %v; want %q", got, err, f.shardHash)
+			}
+
+			res, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if len(res.SweptShards) != 0 {
+				t.Fatalf("exempt shard swept: %+v", res.SweptShards)
+			}
+			if _, err := st.GetShard(ctx, f.fileHash); err != nil {
+				t.Fatalf("GetShard after sweep: %v", err)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != f.shardHash {
+				t.Fatalf("zero sha256 entry after sweep = %q, %v; want untouched", got, err)
+			}
+
+			// Without the file entry the exemption lapses.
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			res, err = Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep after unlink: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{f.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if res.DeletedSHA256Entries != 1 {
+				t.Fatalf("DeletedSHA256Entries = %d, want 1 (the zero entry goes with its shard)", res.DeletedSHA256Entries)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != "" {
+				t.Fatalf("zero sha256 entry = %q, %v; want removed", got, err)
+			}
+		})
+	}
+}
+
+// TestSweepStepAnchorChangeRestarts: a step with a different anchor discards
+// the half-consumed cycle and marks afresh under the new rules.
+func TestSweepStepAnchorChangeRestarts(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			files := putUnlinkedGCFiles(t, ctx, st, "anchor restart one", "anchor restart two")
+			g := NewGC(gcs)
+			res, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if res.Done || res.RemainingShards != 1 || res.RemainingXorbs != 2 {
+				t.Fatalf("first step = done %v, remaining %d/%d; want not done, 1/2", res.Done, res.RemainingShards, res.RemainingXorbs)
+			}
+			swept, kept := files[0], files[1]
+			if res.SweptShards[0].Hash == files[1].shardHash {
+				swept, kept = files[1], files[0]
+			}
+
+			// A different Anchor discards the cycle and re-marks under the
+			// new rules: the kept file's sha256 entry now anchors its shard,
+			// leaving only the already-swept file's orphaned xorb dead.
+			res, err = g.SweepStep(ctx, SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("SweepStep after anchor change: %v", err)
+			}
+			if len(res.SweptShards) != 0 {
+				t.Fatalf("re-marked step swept %d shards, want a fresh accumulator with 0", len(res.SweptShards))
+			}
+			if got, want := sweptHashes(res.SweptXorbs), []string{swept.xorbHashes[0].String()}; !slices.Equal(got, want) {
+				t.Fatalf("SweptXorbs = %v, want %v (only the orphaned xorb)", got, want)
+			}
+			if !res.Done {
+				t.Fatal("re-marked cycle not done after draining the one dead xorb")
+			}
+
+			// The sha-anchored shard and its xorb survived the anchor change.
+			if _, err := gcs.GetShardByHash(ctx, kept.shardHash); err != nil {
+				t.Fatalf("kept shard: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", kept.xorbHashes[0]); !ok {
+				t.Fatal("kept xorb swept")
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256DryRunParity: a dry run under AnchorSHA256 reports
+// exactly what the real sweep then removes, including the zero-digest
+// exemption keeping the empty file's shard alive.
+func TestSweepAnchorSHA256DryRunParity(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			// doomed: sha unlinked, file entry live → dead under AnchorSHA256.
+			doomed := putGCFile(t, ctx, st, [][]byte{[]byte("doomed under sha anchor")})
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(doomed.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+			// kept: sha-anchored. empty: exempt through its zero digest.
+			kept := putGCFile(t, ctx, st, [][]byte{[]byte("kept under sha anchor")})
+			empty := putGCFile(t, ctx, st, nil)
+
+			opts := SweepOptions{Grace: noGrace, Anchor: AnchorSHA256, DryRun: true}
+			dry, err := Sweep(ctx, gcs, opts)
+			if err != nil {
+				t.Fatalf("dry Sweep: %v", err)
+			}
+			if !dry.DryRun {
+				t.Fatal("result not marked dry run")
+			}
+			opts.DryRun = false
+			wet, err := Sweep(ctx, gcs, opts)
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+
+			if got, want := sweptHashes(dry.SweptShards), sweptHashes(wet.SweptShards); !slices.Equal(got, want) {
+				t.Fatalf("dry SweptShards = %v, real = %v", got, want)
+			}
+			if got, want := sweptHashes(dry.SweptXorbs), sweptHashes(wet.SweptXorbs); !slices.Equal(got, want) {
+				t.Fatalf("dry SweptXorbs = %v, real = %v", got, want)
+			}
+			if dry.ReclaimedBytes != wet.ReclaimedBytes {
+				t.Fatalf("dry ReclaimedBytes = %d, real %d", dry.ReclaimedBytes, wet.ReclaimedBytes)
+			}
+			if got, want := sweptHashes(wet.SweptShards), []string{doomed.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("real SweptShards = %v, want %v", got, want)
+			}
+
+			// The real sweep removed exactly the doomed file and spared the
+			// anchored and exempt shards.
+			assertFileIntact(t, ctx, st, kept)
+			if _, err := st.GetShard(ctx, empty.fileHash); err != nil {
+				t.Fatalf("GetShard(empty): %v", err)
+			}
+			if _, err := st.GetShard(ctx, doomed.fileHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("GetShard(doomed) = %v, want ErrNotExist", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", doomed.xorbHashes[0]); ok {
+				t.Fatal("doomed xorb still stored")
+			}
+		})
+	}
+}
+
+// TestSweepUnknownAnchorFails: an unrecognized anchor fails fast at mark.
+func TestSweepUnknownAnchorFails(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			gcs := backend.newStore(t).(GCStore)
+			if _, err := Sweep(ctx, gcs, SweepOptions{Grace: noGrace, Anchor: "bogus"}); err == nil || !strings.Contains(err.Error(), "unknown sweep anchor") {
+				t.Fatalf("Sweep with bogus anchor = %v, want unknown-anchor error", err)
+			}
+			g := NewGC(gcs)
+			if _, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, Anchor: "bogus"}); err == nil || !strings.Contains(err.Error(), "unknown sweep anchor") {
+				t.Fatalf("SweepStep with bogus anchor = %v, want unknown-anchor error", err)
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256RevivesMultiFileRecommit: a sha-dead multi-file shard
+// (its digests owned by live duplicate shards) is recommitted between the
+// mark walks: one file entry is unlinked and PutShard rewrites both. The
+// second look must treat the previously-absent entry as fresh and revive the
+// shard — freshness is per entry→shard pair, not per shard.
+func TestSweepAnchorSHA256RevivesMultiFileRecommit(t *testing.T) {
+	contentA := []byte("first duplicate payload aye")
+	contentB := []byte("second duplicate payload bee")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			// Whole-content shards own the sha256 entries, leaving the two-file
+			// shard below sha-dead.
+			fa := putGCFile(t, ctx, st, [][]byte{contentA})
+			fb := putGCFile(t, ctx, st, [][]byte{contentB})
+			// Pin the sha entries on the whole-content shards: backends differ
+			// in which writer their index keeps.
+			pinSHAOwners := func() {
+				for _, f := range []gcFile{fa, fb} {
+					if err := gcs.SetSHA256IndexEntry(ctx, f.sha256Hex, f.shardHash); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			buildShard := func() (*shard.Shard, xet.FileHash, xet.FileHash) {
+				shardObj := shard.NewShard()
+				f1, _, _ := addGCFileBlock(t, ctx, st, shardObj, [][]byte{contentA[:11], contentA[11:]})
+				f2, _, _ := addGCFileBlock(t, ctx, st, shardObj, [][]byte{contentB[:9], contentB[9:]})
+				return shardObj, f1, f2
+			}
+			shardObj, file1, file2 := buildShard()
+			if _, err := st.PutShard(ctx, shardObj); err != nil {
+				t.Fatal(err)
+			}
+			pinSHAOwners()
+			// Only file1's entry exists at the mark.
+			if _, err := NewGC(gcs).Unlink(ctx, file2); err != nil {
+				t.Fatal(err)
+			}
+
+			// Between the walks a recommit rewrites both file entries (PutShard
+			// only proceeds once no file of the shard has an entry).
+			hooked := &hookedGCStore{GCStore: gcs}
+			hooked.afterWalkXorbs = func() {
+				if _, err := NewGC(gcs).Unlink(ctx, file1); err != nil {
+					t.Fatal(err)
+				}
+				again, _, _ := buildShard()
+				if _, err := st.PutShard(ctx, again); err != nil {
+					t.Fatal(err)
+				}
+				pinSHAOwners()
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("recommitted shard swept: %+v", res)
+			}
+			if _, err := st.GetShard(ctx, file1); err != nil {
+				t.Fatalf("GetShard(file1) after sweep: %v", err)
+			}
+			if _, err := st.GetShard(ctx, file2); err != nil {
+				t.Fatalf("GetShard(file2) after sweep: %v", err)
+			}
+		})
+	}
+}
+
+// setupSHA256RecommitRace stores identical content under two chunkings with
+// the shared sha256 entry pinned on the winner, and arms hooked with the
+// unlink-and-recommit ABA sequence fired between the mark walks and the
+// deletes: the loser's file entry is deleted and the identical shard
+// recommitted, recreating byte-identical entry→shard pairs the pair-level
+// second look cannot tell from the pre-mark state. The winner's sha
+// ownership is re-pinned (the recommit overwrites it on backends whose
+// index keeps the last writer) and the recreated entries keep their true
+// fresh mtimes under an aged wrapper.
+func setupSHA256RecommitRace(t *testing.T, ctx context.Context, st Storage, content []byte) (winner, loser gcFile, hooked *hookedGCStore) {
+	t.Helper()
+	gcs := st.(GCStore)
+
+	winner = putGCFile(t, ctx, st, [][]byte{content})
+	loser = putGCFile(t, ctx, st, [][]byte{content[:14], content[14:]})
+	if winner.sha256Hex != loser.sha256Hex {
+		t.Fatal("test setup: contents must share a SHA-256")
+	}
+	pinWinner := func() {
+		if err := gcs.SetSHA256IndexEntry(ctx, winner.sha256Hex, winner.shardHash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinWinner()
+
+	hooked = &hookedGCStore{GCStore: gcs}
+	hooked.afterWalkXorbs = func() {
+		if _, err := NewGC(gcs).Unlink(ctx, loser.fileHash); err != nil {
+			t.Fatal(err)
+		}
+		rebuilt := shard.NewShard()
+		addGCFileBlock(t, ctx, st, rebuilt, [][]byte{content[:14], content[14:]})
+		if _, err := st.PutShard(ctx, rebuilt); err != nil {
+			t.Fatal(err)
+		}
+		pinWinner()
+		hooked.freshFileEntries = map[string]bool{loser.fileHash.String(): true}
+	}
+	return winner, loser, hooked
+}
+
+// TestSweepAnchorSHA256FreshEntryShieldsRecommit: between the mark and the
+// deletes the sha-dead loser's file entry is unlinked and the identical
+// shard recommitted. The recreated entry→shard pairs look exactly like the
+// pre-mark state, so only their fresh mtimes betray the completed commit:
+// with a positive grace the freshness shield must keep the recommitted
+// upload — entry, shard, and xorbs — whole.
+func TestSweepAnchorSHA256FreshEntryShieldsRecommit(t *testing.T) {
+	content := []byte("recommitted duplicate payload")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+			winner, loser, hooked := setupSHA256RecommitRace(t, ctx, st, content)
+
+			// Age the stored objects and file entries past the cutoff.
+			switch b := st.(type) {
+			case *FileStorage:
+				old := time.Now().Add(-2 * time.Hour)
+				paths := []string{
+					b.objectPath("shards", winner.shardHash),
+					b.objectPath("shards", loser.shardHash),
+					b.objectPath("index/files", winner.fileHash.String()),
+					b.objectPath("index/files", loser.fileHash.String()),
+				}
+				for _, f := range []gcFile{winner, loser} {
+					for _, xh := range f.xorbHashes {
+						paths = append(paths, b.objectPath("xorbs", xh.String()))
+					}
+				}
+				for _, p := range paths {
+					if err := os.Chtimes(p, old, old); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case *S3Storage:
+				// gofakes3 timestamps cannot be set: the wrapper backdates
+				// every walk and entry time instead, sparing the entries the
+				// recommit recreates.
+				hooked.age = 2 * time.Hour
+			}
+
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("recommitted upload destroyed: %+v", res)
+			}
+			if res.DeletedFileEntries != 0 || res.RepointedFileEntries != 0 {
+				t.Fatalf("recommitted file entries touched: %+v", res)
+			}
+
+			// The recommitted upload survived whole and stays reachable.
+			if got, _, err := gcs.GetFileIndexEntry(ctx, loser.fileHash); err != nil || got != loser.shardHash {
+				t.Fatalf("file entry = %q, %v; want %q", got, err, loser.shardHash)
+			}
+			for _, xh := range loser.xorbHashes {
+				if ok, _ := st.HasXorb(ctx, "default", xh); !ok {
+					t.Fatalf("xorb %s of the recommitted shard swept", xh.String())
+				}
+			}
+			assertFileIntact(t, ctx, st, loser)
+			if got, err := gcs.GetSHA256IndexEntry(ctx, winner.sha256Hex); err != nil || got != winner.shardHash {
+				t.Fatalf("sha256 entry = %q, %v; want %q", got, err, winner.shardHash)
+			}
+			assertFileIntact(t, ctx, st, winner)
+
+			// The freshness shield is judged at the mark too: a dry run over
+			// the post-recommit state reports nothing sweepable.
+			dry, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorSHA256, DryRun: true})
+			if err != nil {
+				t.Fatalf("dry Sweep: %v", err)
+			}
+			if len(dry.SweptShards) != 0 || len(dry.SweptXorbs) != 0 {
+				t.Fatalf("dry run reports the shielded recommit sweepable: %+v", dry)
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256RecommitCollectedWithoutGrace: the same ABA sequence
+// with the window disabled collects the recommitted shard — the documented
+// accepted race — proving the freshness shield is grace-gated.
+func TestSweepAnchorSHA256RecommitCollectedWithoutGrace(t *testing.T) {
+	content := []byte("recommitted duplicate payload")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+			winner, loser, hooked := setupSHA256RecommitRace(t, ctx, st, content)
+
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{loser.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, loser.fileHash); err != nil || got != "" {
+				t.Fatalf("file entry = %q, %v; want removed", got, err)
+			}
+			if _, err := gcs.GetShardByHash(ctx, loser.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("recommitted shard load = %v, want ErrNotExist", err)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, winner.sha256Hex); err != nil || got != winner.shardHash {
+				t.Fatalf("sha256 entry = %q, %v; want %q", got, err, winner.shardHash)
+			}
+			assertFileIntact(t, ctx, st, winner)
+		})
+	}
+}
+
+// TestFreshCutoffTruncationInvariant: sweep freshness compares mtimes against
+// the cutoff truncated to whole seconds. For every sub-second cutoff phase,
+// an entry modified at or after the raw cutoff must still read fresh when
+// its mtime is reported at S3's second precision — truncation may only widen
+// the shield, never miss a genuinely fresh entry.
+func TestFreshCutoffTruncationInvariant(t *testing.T) {
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	for phaseMs := 0; phaseMs < 1000; phaseMs += 25 {
+		cutoff := base.Add(time.Duration(phaseMs) * time.Millisecond)
+		freshCutoff := cutoff.Truncate(time.Second)
+		for deltaMs := 0; deltaMs < 2500; deltaMs += 25 {
+			event := cutoff.Add(time.Duration(deltaMs) * time.Millisecond)
+			reported := event.Truncate(time.Second)
+			if reported.Before(freshCutoff) {
+				t.Fatalf("event at cutoff+%dms (phase %dms) reads stale: reported %v < freshCutoff %v",
+					deltaMs, phaseMs, reported, freshCutoff)
+			}
+		}
 	}
 }

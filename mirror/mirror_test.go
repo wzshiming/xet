@@ -503,7 +503,7 @@ func TestMirrorReingestsAfterStorageUnlink(t *testing.T) {
 		t.Fatalf("upstream data GETs = %d, want 1", got)
 	}
 
-	removed, err := storage.Unlink(context.Background(), fx.stor.(storage.GCStore), fileHash)
+	removed, err := storage.NewGC(fx.stor.(storage.GCStore)).Unlink(context.Background(), fileHash)
 	if err != nil {
 		t.Fatal(err)
 	}

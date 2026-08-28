@@ -150,6 +150,90 @@ func TestUnlinkFileEndpoint(t *testing.T) {
 	}
 }
 
+func TestUnlinkSHA256Endpoint(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("sha256 unlink endpoint content")
+	putTestFile(t, ctx, fs, content)
+	digest := sha256.Sum256(content)
+	shaHex := hex.EncodeToString(digest[:])
+	handler := NewHandler(WithStorage(fs))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+shaHex, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["sha256"] != shaHex || resp["removed"] != true {
+		t.Fatalf("response = %v", resp)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+shaHex, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("second unlink status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+
+	// Under anchor=sha256 the remaining file entry does not anchor: the
+	// shard and its xorb are reclaimed.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=sha256", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode sweep: %v", err)
+	}
+	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
+		t.Fatalf("sweep result = %+v", result)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=sha256", nil))
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode second sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("second sweep result = %+v", result)
+	}
+}
+
+func TestUnlinkSHA256EndpointRejectsBadDigests(t *testing.T) {
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+
+	for _, hash := range []string{
+		"abc",                    // too short
+		strings.Repeat("ab", 33), // too long
+		strings.Repeat("zz", 32), // not hex
+		strings.Repeat("00", 32), // all-zero empty-file marker
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+hash, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%q status = %d, want %d", hash, rec.Code, http.StatusBadRequest)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+strings.Repeat("ab", 32), nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown digest status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestGCSweepEndpoint(t *testing.T) {
 	ctx := context.Background()
 	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
@@ -165,9 +249,10 @@ func TestGCSweepEndpoint(t *testing.T) {
 		t.Fatalf("unlink status = %d", rec.Code)
 	}
 
-	// Dry run reports the orphans but removes nothing.
+	// Dry run reports the orphans but removes nothing. anchor=files keeps
+	// this a legacy-mode flow where the file unlink alone orphans the shard.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?dry_run=true&grace=0", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?dry_run=true&grace=0&anchor=files", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("dry run status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -180,7 +265,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=files", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -194,7 +279,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 
 	// Everything is gone: a second sweep finds nothing.
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=files", nil))
 	result = storage.SweepResult{}
 	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
 		t.Fatalf("decode second sweep: %v", err)
@@ -240,7 +325,7 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 	remaining := -1
 	for {
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&max=1", nil))
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&max=1&anchor=files", nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("step %d status = %d: %s", steps, rec.Code, rec.Body.String())
 		}
@@ -271,7 +356,7 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 
 	// Nothing is left for a full pass.
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=files", nil))
 	result = storage.SweepResult{}
 	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
 		t.Fatalf("decode full pass: %v", err)
@@ -317,7 +402,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 		t.Fatalf("unlink status = %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?anchor=files", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -343,7 +428,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 		t.Fatalf("unlink status = %d", rec.Code)
 	}
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?anchor=files", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("default sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -358,7 +443,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	// An explicit parameter overrides the disabled server default.
 	handler = NewHandler(WithStorage(fs2), WithGCGrace(-1))
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=1h", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=1h&anchor=files", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("override sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -371,6 +456,126 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	}
 }
 
+// TestGCSweepEndpointDefaultAnchor: under the default anchor full removal
+// takes both unlinks — the file unlink alone leaves the sha256 entry
+// anchoring the shard.
+func TestGCSweepEndpointDefaultAnchor(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("default anchor content")
+	fileHash := putTestFile(t, ctx, fs, content)
+	digest := sha256.Sum256(content)
+	handler := NewHandler(WithStorage(fs))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("sweep after file unlink alone = %+v", result)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+hex.EncodeToString(digest[:]), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sha256 unlink status = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode second sweep: %v", err)
+	}
+	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
+		t.Fatalf("sweep after both unlinks = %+v", result)
+	}
+}
+
+// TestGCSweepEndpointAnchorParam: the anchor parameter selects the sweep
+// anchor, WithGCAnchor supplies it when omitted, and unknown or misspelled
+// values are rejected.
+func TestGCSweepEndpointAnchorParam(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+
+	for _, v := range []string{"bogus", "Files", "SHA256", "BOTH", "file"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?anchor="+v, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("anchor=%s status = %d, want %d", v, rec.Code, http.StatusBadRequest)
+		}
+	}
+
+	// An explicit anchor=both matches the default: after a file unlink the
+	// sha256 entry still anchors the shard.
+	fileHash := putTestFile(t, ctx, fs, []byte("anchor param content"))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=both", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anchor=both sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode anchor=both sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("anchor=both sweep = %+v", result)
+	}
+
+	// WithGCAnchor supplies the anchor for requests omitting the parameter;
+	// an explicit parameter still overrides the server default.
+	filesHandler := NewHandler(WithStorage(fs), WithGCAnchor(storage.AnchorFiles))
+	rec = httptest.NewRecorder()
+	filesHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=both", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("override sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode override sweep: %v", err)
+	}
+	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
+		t.Fatalf("override sweep = %+v", result)
+	}
+	rec = httptest.NewRecorder()
+	filesHandler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("server-default sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode server-default sweep: %v", err)
+	}
+	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
+		t.Fatalf("server-default anchor sweep = %+v", result)
+	}
+}
+
 func TestGCEndpointsNotImplemented(t *testing.T) {
 	handler := NewHandler(WithStorage(listlessStorage{}))
 
@@ -378,6 +583,12 @@ func TestGCEndpointsNotImplemented(t *testing.T) {
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+strings.Repeat("ab", 32), nil))
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("unlink status = %d, want %d", rec.Code, http.StatusNotImplemented)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+strings.Repeat("ab", 32), nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("sha256 unlink status = %d, want %d", rec.Code, http.StatusNotImplemented)
 	}
 
 	rec = httptest.NewRecorder()
