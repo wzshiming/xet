@@ -117,6 +117,13 @@ type SweepResult struct {
 	// never includes the all-zero empty-file entry.
 	DanglingSHA256Entries []string `json:"dangling_sha256_entries"`
 
+	// UnreadableShards are stored shard objects that could not be loaded —
+	// decode failures or backend errors. Each is treated as live, nothing
+	// of it is deleted, and while any is present the pass sweeps no xorbs:
+	// an unreadable shard's references are unknown, so every queued xorb
+	// might be one of them. Dead-shard cleanup still proceeds.
+	UnreadableShards []string `json:"unreadable_shards"`
+
 	// SkippedInGrace counts unreferenced objects left alone because they
 	// were written within the grace window or shielded by an in-grace
 	// shard's references.
@@ -324,10 +331,13 @@ func (o SweepOptions) window() time.Duration {
 // aged unreferenced shard can race its delete (dedup hits do not refresh
 // mtimes). Those residual races are accepted.
 //
-// Any shard object that exists but cannot be loaded (a decode failure or a
-// transient backend error) fails the sweep at that point — nothing is
-// deleted for it, and the sweep must be re-run once the object is repaired
-// or removed; sweeps are fail-stop, not skip-and-continue.
+// Any shard object that exists but cannot be loaded — a decode failure or
+// a backend error — is reported in UnreadableShards and treated as live:
+// nothing of it is deleted, dead-shard cleanup elsewhere proceeds, and the
+// pass deletes no xorbs at all, since the unreadable shard's references are
+// unknown and any queued xorb might be one of them. Transient errors heal
+// on a later sweep; decode failures keep the shard reported until it is
+// repaired or removed. Context cancellation still aborts the sweep instead.
 //
 // Under AnchorSHA256 one more race matters: a dead shard's file entries can
 // be unlinked and the identical shard recommitted while the sweep runs,
@@ -411,6 +421,21 @@ func (c *sweepCycle) markLive(sh *shard.Shard, shardHash string) {
 	markShardOwners(sh, shardHash, c.chunkOwners, c.shaOwners, c.fileOwners)
 }
 
+// markUnreadable records a shard whose stored object cannot be loaded:
+// treated as live so nothing of it is swept, reported for repair, and — its
+// references being unknown — poisoning the cycle's xorb phase.
+func (c *sweepCycle) markUnreadable(shardHash string) {
+	c.liveShards[shardHash] = true
+	c.res.UnreadableShards = append(c.res.UnreadableShards, shardHash)
+	slices.Sort(c.res.UnreadableShards)
+}
+
+// loadAborts reports a shard-load failure the sweep must stop for — the
+// step's own dying context — rather than brand the shard unreadable.
+func loadAborts(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // matches reports whether the cycle's mark used the same effective window
 // and anchor.
 func (c *sweepCycle) matches(opts SweepOptions) bool {
@@ -436,6 +461,7 @@ func (c *sweepCycle) snapshot() *SweepResult {
 	res.SweptXorbs = slices.Clone(res.SweptXorbs)
 	res.DanglingFileEntries = slices.Clone(res.DanglingFileEntries)
 	res.DanglingSHA256Entries = slices.Clone(res.DanglingSHA256Entries)
+	res.UnreadableShards = slices.Clone(res.UnreadableShards)
 	res.Done = c.phase == sweepPhaseDone
 	res.RemainingShards = len(c.deadShards)
 	res.RemainingXorbs = len(c.deadXorbs)
@@ -468,6 +494,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 			SweptXorbs:            []SweptObject{},
 			DanglingFileEntries:   []string{},
 			DanglingSHA256Entries: []string{},
+			UnreadableShards:      []string{},
 		},
 		liveShards:  map[string]bool{},
 		liveXorbs:   map[string]bool{},
@@ -516,7 +543,11 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 				c.res.DanglingFileEntries = append(c.res.DanglingFileEntries, fileHashes...)
 				continue
 			}
-			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
+			if loadAborts(err) {
+				return nil, err
+			}
+			c.markUnreadable(shardHash)
+			continue
 		}
 		// Under AnchorSHA256 a file entry alone does not anchor, except for
 		// shards carrying files that can never be sha-anchored: a live file
@@ -550,7 +581,11 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 				c.res.DanglingSHA256Entries = append(c.res.DanglingSHA256Entries, shaRefHexes[shardHash]...)
 				continue
 			}
-			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
+			if loadAborts(err) {
+				return nil, err
+			}
+			c.markUnreadable(shardHash)
+			continue
 		}
 		c.markLive(sh, shardHash)
 	}
@@ -580,7 +615,11 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 				if errors.Is(err, iofs.ErrNotExist) {
 					return nil
 				}
-				return fmt.Errorf("load in-grace shard %s: %w", hash, err)
+				if loadAborts(err) {
+					return err
+				}
+				c.markUnreadable(hash)
+				return nil
 			}
 			markShardXorbs(sh, graceXorbs)
 			return nil
@@ -647,7 +686,11 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 			if errors.Is(err, iofs.ErrNotExist) {
 				continue // dangling entry; left for the next sweep to report
 			}
-			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
+			if loadAborts(err) {
+				return nil, err
+			}
+			c.markUnreadable(shardHash)
+			continue
 		}
 		c.markLive(sh, shardHash)
 	}
@@ -684,7 +727,11 @@ func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
 			if errors.Is(err, iofs.ErrNotExist) {
 				return nil
 			}
-			return fmt.Errorf("load shard %s: %w", hash, err)
+			if loadAborts(err) {
+				return err
+			}
+			c.markUnreadable(hash)
+			return nil
 		}
 		markShardXorbs(sh, c.liveXorbs)
 		return nil
@@ -713,6 +760,12 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 		return (maxDeletes > 0 && consumed >= maxDeletes) || (budget > 0 && time.Since(start) >= budget)
 	}
 	dryRun := c.res.DryRun
+	// An unreadable shard poisons the xorb phase: its references are
+	// unknown, so no queued xorb is provably dead. Dropping the queue here
+	// also keeps the re-shield walks from running for nothing.
+	if len(c.res.UnreadableShards) > 0 {
+		c.deadXorbs = nil
+	}
 	reshield := func() error {
 		walkStart := time.Now()
 		err := c.reshieldXorbs(ctx, st)
@@ -781,6 +834,9 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 	}
 
 	for c.phase == sweepPhaseXorbs {
+		if len(c.res.UnreadableShards) > 0 {
+			c.deadXorbs = nil
+		}
 		if len(c.deadXorbs) == 0 {
 			c.phase = sweepPhaseDone
 			break
@@ -841,7 +897,11 @@ func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string
 			// here, and without the shard its entries cannot be enumerated.
 			return false, nil
 		}
-		return false, fmt.Errorf("load dead shard %s: %w", shardHash, err)
+		if loadAborts(err) {
+			return false, err
+		}
+		c.markUnreadable(shardHash)
+		return false, nil
 	}
 
 	// Under AnchorSHA256 with a positive grace a fresh file entry shields

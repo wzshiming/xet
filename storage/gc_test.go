@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -679,6 +680,7 @@ type hookedGCStore struct {
 	walkShardsCalls  int            // WalkShards invocations
 	shardLoads       map[string]int // LoadShard tally, nil = off
 	cachedShardGets  int            // GetShardByHash invocations (GC must not)
+	loadShardErrs    map[string]error
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -762,6 +764,9 @@ func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard
 	}
 	if h.shardLoads != nil {
 		h.shardLoads[shardHash]++
+	}
+	if err, ok := h.loadShardErrs[shardHash]; ok {
+		return nil, err
 	}
 	return h.GCStore.LoadShard(ctx, shardHash)
 }
@@ -1843,6 +1848,121 @@ func TestSweepLeavesShardCacheCold(t *testing.T) {
 		t.Fatalf("shard cache holds %d entries after the sweep, want 0", n)
 	}
 	assertFileIntact(t, ctx, st, fLive)
+}
+
+// TestSweepReportsUnreadableDeadShard: a dead shard whose object cannot be
+// decoded no longer fails the sweep — it is reported, treated as live, and
+// nothing of it (object, entries, xorb) is deleted.
+func TestSweepReportsUnreadableDeadShard(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("unreadable dead shard")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.loadShardErrs = map[string]error{f.shardHash: errors.New("decode stored shard: corrupt")}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep = %v, want the unreadable shard skipped, not fail-stop", err)
+			}
+			if got, want := res.UnreadableShards, []string{f.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("UnreadableShards = %v, want %v", got, want)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("swept %v/%v, want nothing", sweptHashes(res.SweptShards), sweptHashes(res.SweptXorbs))
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("unreadable shard object gone: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("unreadable shard's xorb was swept")
+			}
+			if got, err := gcs.GetChunkIndexEntry(ctx, f.chunkHashes[0]); err != nil || got != f.shardHash {
+				t.Fatalf("chunk entry = %q, %v; want untouched %q", got, err, f.shardHash)
+			}
+		})
+	}
+}
+
+// TestSweepUnreadableShardSuppressesXorbSweep: one unreadable live shard
+// must not stop dead-shard cleanup, but no xorb may be deleted — the
+// unreadable shard could reference any of them.
+func TestSweepUnreadableShardSuppressesXorbSweep(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			fSick := putGCFile(t, ctx, st, [][]byte{[]byte("unreadable live shard")})
+			fDead := putGCFile(t, ctx, st, [][]byte{[]byte("healthy dead shard")})
+			if _, err := NewGC(gcs).Unlink(ctx, fDead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.loadShardErrs = map[string]error{fSick.shardHash: errors.New("decode stored shard: corrupt")}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := res.UnreadableShards, []string{fSick.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("UnreadableShards = %v, want %v", got, want)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v (dead-shard cleanup must proceed)", got, want)
+			}
+			if len(res.SweptXorbs) != 0 || res.RemainingXorbs != 0 {
+				t.Fatalf("xorbs swept %v remaining %d, want none (xorb phase poisoned)", sweptHashes(res.SweptXorbs), res.RemainingXorbs)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", fDead.xorbHashes[0]); !ok {
+				t.Fatal("queued xorb swept despite an unreadable shard")
+			}
+			if _, err := gcs.GetShardByHash(ctx, fDead.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("dead shard load = %v, want ErrNotExist", err)
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, fSick.fileHash); err != nil || got != fSick.shardHash {
+				t.Fatalf("unreadable shard's file entry = %q, %v; want untouched", got, err)
+			}
+		})
+	}
+}
+
+// TestSweepLoadContextErrorAborts: a load failing with the step's own dying
+// context aborts the sweep — parked, not discarded — and must not brand the
+// shard unreadable.
+func TestSweepLoadContextErrorAborts(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := putGCFile(t, ctx, st, [][]byte{[]byte("canceled mid-load")})
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
+		t.Fatal(err)
+	}
+
+	hooked := &hookedGCStore{GCStore: st}
+	hooked.loadShardErrs = map[string]error{f.shardHash: fmt.Errorf("get object: %w", context.Canceled)}
+	g := NewGC(hooked)
+	if _, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, Anchor: AnchorFiles}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SweepStep = %v, want context.Canceled", err)
+	}
+	if g.cycle == nil {
+		t.Fatal("cycle discarded on a context load error, want it parked")
+	}
+	if n := len(g.cycle.res.UnreadableShards); n != 0 {
+		t.Fatalf("UnreadableShards = %d entries, want none for a context error", n)
+	}
+	if _, err := st.GetShardByHash(ctx, f.shardHash); err != nil {
+		t.Fatalf("shard gone after aborted step: %v", err)
+	}
 }
 
 // putShardObject stores an encoded shard object directly, bypassing PutShard
