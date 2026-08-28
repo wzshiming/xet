@@ -170,7 +170,7 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 // SweepStep consumes one bounded slice of a sweep cycle, failing with
 // ErrGCBusy when a sweep is already running. The first call marks a fresh
 // cycle, paying the full mark cost whatever the limits say, and the step
-// that drains the shard queue pays the full re-shield walk the same way;
+// that moves into the xorb queue pays the full re-shield walk the same way;
 // every step that consumes from the xorb queue re-runs the re-shield first,
 // so the late-commit loss window is bounded by one step, not by the parked
 // lifetime of the cycle, and steps with an empty xorb queue skip the walk.
@@ -286,9 +286,11 @@ func (o SweepOptions) window() time.Duration {
 // (PutShard commits chunk entries, then sha256, then files last, so a fresh
 // file ref implies a completed commit), each dead shard's own entries are
 // re-read per the anchor right before it is deleted, and once the shard
-// deletes finish every shard object still stored re-shields its xorbs,
-// covering commits that landed during that phase, and a step resuming a
-// parked cycle in the xorb phase repeats that walk before consuming more.
+// deletes finish every shard object stored since the cycle last looked
+// re-shields its xorbs — older unreferenced shards were already judged at
+// the mark — covering commits that landed during that phase, and a step
+// resuming a parked cycle in the xorb phase repeats that walk before
+// consuming more.
 // A commit landing behind the re-shield walk's cursor during the walk, or
 // after it within the same step, can still lose the xorb it reuses; an
 // upload committed after the mark may see the chunk/sha256 entries
@@ -357,6 +359,10 @@ type sweepCycle struct {
 	// precision; truncating the cutoff the same way can only widen the
 	// shield by under a second, never miss a genuinely fresh entry.
 	freshCutoff time.Time
+	// lastLook is the instant before the cycle's latest full look at the
+	// stored shards — the mark or the newest re-shield walk. Only shards
+	// written at or after it can carry commits the cycle has not judged.
+	lastLook time.Time
 
 	res *SweepResult
 
@@ -425,6 +431,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		marked:      now,
 		cutoff:      cutoff,
 		freshCutoff: cutoff.Truncate(time.Second),
+		lastLook:    now,
 		res: &SweepResult{
 			DryRun:                opts.DryRun,
 			SweptShards:           []SweptObject{},
@@ -624,12 +631,22 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 }
 
 // reshieldXorbs walks the stored shards and marks the xorbs of every shard
-// object not already live, shielding commits whose shards appeared since
-// the cycle last looked from the queued xorb deletes; a shard vanishing
-// mid-walk is skipped.
+// object not already live and written since the cycle's last full look,
+// shielding commits whose shards appeared since the cycle last looked from
+// the queued xorb deletes; a shard vanishing mid-walk is skipped. Older
+// non-live shards are not reloaded: the mark already judged them — their
+// xorbs were queued, or kept off the queue by the grace shield — and a
+// previous walk covered anything since. The threshold is truncated to whole
+// seconds for S3's second-precision timestamps, which can only widen the
+// reload set; like the grace comparisons it assumes backend and sweeper
+// clocks agree to about a second.
 func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
-	return st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
-		if c.liveShards[hash] {
+	threshold := c.lastLook.Truncate(time.Second)
+	// Advanced only when the walk completes: an aborted walk must stay
+	// re-coverable by the next one.
+	walkStart := time.Now()
+	err := st.WalkShards(ctx, func(hash string, _ int64, modTime time.Time) error {
+		if c.liveShards[hash] || modTime.Before(threshold) {
 			return nil
 		}
 		sh, err := st.GetShardByHash(ctx, hash)
@@ -642,6 +659,11 @@ func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
 		markShardXorbs(sh, c.liveXorbs)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	c.lastLook = walkStart
+	return nil
 }
 
 // run consumes the dead queues through the per-item delete logic. maxDeletes
@@ -684,6 +706,11 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 
 	for c.phase == sweepPhaseShards {
 		if len(c.deadShards) == 0 {
+			// A step spent exactly at the queue's end parks here: the next
+			// step's transition walk covers the gap, one walk instead of two.
+			if exhausted() {
+				return nil
+			}
 			// Re-shield at the transition: the shard-delete phase can take
 			// long, so any shard object stored at this point (late commits,
 			// in-grace uploads, skipped shards) shields its xorbs from the
