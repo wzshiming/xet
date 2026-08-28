@@ -89,8 +89,8 @@ type SweepResult struct {
 	DeletedChunkEntries  int `json:"deleted_chunk_entries"`
 	DeletedSHA256Entries int `json:"deleted_sha256_entries"`
 	// DeletedFileEntries counts file entries of dead shards removed by the
-	// reverse-clean; under anchors where file entries confer liveness it
-	// stays zero short of racing commits.
+	// reverse-clean — AnchorSHA256's stale-entry cleanup only; under anchors
+	// where file entries confer liveness the abort guard keeps it at zero.
 	DeletedFileEntries int `json:"deleted_file_entries"`
 
 	// Repointed*Entries count dead-shard index entries redirected to a live
@@ -260,8 +260,9 @@ func (o SweepOptions) window() time.Duration {
 // some live shard carries the same chunk, SHA-256, or file the entry is
 // repointed to that shard instead of deleted, so dedup and lookups keep
 // working for the surviving content. File entries of a dead shard with no
-// live owner are deleted with it — under anchors where file entries confer
-// liveness that only happens against racing commits.
+// live owner are deleted with it — only under AnchorSHA256, whose sweeps
+// clean up the stale entries of sha-dead shards; under the other anchors an
+// entry found still pointing at the shard aborts its deletion instead.
 //
 // Sweep does not lock out writers: work owned by someone else is skipped
 // instead. Writers are protected by the mtime grace window and the
@@ -288,11 +289,15 @@ func (o SweepOptions) window() time.Duration {
 // keeps its first writer, so the recommit does not win back sha entries
 // owned by other shards — the file-entry mtimes are its only trace). With a
 // positive grace a fresh file entry, one modified at or after the mark's
-// cutoff, therefore shields the shard it points at, judged both at the mark
-// and at the per-shard re-read — against the cutoff truncated to whole
-// seconds, since S3 reports entry times at second precision — so a
-// re-commit completed inside the window is never destroyed; with the window
-// disabled that delete-and-recreate race is accepted like the others above.
+// cutoff, therefore shields the shard it points at, judged at the mark, at
+// the per-shard re-read, and again at each file-entry read of the delete
+// loop — against the cutoff truncated to whole seconds, since S3 reports
+// entry times at second precision. What stays exposed is a commit landing
+// between an entry's final read and that entry's delete: read-then-delete
+// is not atomic, neither backend has a compare-and-delete, and on
+// FileStorage the recommit's index writes are first-writer-wins no-ops, so
+// such a commit can still be lost undetectably; with the window disabled
+// the whole delete-and-recreate race is accepted like the others above.
 //
 // Sweep always runs to completion: MaxDeletes and Budget only bound
 // GC.SweepStep, through which a GC can consume one pass in bounded steps;
@@ -694,9 +699,13 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 // it, keeping lookups alive on backends whose index keeps the first writer;
 // otherwise it is deleted. Entries go first — files, then chunks, then
 // sha256, then the shard object — so a crash mid-way leaves a re-sweepable
-// shard, never entries pointing into nothing. A re-upload committing after
-// the re-read can lose the shard and leave dangling file entries, reported
-// by the next sweep's DanglingFileEntries for repair — an accepted race.
+// shard, never entries pointing into nothing. A racing commit whose entries
+// become visible to the delete loops aborts the deletion: an anchoring
+// entry found pointing back at the shard contradicts the re-read, so the
+// shard is re-marked live instead. A commit whose file entry lands only
+// after the file loop's reads can still lose entries and the shard; the
+// entry then dangles and is reported by the next sweep's
+// DanglingFileEntries for repair — an accepted race.
 func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string) (bool, error) {
 	sh, err := st.GetShardByHash(ctx, shardHash)
 	if err != nil {
@@ -760,12 +769,26 @@ func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string
 
 	for i := range sh.Files {
 		fileHash := sh.Files[i].FileHash
-		current, _, err := st.GetFileIndexEntry(ctx, fileHash)
+		current, modTime, err := st.GetFileIndexEntry(ctx, fileHash)
 		if err != nil {
 			return false, err
 		}
 		if current != shardHash {
 			continue
+		}
+		// Under anchors where file entries confer liveness the re-read above
+		// saw none pointing here, so this entry belongs to a racing commit:
+		// abort the shard's deletion instead of destroying the commit.
+		if c.anchor != AnchorSHA256 {
+			c.markLive(sh, shardHash)
+			return false, nil
+		}
+		// Under AnchorSHA256 stale entries of sha-dead shards are the designed
+		// cleanup, but with a positive grace a fresh entry is a completed
+		// recommit: abort like the mark and re-read freshness shields do.
+		if c.grace > 0 && !modTime.Before(c.freshCutoff) {
+			c.markLive(sh, shardHash)
+			return false, nil
 		}
 		if owner, ok := c.fileOwners[fileHash.String()]; ok {
 			if err := st.SetFileIndexEntry(ctx, fileHash, owner); err != nil {
@@ -814,6 +837,15 @@ func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string
 		}
 		if current != shardHash {
 			continue
+		}
+		// Under anchors where sha256 entries confer liveness the re-read saw
+		// no non-zero entry pointing here, and PutShard commits sha256
+		// entries before file entries: this entry is a commit in flight —
+		// abort the shard's deletion. The zero entry never anchors and is
+		// cleaned up with its shard as usual.
+		if c.anchor != AnchorFiles && key != zeroSHA256Hex {
+			c.markLive(sh, shardHash)
+			return false, nil
 		}
 		if owner, ok := c.shaOwners[key]; ok {
 			if err := st.SetSHA256IndexEntry(ctx, key, owner); err != nil {

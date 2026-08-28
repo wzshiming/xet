@@ -594,6 +594,13 @@ type hookedGCStore struct {
 	afterWalkXorbs     func()
 	beforeFileEntryGet func()
 	beforeShardLoad    func()
+	// onFileEntryGet / onSHA256EntryGet fire before every call of the
+	// wrapped getter with a 1-based call count, unlike the before* hooks
+	// consumed on first fire.
+	onFileEntryGet   func(n int)
+	fileEntryGets    int
+	onSHA256EntryGet func(n int)
+	sha256EntryGets  int
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -633,6 +640,10 @@ func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.File
 		h.beforeFileEntryGet = nil
 		cb()
 	}
+	if h.onFileEntryGet != nil {
+		h.fileEntryGets++
+		h.onFileEntryGet(h.fileEntryGets)
+	}
 	shardHash, modTime, err := h.GCStore.GetFileIndexEntry(ctx, fileHash)
 	if err == nil && shardHash != "" {
 		if h.freshFileEntries[fileHash.String()] {
@@ -643,6 +654,14 @@ func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.File
 		}
 	}
 	return shardHash, modTime, err
+}
+
+func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error) {
+	if h.onSHA256EntryGet != nil {
+		h.sha256EntryGets++
+		h.onSHA256EntryGet(h.sha256EntryGets)
+	}
+	return h.GCStore.GetSHA256IndexEntry(ctx, sha256Hex)
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -2046,6 +2065,184 @@ func TestSweepAnchorSHA256RecommitCollectedWithoutGrace(t *testing.T) {
 				t.Fatalf("sha256 entry = %q, %v; want %q", got, err, winner.shardHash)
 			}
 			assertFileIntact(t, ctx, st, winner)
+		})
+	}
+}
+
+// TestSweepDeleteLoopAbortsOnRacingFileEntry: a commit lands between the
+// per-shard liveness re-read and the file-entry delete loop, recreating the
+// dead shard's file entry. Under the default anchor such an entry
+// contradicts the re-read, so the sweep must abort the shard's deletion and
+// keep the commit whole instead of silently destroying its entry.
+func TestSweepDeleteLoopAbortsOnRacingFileEntry(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("racing file-entry recommit")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+
+			// Aged out of grace; the re-read (call 1) sees no entry, then the
+			// commit rewrites it right before the delete loop's read (call 2).
+			hooked := agedStore(gcs)
+			recommitted := false
+			hooked.onFileEntryGet = func(n int) {
+				if n != 2 {
+					return
+				}
+				recommitted = true
+				if err := gcs.SetFileIndexEntry(ctx, f.fileHash, f.shardHash); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if !recommitted {
+				t.Fatal("hook did not fire")
+			}
+
+			if len(res.SweptShards) != 0 {
+				t.Fatalf("SweptShards = %v, want none", sweptHashes(res.SweptShards))
+			}
+			if res.DeletedFileEntries != 0 || res.RepointedFileEntries != 0 {
+				t.Fatalf("racing commit's file entry touched: %+v", res)
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, f.fileHash); err != nil || got != f.shardHash {
+				t.Fatalf("file entry = %q, %v; want %q", got, err, f.shardHash)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("shard destroyed under the racing commit: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb destroyed under the racing commit")
+			}
+		})
+	}
+}
+
+// TestSweepAnchorSHA256DeleteLoopSparesFreshRecommit: a sha-dead shard's
+// stale file entry is judged deletable at the mark (call 1) and the re-read
+// (call 2), but a recommit rewrites it fresh before the delete loop's read
+// (call 3). With a positive grace the loop must treat the fresh entry as a
+// completed commit and abort the shard's deletion.
+func TestSweepAnchorSHA256DeleteLoopSparesFreshRecommit(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("fresh recommit under sha anchor")})
+			// Sha-dead: only the aged file entry still points at the shard.
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			recommitted := false
+			hooked.onFileEntryGet = func(n int) {
+				if n != 3 {
+					return
+				}
+				recommitted = true
+				if err := gcs.SetFileIndexEntry(ctx, f.fileHash, f.shardHash); err != nil {
+					t.Fatal(err)
+				}
+				// The rewritten entry keeps its true fresh mtime.
+				hooked.freshFileEntries = map[string]bool{f.fileHash.String(): true}
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorSHA256})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if !recommitted {
+				t.Fatal("hook did not fire")
+			}
+
+			if len(res.SweptShards) != 0 {
+				t.Fatalf("SweptShards = %v, want none", sweptHashes(res.SweptShards))
+			}
+			if res.DeletedFileEntries != 0 || res.RepointedFileEntries != 0 {
+				t.Fatalf("fresh recommit's file entry touched: %+v", res)
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, f.fileHash); err != nil || got != f.shardHash {
+				t.Fatalf("file entry = %q, %v; want %q", got, err, f.shardHash)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("shard destroyed under the fresh recommit: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb destroyed under the fresh recommit")
+			}
+		})
+	}
+}
+
+// TestSweepDeleteLoopAbortsOnRacingSHA256Entry: a commit's sha256 entry —
+// PutShard commits sha256 entries before file entries — becomes visible
+// after the file-entry loop but before the sha256 loop's read. Under the
+// default anchor that entry contradicts the liveness re-read, so the sweep
+// must abort the shard's deletion and leave the entry in place.
+func TestSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("racing sha256-entry recommit")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewGC(gcs).UnlinkSHA256(ctx, sha256Digest(f.sha256Hex)); err != nil {
+				t.Fatal(err)
+			}
+
+			// Read 1 is the liveness re-read; the commit lands before the
+			// delete loop's read 2.
+			hooked := &hookedGCStore{GCStore: gcs}
+			recommitted := false
+			hooked.onSHA256EntryGet = func(n int) {
+				if n != 2 {
+					return
+				}
+				recommitted = true
+				if err := gcs.SetSHA256IndexEntry(ctx, f.sha256Hex, f.shardHash); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if !recommitted {
+				t.Fatal("hook did not fire")
+			}
+
+			if len(res.SweptShards) != 0 {
+				t.Fatalf("SweptShards = %v, want none", sweptHashes(res.SweptShards))
+			}
+			if res.DeletedSHA256Entries != 0 || res.RepointedSHA256Entries != 0 {
+				t.Fatalf("racing commit's sha256 entry touched: %+v", res)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, f.sha256Hex); err != nil || got != f.shardHash {
+				t.Fatalf("sha256 entry = %q, %v; want %q", got, err, f.shardHash)
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("shard destroyed under the racing commit: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("xorb destroyed under the racing commit")
+			}
 		})
 	}
 }
