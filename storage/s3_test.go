@@ -532,3 +532,43 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 		t.Fatalf("GetShardByChunkHash after retry: %v", err)
 	}
 }
+
+// TestS3PutShardEvictsStaleIndexCaches: putIndexObject overwrites index
+// objects, so PutShard must evict the in-process caches for every key it
+// writes — a warm chunk cache must not keep resolving to the shard the
+// entry pointed at before the overwrite.
+func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+
+	shared := []byte("chunk shared by both shards")
+	f1 := putGCFile(t, ctx, ss, [][]byte{shared, []byte("unique to file one")})
+
+	// Warm the chunk cache: the shared chunk resolves to f1's shard.
+	sh, err := ss.GetShardByChunkHash(ctx, "default", f1.chunkHashes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sh.Files[0].FileHash; got != f1.fileHash {
+		t.Fatalf("chunk resolves to file %s, want %s", got.String(), f1.fileHash.String())
+	}
+
+	// A second shard carrying the same chunk (a different file, so PutShard
+	// commits it) overwrites the chunk index object.
+	f2 := putGCFile(t, ctx, ss, [][]byte{shared, []byte("unique to file two")})
+	if f1.chunkHashes[0] != f2.chunkHashes[0] {
+		t.Fatal("test setup: shared part must map to one chunk hash")
+	}
+	if got, err := ss.GetChunkIndexEntry(ctx, f2.chunkHashes[0]); err != nil || got != f2.shardHash {
+		t.Fatalf("stored chunk entry = %q, %v; want %q", got, err, f2.shardHash)
+	}
+
+	// A fresh resolution must follow the overwritten entry, not the cache.
+	sh, err = ss.GetShardByChunkHash(ctx, "default", f2.chunkHashes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sh.Files[0].FileHash; got != f2.fileHash {
+		t.Fatalf("chunk resolves to file %s, want %s (stale cache)", got.String(), f2.fileHash.String())
+	}
+}

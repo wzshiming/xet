@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -410,5 +411,55 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				t.Fatalf("GetXorbDataRange() after xorb removal: %v", err)
 			}
 		})
+	}
+}
+
+// TestOverwriteIndexFileConcurrentSameKey races writers over the same keys:
+// each writer renames its own unique temp file, so no rename can steal
+// another writer's temp (the old fixed "<path>.tmp" scheme failed with
+// ENOENT) and every key ends up holding one of the written values.
+func TestOverwriteIndexFileConcurrentSameKey(t *testing.T) {
+	dir := t.TempDir()
+	keys := []string{
+		filepath.Join(dir, "aa", "key-one"),
+		filepath.Join(dir, "ab", "key-two"),
+	}
+	const writers = 20
+	const rounds = 50
+
+	valid := map[string]bool{}
+	for i := range writers {
+		valid[fmt.Sprintf("shard-%02d", i)] = true
+	}
+
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			value := []byte(fmt.Sprintf("shard-%02d", i))
+			for r := range rounds {
+				if err := overwriteIndexFile(keys[(i+r)%len(keys)], value); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("overwriteIndexFile: %v", err)
+	}
+
+	for _, key := range keys {
+		data, err := os.ReadFile(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !valid[string(data)] {
+			t.Fatalf("key %s holds %q, not one of the written values", key, data)
+		}
 	}
 }
