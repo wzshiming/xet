@@ -179,9 +179,13 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 // A parked cycle expires one grace window after its mark and is re-marked
 // on the next step with a fresh accumulation — consuming a cycle within
 // one window bounds the staleness of its shield state; a non-positive
-// grace never expires. A cycle marked with a different Grace or Anchor is
-// discarded and re-marked; dry runs report a full stateless pass and
-// leave the cycle alone; any non-dry-run error discards the cycle.
+// grace expires after DefaultSweepGrace instead, so an abandoned cycle's
+// queues and shield maps are never pinned for good. A cycle marked with a
+// different Grace or Anchor is discarded and re-marked; dry runs report a
+// full stateless pass and leave the cycle alone; any non-dry-run error
+// discards the cycle, except a canceled or timed-out context, which parks
+// it like an exhausted budget — a disconnected client's progress survives,
+// and the resuming step's result still accumulates everything consumed.
 func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, error) {
 	if !g.mu.TryLock() {
 		return nil, ErrGCBusy
@@ -208,6 +212,12 @@ func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, er
 		}
 	}
 	if err := c.run(ctx, g.st, opts.MaxDeletes, opts.Budget); err != nil {
+		// A canceled or timed-out context parks the cycle instead of
+		// discarding it: the caller vanished, the shield state did not go
+		// bad, and the next step must not re-pay the mark.
+		if c.phase != sweepPhaseDone && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			g.cycle = c
+		}
 		return nil, err
 	}
 	if c.phase != sweepPhaseDone {
@@ -392,11 +402,16 @@ func (c *sweepCycle) matches(opts SweepOptions) bool {
 	return c.grace == opts.window() && c.anchor == opts.Anchor
 }
 
-// expired reports whether the cycle has outlived one grace window since its
-// mark; a non-positive grace (the explicit no-safety-window mode) never
-// expires.
+// expired reports whether the cycle has outlived its parked lifetime: one
+// grace window since its mark, or DefaultSweepGrace under a non-positive
+// grace (the explicit no-safety-window mode), so an abandoned cycle's
+// queues and shield maps are reclaimed instead of pinned until restart.
 func (c *sweepCycle) expired() bool {
-	return c.grace > 0 && time.Since(c.marked) >= c.grace
+	ttl := c.grace
+	if ttl <= 0 {
+		ttl = DefaultSweepGrace
+	}
+	return time.Since(c.marked) >= ttl
 }
 
 // snapshot clones the accumulated result with the progress fields filled in.

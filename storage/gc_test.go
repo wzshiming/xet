@@ -1312,8 +1312,8 @@ func TestSweepStepBudgetProgress(t *testing.T) {
 
 // TestSweepStepExpiredCycleRemarks: a cycle parked for one grace window
 // after its mark is discarded and re-marked on the next step, so its shield
-// state can never go staler than one window; a non-positive grace is the
-// explicit no-safety-window mode and never expires.
+// state can never go staler than one window; a non-positive grace parks
+// under DefaultSweepGrace instead — resumable within it, reclaimed after.
 func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	ctx := context.Background()
 	st, err := NewFileStorage(WithBasePath(t.TempDir()))
@@ -1350,7 +1350,7 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	putUnlinkedGCFiles(t, ctx, st2, "immortal cycle one", "immortal cycle two")
+	putUnlinkedGCFiles(t, ctx, st2, "no-grace cycle one", "no-grace cycle two")
 	g2 := NewGC(st2)
 	opts = SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 	res, err = g2.SweepStep(ctx, opts)
@@ -1363,13 +1363,77 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	if g2.cycle == nil {
 		t.Fatal("no parked cycle after the first step")
 	}
-	g2.cycle.marked = time.Now().Add(-1000 * time.Hour)
+
+	// Parked within DefaultSweepGrace: the cycle resumes and accumulates.
+	g2.cycle.marked = time.Now().Add(-DefaultSweepGrace / 2)
 	res, err = g2.SweepStep(ctx, opts)
 	if err != nil {
-		t.Fatalf("SweepStep after aging: %v", err)
+		t.Fatalf("SweepStep within the park TTL: %v", err)
 	}
 	if len(res.SweptShards) != 2 {
-		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed under a non-positive grace)", len(res.SweptShards))
+		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed within DefaultSweepGrace)", len(res.SweptShards))
+	}
+
+	// Parked past it: the next step discards the cycle and marks afresh,
+	// so an abandoned no-grace cycle cannot pin its maps forever.
+	if g2.cycle == nil {
+		t.Fatal("no parked cycle after the second step")
+	}
+	g2.cycle.marked = time.Now().Add(-2 * DefaultSweepGrace)
+	res, err = g2.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("SweepStep after the park TTL: %v", err)
+	}
+	if got := len(res.SweptShards) + len(res.SweptXorbs); got != 1 {
+		t.Fatalf("swept objects after expiry = %d, want 1 (a fresh accumulation)", got)
+	}
+}
+
+// TestSweepStepParksOnContextCancel: a step whose context dies mid-cycle
+// returns the error but parks the cycle, so the progress already paid —
+// deletions and the mark — survives a client disconnect and the resuming
+// step accumulates it instead of re-marking.
+func TestSweepStepParksOnContextCancel(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putUnlinkedGCFiles(t, ctx, st, "canceled step one", "canceled step two")
+
+	hooked := &hookedGCStore{GCStore: st}
+	g := NewGC(hooked)
+	opts := SweepOptions{Grace: noGrace, Anchor: AnchorFiles}
+
+	// The cancel fires while the first dead shard is being swept; the
+	// file backend ignores contexts, so that shard still completes and the
+	// loop's own check stops the step before the second one.
+	stepCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	hooked.onFileEntryGet = func(n int) {
+		if n == 2 {
+			cancel()
+		}
+	}
+	if _, err := g.SweepStep(stepCtx, opts); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled SweepStep = %v, want context.Canceled", err)
+	}
+	if g.cycle == nil {
+		t.Fatal("cycle discarded on cancellation, want it parked")
+	}
+	hooked.onFileEntryGet = nil
+
+	res, err := g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("resumed SweepStep: %v", err)
+	}
+	if !res.Done || len(res.SweptShards) != 2 || len(res.SweptXorbs) != 2 {
+		t.Fatalf("resumed result = %+v, want the canceled step's progress accumulated (2/2)", res)
+	}
+	// One dead-collection walk plus one transition re-shield: a re-mark
+	// would have added a second dead collection.
+	if hooked.walkShardsCalls != 2 {
+		t.Fatalf("WalkShards called %d times, want 2 (no re-mark after the cancel)", hooked.walkShardsCalls)
 	}
 }
 
