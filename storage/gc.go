@@ -81,6 +81,10 @@ type SweptObject struct {
 
 // SweepResult reports what one Sweep pass removed or would remove.
 type SweepResult struct {
+	// DryRun marks a report produced without deleting anything. It is an
+	// upper bound on the next real pass, which re-validates every dead
+	// shard against the live index right before deletion and may spare
+	// more than the dry run predicts.
 	DryRun bool `json:"dry_run"`
 
 	SweptShards []SweptObject `json:"swept_shards"`
@@ -103,13 +107,19 @@ type SweepResult struct {
 	// missing; they are reported for repair, never deleted.
 	DanglingFileEntries []string `json:"dangling_file_entries"`
 	// DanglingSHA256Entries are index/sha256 entries whose shard object is
-	// missing; they are reported for repair, never deleted.
+	// missing; they are reported for repair, never deleted. Always empty
+	// under AnchorFiles, whose sweeps do not walk the sha256 index, and
+	// never includes the all-zero empty-file entry.
 	DanglingSHA256Entries []string `json:"dangling_sha256_entries"`
 
 	// SkippedInGrace counts unreferenced objects left alone because they
 	// were written within the grace window or shielded by an in-grace
 	// shard's references.
 	SkippedInGrace int `json:"skipped_in_grace"`
+	// SkippedRevived counts queued dead xorbs consumed without deletion
+	// because a later look — a re-shield walk or an aborted shard delete —
+	// marked them live; like sweeps, they count against MaxDeletes.
+	SkippedRevived int `json:"skipped_revived"`
 	// ReclaimedBytes sums the sizes of swept shards and xorbs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 
@@ -781,6 +791,7 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 		consumed++
 		// A shard skipped as re-committed shields its xorbs.
 		if c.liveXorbs[obj.Hash] {
+			c.res.SkippedRevived++
 			continue
 		}
 		c.res.SweptXorbs = append(c.res.SweptXorbs, obj)

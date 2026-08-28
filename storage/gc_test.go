@@ -1182,6 +1182,63 @@ func TestSweepStepMidCycleCommitSurvives(t *testing.T) {
 	}
 }
 
+// TestSweepStepCountsRevivedXorbs: a queued dead xorb revived by a
+// mid-cycle recommit still consumes its step's allowance; the result must
+// say so instead of reporting a step that did nothing.
+func TestSweepStepCountsRevivedXorbs(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			files := putUnlinkedGCFiles(t, ctx, st, "revived counter one", "revived counter two")
+			g := NewGC(gcs)
+			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
+			res, err := g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if len(res.SweptShards) != 1 || res.RemainingShards != 1 {
+				t.Fatalf("first step = %+v, want one shard swept, one queued", res)
+			}
+
+			// Recommit the still-queued shard's file: the shard delete aborts
+			// and its queued xorb is revived.
+			kept, gone := files[0], files[1]
+			if res.SweptShards[0].Hash == kept.shardHash {
+				kept, gone = gone, kept
+			}
+			if again := putGCFile(t, ctx, st, [][]byte{kept.content}); again.shardHash != kept.shardHash {
+				t.Fatal("re-upload produced different hashes")
+			}
+
+			var last *SweepResult
+			for i := 0; ; i++ {
+				if i > 20 {
+					t.Fatal("cycle did not finish in 20 steps")
+				}
+				if last, err = g.SweepStep(ctx, opts); err != nil {
+					t.Fatalf("SweepStep: %v", err)
+				}
+				if last.Done {
+					break
+				}
+			}
+			if last.SkippedRevived != 1 {
+				t.Fatalf("SkippedRevived = %d, want 1 (the revived xorb consumed a step): %+v", last.SkippedRevived, last)
+			}
+			if got, want := sweptHashes(last.SweptXorbs), []string{gone.xorbHashes[0].String()}; !slices.Equal(got, want) {
+				t.Fatalf("SweptXorbs = %v, want %v", got, want)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", kept.xorbHashes[0]); !ok {
+				t.Fatal("revived xorb was swept")
+			}
+			assertFileIntact(t, ctx, st, kept)
+		})
+	}
+}
+
 // TestSweepStepOptionChangeRestarts: a step with a different window discards
 // the half-consumed cycle and marks afresh, picking up objects unlinked
 // after the first mark.
