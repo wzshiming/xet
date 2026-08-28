@@ -164,14 +164,11 @@ func (h *Handler) serveReady(w http.ResponseWriter, r *http.Request, e *mirror.E
 		w.Header().Add("Link", fmt.Sprintf("<%s%s>; rel=\"xet-auth\", <%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\"", base, tokenEndpointPath, base, e.FileHash))
 		w.Header().Set("X-Xet-Hash", e.FileHash)
 	}
-	if e.Size == 0 {
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+
 	// The Location must be absolute: hub clients follow relative redirects
 	// before reading metadata, which would strip the xet headers off the
-	// response they end up looking at.
+	// response they end up looking at. Empty files redirect too: the bridge
+	// serves the well-known zero-byte digest without storage.
 	http.Redirect(w, r, base+"/xet-bridge/"+e.SHA256, http.StatusFound)
 }
 
@@ -212,7 +209,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 	}
 	if r.Method == http.MethodHead {
 		writeMetadataHeaders(w, etag, size, commit)
-		w.Header().Set("Content-Type", "application/octet-stream")
+		// Hub clients read the size of a HEAD from Content-Length.
 		if size >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		}
@@ -253,6 +250,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 // writeMetadataHeaders emits the header set downstream tooling relies on,
 // mirroring what the upstream hub advertised.
 func writeMetadataHeaders(w http.ResponseWriter, etag string, size int64, commit string) {
+	w.Header().Set("Content-Type", "application/octet-stream")
 	if etag != "" {
 		quoted := `"` + etag + `"`
 		w.Header().Set("ETag", quoted)
@@ -264,7 +262,6 @@ func writeMetadataHeaders(w http.ResponseWriter, etag string, size int64, commit
 	if commit != "" {
 		w.Header().Set("X-Repo-Commit", commit)
 	}
-	w.Header().Set("Accept-Ranges", "bytes")
 }
 
 // handleToken hands out a short-lived CAS token pointing downstream clients

@@ -145,3 +145,34 @@ func TestXetBridgeRejectsInvalidAndUnknownSHA256(t *testing.T) {
 		}
 	}
 }
+
+// TestXetBridgeServesEmptyDigest: the sha256 of zero bytes names content that
+// is never ingested, so the bridge answers it without touching storage.
+func TestXetBridgeServesEmptyDigest(t *testing.T) {
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(stor))
+	digest := sha256.Sum256(nil)
+	path := "/xet-bridge/" + hex.EncodeToString(digest[:])
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		resp := rec.Result()
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", method, resp.StatusCode, http.StatusOK)
+		}
+		if len(body) != 0 {
+			t.Fatalf("%s body = %q, want empty", method, body)
+		}
+		if resp.ContentLength != 0 {
+			t.Fatalf("%s Content-Length = %d, want 0", method, resp.ContentLength)
+		}
+	}
+}
