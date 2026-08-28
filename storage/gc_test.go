@@ -601,6 +601,8 @@ type hookedGCStore struct {
 	fileEntryGets    int
 	onSHA256EntryGet func(n int)
 	sha256EntryGets  int
+	beforeWalkShards func() // fired before every WalkShards delegation
+	walkShardsCalls  int    // WalkShards invocations
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -617,6 +619,10 @@ func (h *hookedGCStore) walkTime(modTime time.Time) time.Time {
 }
 
 func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error {
+	h.walkShardsCalls++
+	if h.beforeWalkShards != nil {
+		h.beforeWalkShards()
+	}
 	return h.GCStore.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
 		return fn(shardHash, size, h.walkTime(modTime))
 	})
@@ -1269,6 +1275,158 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	}
 	if len(res.SweptShards) != 2 {
 		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed under a non-positive grace)", len(res.SweptShards))
+	}
+}
+
+// TestSweepStepResumeReshieldsLateCommit: a stepped cycle parks in the xorb
+// phase with an aged xorb still queued; a commit landing during the park
+// dedup-reuses that xorb. The resuming step must re-run the re-shield before
+// consuming the queue, so the late commit's xorb survives the cycle.
+func TestSweepStepResumeReshieldsLateCommit(t *testing.T) {
+	partShared := []byte("aged payload a late commit reuses")
+	partExtra := []byte("unique to the late commit")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f1 := putGCFile(t, ctx, st, [][]byte{partShared})
+			if _, err := NewGC(gcs).Unlink(ctx, f1.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			// Aged mtimes make the unlinked shard and xorb sweepable.
+			g := NewGC(agedStore(gcs))
+			opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1, Anchor: AnchorFiles}
+			res, err := g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if res.Done || res.RemainingShards != 0 || res.RemainingXorbs != 1 {
+				t.Fatalf("first step = done %v, remaining %d/%d; want parked with 0/1", res.Done, res.RemainingShards, res.RemainingXorbs)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{f1.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			// The commit below only exercises the resume re-shield if the
+			// cycle really parked in the xorb phase.
+			if g.cycle == nil || g.cycle.phase != sweepPhaseXorbs {
+				t.Fatal("cycle not parked in the xorb phase")
+			}
+
+			// A commit lands during the park, dedup-reusing the queued xorb.
+			f2 := putGCFile(t, ctx, st, [][]byte{partShared, partExtra})
+			if f2.xorbHashes[0] != f1.xorbHashes[0] {
+				t.Fatal("test setup: shared part must map to one xorb")
+			}
+
+			res, err = g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("resumed SweepStep: %v", err)
+			}
+			if !res.Done || res.RemainingXorbs != 0 {
+				t.Fatalf("resumed step = done %v, remaining xorbs %d; want done 0", res.Done, res.RemainingXorbs)
+			}
+			if len(res.SweptXorbs) != 0 {
+				t.Fatalf("SweptXorbs = %v, want none (the late commit reuses the queued xorb)", sweptHashes(res.SweptXorbs))
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f1.xorbHashes[0]); !ok {
+				t.Fatal("xorb reused by the late commit was swept")
+			}
+			assertFileIntact(t, ctx, st, f2)
+		})
+	}
+}
+
+// TestSweepReshieldSkippedWithoutDeadXorbs: a sweep with dead shards but an
+// empty dead-xorb queue has nothing to re-shield, so the transition walk is
+// skipped — the stored shards are walked exactly once, by the mark's dead
+// collection — while the dead shard is still reclaimed.
+func TestSweepReshieldSkippedWithoutDeadXorbs(t *testing.T) {
+	shared := []byte("xorb shared with a live file")
+	extra := []byte("exclusive to the live file")
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			// The dead shard's only xorb is shared with a live file, so the
+			// dead-xorb queue stays empty.
+			f1 := putGCFile(t, ctx, st, [][]byte{shared})
+			f2 := putGCFile(t, ctx, st, [][]byte{shared, extra})
+			if f2.xorbHashes[0] != f1.xorbHashes[0] {
+				t.Fatal("test setup: shared part must map to one xorb")
+			}
+			if _, err := NewGC(gcs).Unlink(ctx, f1.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := &hookedGCStore{GCStore: gcs}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: noGrace, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if hooked.walkShardsCalls != 1 {
+				t.Fatalf("WalkShards called %d times, want 1 (mark only; re-shield skipped)", hooked.walkShardsCalls)
+			}
+
+			// The sweep itself still works: dead shard gone, nothing else.
+			if got, want := sweptHashes(res.SweptShards), []string{f1.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if len(res.SweptXorbs) != 0 {
+				t.Fatalf("SweptXorbs = %v, want none", sweptHashes(res.SweptXorbs))
+			}
+			if _, err := gcs.GetShardByHash(ctx, f1.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("dead shard load = %v, want ErrNotExist", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f1.xorbHashes[0]); !ok {
+				t.Fatal("shared xorb was swept")
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f2.xorbHashes[1]); !ok {
+				t.Fatal("live file's exclusive xorb was swept")
+			}
+			assertFileIntact(t, ctx, st, f2)
+		})
+	}
+}
+
+// TestSweepStepReshieldNotChargedToBudget: the resume re-shield always runs
+// whole and its wall time must not count against the step's Budget — a walk
+// slower than the whole budget still leaves the step its full allowance.
+func TestSweepStepReshieldNotChargedToBudget(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putUnlinkedGCFiles(t, ctx, st, "budgeted walk one", "budgeted walk two")
+
+	hooked := &hookedGCStore{GCStore: st}
+	g := NewGC(hooked)
+	res, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, MaxDeletes: 2, Anchor: AnchorFiles})
+	if err != nil {
+		t.Fatalf("SweepStep: %v", err)
+	}
+	if res.Done || res.RemainingShards != 0 || res.RemainingXorbs != 2 {
+		t.Fatalf("first step = done %v, remaining %d/%d; want parked with 0/2", res.Done, res.RemainingShards, res.RemainingXorbs)
+	}
+	if g.cycle == nil || g.cycle.phase != sweepPhaseXorbs {
+		t.Fatal("cycle not parked in the xorb phase")
+	}
+
+	// The resume re-shield outlasts the entire budget; both queued xorbs
+	// must still be consumed within it.
+	hooked.beforeWalkShards = func() { time.Sleep(500 * time.Millisecond) }
+	res, err = g.SweepStep(ctx, SweepOptions{Grace: noGrace, Budget: 250 * time.Millisecond, Anchor: AnchorFiles})
+	if err != nil {
+		t.Fatalf("resumed SweepStep: %v", err)
+	}
+	if !res.Done || res.RemainingXorbs != 0 || len(res.SweptXorbs) != 2 {
+		t.Fatalf("resumed step = done %v, remaining xorbs %d, swept xorbs %d; want done 0/2 (re-shield charged to the budget)",
+			res.Done, res.RemainingXorbs, len(res.SweptXorbs))
 	}
 }
 

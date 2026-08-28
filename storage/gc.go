@@ -161,7 +161,10 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 // ErrGCBusy when a sweep is already running. The first call marks a fresh
 // cycle, paying the full mark cost whatever the limits say, and the step
 // that drains the shard queue pays the full re-shield walk the same way;
-// later calls resume the cycle until the returned result reports Done.
+// every step that consumes from the xorb queue re-runs the re-shield first,
+// so the late-commit loss window is bounded by one step, not by the parked
+// lifetime of the cycle, and steps with an empty xorb queue skip the walk.
+// Later calls resume the cycle until the returned result reports Done.
 // Results accumulate, so the Done step reads like one full Sweep pass.
 // A parked cycle expires one grace window after its mark and is re-marked
 // on the next step with a fresh accumulation — consuming a cycle within
@@ -229,7 +232,7 @@ type SweepOptions struct {
 	DryRun     bool          // report removable objects without deleting
 	Anchor     SweepAnchor   // which index entries anchor shard liveness
 	MaxDeletes int           // max dead-queue items one GC.SweepStep consumes, swept or skipped; 0 = unlimited, ignored by Sweep
-	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items only (mark and re-shield always run whole); 0 = unlimited, ignored by Sweep
+	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items only (mark and re-shield always run whole, their time uncharged); 0 = unlimited, ignored by Sweep
 }
 
 // window returns the grace window with zero defaulted.
@@ -274,9 +277,11 @@ func (o SweepOptions) window() time.Duration {
 // file ref implies a completed commit), each dead shard's own entries are
 // re-read per the anchor right before it is deleted, and once the shard
 // deletes finish every shard object still stored re-shields its xorbs,
-// covering commits that landed during that phase. A commit landing between
-// that final re-shield and an individual xorb delete can still lose that
-// xorb; an upload committed after the mark may see the chunk/sha256 entries
+// covering commits that landed during that phase, and a step resuming a
+// parked cycle in the xorb phase repeats that walk before consuming more.
+// A commit landing behind the re-shield walk's cursor during the walk, or
+// after it within the same step, can still lose the xorb it reuses; an
+// upload committed after the mark may see the chunk/sha256 entries
 // it reused from a dead shard removed or repointed (a dedup miss or a
 // broken SHA-256 lookup, never lost file data); and a dedup re-upload of an
 // aged unreferenced shard can race its delete (dedup hits do not refresh
@@ -586,11 +591,34 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 	return c, nil
 }
 
+// reshieldXorbs walks the stored shards and marks the xorbs of every shard
+// object not already live, shielding commits whose shards appeared since
+// the cycle last looked from the queued xorb deletes; a shard vanishing
+// mid-walk is skipped.
+func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
+	return st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
+		if c.liveShards[hash] {
+			return nil
+		}
+		sh, err := st.GetShardByHash(ctx, hash)
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("load shard %s: %w", hash, err)
+		}
+		markShardXorbs(sh, c.liveXorbs)
+		return nil
+	})
+}
+
 // run consumes the dead queues through the per-item delete logic. maxDeletes
 // caps consumed items (swept or skipped) and budget the wall clock, both
 // checked between items with at least one item consumed per call; zero means
-// unlimited. The final re-shield runs once at the shard-to-xorb transition,
-// not counted as consumption.
+// unlimited. The re-shield runs at the shard-to-xorb transition and again
+// whenever a call starts on a cycle already in the xorb phase, skipped when
+// no dead xorbs are queued; it is never counted as consumption nor charged
+// against the budget.
 func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget time.Duration) error {
 	start := time.Now()
 	consumed := 0
@@ -601,30 +629,37 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 		return (maxDeletes > 0 && consumed >= maxDeletes) || (budget > 0 && time.Since(start) >= budget)
 	}
 	dryRun := c.res.DryRun
+	reshield := func() error {
+		walkStart := time.Now()
+		err := c.reshieldXorbs(ctx, st)
+		// The walk runs whole; shifting start keeps it off the budget clock.
+		start = start.Add(time.Since(walkStart))
+		return err
+	}
+
+	// A step resuming a cycle parked in the xorb phase re-runs the re-shield
+	// first: commits that landed during the park must shield their xorbs
+	// before any more deletes, and queue entries revived live are pruned so
+	// RemainingXorbs stays honest.
+	if c.phase == sweepPhaseXorbs && !dryRun && len(c.deadXorbs) > 0 {
+		if err := reshield(); err != nil {
+			return err
+		}
+		c.deadXorbs = slices.DeleteFunc(c.deadXorbs, func(obj SweptObject) bool {
+			return c.liveXorbs[obj.Hash]
+		})
+	}
 
 	for c.phase == sweepPhaseShards {
 		if len(c.deadShards) == 0 {
-			// Final re-shield: the shard-delete phase can take long, so any
-			// shard object stored at this point (late commits, in-grace
-			// uploads, skipped shards) shields its xorbs from the deletes
-			// below. Skipped in dry runs, where the undeleted dead shards
-			// would shield their own xorbs and empty the report.
-			if !dryRun {
-				err := st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
-					if c.liveShards[hash] {
-						return nil
-					}
-					sh, err := st.GetShardByHash(ctx, hash)
-					if err != nil {
-						if errors.Is(err, iofs.ErrNotExist) {
-							return nil
-						}
-						return fmt.Errorf("load shard %s: %w", hash, err)
-					}
-					markShardXorbs(sh, c.liveXorbs)
-					return nil
-				})
-				if err != nil {
+			// Re-shield at the transition: the shard-delete phase can take
+			// long, so any shard object stored at this point (late commits,
+			// in-grace uploads, skipped shards) shields its xorbs from the
+			// deletes below. Skipped in dry runs, where the undeleted dead
+			// shards would shield their own xorbs and empty the report, and
+			// when no dead xorbs are queued — nothing to shield.
+			if !dryRun && len(c.deadXorbs) > 0 {
+				if err := reshield(); err != nil {
 					return err
 				}
 			}
