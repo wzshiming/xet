@@ -233,6 +233,20 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 		return value.(*shard.Shard), nil
 	}
 
+	s, err := fs.loadShard(shardHash)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.shardMut.Lock()
+	fs.shardIndex.Add(shardHash, s)
+	fs.shardMut.Unlock()
+
+	return s, nil
+}
+
+// loadShard reads and decodes a stored shard object straight from disk.
+func (fs *FileStorage) loadShard(shardHash string) (*shard.Shard, error) {
 	shardPath := fs.objectPath("shards", shardHash)
 	f, err := os.Open(shardPath)
 	if err != nil {
@@ -252,12 +266,13 @@ func (fs *FileStorage) getShardByHash(shardHash string) (*shard.Shard, error) {
 		// time, so pin it to the ingest time instead of the first-serve time.
 		s.SetFooter(info.ModTime())
 	}
-
-	fs.shardMut.Lock()
-	fs.shardIndex.Add(shardHash, s)
-	fs.shardMut.Unlock()
-
 	return s, nil
+}
+
+// LoadShard reads a stored shard object, bypassing the shard cache both
+// ways so bulk scans cannot evict hot entries.
+func (fs *FileStorage) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	return fs.loadShard(shardHash)
 }
 
 // GetShardByHash loads a stored shard by the hash of its serialized bytes.

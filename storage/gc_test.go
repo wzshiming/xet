@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -664,6 +665,7 @@ type hookedGCStore struct {
 	GCStore
 	age                time.Duration
 	freshFileEntries   map[string]bool
+	shardModTimes      map[string]time.Time // per-shard walk mtime overrides
 	afterWalkXorbs     func()
 	beforeFileEntryGet func()
 	beforeShardLoad    func()
@@ -674,8 +676,11 @@ type hookedGCStore struct {
 	fileEntryGets    int
 	onSHA256EntryGet func(n int)
 	sha256EntryGets  int
-	beforeWalkShards func() // fired before every WalkShards delegation
-	walkShardsCalls  int    // WalkShards invocations
+	beforeWalkShards func()         // fired before every WalkShards delegation
+	walkShardsCalls  int            // WalkShards invocations
+	shardLoads       map[string]int // LoadShard tally, nil = off
+	cachedShardGets  int            // GetShardByHash invocations (GC must not)
+	loadShardErrs    map[string]error
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -697,6 +702,9 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 		h.beforeWalkShards()
 	}
 	return h.GCStore.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
+		if t, ok := h.shardModTimes[shardHash]; ok {
+			return fn(shardHash, size, t)
+		}
 		return fn(shardHash, size, h.walkTime(modTime))
 	})
 }
@@ -744,12 +752,37 @@ func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex strin
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	h.cachedShardGets++
+	return h.GCStore.GetShardByHash(ctx, shardHash)
+}
+
+func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	if h.beforeShardLoad != nil {
 		cb := h.beforeShardLoad
 		h.beforeShardLoad = nil
 		cb()
 	}
-	return h.GCStore.GetShardByHash(ctx, shardHash)
+	if h.shardLoads != nil {
+		h.shardLoads[shardHash]++
+	}
+	if err, ok := h.loadShardErrs[shardHash]; ok {
+		return nil, err
+	}
+	return h.GCStore.LoadShard(ctx, shardHash)
+}
+
+// assertChunkEntriesIntact fails when an aborted shard deletion touched the
+// chunk entries a racing commit relies on for dedup.
+func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs GCStore, f gcFile, res *SweepResult) {
+	t.Helper()
+	if res.DeletedChunkEntries != 0 || res.RepointedChunkEntries != 0 {
+		t.Fatalf("racing commit's chunk entries touched: %+v", res)
+	}
+	for _, chunkHash := range f.chunkHashes {
+		if got, err := gcs.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != f.shardHash {
+			t.Fatalf("chunk entry = %q, %v; want %q", got, err, f.shardHash)
+		}
+	}
 }
 
 func assertFileIntact(t *testing.T, ctx context.Context, st Storage, f gcFile) {
@@ -1160,6 +1193,63 @@ func TestSweepStepMidCycleCommitSurvives(t *testing.T) {
 	}
 }
 
+// TestSweepStepCountsRevivedXorbs: a queued dead xorb revived by a
+// mid-cycle recommit still consumes its step's allowance; the result must
+// say so instead of reporting a step that did nothing.
+func TestSweepStepCountsRevivedXorbs(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			files := putUnlinkedGCFiles(t, ctx, st, "revived counter one", "revived counter two")
+			g := NewGC(gcs)
+			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
+			res, err := g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if len(res.SweptShards) != 1 || res.RemainingShards != 1 {
+				t.Fatalf("first step = %+v, want one shard swept, one queued", res)
+			}
+
+			// Recommit the still-queued shard's file: the shard delete aborts
+			// and its queued xorb is revived.
+			kept, gone := files[0], files[1]
+			if res.SweptShards[0].Hash == kept.shardHash {
+				kept, gone = gone, kept
+			}
+			if again := putGCFile(t, ctx, st, [][]byte{kept.content}); again.shardHash != kept.shardHash {
+				t.Fatal("re-upload produced different hashes")
+			}
+
+			var last *SweepResult
+			for i := 0; ; i++ {
+				if i > 20 {
+					t.Fatal("cycle did not finish in 20 steps")
+				}
+				if last, err = g.SweepStep(ctx, opts); err != nil {
+					t.Fatalf("SweepStep: %v", err)
+				}
+				if last.Done {
+					break
+				}
+			}
+			if last.SkippedRevived != 1 {
+				t.Fatalf("SkippedRevived = %d, want 1 (the revived xorb consumed a step): %+v", last.SkippedRevived, last)
+			}
+			if got, want := sweptHashes(last.SweptXorbs), []string{gone.xorbHashes[0].String()}; !slices.Equal(got, want) {
+				t.Fatalf("SweptXorbs = %v, want %v", got, want)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", kept.xorbHashes[0]); !ok {
+				t.Fatal("revived xorb was swept")
+			}
+			assertFileIntact(t, ctx, st, kept)
+		})
+	}
+}
+
 // TestSweepStepOptionChangeRestarts: a step with a different window discards
 // the half-consumed cycle and marks afresh, picking up objects unlinked
 // after the first mark.
@@ -1290,8 +1380,8 @@ func TestSweepStepBudgetProgress(t *testing.T) {
 
 // TestSweepStepExpiredCycleRemarks: a cycle parked for one grace window
 // after its mark is discarded and re-marked on the next step, so its shield
-// state can never go staler than one window; a non-positive grace is the
-// explicit no-safety-window mode and never expires.
+// state can never go staler than one window; a non-positive grace parks
+// under DefaultSweepGrace instead — resumable within it, reclaimed after.
 func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	ctx := context.Background()
 	st, err := NewFileStorage(WithBasePath(t.TempDir()))
@@ -1328,7 +1418,7 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	putUnlinkedGCFiles(t, ctx, st2, "immortal cycle one", "immortal cycle two")
+	putUnlinkedGCFiles(t, ctx, st2, "no-grace cycle one", "no-grace cycle two")
 	g2 := NewGC(st2)
 	opts = SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 	res, err = g2.SweepStep(ctx, opts)
@@ -1341,22 +1431,88 @@ func TestSweepStepExpiredCycleRemarks(t *testing.T) {
 	if g2.cycle == nil {
 		t.Fatal("no parked cycle after the first step")
 	}
-	g2.cycle.marked = time.Now().Add(-1000 * time.Hour)
+
+	// Parked within DefaultSweepGrace: the cycle resumes and accumulates.
+	g2.cycle.marked = time.Now().Add(-DefaultSweepGrace / 2)
 	res, err = g2.SweepStep(ctx, opts)
 	if err != nil {
-		t.Fatalf("SweepStep after aging: %v", err)
+		t.Fatalf("SweepStep within the park TTL: %v", err)
 	}
 	if len(res.SweptShards) != 2 {
-		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed under a non-positive grace)", len(res.SweptShards))
+		t.Fatalf("cumulative SweptShards = %d, want 2 (cycle resumed within DefaultSweepGrace)", len(res.SweptShards))
+	}
+
+	// Parked past it: the next step discards the cycle and marks afresh,
+	// so an abandoned no-grace cycle cannot pin its maps forever.
+	if g2.cycle == nil {
+		t.Fatal("no parked cycle after the second step")
+	}
+	g2.cycle.marked = time.Now().Add(-2 * DefaultSweepGrace)
+	res, err = g2.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("SweepStep after the park TTL: %v", err)
+	}
+	if got := len(res.SweptShards) + len(res.SweptXorbs); got != 1 {
+		t.Fatalf("swept objects after expiry = %d, want 1 (a fresh accumulation)", got)
+	}
+}
+
+// TestSweepStepParksOnContextCancel: a step whose context dies mid-cycle
+// returns the error but parks the cycle, so the progress already paid —
+// deletions and the mark — survives a client disconnect and the resuming
+// step accumulates it instead of re-marking.
+func TestSweepStepParksOnContextCancel(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putUnlinkedGCFiles(t, ctx, st, "canceled step one", "canceled step two")
+
+	hooked := &hookedGCStore{GCStore: st}
+	g := NewGC(hooked)
+	opts := SweepOptions{Grace: noGrace, Anchor: AnchorFiles}
+
+	// The cancel fires while the first dead shard is being swept; the
+	// file backend ignores contexts, so that shard still completes and the
+	// loop's own check stops the step before the second one.
+	stepCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	hooked.onFileEntryGet = func(n int) {
+		if n == 2 {
+			cancel()
+		}
+	}
+	if _, err := g.SweepStep(stepCtx, opts); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled SweepStep = %v, want context.Canceled", err)
+	}
+	if g.cycle == nil {
+		t.Fatal("cycle discarded on cancellation, want it parked")
+	}
+	hooked.onFileEntryGet = nil
+
+	res, err := g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("resumed SweepStep: %v", err)
+	}
+	if !res.Done || len(res.SweptShards) != 2 || len(res.SweptXorbs) != 2 {
+		t.Fatalf("resumed result = %+v, want the canceled step's progress accumulated (2/2)", res)
+	}
+	// One dead-collection walk plus one transition re-shield: a re-mark
+	// would have added a second dead collection.
+	if hooked.walkShardsCalls != 2 {
+		t.Fatalf("WalkShards called %d times, want 2 (no re-mark after the cancel)", hooked.walkShardsCalls)
 	}
 }
 
 // TestSweepStepResumeReshieldsLateCommit: a stepped cycle parks in the xorb
-// phase with an aged xorb still queued; a commit landing during the park
+// phase with a xorb still queued; a commit landing during the park
 // dedup-reuses that xorb. The resuming step must re-run the re-shield before
-// consuming the queue, so the late commit's xorb survives the cycle.
+// consuming the queue — and its mtime filter must treat the fresh shard as
+// unseen — so the late commit's xorb survives the cycle.
 func TestSweepStepResumeReshieldsLateCommit(t *testing.T) {
-	partShared := []byte("aged payload a late commit reuses")
+	partOne := []byte("queued payload a late commit reuses")
+	partTwo := []byte("second queued payload of the same file")
 	partExtra := []byte("unique to the late commit")
 	for _, backend := range listBackends() {
 		t.Run(backend.name, func(t *testing.T) {
@@ -1364,34 +1520,44 @@ func TestSweepStepResumeReshieldsLateCommit(t *testing.T) {
 			st := backend.newStore(t)
 			gcs := st.(GCStore)
 
-			f1 := putGCFile(t, ctx, st, [][]byte{partShared})
+			// One dead shard with two xorbs, so the cycle can park mid-queue.
+			f1 := putGCFile(t, ctx, st, [][]byte{partOne, partTwo})
 			if _, err := NewGC(gcs).Unlink(ctx, f1.fileHash); err != nil {
 				t.Fatal(err)
 			}
 
-			// Aged mtimes make the unlinked shard and xorb sweepable.
-			g := NewGC(agedStore(gcs))
-			opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1, Anchor: AnchorFiles}
+			g := NewGC(&hookedGCStore{GCStore: gcs})
+			opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
 			res, err := g.SweepStep(ctx, opts)
 			if err != nil {
 				t.Fatalf("SweepStep: %v", err)
 			}
-			if res.Done || res.RemainingShards != 0 || res.RemainingXorbs != 1 {
-				t.Fatalf("first step = done %v, remaining %d/%d; want parked with 0/1", res.Done, res.RemainingShards, res.RemainingXorbs)
+			if res.Done || res.RemainingShards != 0 || res.RemainingXorbs != 2 {
+				t.Fatalf("first step = done %v, remaining %d/%d; want parked with 0/2", res.Done, res.RemainingShards, res.RemainingXorbs)
 			}
 			if got, want := sweptHashes(res.SweptShards), []string{f1.shardHash}; !slices.Equal(got, want) {
 				t.Fatalf("SweptShards = %v, want %v", got, want)
 			}
-			// The commit below only exercises the resume re-shield if the
-			// cycle really parked in the xorb phase.
+
+			// The second step consumes one queued xorb and must park inside
+			// the xorb phase for the commit below to exercise the resume
+			// re-shield.
+			res, err = g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if res.Done || res.RemainingXorbs != 1 || len(res.SweptXorbs) != 1 {
+				t.Fatalf("second step = done %v, remaining xorbs %d, swept %d; want parked with 1 left", res.Done, res.RemainingXorbs, len(res.SweptXorbs))
+			}
 			if g.cycle == nil || g.cycle.phase != sweepPhaseXorbs {
 				t.Fatal("cycle not parked in the xorb phase")
 			}
 
-			// A commit lands during the park, dedup-reusing the queued xorb.
-			f2 := putGCFile(t, ctx, st, [][]byte{partShared, partExtra})
-			if f2.xorbHashes[0] != f1.xorbHashes[0] {
-				t.Fatal("test setup: shared part must map to one xorb")
+			// A commit lands during the park, dedup-reusing both original
+			// parts — including the one still queued for deletion.
+			f2 := putGCFile(t, ctx, st, [][]byte{partOne, partTwo, partExtra})
+			if f2.xorbHashes[0] != f1.xorbHashes[0] || f2.xorbHashes[1] != f1.xorbHashes[1] {
+				t.Fatal("test setup: shared parts must map to the same xorbs")
 			}
 
 			res, err = g.SweepStep(ctx, opts)
@@ -1401,14 +1567,113 @@ func TestSweepStepResumeReshieldsLateCommit(t *testing.T) {
 			if !res.Done || res.RemainingXorbs != 0 {
 				t.Fatalf("resumed step = done %v, remaining xorbs %d; want done 0", res.Done, res.RemainingXorbs)
 			}
-			if len(res.SweptXorbs) != 0 {
-				t.Fatalf("SweptXorbs = %v, want none (the late commit reuses the queued xorb)", sweptHashes(res.SweptXorbs))
+			if len(res.SweptXorbs) != 1 {
+				t.Fatalf("SweptXorbs = %v, want only the pre-commit delete (the late commit reuses the queued xorb)", sweptHashes(res.SweptXorbs))
 			}
-			if ok, _ := st.HasXorb(ctx, "default", f1.xorbHashes[0]); !ok {
-				t.Fatal("xorb reused by the late commit was swept")
+			for _, xh := range f2.xorbHashes {
+				if ok, _ := st.HasXorb(ctx, "default", xh); !ok {
+					t.Fatalf("xorb %s reused by the late commit is missing", xh)
+				}
 			}
 			assertFileIntact(t, ctx, st, f2)
 		})
+	}
+}
+
+// TestSweepStepReshieldSkipsAlreadyShieldedShards: re-shield walks reload
+// only shards written since the cycle's last full look. An in-grace shard
+// judged at the mark — its xorbs never queued — is loaded exactly once, by
+// the mark, however many re-shield walks the stepped cycle runs.
+func TestSweepStepReshieldSkipsAlreadyShieldedShards(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			putUnlinkedGCFiles(t, ctx, st, "reload dead one", "reload dead two")
+			fGrace := putGCFile(t, ctx, st, [][]byte{[]byte("uncommitted in-grace upload")})
+			if _, err := NewGC(gcs).Unlink(ctx, fGrace.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			// Everything is aged out of the window except the in-grace shard,
+			// pinned well inside it and well before any re-shield threshold.
+			hooked := agedStore(gcs)
+			hooked.shardModTimes = map[string]time.Time{
+				fGrace.shardHash: time.Now().Add(-30 * time.Minute),
+			}
+			hooked.shardLoads = map[string]int{}
+			g := NewGC(hooked)
+			opts := SweepOptions{Grace: time.Hour, MaxDeletes: 1, Anchor: AnchorFiles}
+
+			res, err := g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			for i := 0; !res.Done; i++ {
+				if i > 20 {
+					t.Fatal("cycle did not finish in 20 steps")
+				}
+				if res, err = g.SweepStep(ctx, opts); err != nil {
+					t.Fatalf("SweepStep: %v", err)
+				}
+			}
+			if len(res.SweptShards) != 2 || len(res.SweptXorbs) != 2 {
+				t.Fatalf("cumulative result = %d shards, %d xorbs; want 2/2", len(res.SweptShards), len(res.SweptXorbs))
+			}
+			if res.SkippedInGrace == 0 {
+				t.Fatalf("SkippedInGrace = 0, want the in-grace shard counted: %+v", res)
+			}
+			if hooked.walkShardsCalls < 3 {
+				t.Fatalf("WalkShards called %d times, want at least mark + two re-shields", hooked.walkShardsCalls)
+			}
+			if got := hooked.shardLoads[fGrace.shardHash]; got != 1 {
+				t.Fatalf("in-grace shard loaded %d times, want 1 (mark only; re-shields must skip it)", got)
+			}
+			if _, err := gcs.GetShardByHash(ctx, fGrace.shardHash); err != nil {
+				t.Fatalf("in-grace shard gone: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", fGrace.xorbHashes[0]); !ok {
+				t.Fatal("in-grace shard's xorb was swept")
+			}
+		})
+	}
+}
+
+// TestSweepTransitionReshieldDeferredWhenExhausted: a step that spends its
+// whole allowance draining the shard queue parks at the boundary; the
+// transition re-shield runs once, in the resuming step, not twice.
+func TestSweepTransitionReshieldDeferredWhenExhausted(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putUnlinkedGCFiles(t, ctx, st, "boundary walk file")
+
+	hooked := &hookedGCStore{GCStore: st}
+	g := NewGC(hooked)
+	opts := SweepOptions{Grace: noGrace, MaxDeletes: 1, Anchor: AnchorFiles}
+	res, err := g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("SweepStep: %v", err)
+	}
+	if res.Done || len(res.SweptShards) != 1 || res.RemainingXorbs != 1 {
+		t.Fatalf("first step = %+v, want the shard swept and the xorb still queued", res)
+	}
+	if hooked.walkShardsCalls != 1 {
+		t.Fatalf("WalkShards after the boundary step = %d, want 1 (mark only; transition walk deferred)", hooked.walkShardsCalls)
+	}
+	res, err = g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("resumed SweepStep: %v", err)
+	}
+	if !res.Done || len(res.SweptXorbs) != 1 {
+		t.Fatalf("resumed step = %+v, want done with the xorb swept", res)
+	}
+	if hooked.walkShardsCalls != 2 {
+		t.Fatalf("WalkShards after the cycle = %d, want 2 (one transition walk total)", hooked.walkShardsCalls)
 	}
 }
 
@@ -1486,12 +1751,12 @@ func TestSweepStepReshieldNotChargedToBudget(t *testing.T) {
 	if res.Done || res.RemainingShards != 0 || res.RemainingXorbs != 2 {
 		t.Fatalf("first step = done %v, remaining %d/%d; want parked with 0/2", res.Done, res.RemainingShards, res.RemainingXorbs)
 	}
-	if g.cycle == nil || g.cycle.phase != sweepPhaseXorbs {
-		t.Fatal("cycle not parked in the xorb phase")
+	if g.cycle == nil || g.cycle.phase != sweepPhaseShards || len(g.cycle.deadShards) != 0 {
+		t.Fatal("cycle not parked at the shard-queue boundary")
 	}
 
-	// The resume re-shield outlasts the entire budget; both queued xorbs
-	// must still be consumed within it.
+	// The transition re-shield in the resuming step outlasts the entire
+	// budget; both queued xorbs must still be consumed within it.
 	hooked.beforeWalkShards = func() { time.Sleep(500 * time.Millisecond) }
 	res, err = g.SweepStep(ctx, SweepOptions{Grace: noGrace, Budget: 250 * time.Millisecond, Anchor: AnchorFiles})
 	if err != nil {
@@ -1500,6 +1765,203 @@ func TestSweepStepReshieldNotChargedToBudget(t *testing.T) {
 	if !res.Done || res.RemainingXorbs != 0 || len(res.SweptXorbs) != 2 {
 		t.Fatalf("resumed step = done %v, remaining xorbs %d, swept xorbs %d; want done 0/2 (re-shield charged to the budget)",
 			res.Done, res.RemainingXorbs, len(res.SweptXorbs))
+	}
+}
+
+// TestSweepNeverTouchesShardCache: every shard load a sweep performs — the
+// mark's live and in-grace loads, the dead-shard load, and the re-shield's —
+// must go through LoadShard, never the cache-populating GetShardByHash, so
+// bulk sweeps cannot evict hot serving entries.
+func TestSweepNeverTouchesShardCache(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			fLive := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold live file")})
+			fDead := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold dead file")})
+			if _, err := NewGC(gcs).Unlink(ctx, fDead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			fGrace := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold in-grace upload")})
+			if _, err := NewGC(gcs).Unlink(ctx, fGrace.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.shardModTimes = map[string]time.Time{
+				fGrace.shardHash: time.Now().Add(-30 * time.Minute),
+			}
+			// A commit landing mid-sweep exercises the re-shield load too.
+			hooked.beforeFileEntryGet = func() {
+				fMid := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold mid-sweep commit")})
+				hooked.shardModTimes[fMid.shardHash] = time.Now()
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if hooked.walkShardsCalls < 2 {
+				t.Fatalf("WalkShards called %d times, want mark + re-shield", hooked.walkShardsCalls)
+			}
+			if hooked.cachedShardGets != 0 {
+				t.Fatalf("GetShardByHash called %d times during the sweep, want 0 (loads must bypass the cache)", hooked.cachedShardGets)
+			}
+			assertFileIntact(t, ctx, st, fLive)
+		})
+	}
+}
+
+// TestSweepLeavesShardCacheCold: a sweep over a store whose shard cache is
+// empty leaves it empty — LoadShard populates nothing, so hot entries of a
+// serving process survive its sweeps untouched.
+func TestSweepLeavesShardCacheCold(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := NewFileStorage(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fLive := putGCFile(t, ctx, st, [][]byte{[]byte("cold cache live")})
+	fDead := putGCFile(t, ctx, st, [][]byte{[]byte("cold cache dead")})
+	if _, err := NewGC(st).Unlink(ctx, fDead.fileHash); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second view over the same directory starts with a cold cache.
+	sweeper, err := NewFileStorage(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Sweep(ctx, agedStore(sweeper), SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+		t.Fatalf("SweptShards = %v, want %v", got, want)
+	}
+	if n := sweeper.shardIndex.Len(); n != 0 {
+		t.Fatalf("shard cache holds %d entries after the sweep, want 0", n)
+	}
+	assertFileIntact(t, ctx, st, fLive)
+}
+
+// TestSweepReportsUnreadableDeadShard: a dead shard whose object cannot be
+// decoded no longer fails the sweep — it is reported, treated as live, and
+// nothing of it (object, entries, xorb) is deleted.
+func TestSweepReportsUnreadableDeadShard(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			f := putGCFile(t, ctx, st, [][]byte{[]byte("unreadable dead shard")})
+			if _, err := NewGC(gcs).Unlink(ctx, f.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.loadShardErrs = map[string]error{f.shardHash: errors.New("decode stored shard: corrupt")}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep = %v, want the unreadable shard skipped, not fail-stop", err)
+			}
+			if got, want := res.UnreadableShards, []string{f.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("UnreadableShards = %v, want %v", got, want)
+			}
+			if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+				t.Fatalf("swept %v/%v, want nothing", sweptHashes(res.SweptShards), sweptHashes(res.SweptXorbs))
+			}
+			if _, err := gcs.GetShardByHash(ctx, f.shardHash); err != nil {
+				t.Fatalf("unreadable shard object gone: %v", err)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
+				t.Fatal("unreadable shard's xorb was swept")
+			}
+			if got, err := gcs.GetChunkIndexEntry(ctx, f.chunkHashes[0]); err != nil || got != f.shardHash {
+				t.Fatalf("chunk entry = %q, %v; want untouched %q", got, err, f.shardHash)
+			}
+		})
+	}
+}
+
+// TestSweepUnreadableShardSuppressesXorbSweep: one unreadable live shard
+// must not stop dead-shard cleanup, but no xorb may be deleted — the
+// unreadable shard could reference any of them.
+func TestSweepUnreadableShardSuppressesXorbSweep(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			fSick := putGCFile(t, ctx, st, [][]byte{[]byte("unreadable live shard")})
+			fDead := putGCFile(t, ctx, st, [][]byte{[]byte("healthy dead shard")})
+			if _, err := NewGC(gcs).Unlink(ctx, fDead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.loadShardErrs = map[string]error{fSick.shardHash: errors.New("decode stored shard: corrupt")}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := res.UnreadableShards, []string{fSick.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("UnreadableShards = %v, want %v", got, want)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v (dead-shard cleanup must proceed)", got, want)
+			}
+			if len(res.SweptXorbs) != 0 || res.RemainingXorbs != 0 {
+				t.Fatalf("xorbs swept %v remaining %d, want none (xorb phase poisoned)", sweptHashes(res.SweptXorbs), res.RemainingXorbs)
+			}
+			if ok, _ := st.HasXorb(ctx, "default", fDead.xorbHashes[0]); !ok {
+				t.Fatal("queued xorb swept despite an unreadable shard")
+			}
+			if _, err := gcs.GetShardByHash(ctx, fDead.shardHash); !errors.Is(err, iofs.ErrNotExist) {
+				t.Fatalf("dead shard load = %v, want ErrNotExist", err)
+			}
+			if got, _, err := gcs.GetFileIndexEntry(ctx, fSick.fileHash); err != nil || got != fSick.shardHash {
+				t.Fatalf("unreadable shard's file entry = %q, %v; want untouched", got, err)
+			}
+		})
+	}
+}
+
+// TestSweepLoadContextErrorAborts: a load failing with the step's own dying
+// context aborts the sweep — parked, not discarded — and must not brand the
+// shard unreadable.
+func TestSweepLoadContextErrorAborts(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := putGCFile(t, ctx, st, [][]byte{[]byte("canceled mid-load")})
+	if _, err := NewGC(st).Unlink(ctx, f.fileHash); err != nil {
+		t.Fatal(err)
+	}
+
+	hooked := &hookedGCStore{GCStore: st}
+	hooked.loadShardErrs = map[string]error{f.shardHash: fmt.Errorf("get object: %w", context.Canceled)}
+	g := NewGC(hooked)
+	if _, err := g.SweepStep(ctx, SweepOptions{Grace: noGrace, Anchor: AnchorFiles}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SweepStep = %v, want context.Canceled", err)
+	}
+	if g.cycle == nil {
+		t.Fatal("cycle discarded on a context load error, want it parked")
+	}
+	if n := len(g.cycle.res.UnreadableShards); n != 0 {
+		t.Fatalf("UnreadableShards = %d entries, want none for a context error", n)
+	}
+	if _, err := st.GetShardByHash(ctx, f.shardHash); err != nil {
+		t.Fatalf("shard gone after aborted step: %v", err)
 	}
 }
 
@@ -2356,6 +2818,7 @@ func TestSweepDeleteLoopAbortsOnRacingFileEntry(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the racing commit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
@@ -2414,6 +2877,7 @@ func TestSweepAnchorSHA256DeleteLoopSparesFreshRecommit(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the fresh recommit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
@@ -2474,6 +2938,7 @@ func TestSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T) {
 			if ok, _ := st.HasXorb(ctx, "default", f.xorbHashes[0]); !ok {
 				t.Fatal("xorb destroyed under the racing commit")
 			}
+			assertChunkEntriesIntact(t, ctx, gcs, f, res)
 		})
 	}
 }
