@@ -677,7 +677,8 @@ type hookedGCStore struct {
 	sha256EntryGets  int
 	beforeWalkShards func()         // fired before every WalkShards delegation
 	walkShardsCalls  int            // WalkShards invocations
-	shardLoads       map[string]int // GetShardByHash tally, nil = off
+	shardLoads       map[string]int // LoadShard tally, nil = off
+	cachedShardGets  int            // GetShardByHash invocations (GC must not)
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -749,6 +750,11 @@ func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex strin
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	h.cachedShardGets++
+	return h.GCStore.GetShardByHash(ctx, shardHash)
+}
+
+func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	if h.beforeShardLoad != nil {
 		cb := h.beforeShardLoad
 		h.beforeShardLoad = nil
@@ -757,7 +763,7 @@ func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*
 	if h.shardLoads != nil {
 		h.shardLoads[shardHash]++
 	}
-	return h.GCStore.GetShardByHash(ctx, shardHash)
+	return h.GCStore.LoadShard(ctx, shardHash)
 }
 
 // assertChunkEntriesIntact fails when an aborted shard deletion touched the
@@ -1755,6 +1761,88 @@ func TestSweepStepReshieldNotChargedToBudget(t *testing.T) {
 		t.Fatalf("resumed step = done %v, remaining xorbs %d, swept xorbs %d; want done 0/2 (re-shield charged to the budget)",
 			res.Done, res.RemainingXorbs, len(res.SweptXorbs))
 	}
+}
+
+// TestSweepNeverTouchesShardCache: every shard load a sweep performs — the
+// mark's live and in-grace loads, the dead-shard load, and the re-shield's —
+// must go through LoadShard, never the cache-populating GetShardByHash, so
+// bulk sweeps cannot evict hot serving entries.
+func TestSweepNeverTouchesShardCache(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			fLive := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold live file")})
+			fDead := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold dead file")})
+			if _, err := NewGC(gcs).Unlink(ctx, fDead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			fGrace := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold in-grace upload")})
+			if _, err := NewGC(gcs).Unlink(ctx, fGrace.fileHash); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := agedStore(gcs)
+			hooked.shardModTimes = map[string]time.Time{
+				fGrace.shardHash: time.Now().Add(-30 * time.Minute),
+			}
+			// A commit landing mid-sweep exercises the re-shield load too.
+			hooked.beforeFileEntryGet = func() {
+				fMid := putGCFile(t, ctx, st, [][]byte{[]byte("cache-cold mid-sweep commit")})
+				hooked.shardModTimes[fMid.shardHash] = time.Now()
+			}
+			res, err := Sweep(ctx, hooked, SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if hooked.walkShardsCalls < 2 {
+				t.Fatalf("WalkShards called %d times, want mark + re-shield", hooked.walkShardsCalls)
+			}
+			if hooked.cachedShardGets != 0 {
+				t.Fatalf("GetShardByHash called %d times during the sweep, want 0 (loads must bypass the cache)", hooked.cachedShardGets)
+			}
+			assertFileIntact(t, ctx, st, fLive)
+		})
+	}
+}
+
+// TestSweepLeavesShardCacheCold: a sweep over a store whose shard cache is
+// empty leaves it empty — LoadShard populates nothing, so hot entries of a
+// serving process survive its sweeps untouched.
+func TestSweepLeavesShardCacheCold(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := NewFileStorage(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fLive := putGCFile(t, ctx, st, [][]byte{[]byte("cold cache live")})
+	fDead := putGCFile(t, ctx, st, [][]byte{[]byte("cold cache dead")})
+	if _, err := NewGC(st).Unlink(ctx, fDead.fileHash); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second view over the same directory starts with a cold cache.
+	sweeper, err := NewFileStorage(WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Sweep(ctx, agedStore(sweeper), SweepOptions{Grace: time.Hour, Anchor: AnchorFiles})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := sweptHashes(res.SweptShards), []string{fDead.shardHash}; !slices.Equal(got, want) {
+		t.Fatalf("SweptShards = %v, want %v", got, want)
+	}
+	if n := sweeper.shardIndex.Len(); n != 0 {
+		t.Fatalf("shard cache holds %d entries after the sweep, want 0", n)
+	}
+	assertFileIntact(t, ctx, st, fLive)
 }
 
 // putShardObject stores an encoded shard object directly, bypassing PutShard

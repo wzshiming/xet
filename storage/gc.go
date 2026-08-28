@@ -40,6 +40,11 @@ type GCStore interface {
 	// WalkSHA256Index calls fn for every index/sha256 entry.
 	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error
 
+	// LoadShard reads a stored shard object without consulting or
+	// populating any read cache: sweeps load whole stores, and routing
+	// them through the serving cache would evict every hot entry.
+	LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error)
+
 	// GetFileIndexEntry returns the shard hash recorded for fileHash, or
 	// "" when the entry is absent, bypassing caches, together with the
 	// entry's modification time (the zero time when absent).
@@ -505,7 +510,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 
 	graceXorbs := map[string]bool{} // shielded by in-grace uncommitted shards
 	for shardHash, fileHashes := range liveFiles {
-		sh, err := st.GetShardByHash(ctx, shardHash)
+		sh, err := st.LoadShard(ctx, shardHash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				c.res.DanglingFileEntries = append(c.res.DanglingFileEntries, fileHashes...)
@@ -538,7 +543,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		if c.liveShards[shardHash] {
 			continue
 		}
-		sh, err := st.GetShardByHash(ctx, shardHash)
+		sh, err := st.LoadShard(ctx, shardHash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				// Dangling sha256 entries: reported for repair, never deleted.
@@ -570,7 +575,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 			c.res.SkippedInGrace++
 			// Likely an upload that has not committed its file entry yet:
 			// shield the xorbs it references, dedup may have reused old ones.
-			sh, err := st.GetShardByHash(ctx, hash)
+			sh, err := st.LoadShard(ctx, hash)
 			if err != nil {
 				if errors.Is(err, iofs.ErrNotExist) {
 					return nil
@@ -637,7 +642,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 		}
 	}
 	for _, shardHash := range recommitted {
-		sh, err := st.GetShardByHash(ctx, shardHash)
+		sh, err := st.LoadShard(ctx, shardHash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				continue // dangling entry; left for the next sweep to report
@@ -674,7 +679,7 @@ func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
 		if c.liveShards[hash] || modTime.Before(threshold) {
 			return nil
 		}
-		sh, err := st.GetShardByHash(ctx, hash)
+		sh, err := st.LoadShard(ctx, hash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				return nil
@@ -829,7 +834,7 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 // entry then dangles and is reported by the next sweep's
 // DanglingFileEntries for repair — an accepted race.
 func sweepShard(ctx context.Context, st GCStore, c *sweepCycle, shardHash string) (bool, error) {
-	sh, err := st.GetShardByHash(ctx, shardHash)
+	sh, err := st.LoadShard(ctx, shardHash)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) {
 			// Deleted by someone else after the walk: nothing was reclaimed

@@ -552,6 +552,20 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 		return value.(*shard.Shard), nil
 	}
 
+	s, err := ss.loadShard(ctx, shardHash)
+	if err != nil {
+		return nil, err
+	}
+
+	ss.shardMut.Lock()
+	ss.shardIndex.Add(shardHash, s)
+	ss.shardMut.Unlock()
+
+	return s, nil
+}
+
+// loadShard reads and decodes a stored shard object straight from S3.
+func (ss *S3Storage) loadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(ss.bucket),
 		Key:    aws.String(ss.objectKey("shards", shardHash)),
@@ -573,12 +587,18 @@ func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*sha
 		}
 		s.SetFooter(creationTime)
 	}
-
-	ss.shardMut.Lock()
-	ss.shardIndex.Add(shardHash, s)
-	ss.shardMut.Unlock()
-
 	return s, nil
+}
+
+// LoadShard reads a stored shard object, bypassing the shard cache both
+// ways so bulk scans cannot evict hot entries. The returned error wraps
+// fs.ErrNotExist when the shard is absent.
+func (ss *S3Storage) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
+	s, err := ss.loadShard(ctx, shardHash)
+	if err != nil && isS3NotFound(err) {
+		return nil, fmt.Errorf("shard %s: %w", shardHash, iofs.ErrNotExist)
+	}
+	return s, err
 }
 
 // GetShardByHash loads a stored shard by the hash of its serialized bytes.
