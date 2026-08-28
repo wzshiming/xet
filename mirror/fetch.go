@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wzshiming/xet/hf"
+	"github.com/wzshiming/xet/client/hf"
 )
 
 // fetchXet downloads the file through the upstream xet CAS into the spool,

@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wzshiming/xet/hf"
+	"github.com/wzshiming/xet/client/hf"
 )
 
 // authInjector adds the mirror's upstream credential to requests that target

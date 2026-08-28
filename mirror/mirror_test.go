@@ -21,7 +21,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/hf"
+	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
