@@ -212,6 +212,59 @@ func TestMergeKeepsInUseSource(t *testing.T) {
 	verifyChunks(t, dir, testCacheHash, []string{"aaa", "bbb", "ccc", "ddd"})
 }
 
+func TestMergeWorkerRetriesPinnedSource(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	m.mergeQuiet = 10 * time.Millisecond
+
+	// Pin the first entry so the worker's pass cannot remove it, then
+	// publish the neighbor to arm the merger.
+	first := writeRangeEntry(t, m, testCacheHash, 0, 2, 0, 100, []string{"aaa", "bbb"})
+	pinned, err := openCachedRange(m, testCacheHash, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned == nil {
+		t.Fatal("first entry was not found in cache")
+	}
+	writeRangeEntry(t, m, testCacheHash, 2, 4, 100, 200, []string{"ccc", "ddd"})
+
+	// The worker writes the covering entry but must keep the pinned source.
+	merged := cacheFilePath(dir, testCacheHash, 0, 4, 0, 200)
+	mergedName := cacheFileName(0, 4, 0, 200)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if info, err := os.Stat(merged); err == nil && isCompleteCacheFile(merged, 0, 4, info.Size()) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not write the merged entry")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Let the publish-hinted retry pass fire and be refused while the pin
+	// is still held, so releasing it is the only remaining trigger.
+	time.Sleep(20 * m.mergeQuiet)
+	if _, err := os.Stat(first); err != nil {
+		t.Fatalf("pinned source was removed: %v", err)
+	}
+
+	// Releasing the pin must be enough: the worker retries on its own,
+	// with no further publish or read hinting this hash.
+	pinned.Done()
+	for {
+		names := listEntryNames(t, dir, testCacheHash)
+		if len(names) == 1 && names[0] == mergedName {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("worker did not retry after pin release, still have %v", names)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	verifyChunks(t, dir, testCacheHash, []string{"aaa", "bbb", "ccc", "ddd"})
+}
+
 func TestMergeIgnoresIncompleteNeighbor(t *testing.T) {
 	dir := t.TempDir()
 	m := NewCacheManager(dir, 0)

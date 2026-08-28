@@ -40,8 +40,9 @@ func (r *cachedChunkReader) Read(p []byte) (int, error) {
 
 // mergeHashDir compacts the cache directory of one xorb hash: runs of sealed
 // entries whose chunk ranges touch or overlap are rewritten as one covering
-// entry and the now-redundant sources are unlinked. Best-effort: entries in
-// use, locked elsewhere, or vanishing mid-pass are left to normal eviction.
+// entry and the now-redundant sources are unlinked. Entries vanishing
+// mid-pass are left to normal eviction; sources kept because they are in use
+// or locked elsewhere re-arm the merge hint so a later pass retries.
 func mergeHashDir(m *CacheManager, hash string) error {
 	if len(hash) < 2 {
 		return nil
@@ -87,6 +88,7 @@ func mergeHashDir(m *CacheManager, hash string) error {
 
 	// Walk maximal runs of touching or overlapping chunk ranges.
 	var firstErr error
+	retry := false
 	for i := 0; i < len(cands); {
 		j := i + 1
 		end := cands[i].end
@@ -95,18 +97,28 @@ func mergeHashDir(m *CacheManager, hash string) error {
 			j++
 		}
 		if j-i >= 2 {
-			if err := mergeRun(m, hash, cands[i:j], cands[i].start, end); err != nil && firstErr == nil {
+			kept, err := mergeRun(m, hash, cands[i:j], cands[i].start, end)
+			if err != nil && firstErr == nil {
 				firstErr = err
 			}
+			retry = retry || kept
 		}
 		i = j
+	}
+	if retry {
+		// Readers may pin a source across this pass and never hint again
+		// once the covering entry serves them; retry after another quiet
+		// period so the directory still converges to one entry.
+		m.noteMergeCandidate(hash)
 	}
 	return firstErr
 }
 
 // mergeRun replaces the entries in run with one entry covering
 // [chunkStart, chunkEnd), reusing an existing covering entry when present.
-func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, chunkEnd uint32) error {
+// kept reports that a redundant source had to be left behind because it is
+// still in use or locked elsewhere.
+func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, chunkEnd uint32) (kept bool, err error) {
 	bytesStart := run[0].bytesStart
 	bytesEnd := run[0].bytesEnd
 	covering := ""
@@ -118,19 +130,20 @@ func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, ch
 		}
 	}
 	if covering == "" {
-		var err error
 		covering, err = writeMergedEntry(m, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 		if err != nil || covering == "" {
-			return err
+			return false, err
 		}
 	}
 	for _, c := range run {
 		if c.path == covering {
 			continue
 		}
-		m.forgetIfIdle(c.path)
+		if !m.forgetIfIdle(c.path) {
+			kept = true
+		}
 	}
-	return nil
+	return kept, nil
 }
 
 // writeMergedEntry rewrites the already-cached chunks [chunkStart, chunkEnd)
