@@ -29,18 +29,18 @@ func (b *branchEntry) key() string {
 	return b.Repo + "\x00" + b.Rev
 }
 
-func (h *Handler) branchDir() string {
-	return filepath.Join(h.indexDir, "branches")
+func (m *Mirror) branchDir() string {
+	return filepath.Join(m.indexDir, "branches")
 }
 
 // branchStale reports whether a branch mapping must be re-checked, following
 // the revalidation cadence: zero interval re-checks every request, negative
 // never does.
-func (h *Handler) branchStale(b *branchEntry) bool {
-	if h.revalidateInterval < 0 {
+func (m *Mirror) branchStale(b *branchEntry) bool {
+	if m.revalidateInterval < 0 {
 		return false
 	}
-	return time.Since(b.CheckedAt) >= h.revalidateInterval
+	return time.Since(b.CheckedAt) >= m.revalidateInterval
 }
 
 // branchProbe is the singleflight result of a branch mapping refresh. The
@@ -59,25 +59,25 @@ type branchProbe struct {
 // probe failures fall back to the last known commit so cached content stays
 // served while the upstream is unreachable. The returned probe result is
 // non-nil when this call probed the upstream for exactly this key.
-func (h *Handler) branchCommit(key resolveKey) (string, *probeResult, bool) {
+func (m *Mirror) branchCommit(key resolveKey) (string, *probeResult, bool) {
 	name := key.repo + "\x00" + key.rev
-	h.mu.Lock()
-	b := h.branches[name]
-	h.mu.Unlock()
-	if b != nil && !h.branchStale(b) {
+	m.mu.Lock()
+	b := m.branches[name]
+	m.mu.Unlock()
+	if b != nil && !m.branchStale(b) {
 		return b.Commit, nil, b.Commit != ""
 	}
 
-	v, _, _ := h.flight.Do("branch\x00"+name, func() (any, error) {
-		h.mu.Lock()
-		b := h.branches[name]
-		h.mu.Unlock()
-		if b != nil && !h.branchStale(b) {
+	v, _, _ := m.flight.Do("branch\x00"+name, func() (any, error) {
+		m.mu.Lock()
+		b := m.branches[name]
+		m.mu.Unlock()
+		if b != nil && !m.branchStale(b) {
 			return &branchProbe{b: b}, nil
 		}
 		// Background context: the probe result is shared by every request of
 		// the repo branch, so one disconnecting client must not fail it.
-		pr, err := h.probe(context.Background(), key.String())
+		pr, err := m.probe(context.Background(), key.String())
 		if err != nil {
 			return &branchProbe{b: b}, nil // unreachable upstream: serve the last known commit
 		}
@@ -85,10 +85,10 @@ func (h *Handler) branchCommit(key resolveKey) (string, *probeResult, bool) {
 		if pr.realCommit && commitRevRe.MatchString(pr.commit) {
 			nb.Commit = pr.commit
 		}
-		h.mu.Lock()
-		h.branches[name] = nb
-		h.mu.Unlock()
-		_ = persistBranch(h.branchDir(), nb)
+		m.mu.Lock()
+		m.branches[name] = nb
+		m.mu.Unlock()
+		_ = persistBranch(m.branchDir(), nb)
 		return &branchProbe{b: nb, key: key, pr: pr}, nil
 	})
 	bp := v.(*branchProbe)

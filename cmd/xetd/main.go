@@ -13,6 +13,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
@@ -90,8 +91,8 @@ func main() {
 
 	if *upstream != "" {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
-		// The mirror handles resolve/token requests and proxies the rest to
-		// the upstream; the CAS server below matches its own routes first.
+		// The hub front end handles resolve/token/tree requests through the
+		// mirror engine and proxies the rest to the upstream.
 		xetClient, err := client.NewClient(
 			client.WithCacheDir(filepath.Join(*storageDir, "mirror", "chunks")),
 		)
@@ -100,26 +101,30 @@ func main() {
 			os.Exit(1)
 		}
 
-		proxy, err := mirror.NewUpstreamProxy(*upstream, *upstreamToken)
+		next, err = hf.NewUpstreamProxy(*upstream, *upstreamToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create upstream proxy: %v\n", err)
 			os.Exit(1)
 		}
 
-		next, err = mirror.NewHandler(
+		mir, err := mirror.NewMirror(
 			mirror.WithStorage(stor),
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
-			mirror.WithExternalURL(*baseURL),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
 			mirror.WithClient(xetClient),
-			mirror.WithMintToken(issuer.Mint),
-			mirror.WithNext(proxy),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
 			os.Exit(1)
 		}
+
+		next = hf.NewHandler(
+			hf.WithMirror(mir),
+			hf.WithExternalURL(*baseURL),
+			hf.WithMintToken(issuer.Mint),
+			hf.WithNext(next),
+		)
 
 		fmt.Printf("Mirror mode enabled, upstream: %s\n", *upstream)
 	}

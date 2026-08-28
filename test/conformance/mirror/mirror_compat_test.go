@@ -28,6 +28,7 @@ import (
 
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
 )
@@ -125,9 +126,10 @@ func unreachableUpstream(t *testing.T) string {
 }
 
 // startMirror wires the same composition as cmd/xetd: a CAS server that
-// matches its routes first and falls through to the mirror handler, with a
-// shared issuer tying token minting to validation. storageDir and cacheDir
-// are taken by the caller so a restarted mirror can reuse them.
+// matches its routes first, serves the hub front end over the mirror engine,
+// and falls through to the upstream proxy, with a shared issuer tying token
+// minting to validation. storageDir and cacheDir are taken by the caller so
+// a restarted mirror can reuse them.
 func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mirror.Option) string {
 	t.Helper()
 	var inner atomic.Value
@@ -147,27 +149,30 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := mirror.NewUpstreamProxy(upstream, "")
+	proxy, err := hf.NewUpstreamProxy(upstream, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := mirror.NewHandler(
+	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
 			mirror.WithUpstream(upstream),
-			mirror.WithExternalURL(srv.URL),
 			mirror.WithCacheDir(cacheDir),
-			mirror.WithMintToken(issuer.Mint),
-			mirror.WithNext(proxy),
 		}, opts...)...,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	hfh := hf.NewHandler(
+		hf.WithMirror(m),
+		hf.WithExternalURL(srv.URL),
+		hf.WithMintToken(issuer.Mint),
+		hf.WithNext(proxy),
+	)
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),
 		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
-		server.WithNext(h),
+		server.WithNext(hfh),
 	)))
 	return srv.URL
 }

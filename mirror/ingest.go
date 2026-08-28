@@ -73,23 +73,22 @@ func (in *Ingestion) Entry() (*Entry, error) {
 // Ingest starts ingesting the file at /{repo}/resolve/{rev}/{path} into local
 // storage — bytes fetched, xorbs and shards landed, index entry persisted —
 // or joins the in-flight ingest, and returns immediately: wait on Done, then
-// read Entry. The components must be given in the escaped URL path form
-// ServeHTTP sees, so Ingest and the HTTP path share tasks, entries, and
-// spools.
+// read Entry. The components must be given in escaped URL path form, so
+// Ingest and Resolve share tasks, entries, and spools.
 //
 // The whole resolution (branch pinning, upstream probes, task wait) runs off
 // the calling goroutine, deduplicated per key: concurrent Ingests of one file
 // share a single flight. Ready entries resolve quickly (revalidated on the
 // usual cadence), as do failed ingests still inside their retry backoff.
-func (h *Handler) Ingest(repo, rev, path string) (*Ingestion, error) {
+func (m *Mirror) Ingest(repo, rev, path string) (*Ingestion, error) {
 	if repo == "" || rev == "" || path == "" || strings.Contains(rev, "/") {
 		return nil, fmt.Errorf("mirror: invalid resolve components repo=%q rev=%q path=%q", repo, rev, path)
 	}
 	key := resolveKey{repo: repo, rev: rev, path: path}
 
 	in := &Ingestion{done: make(chan struct{})}
-	ch := h.flight.DoChan("ingest\x00"+key.String(), func() (any, error) {
-		return h.ingest(key)
+	ch := m.flight.DoChan("ingest\x00"+key.String(), func() (any, error) {
+		return m.ingest(key)
 	})
 	go func() {
 		res := <-ch
@@ -104,20 +103,20 @@ func (h *Handler) Ingest(repo, rev, path string) (*Ingestion, error) {
 
 // ingest resolves one Ingest flight through the shared acquire flow and
 // blocks until the entry is ready or failed.
-func (h *Handler) ingest(key resolveKey) (*Entry, error) {
-	key, t, e, err := h.acquire(context.Background(), key)
+func (m *Mirror) ingest(key resolveKey) (*Entry, error) {
+	key, t, e, err := m.acquire(context.Background(), key)
 	if err != nil {
 		return nil, err
 	}
 	if t != nil {
 		<-t.done
-		h.mu.Lock()
-		e = h.entries[key]
-		h.mu.Unlock()
+		m.mu.Lock()
+		e = m.entries[key]
+		m.mu.Unlock()
 		if e == nil {
 			// Only possible when a concurrent revalidation found the fresh
-			// entry already stale; the same window the HTTP path answers
-			// with 404.
+			// entry already stale; the same window Resolve reports as a
+			// drained stream.
 			return nil, fmt.Errorf("mirror: %q changed upstream during ingest", key)
 		}
 	}

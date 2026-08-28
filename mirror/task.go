@@ -44,14 +44,14 @@ func (t *task) setSize(n int64) {
 // startup itself runs inside the singleflight, so the task is registered
 // exactly once per key. A pre-probe result from the branch mapping refresh is
 // handed to the task so the upstream is not probed twice.
-func (h *Handler) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry, error) {
-	v, err, _ := h.flight.Do(key.String(), func() (any, error) {
+func (m *Mirror) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry, error) {
+	v, err, _ := m.flight.Do(key.String(), func() (any, error) {
 		// A previous flight may have registered a task, or finished the whole
 		// ingest, between the caller's check and this one.
-		h.mu.Lock()
-		t := h.tasks[key]
-		e := h.entries[key]
-		h.mu.Unlock()
+		m.mu.Lock()
+		t := m.tasks[key]
+		e := m.entries[key]
+		m.mu.Unlock()
 		if t != nil {
 			return t, nil
 		}
@@ -65,10 +65,10 @@ func (h *Handler) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry
 		}
 		nt := &task{probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
 		nt.size.Store(-1)
-		h.mu.Lock()
-		h.tasks[key] = nt
-		h.mu.Unlock()
-		go h.runTask(key, nt, pre)
+		m.mu.Lock()
+		m.tasks[key] = nt
+		m.mu.Unlock()
+		go m.runTask(key, nt, pre)
 		return nt, nil
 	})
 	if err != nil {
@@ -80,27 +80,27 @@ func (h *Handler) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry
 	return nil, v.(*fileEntry), nil
 }
 
-// acquire is the shared resolution flow behind both the HTTP resolve path and
-// Ingest: it pins branch revisions to their upstream commit and returns what
-// the request attaches to — the in-flight task, or the terminal entry (ready,
+// acquire is the shared resolution flow behind both Resolve and Ingest: it
+// pins branch revisions to their upstream commit and returns what the request
+// attaches to — the in-flight task, or the terminal entry (ready,
 // revalidated on the usual cadence, or failed and still inside its retry
 // backoff) — starting a new ingest task when neither exists. Exactly one of
 // the returned task and entry is non-nil; the returned key carries the branch
 // pin. ctx bounds only the revalidation probe.
-func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *task, *fileEntry, error) {
+func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task, *fileEntry, error) {
 	var preProbe *probeResult
 	if !commitRevRe.MatchString(key.rev) {
-		commit, pr, ok := h.branchCommit(key)
+		commit, pr, ok := m.branchCommit(key)
 		preProbe = pr
 		if ok {
 			key.rev = commit
 		}
 	}
 
-	h.mu.Lock()
-	t := h.tasks[key]
-	e := h.entries[key]
-	h.mu.Unlock()
+	m.mu.Lock()
+	t := m.tasks[key]
+	e := m.entries[key]
+	m.mu.Unlock()
 
 	if t != nil {
 		return key, t, nil, nil
@@ -108,11 +108,11 @@ func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *tas
 	if e != nil {
 		switch e.State {
 		case stateReady:
-			if h.needsRevalidate(e, key.rev) {
-				e = h.revalidate(ctx, key, e)
+			if m.needsRevalidate(e, key.rev) {
+				e = m.revalidate(ctx, key, e)
 			}
-			if e != nil && !h.entryLive(ctx, e) {
-				h.dropEntry(key, e)
+			if e != nil && !m.entryLive(ctx, e) {
+				m.dropEntry(key, e)
 				e = nil
 			}
 			if e != nil {
@@ -126,7 +126,7 @@ func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *tas
 		}
 	}
 
-	t, e, err := h.startTask(key, preProbe)
+	t, e, err := m.startTask(key, preProbe)
 	return key, t, e, err
 }
 
@@ -134,14 +134,14 @@ func (h *Handler) acquire(ctx context.Context, key resolveKey) (resolveKey, *tas
 // disconnects never cancel it. The spool opens after the probe so partial
 // bytes from a previous failed task (or a previous process) are resumed when
 // the upstream etag still matches. A non-nil pre stands in for the probe.
-func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
+func (m *Mirror) runTask(key resolveKey, t *task, pre *probeResult) {
 	ctx := context.Background()
 	upath := key.String()
 	defer close(t.done) // the entry is published by then, on every path
 
 	pr, err := pre, error(nil)
 	if pr == nil {
-		pr, err = h.probe(ctx, upath)
+		pr, err = m.probe(ctx, upath)
 	}
 	if err == nil {
 		switch {
@@ -155,15 +155,15 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 		t.probeErr = err
 		t.notFound = errors.Is(err, ErrUpstreamNotFound)
 		close(t.probed)
-		h.failTask(key, t, err)
+		m.failTask(key, t, err)
 		return
 	}
 
-	sp, err := openSpool(h.spoolDir, upath, pr.etag, pr.size)
+	sp, err := openSpool(m.spoolDir, upath, pr.etag, pr.size)
 	if err != nil {
 		t.probeErr = err
 		close(t.probed)
-		h.failTask(key, t, err)
+		m.failTask(key, t, err)
 		return
 	}
 	t.spool = sp
@@ -185,9 +185,9 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 		// The xet ingest reports no size before completion; when the probe
 		// found none there is no early source, so stop replies waiting for one.
 		t.setSize(-1)
-		err = h.fetchXet(ctx, t, upath)
+		err = m.fetchXet(ctx, t, upath)
 	default:
-		err = h.fetchPlain(ctx, t, upath)
+		err = m.fetchPlain(ctx, t, upath)
 	}
 	if err == nil {
 		if want := t.size.Load(); want >= 0 && t.spool.size() != want {
@@ -199,40 +199,40 @@ func (h *Handler) runTask(key resolveKey, t *task, pre *probeResult) {
 	}
 	if err != nil {
 		t.spool.finish(err)
-		h.failTask(key, t, err)
+		m.failTask(key, t, err)
 		return
 	}
 	t.size.Store(t.spool.size())
 	t.setSize(-1) // definitive size stored above; signal any waiters
 	t.spool.finish(nil)
 
-	entry, err := h.ingestSpool(ctx, t, key)
+	entry, err := m.ingestSpool(ctx, t, key)
 	if err != nil {
 		if errors.Is(err, errSpoolCorrupt) {
 			t.spool.markRemove()
 		}
-		h.failTask(key, t, err)
+		m.failTask(key, t, err)
 		return
 	}
 
-	h.mu.Lock()
-	h.entries[key] = entry
-	delete(h.tasks, key)
-	h.mu.Unlock()
+	m.mu.Lock()
+	m.entries[key] = entry
+	delete(m.tasks, key)
+	m.mu.Unlock()
 	t.spool.markRemove() // bytes now live in storage; drop the spool when drained
 }
 
 // failTask records a failure with exponential backoff and clears the task.
-func (h *Handler) failTask(key resolveKey, t *task, err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (m *Mirror) failTask(key resolveKey, t *task, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	failures := 1
-	if prev := h.entries[key]; prev != nil && prev.State == stateFailed {
+	if prev := m.entries[key]; prev != nil && prev.State == stateFailed {
 		failures = prev.failures + 1
 	}
 	shift := min(failures-1, maxFailureShift)
 	backoff := min(failureBackoffBase<<shift, failureBackoffCap)
-	h.entries[key] = &fileEntry{
+	m.entries[key] = &fileEntry{
 		Key:       key.String(),
 		State:     stateFailed,
 		failures:  failures,
@@ -240,12 +240,12 @@ func (h *Handler) failTask(key resolveKey, t *task, err error) {
 		lastErr:   err,
 		notFound:  t.notFound,
 	}
-	delete(h.tasks, key)
+	delete(m.tasks, key)
 }
 
 // ingestSpool verifies the spooled bytes and runs the standard upload pipeline
 // against local storage, then returns the ready index entry.
-func (h *Handler) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fileEntry, error) {
+func (m *Mirror) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fileEntry, error) {
 	f, err := os.Open(t.spool.f.Name())
 	if err != nil {
 		return nil, fmt.Errorf("open spool: %w", err)
@@ -278,7 +278,7 @@ func (h *Handler) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fi
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("rewind spool: %w", err)
 		}
-		fileHash, err := upload.UploadFile(ctx, h.localAdapter, f,
+		fileHash, err := upload.UploadFile(ctx, m.localAdapter, f,
 			upload.WithEnableSHA256(true),
 			upload.WithConcurrency(4),
 		)
@@ -288,7 +288,7 @@ func (h *Handler) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fi
 		entry.FileHash = fileHash.String()
 	}
 
-	if err := persistEntry(h.indexDir, entry); err != nil {
+	if err := persistEntry(m.indexDir, entry); err != nil {
 		return nil, err
 	}
 	return entry, nil
