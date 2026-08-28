@@ -19,21 +19,21 @@ import (
 // dropped bodies via the client's built-in httpseek transport. The resolve
 // itself runs inside the retry loop so a transient failure there does not
 // fail the whole task.
-func (h *Handler) fetchXet(ctx context.Context, t *task, key string) error {
+func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
 	return fetchWithRetries(ctx, "xet download", func() error {
-		fileHash, provider, err := hf.ResolveDownload(ctx, h.probeClient, h.upstreamURL(key))
+		fileHash, provider, err := hf.ResolveDownload(ctx, m.probeClient, m.upstreamURL(key))
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return h.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, t.spool)
+		return m.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, t.spool)
 	})
 }
 
 // fetchPlain downloads the file bytes over plain HTTP into the spool, resuming
 // from the current spool offset with Range requests on retries.
-func (h *Handler) fetchPlain(ctx context.Context, t *task, key string) error {
+func (m *Mirror) fetchPlain(ctx context.Context, t *task, key string) error {
 	return fetchWithRetries(ctx, "plain download", func() error {
-		return h.fetchPlainOnce(ctx, t, key)
+		return m.fetchPlainOnce(ctx, t, key)
 	})
 }
 
@@ -51,9 +51,9 @@ func fetchWithRetries(ctx context.Context, operation string, fetch func() error)
 	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxFetchAttempts, lastErr)
 }
 
-func (h *Handler) fetchPlainOnce(ctx context.Context, t *task, key string) error {
+func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, key string) error {
 	offset := t.spool.size()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.upstreamURL(key), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.upstreamURL(key), nil)
 	if err != nil {
 		return err
 	}
@@ -62,7 +62,7 @@ func (h *Handler) fetchPlainOnce(ctx context.Context, t *task, key string) error
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	resp, err := h.fetchClient.Do(req)
+	resp, err := m.fetchClient.Do(req)
 	if err != nil {
 		return err
 	}

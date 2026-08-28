@@ -31,8 +31,8 @@ func (t *authInjector) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // upstreamURL maps a local resolve path to the upstream equivalent.
-func (h *Handler) upstreamURL(key string) string {
-	return strings.TrimRight(h.upstream.String(), "/") + key
+func (m *Mirror) upstreamURL(key string) string {
+	return strings.TrimRight(m.upstream.String(), "/") + key
 }
 
 // probeResult captures upstream metadata for one resolve path. Everything is
@@ -57,10 +57,10 @@ var hexSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // carry no size at all (e.g. modelscope.cn) leave size at -1; the ingest
 // download learns it from its first response headers and resolve replies wait
 // for that (task.sized).
-func (h *Handler) probe(ctx context.Context, key string) (*probeResult, error) {
+func (m *Mirror) probe(ctx context.Context, key string) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
-	cur := h.upstreamURL(key)
+	cur := m.upstreamURL(key)
 	for range 8 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {
@@ -69,7 +69,7 @@ func (h *Handler) probe(ctx context.Context, key string) (*probeResult, error) {
 		// Disable transparent gzip so sizes describe the raw bytes.
 		req.Header.Set("Accept-Encoding", "identity")
 
-		resp, err := h.probeClient.Do(req)
+		resp, err := m.probeClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("probe %s: %w", cur, err)
 		}
@@ -107,11 +107,11 @@ func (h *Handler) probe(ctx context.Context, key string) (*probeResult, error) {
 		// response has no X-Repo-Commit; synthesize one for upstreams (e.g.
 		// modelscope.cn) that omit it: the revision itself when it already is
 		// a commit hash, otherwise a stable hash of repo identity + revision.
-		if m := resolveRe.FindStringSubmatch(key); m != nil {
-			if commitRevRe.MatchString(m[2]) {
-				res.commit = m[2]
+		if seg := resolveRe.FindStringSubmatch(key); seg != nil {
+			if commitRevRe.MatchString(seg[2]) {
+				res.commit = seg[2]
 			} else {
-				sum := sha256.Sum256([]byte("xet-mirror-pseudo-commit\x00" + m[1] + "\x00" + m[2]))
+				sum := sha256.Sum256([]byte("xet-mirror-pseudo-commit\x00" + seg[1] + "\x00" + seg[2]))
 				res.commit = hex.EncodeToString(sum[:20])
 			}
 		}

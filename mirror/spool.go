@@ -15,7 +15,7 @@ import (
 )
 
 // spool is an append-only file that is written by exactly one ingest download
-// and concurrently tail-read by any number of HTTP responses. Readers block
+// and concurrently tail-read by any number of stream readers. Readers block
 // at the current end until more bytes land or the writer finishes.
 //
 // The file name is <keyhash>-<etag>-<size>.spool, so the content identity is

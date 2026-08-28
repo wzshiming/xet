@@ -20,6 +20,7 @@ import (
 
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/token"
 )
@@ -143,7 +144,8 @@ func (u *fakeHub) serveData(w http.ResponseWriter, r *http.Request, path string)
 }
 
 // newMirrorServer wires the same composition as cmd/xetd: the CAS server
-// matches its routes first and falls through to the mirror handler.
+// matches its routes first, serves the hub front end over the mirror engine,
+// and falls through to the upstream proxy.
 func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opts ...mirror.Option) *httptest.Server {
 	t.Helper()
 	var inner atomic.Value
@@ -163,18 +165,15 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := mirror.NewUpstreamProxy(upstreamURL, "")
+	proxy, err := hf.NewUpstreamProxy(upstreamURL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := mirror.NewHandler(
+	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
 			mirror.WithUpstream(upstreamURL),
-			mirror.WithExternalURL(srv.URL),
 			mirror.WithCacheDir(cacheDir),
-			mirror.WithMintToken(issuer.Mint),
-			mirror.WithNext(proxy),
 		}, opts...)...,
 	)
 	if err != nil {
@@ -183,7 +182,12 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),
 		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
-		server.WithNext(h),
+		server.WithNext(hf.NewHandler(
+			hf.WithMirror(m),
+			hf.WithExternalURL(srv.URL),
+			hf.WithMintToken(issuer.Mint),
+			hf.WithNext(proxy),
+		)),
 	)))
 	return srv
 }

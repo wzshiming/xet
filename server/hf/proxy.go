@@ -1,4 +1,4 @@
-package mirror
+package hf
 
 import (
 	"fmt"
@@ -9,12 +9,12 @@ import (
 
 // NewUpstreamProxy builds a reverse proxy that forwards control-plane
 // requests to the upstream hub with the given credential injected, intended
-// as the Handler's next (WithNext). Downstream Authorization headers are
-// never forwarded upstream.
+// as the Handler's next (WithNext) in mirror mode. Downstream Authorization
+// headers are never forwarded upstream.
 func NewUpstreamProxy(upstream, upstreamToken string) (http.Handler, error) {
 	u, err := url.Parse(upstream)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("mirror: invalid upstream URL %q", upstream)
+		return nil, fmt.Errorf("hf: invalid upstream URL %q", upstream)
 	}
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {

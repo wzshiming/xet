@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,19 +23,19 @@ func TestIngest(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/model.bin"
 	upstream.set(resolvePath, data)
 
-	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 
 	t.Run("rejects invalid components", func(t *testing.T) {
-		if _, err := fx.handler.Ingest("org/repo", "main/extra", "model.bin"); err == nil {
+		if _, err := m.Ingest("org/repo", "main/extra", "model.bin"); err == nil {
 			t.Fatal("expected an error for a rev containing a slash")
 		}
-		if _, err := fx.handler.Ingest("org/repo", "main", ""); err == nil {
+		if _, err := m.Ingest("org/repo", "main", ""); err == nil {
 			t.Fatal("expected an error for an empty path")
 		}
 	})
 
 	t.Run("resolves once done", func(t *testing.T) {
-		in, err := fx.handler.Ingest("org/repo", "main", "model.bin")
+		in, err := m.Ingest("org/repo", "main", "model.bin")
 		if err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
@@ -60,24 +61,26 @@ func TestIngest(t *testing.T) {
 			t.Fatal("ETag is empty")
 		}
 
-		// Readiness must hold the moment Done closes: the resolve answers
-		// with the ready-state redirect and the xet path serves the bytes.
-		resp, err := noRedirect().Get(fx.srv.URL + resolvePath)
+		// Readiness must hold the moment Done closes: Resolve answers with
+		// the ready entry and storage serves the bytes.
+		res, err := m.Resolve(context.Background(), "org/repo", "main", "model.bin")
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Resolve: %v", err)
 		}
-		resp.Body.Close()
-		if resp.StatusCode != 302 {
-			t.Fatalf("resolve status = %d, want 302 immediately after Done", resp.StatusCode)
+		if res.Entry == nil {
+			t.Fatal("Resolve did not return the ready entry immediately after Done")
 		}
-		if got := downloadViaXet(t, fx.srv.URL+resolvePath); !bytes.Equal(got, data) {
-			t.Fatalf("xet download mismatch: got %d bytes, want %d", len(got), len(data))
+		if res.Entry.FileHash != entry.FileHash {
+			t.Fatalf("Resolve FileHash = %q, want %q", res.Entry.FileHash, entry.FileHash)
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+			t.Fatalf("stored bytes mismatch: got %d bytes, want %d", len(got), len(data))
 		}
 	})
 
 	t.Run("ready entry resolves without new downloads", func(t *testing.T) {
 		before := upstream.dataGETs.Load()
-		in, err := fx.handler.Ingest("org/repo", "main", "model.bin")
+		in, err := m.Ingest("org/repo", "main", "model.bin")
 		if err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
@@ -95,7 +98,7 @@ func TestIngest(t *testing.T) {
 	})
 
 	t.Run("not found matches ErrUpstreamNotFound", func(t *testing.T) {
-		in, err := fx.handler.Ingest("org/repo", "main", "missing.bin")
+		in, err := m.Ingest("org/repo", "main", "missing.bin")
 		if err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
@@ -104,7 +107,7 @@ func TestIngest(t *testing.T) {
 			t.Fatalf("err = %v, want ErrUpstreamNotFound", err)
 		}
 		// The failure is cached with backoff and resolves without re-probing.
-		in, err = fx.handler.Ingest("org/repo", "main", "missing.bin")
+		in, err = m.Ingest("org/repo", "main", "missing.bin")
 		if err != nil {
 			t.Fatalf("Ingest: %v", err)
 		}
@@ -132,9 +135,9 @@ func TestIngestInFlight(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/model.bin"
 	upstream.set(resolvePath, data)
 
-	fx := newMirrorFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	m, _ := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 
-	in, err := fx.handler.Ingest("org/repo", "main", "model.bin")
+	in, err := m.Ingest("org/repo", "main", "model.bin")
 	if err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
@@ -149,7 +152,7 @@ func TestIngestInFlight(t *testing.T) {
 		t.Fatalf("Entry before Done = %v, %v; want nil, nil", e, err)
 	}
 
-	joined, err := fx.handler.Ingest("org/repo", "main", "model.bin")
+	joined, err := m.Ingest("org/repo", "main", "model.bin")
 	if err != nil {
 		t.Fatalf("joining Ingest: %v", err)
 	}
