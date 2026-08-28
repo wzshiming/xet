@@ -209,7 +209,10 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 	}
 	if r.Method == http.MethodHead {
 		writeMetadataHeaders(w, etag, size, commit)
-		w.Header().Set("Content-Type", "application/octet-stream")
+		// Hub clients read the size of a HEAD from Content-Length.
+		if size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
 		w.WriteHeader(http.StatusOK)
 		return true
 	}
