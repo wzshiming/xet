@@ -96,6 +96,8 @@ func (s *Handler) registerRoutes() {
 	s.root.NotFoundHandler = s.next
 }
 
+var zeroDigest = sha256.Sum256(nil)
+
 // handleXetBridge reconstructs a complete file addressed by its SHA-256 digest.
 func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 	sh256Hash := mux.Vars(r)["sha256"]
@@ -106,6 +108,14 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], digestBytes)
+
+	// Empty files are never ingested: the zero-byte digest is served without storage.
+	if digest == zeroDigest {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", fmt.Sprintf(`"%s"`, sh256Hash))
+		http.ServeContent(w, r, sh256Hash, time.Time{}, strings.NewReader(""))
+		return
+	}
 
 	content, err := s.storage.GetReconstructedFile(r.Context(), "default", digest)
 	if err != nil {

@@ -297,8 +297,9 @@ func getBody(t *testing.T, url string) []byte {
 	return body
 }
 
-// TestMirrorEmptyFile: zero-byte files are cached and served as a direct 200
-// with no redirect and no xet Link headers, and survive a restart.
+// TestMirrorEmptyFile: zero-byte files redirect to the bridge like any other
+// ready file — the bridge serves the well-known empty digest without storage
+// — carry no xet Link headers, and survive a restart.
 func TestMirrorEmptyFile(t *testing.T) {
 	hub := newFakeHub()
 	hubSrv := httptest.NewServer(hub)
@@ -317,18 +318,19 @@ func TestMirrorEmptyFile(t *testing.T) {
 	waitIndexPersisted(t, cacheDir)
 
 	emptySum := sha256.Sum256(nil)
-	wantETag := `"` + hex.EncodeToString(emptySum[:]) + `"`
+	emptyHex := hex.EncodeToString(emptySum[:])
+	wantETag := `"` + emptyHex + `"`
 
 	resp, err := noRedirectClient().Get(resolveURL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("ready status = %d, want 200 (not a redirect)", resp.StatusCode)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("ready status = %d, want %d", resp.StatusCode, http.StatusFound)
 	}
-	if resp.ContentLength != 0 {
-		t.Fatalf("Content-Length = %d, want 0", resp.ContentLength)
+	if got, want := resp.Header.Get("Location"), srv.URL+"/xet-bridge/"+emptyHex; got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
 	}
 	if got := resp.Header.Get("ETag"); got != wantETag {
 		t.Fatalf("ETag = %q, want %q", got, wantETag)
@@ -338,6 +340,9 @@ func TestMirrorEmptyFile(t *testing.T) {
 	}
 	if links := resp.Header.Values("Link"); len(links) != 0 {
 		t.Fatalf("empty file must carry no xet Link headers, got %q", links)
+	}
+	if body := getBody(t, srv.URL+"/xet-bridge/"+emptyHex); len(body) != 0 {
+		t.Fatalf("bridge body = %d bytes, want 0", len(body))
 	}
 
 	// Restart with the same storage and cache: still served, no re-probe.
