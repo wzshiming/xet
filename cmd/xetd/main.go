@@ -136,6 +136,7 @@ func main() {
 		// bypass authentication.
 		next = internalapi.NewHandler(
 			internalapi.WithStorage(stor),
+			internalapi.WithGCGrace(1*time.Hour),
 			internalapi.WithNext(next),
 		)
 		fmt.Println("Internal management endpoints enabled at /internal/")

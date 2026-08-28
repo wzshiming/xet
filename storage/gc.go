@@ -26,8 +26,9 @@ const DefaultSweepGrace = time.Hour
 // ErrGCBusy is returned when a sweep is already running on the same GC.
 var ErrGCBusy = errors.New("gc already running")
 
-// GCStore is the per-backend surface needed to unlink files and sweep
+// GCStore is the bare per-backend surface needed to unlink files and sweep
 // unreferenced shards and xorbs; the orchestration lives in Unlink and Sweep.
+// The bare backends (*FileStorage, *S3Storage) implement it directly.
 type GCStore interface {
 	ListStore
 
@@ -101,19 +102,25 @@ type SweepResult struct {
 	DanglingFileEntries []string `json:"dangling_file_entries"`
 
 	// SkippedInGrace counts unreferenced objects left alone because they
-	// were modified within the grace window.
+	// were written within the grace window.
 	SkippedInGrace int `json:"skipped_in_grace"`
 	// ReclaimedBytes sums the sizes of swept shards and xorbs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
+
+	// Done reports a finished pass; Remaining* are the unconsumed dead-queue lengths, best-effort estimates.
+	Done            bool `json:"done"`
+	RemainingShards int  `json:"remaining_shards"`
+	RemainingXorbs  int  `json:"remaining_xorbs"`
 }
 
 // GC serializes sweeps over one store within a single process: concurrent
-// Sweep calls fail fast with ErrGCBusy instead of queueing. Nothing
+// sweeps fail fast with ErrGCBusy instead of queueing. Nothing
 // serializes sweepers across processes; deployments sharing a store must
 // run at most one sweeper.
 type GC struct {
-	st GCStore
-	mu sync.Mutex
+	st    GCStore
+	mu    sync.Mutex
+	cycle *sweepCycle // in-progress stepped sweep, guarded by mu
 }
 
 // NewGC creates a GC coordinator over st.
@@ -126,14 +133,66 @@ func (g *GC) Unlink(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	return Unlink(ctx, g.st, fileHash)
 }
 
-// Sweep runs one sweep pass, failing with ErrGCBusy when one is already
-// running.
-func (g *GC) Sweep(ctx context.Context, grace time.Duration, dryRun bool) (*SweepResult, error) {
+// SweepStep consumes one bounded slice of a sweep cycle, failing with
+// ErrGCBusy when a sweep is already running. The first call marks a fresh
+// cycle, paying the full mark cost whatever the limits say, and the step
+// that drains the shard queue pays the full re-shield walk the same way;
+// later calls resume the cycle until the returned result reports Done.
+// Results accumulate, so the Done step reads like one full Sweep pass.
+// A parked cycle expires one grace window after its mark and is re-marked
+// on the next step with a fresh accumulation — consuming a cycle within
+// one window bounds the staleness of its shield state; a non-positive
+// grace never expires. A cycle marked with a different Grace value is
+// discarded and re-marked; dry runs report a full stateless pass and
+// leave the cycle alone; any non-dry-run error discards the cycle.
+func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, error) {
 	if !g.mu.TryLock() {
 		return nil, ErrGCBusy
 	}
 	defer g.mu.Unlock()
-	return Sweep(ctx, g.st, grace, dryRun)
+	// Discarded before the dry-run return too, so even dry-run-only callers
+	// release an expired cycle's shield maps.
+	if g.cycle != nil && g.cycle.expired() {
+		g.cycle = nil
+	}
+	if opts.DryRun {
+		return Sweep(ctx, g.st, opts)
+	}
+	c := g.cycle
+	g.cycle = nil
+	if c != nil && !c.matches(opts) {
+		c = nil
+	}
+	if c == nil {
+		var err error
+		c, err = sweepMark(ctx, g.st, opts)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := c.run(ctx, g.st, opts.MaxDeletes, opts.Budget); err != nil {
+		return nil, err
+	}
+	if c.phase != sweepPhaseDone {
+		g.cycle = c
+	}
+	return c.snapshot(), nil
+}
+
+// SweepOptions configures one Sweep pass; a zero Grace means DefaultSweepGrace, a negative one disables the window.
+type SweepOptions struct {
+	Grace      time.Duration // shields objects recently written (mtime)
+	DryRun     bool          // report removable objects without deleting
+	MaxDeletes int           // max dead-queue items one GC.SweepStep consumes, swept or skipped; 0 = unlimited, ignored by Sweep
+	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items only (mark and re-shield always run whole); 0 = unlimited, ignored by Sweep
+}
+
+// window returns the grace window with zero defaulted.
+func (o SweepOptions) window() time.Duration {
+	if o.Grace == 0 {
+		return DefaultSweepGrace
+	}
+	return o.Grace
 }
 
 // Sweep is a mark-and-sweep pass at shard granularity: a shard is live while
@@ -146,31 +205,113 @@ func (g *GC) Sweep(ctx context.Context, grace time.Duration, dryRun bool) (*Swee
 // working for the surviving content.
 //
 // Sweep does not lock out writers: work owned by someone else is skipped
-// instead. Unreferenced shards inside the grace window are treated as
-// uploads mid-commit and shield every xorb they reference (dedup may have
-// reused xorbs far older than the window), the dead sets are re-checked
-// against the file index once the walks finish, each dead shard's own file
-// entries are read once more right before it is deleted, and once the
-// shard deletes finish every shard object still stored re-shields its
-// xorbs, covering commits that landed during that phase. A commit landing
-// between the final re-shield and an individual xorb delete can still lose
-// that xorb, and an upload committed after the mark may see the
-// chunk/sha256 entries it reused from a dead shard removed or repointed (a
-// dedup miss or a broken SHA-256 lookup, never lost file data); those
-// residual races are accepted.
-func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*SweepResult, error) {
-
-	if grace == 0 {
-		grace = DefaultSweepGrace
+// instead. Writers are protected by the mtime grace window and the
+// re-checks: unreferenced shards inside the window are treated as uploads
+// mid-commit and shield every xorb they reference (dedup may have reused
+// xorbs far older than the window), the dead sets are re-checked against
+// the file index once the walks finish, each dead shard's own file entries
+// are read once more right before it is deleted, and once the shard
+// deletes finish every shard object still stored re-shields its xorbs,
+// covering commits that landed during that phase. A commit landing between
+// that final re-shield and an individual xorb delete can still lose that
+// xorb; an upload committed after the mark may see the chunk/sha256
+// entries it reused from a dead shard removed or repointed (a dedup miss
+// or a broken SHA-256 lookup, never lost file data); and a dedup re-upload
+// of an aged unreferenced shard can race its delete (dedup hits do not
+// refresh mtimes). Those residual races are accepted.
+//
+// Sweep always runs to completion: MaxDeletes and Budget only bound
+// GC.SweepStep, through which a GC can consume one pass in bounded steps;
+// the grace anchor of such a cycle stays fixed at its mark time.
+func Sweep(ctx context.Context, st GCStore, opts SweepOptions) (*SweepResult, error) {
+	c, err := sweepMark(ctx, st, opts)
+	if err != nil {
+		return nil, err
 	}
-	// A negative grace pushes the cutoff into the future: nothing is exempt.
-	cutoff := time.Now().Add(-grace)
+	if err := c.run(ctx, st, 0, 0); err != nil {
+		return nil, err
+	}
+	c.res.Done = true
+	return c.res, nil
+}
 
-	res := &SweepResult{
-		DryRun:              dryRun,
-		SweptShards:         []SweptObject{},
-		SweptXorbs:          []SweptObject{},
-		DanglingFileEntries: []string{},
+// One cycle's phases: consume dead shards, then — after the final
+// re-shield — dead xorbs.
+const (
+	sweepPhaseShards = iota
+	sweepPhaseXorbs
+	sweepPhaseDone
+)
+
+// sweepCycle is one mark's worth of sweep work, consumable in bounded steps:
+// the dead queues plus the shield state and grace anchor fixed at mark
+// time. res accumulates across steps, so once both queues drain it reads
+// like the result of a single full pass.
+type sweepCycle struct {
+	grace  time.Duration // normalized window the mark ran with
+	marked time.Time     // mark anchor; a parked cycle expires one grace window after it
+
+	cutoff time.Time
+
+	res *SweepResult
+
+	deadShards []SweptObject
+	deadXorbs  []SweptObject
+
+	liveShards  map[string]bool
+	liveXorbs   map[string]bool
+	chunkOwners map[string]string
+	shaOwners   map[string]string
+
+	phase int
+}
+
+// matches reports whether the cycle's mark used the same effective window.
+func (c *sweepCycle) matches(opts SweepOptions) bool {
+	return c.grace == opts.window()
+}
+
+// expired reports whether the cycle has outlived one grace window since its
+// mark; a non-positive grace (the explicit no-safety-window mode) never
+// expires.
+func (c *sweepCycle) expired() bool {
+	return c.grace > 0 && time.Since(c.marked) >= c.grace
+}
+
+// snapshot clones the accumulated result with the progress fields filled in.
+func (c *sweepCycle) snapshot() *SweepResult {
+	res := *c.res
+	res.SweptShards = slices.Clone(res.SweptShards)
+	res.SweptXorbs = slices.Clone(res.SweptXorbs)
+	res.DanglingFileEntries = slices.Clone(res.DanglingFileEntries)
+	res.Done = c.phase == sweepPhaseDone
+	res.RemainingShards = len(c.deadShards)
+	res.RemainingXorbs = len(c.deadXorbs)
+	return &res
+}
+
+// sweepMark runs the mark phase: one time anchor, the live and dead walks,
+// and the second file-index look pruning both dead queues.
+func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle, error) {
+	grace := opts.window()
+	now := time.Now()
+	// A negative grace pushes the cutoff into the future: nothing is exempt.
+	cutoff := now.Add(-grace)
+
+	c := &sweepCycle{
+		grace:  grace,
+		marked: now,
+		cutoff: cutoff,
+		res: &SweepResult{
+			DryRun:              opts.DryRun,
+			SweptShards:         []SweptObject{},
+			SweptXorbs:          []SweptObject{},
+			DanglingFileEntries: []string{},
+		},
+		liveShards:  map[string]bool{},
+		liveXorbs:   map[string]bool{},
+		chunkOwners: map[string]string{},
+		shaOwners:   map[string]string{},
 	}
 
 	// Mark: group file-index entries by shard, then load each referenced
@@ -184,34 +325,29 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 		return nil, err
 	}
 
-	liveShards := map[string]bool{}
-	liveXorbs := map[string]bool{}
-	graceXorbs := map[string]bool{}    // shielded by in-grace uncommitted shards
-	chunkOwners := map[string]string{} // chunk hex -> live shard hash
-	shaOwners := map[string]string{}   // sha256 hex -> live shard hash
+	graceXorbs := map[string]bool{} // shielded by in-grace uncommitted shards
 	for shardHash, fileHashes := range liveFiles {
 		sh, err := st.GetShardByHash(ctx, shardHash)
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
-				res.DanglingFileEntries = append(res.DanglingFileEntries, fileHashes...)
+				c.res.DanglingFileEntries = append(c.res.DanglingFileEntries, fileHashes...)
 				continue
 			}
 			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
 		}
-		liveShards[shardHash] = true
-		markShardXorbs(sh, liveXorbs)
-		markShardOwners(sh, shardHash, chunkOwners, shaOwners)
+		c.liveShards[shardHash] = true
+		markShardXorbs(sh, c.liveXorbs)
+		markShardOwners(sh, shardHash, c.chunkOwners, c.shaOwners)
 	}
-	slices.Sort(res.DanglingFileEntries)
+	slices.Sort(c.res.DanglingFileEntries)
 
 	// Collect dead objects first so nothing is deleted mid-walk.
-	var deadShards, deadXorbs []SweptObject
 	err = st.WalkShards(ctx, func(hash string, size int64, modTime time.Time) error {
-		if liveShards[hash] {
+		if c.liveShards[hash] {
 			return nil
 		}
 		if !modTime.Before(cutoff) {
-			res.SkippedInGrace++
+			c.res.SkippedInGrace++
 			// Likely an upload that has not committed its file entry yet:
 			// shield the xorbs it references, dedup may have reused old ones.
 			sh, err := st.GetShardByHash(ctx, hash)
@@ -224,21 +360,21 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 			markShardXorbs(sh, graceXorbs)
 			return nil
 		}
-		deadShards = append(deadShards, SweptObject{Hash: hash, Size: size})
+		c.deadShards = append(c.deadShards, SweptObject{Hash: hash, Size: size})
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	err = st.WalkXorbs(ctx, func(hash string, size int64, modTime time.Time) error {
-		if liveXorbs[hash] {
+		if c.liveXorbs[hash] {
 			return nil
 		}
 		if graceXorbs[hash] || !modTime.Before(cutoff) {
-			res.SkippedInGrace++
+			c.res.SkippedInGrace++
 			return nil
 		}
-		deadXorbs = append(deadXorbs, SweptObject{Hash: hash, Size: size})
+		c.deadXorbs = append(c.deadXorbs, SweptObject{Hash: hash, Size: size})
 		return nil
 	})
 	if err != nil {
@@ -249,8 +385,8 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 	// to in-flight uploads; their shards and xorbs are skipped, not raced.
 	var recommitted []string
 	err = st.WalkFileIndex(ctx, func(_, shardHash string) error {
-		if !liveShards[shardHash] {
-			liveShards[shardHash] = true
+		if !c.liveShards[shardHash] {
+			c.liveShards[shardHash] = true
 			recommitted = append(recommitted, shardHash)
 		}
 		return nil
@@ -266,75 +402,120 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 			}
 			return nil, fmt.Errorf("load live shard %s: %w", shardHash, err)
 		}
-		markShardXorbs(sh, liveXorbs)
-		markShardOwners(sh, shardHash, chunkOwners, shaOwners)
+		markShardXorbs(sh, c.liveXorbs)
+		markShardOwners(sh, shardHash, c.chunkOwners, c.shaOwners)
 	}
-	deadShards = slices.DeleteFunc(deadShards, func(obj SweptObject) bool {
-		return liveShards[obj.Hash]
+	c.deadShards = slices.DeleteFunc(c.deadShards, func(obj SweptObject) bool {
+		return c.liveShards[obj.Hash]
 	})
-	deadXorbs = slices.DeleteFunc(deadXorbs, func(obj SweptObject) bool {
-		return liveXorbs[obj.Hash]
+	c.deadXorbs = slices.DeleteFunc(c.deadXorbs, func(obj SweptObject) bool {
+		return c.liveXorbs[obj.Hash]
 	})
+	return c, nil
+}
 
-	for _, obj := range deadShards {
+// run consumes the dead queues through the per-item delete logic. maxDeletes
+// caps consumed items (swept or skipped) and budget the wall clock, both
+// checked between items with at least one item consumed per call; zero means
+// unlimited. The final re-shield runs once at the shard-to-xorb transition,
+// not counted as consumption.
+func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget time.Duration) error {
+	start := time.Now()
+	consumed := 0
+	exhausted := func() bool {
+		if consumed == 0 {
+			return false
+		}
+		return (maxDeletes > 0 && consumed >= maxDeletes) || (budget > 0 && time.Since(start) >= budget)
+	}
+	dryRun := c.res.DryRun
+
+	for c.phase == sweepPhaseShards {
+		if len(c.deadShards) == 0 {
+			// Final re-shield: the shard-delete phase can take long, so any
+			// shard object stored at this point (late commits, in-grace
+			// uploads, skipped shards) shields its xorbs from the deletes
+			// below. Skipped in dry runs, where the undeleted dead shards
+			// would shield their own xorbs and empty the report.
+			if !dryRun {
+				err := st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
+					if c.liveShards[hash] {
+						return nil
+					}
+					sh, err := st.GetShardByHash(ctx, hash)
+					if err != nil {
+						if errors.Is(err, iofs.ErrNotExist) {
+							return nil
+						}
+						return fmt.Errorf("load shard %s: %w", hash, err)
+					}
+					markShardXorbs(sh, c.liveXorbs)
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+			c.phase = sweepPhaseXorbs
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if exhausted() {
+			return nil
+		}
+		obj := c.deadShards[0]
+		c.deadShards = c.deadShards[1:]
+		consumed++
 		if dryRun {
-			res.SweptShards = append(res.SweptShards, obj)
-			res.ReclaimedBytes += obj.Size
+			c.res.SweptShards = append(c.res.SweptShards, obj)
+			c.res.ReclaimedBytes += obj.Size
 			continue
 		}
-		swept, err := sweepShard(ctx, st, obj.Hash, liveXorbs, chunkOwners, shaOwners, res)
+		swept, err := sweepShard(ctx, st, obj.Hash, c.liveXorbs, c.chunkOwners, c.shaOwners, c.res)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !swept {
 			continue
 		}
-		res.SweptShards = append(res.SweptShards, obj)
-		res.ReclaimedBytes += obj.Size
+		c.res.SweptShards = append(c.res.SweptShards, obj)
+		c.res.ReclaimedBytes += obj.Size
 	}
-	// Final re-shield: the shard-delete phase above can take long, so any
-	// shard object stored at this point (late commits, in-grace uploads,
-	// skipped shards) shields its xorbs from the delete loop below. Skipped
-	// in dry runs, where the undeleted dead shards would shield their own
-	// xorbs and empty the report.
-	if !dryRun {
-		err = st.WalkShards(ctx, func(hash string, _ int64, _ time.Time) error {
-			if liveShards[hash] {
-				return nil
-			}
-			sh, err := st.GetShardByHash(ctx, hash)
-			if err != nil {
-				if errors.Is(err, iofs.ErrNotExist) {
-					return nil
-				}
-				return fmt.Errorf("load shard %s: %w", hash, err)
-			}
-			markShardXorbs(sh, liveXorbs)
-			return nil
-		})
-		if err != nil {
-			return nil, err
+
+	for c.phase == sweepPhaseXorbs {
+		if len(c.deadXorbs) == 0 {
+			c.phase = sweepPhaseDone
+			break
 		}
-	}
-	for _, obj := range deadXorbs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if exhausted() {
+			return nil
+		}
+		obj := c.deadXorbs[0]
+		c.deadXorbs = c.deadXorbs[1:]
+		consumed++
 		// A shard skipped as re-committed shields its xorbs.
-		if liveXorbs[obj.Hash] {
+		if c.liveXorbs[obj.Hash] {
 			continue
 		}
-		res.SweptXorbs = append(res.SweptXorbs, obj)
-		res.ReclaimedBytes += obj.Size
+		c.res.SweptXorbs = append(c.res.SweptXorbs, obj)
+		c.res.ReclaimedBytes += obj.Size
 		if dryRun {
 			continue
 		}
 		xorbHash, err := xet.ParseXorbHash(obj.Hash)
 		if err != nil {
-			return nil, fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
+			return fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
 		}
 		if err := st.DeleteXorb(ctx, xorbHash); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return res, nil
+	return nil
 }
 
 // sweepShard removes one dead shard together with the chunk and sha256 index
@@ -345,7 +526,10 @@ func Sweep(ctx context.Context, st GCStore, grace time.Duration, dryRun bool) (*
 // chunk or SHA-256 the entry is repointed to it, keeping dedup and SHA-256
 // lookups alive on backends whose index keeps the first writer; otherwise
 // it is deleted. Entries go first: a crash mid-way leaves a re-sweepable
-// shard, never entries pointing into nothing.
+// shard, never entries pointing into nothing. A re-upload committing after
+// the file-entry re-read can lose the shard and leave dangling file
+// entries, reported by the next sweep's DanglingFileEntries for repair —
+// an accepted race.
 func sweepShard(ctx context.Context, st GCStore, shardHash string, liveXorbs map[string]bool, chunkOwners, shaOwners map[string]string, res *SweepResult) (bool, error) {
 	sh, err := st.GetShardByHash(ctx, shardHash)
 	if err != nil {
