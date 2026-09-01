@@ -14,3 +14,13 @@ func computeShardHashFromReader(r io.Reader) (string, error) {
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
+
+// isHexHash64 reports whether name is a 64-character hex hash, the only
+// shape stored object names take.
+func isHexHash64(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(name)
+	return err == nil
+}

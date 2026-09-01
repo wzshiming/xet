@@ -39,6 +39,14 @@ type GCStore interface {
 	WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error
 	// WalkSHA256Index calls fn for every index/sha256 entry.
 	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error
+	// WalkChunkIndex calls fn for every index/chunks entry together with
+	// the entry's modification time.
+	WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error
+
+	// HasShardObject reports whether the shard object is stored — a cheap
+	// existence probe, no decode, no cache. Non-64-hex names read as
+	// absent: on disk they would stat the kind root or a fanout directory.
+	HasShardObject(ctx context.Context, shardHash string) (bool, error)
 
 	// LoadShard reads a stored shard object without consulting or
 	// populating any read cache: sweeps load whole stores, and routing
@@ -197,7 +205,8 @@ type GCStatus struct {
 	RunningSince time.Time `json:"running_since,omitzero"`
 
 	// Parked reports a half-consumed cycle waiting for its next step, with
-	// the phase it parked in ("shards" or "xorbs") and its queue lengths.
+	// the phase it parked in ("shards", "xorbs", or "chunks") and its
+	// queue lengths.
 	Parked          bool      `json:"parked"`
 	ParkedPhase     string    `json:"parked_phase,omitempty"`
 	RemainingShards int       `json:"remaining_shards"`
@@ -227,9 +236,12 @@ func (g *GC) Status() GCStatus {
 			s.Marked = c.marked
 			s.RemainingShards = len(c.deadShards)
 			s.RemainingXorbs = len(c.deadXorbs)
-			if c.phase == sweepPhaseXorbs {
+			switch c.phase {
+			case sweepPhaseXorbs:
 				s.ParkedPhase = "xorbs"
-			} else {
+			case sweepPhaseChunks:
+				s.ParkedPhase = "chunks"
+			default:
 				s.ParkedPhase = "shards"
 			}
 		}
@@ -294,10 +306,12 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 // one window bounds the staleness of its shield state; a non-positive
 // grace expires after DefaultSweepGrace instead, so an abandoned cycle's
 // queues and shield maps are never pinned for good. A cycle marked with a
-// different Grace or Anchor is discarded and re-marked; dry runs report a
+// different Grace, Anchor, or CleanChunkIndex is discarded and re-marked;
+// dry runs report a
 // full stateless pass and leave the cycle alone. A per-item delete failure
 // does not end the step: the item is consumed and reported in
-// FailedDeletes. Only mark and re-shield errors discard the cycle, except
+// FailedDeletes. Only mark, re-shield, and chunk-pass errors discard the
+// cycle, except
 // a canceled or timed-out context, which parks it like an exhausted budget
 // — a disconnected client's progress survives, an item mid-delete goes
 // back on its queue, and the resuming step's result still accumulates
@@ -384,6 +398,11 @@ type SweepOptions struct {
 	Anchor     SweepAnchor   // which index entries anchor shard liveness
 	MaxDeletes int           // max dead-queue items one GC.SweepStep consumes, swept or skipped; 0 = unlimited, ignored by Sweep
 	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items only (mark and re-shield always run whole, their time uncharged); 0 = unlimited, ignored by Sweep
+
+	// CleanChunkIndex opts into a reverse pass over the whole chunk index
+	// (S3: one GET per entry) after the xorb phase, unbounded by MaxDeletes
+	// and Budget like the mark.
+	CleanChunkIndex bool
 }
 
 // window returns the grace window with zero defaulted.
@@ -469,6 +488,21 @@ func (o SweepOptions) window() time.Duration {
 // the window disabled
 // the whole delete-and-recreate race is accepted like the others above.
 //
+// With CleanChunkIndex the pass ends with a reverse walk of the whole
+// chunk index — the only look that can see entries whose shard object
+// vanished out-of-band, since dead-shard cleanup reaches chunk entries only
+// through a loadable shard, and first-writer backends never rewrite them.
+// An entry pointing at a shard neither live nor stored is repointed to a
+// live shard carrying the same chunk when that owner is still stored, and
+// deleted otherwise; entries younger than the grace window are left alone
+// and counted in SkippedInGrace. The walk runs whole, unbounded by
+// MaxDeletes and Budget like the mark, with one existence probe per
+// distinct target shard; in dry runs it only counts. Present-but-unreadable
+// shards read as stored, so UnreadableShards never poisons this pass —
+// though an unreadable shard contributes no repoint owners, so an orphan
+// entry whose chunk survives only there is deleted, a dedup miss until a
+// later upload rewrites it.
+//
 // Sweep always runs to completion: MaxDeletes and Budget only bound
 // GC.SweepStep, through which a GC can consume one pass in bounded steps;
 // the grace anchor of such a cycle stays fixed at its mark time.
@@ -485,10 +519,11 @@ func Sweep(ctx context.Context, st GCStore, opts SweepOptions) (*SweepResult, er
 }
 
 // One cycle's phases: consume dead shards, then — after the final
-// re-shield — dead xorbs.
+// re-shield — dead xorbs, then the opt-in chunk-index pass.
 const (
 	sweepPhaseShards = iota
 	sweepPhaseXorbs
+	sweepPhaseChunks
 	sweepPhaseDone
 )
 
@@ -497,9 +532,10 @@ const (
 // time. res accumulates across steps, so once both queues drain it reads
 // like the result of a single full pass.
 type sweepCycle struct {
-	grace  time.Duration // normalized window the mark ran with
-	anchor SweepAnchor   // liveness anchor the mark ran with
-	marked time.Time     // mark anchor; a parked cycle expires one grace window after it
+	grace           time.Duration // normalized window the mark ran with
+	anchor          SweepAnchor   // liveness anchor the mark ran with
+	cleanChunkIndex bool          // chunk-pass opt-in the mark ran with
+	marked          time.Time     // mark anchor; a parked cycle expires one grace window after it
 
 	cutoff time.Time
 	// freshCutoff is cutoff truncated to whole seconds. File-entry freshness
@@ -549,10 +585,11 @@ func loadAborts(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// matches reports whether the cycle's mark used the same effective window
-// and anchor.
+// matches reports whether the cycle's mark used the same effective window,
+// anchor, and chunk-pass flag; a resumed step asking for a different chunk
+// pass re-marks — the simplest honest semantics.
 func (c *sweepCycle) matches(opts SweepOptions) bool {
-	return c.grace == opts.window() && c.anchor == opts.Anchor
+	return c.grace == opts.window() && c.anchor == opts.Anchor && c.cleanChunkIndex == opts.CleanChunkIndex
 }
 
 // expired reports whether the cycle has outlived its parked lifetime: one
@@ -590,12 +627,13 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 	cutoff := now.Add(-grace)
 
 	c := &sweepCycle{
-		grace:       grace,
-		anchor:      opts.Anchor,
-		marked:      now,
-		cutoff:      cutoff,
-		freshCutoff: cutoff.Truncate(time.Second),
-		lastLook:    now,
+		grace:           grace,
+		anchor:          opts.Anchor,
+		cleanChunkIndex: opts.CleanChunkIndex,
+		marked:          now,
+		cutoff:          cutoff,
+		freshCutoff:     cutoff.Truncate(time.Second),
+		lastLook:        now,
 		res: &SweepResult{
 			DryRun:                opts.DryRun,
 			SweptShards:           []SweptObject{},
@@ -958,16 +996,7 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 			c.deadXorbs = nil
 		}
 		if len(c.deadXorbs) == 0 {
-			// Real cycle end: reap temps stranded before the grace boundary;
-			// a reap error never fails the sweep — the next cycle retries.
-			// Files removed before the error are still counted.
-			if !dryRun {
-				if tr, ok := st.(tempReaper); ok {
-					n, _ := tr.ReapTemps(ctx, c.cutoff)
-					c.res.ReapedTempFiles += n
-				}
-			}
-			c.phase = sweepPhaseDone
+			c.phase = sweepPhaseChunks
 			break
 		}
 		if err := ctx.Err(); err != nil {
@@ -1008,6 +1037,123 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 		c.res.SweptXorbs = append(c.res.SweptXorbs, obj)
 		c.res.ReclaimedBytes += obj.Size
 	}
+
+	// Cycle tail once the xorb queue drains: the opt-in chunk pass, then —
+	// real mode only — the temp reap, exactly once per finished cycle; both
+	// uncounted and unbudgeted like the mark. A context abort in the chunk
+	// walk parks the cycle in this phase and the resumed step re-runs the
+	// whole walk, which is idempotent for writes: deleted entries are gone
+	// from the listing and repointed ones now target a stored live owner the
+	// probe skips, so the write counters never double-count.
+	if c.phase == sweepPhaseChunks {
+		if c.cleanChunkIndex {
+			if err := c.sweepChunkIndex(ctx, st); err != nil {
+				return err
+			}
+		}
+		// A reap error never fails the sweep — the next cycle retries — and
+		// files removed before the error are still counted.
+		if !dryRun {
+			if tr, ok := st.(tempReaper); ok {
+				n, _ := tr.ReapTemps(ctx, c.cutoff)
+				c.res.ReapedTempFiles += n
+			}
+		}
+		c.phase = sweepPhaseDone
+	}
+	return nil
+}
+
+// sweepChunkIndex is the opt-in reverse pass over index/chunks: entries
+// whose target shard is neither live nor stored — out-of-band loss the
+// forward sweep can never enumerate — are repointed to a live owner of the
+// same chunk or deleted. Any per-entry backend error aborts the walk with
+// it, mark-like: repoints and deletes already made stay made, and a later
+// pass revisits the rest.
+func (c *sweepCycle) sweepChunkIndex(ctx context.Context, st GCStore) error {
+	dryRun := c.res.DryRun
+	// Memoized per walk, not per cycle: chunk entries cluster by shard, and
+	// a re-run after a park must not trust probes older than the park.
+	probed := map[string]bool{}
+	hasObject := func(shardHash string) (bool, error) {
+		if ok, seen := probed[shardHash]; seen {
+			return ok, nil
+		}
+		ok, err := st.HasShardObject(ctx, shardHash)
+		if err != nil {
+			return false, err
+		}
+		probed[shardHash] = ok
+		return ok, nil
+	}
+	// Entries are judged like the object walks' objCutoff: truncated under a
+	// positive grace for S3's second-precision times, raw otherwise.
+	entryCutoff := c.cutoff
+	if c.grace > 0 {
+		entryCutoff = c.freshCutoff
+	}
+	freshSkips := 0
+	err := st.WalkChunkIndex(ctx, func(chunkHash, shardHash string, modTime time.Time) error {
+		if c.liveShards[shardHash] {
+			return nil
+		}
+		stored, err := hasObject(shardHash)
+		if err != nil {
+			return err
+		}
+		if stored {
+			// Unreadable-but-present shards land here: present means skip,
+			// so UnreadableShards never poisons this pass.
+			return nil
+		}
+		if !modTime.Before(entryCutoff) {
+			// PutShard stores the object before its entries, so a fresh entry
+			// with a missing object is a racing writer or racing loss (a
+			// re-upload mid-store, a repoint whose owner just vanished, a
+			// lagging S3 listing) — spared one window like the object walks.
+			freshSkips++
+			return nil
+		}
+		if owner, ok := c.chunkOwners[chunkHash]; ok {
+			// Owners were stored at mark time but may have vanished since;
+			// repointing at another missing shard helps nothing — verify, and
+			// fall through to delete when the owner is gone too.
+			ownerStored, err := hasObject(owner)
+			if err != nil {
+				return err
+			}
+			if ownerStored {
+				if !dryRun {
+					ch, err := xet.ParseChunkHash(chunkHash)
+					if err != nil {
+						return err
+					}
+					if err := st.SetChunkIndexEntry(ctx, ch, owner); err != nil {
+						return err
+					}
+				}
+				c.res.RepointedChunkEntries++
+				return nil
+			}
+		}
+		if !dryRun {
+			ch, err := xet.ParseChunkHash(chunkHash)
+			if err != nil {
+				return err
+			}
+			if err := st.DeleteChunkIndexEntry(ctx, ch); err != nil {
+				return err
+			}
+		}
+		c.res.DeletedChunkEntries++
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Added only after a completed walk: an aborted walk's re-run would
+	// re-count fresh skips, unlike the naturally idempotent writes.
+	c.res.SkippedInGrace += freshSkips
 	return nil
 }
 

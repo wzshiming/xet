@@ -8,8 +8,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -375,11 +378,80 @@ func TestGCSweepEndpointRejectsInvalidStepParams(t *testing.T) {
 	for _, query := range []string{
 		"max=bogus", "max=-1",
 		"budget=bogus", "budget=-5s",
+		"clean_chunks=bogus",
 	} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?"+query, nil))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s status = %d, want %d", query, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+// TestGCSweepEndpointCleanChunks: clean_chunks=true reaches the sweep
+// options — an entry orphaned by out-of-band shard loss survives a default
+// sweep and is cleaned by a flagged one.
+func TestGCSweepEndpointCleanChunks(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHash := putTestFile(t, ctx, fs, []byte("clean chunks endpoint"))
+	shardHash, _, err := fs.GetFileIndexEntry(ctx, fileHash)
+	if err != nil || shardHash == "" {
+		t.Fatalf("file index entry = %q, %v", shardHash, err)
+	}
+	var chunkHashes []string
+	if err := fs.WalkChunkIndex(ctx, func(chunkHash, _ string, _ time.Time) error {
+		chunkHashes = append(chunkHashes, chunkHash)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chunkHashes) == 0 {
+		t.Fatal("no chunk entries stored")
+	}
+	// The shard object vanishes out-of-band, orphaning the chunk entries.
+	if err := os.Remove(filepath.Join(dir, "shards", shardHash[:2], shardHash[2:])); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+
+	// Without the flag the orphaned entries survive a full sweep.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedChunkEntries != 0 || result.RepointedChunkEntries != 0 {
+		t.Fatalf("default sweep touched chunk entries: %+v", result)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&clean_chunks=true", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clean_chunks sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	result = storage.SweepResult{}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedChunkEntries != len(chunkHashes) {
+		t.Fatalf("DeletedChunkEntries = %d, want %d", result.DeletedChunkEntries, len(chunkHashes))
+	}
+	for _, hexHash := range chunkHashes {
+		ch, err := xet.ParseChunkHash(hexHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := fs.GetChunkIndexEntry(ctx, ch); err != nil || got != "" {
+			t.Fatalf("chunk entry %s = %q, %v; want removed", hexHash, got, err)
 		}
 	}
 }

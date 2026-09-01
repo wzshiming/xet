@@ -682,6 +682,10 @@ type hookedGCStore struct {
 	shardLoads       map[string]int // LoadShard tally, nil = off
 	cachedShardGets  int            // GetShardByHash invocations (GC must not)
 	loadShardErrs    map[string]error
+	// beforeWalkChunkIndex fires once before the next WalkChunkIndex
+	// delegation; walkChunkIndexCalls tallies every invocation.
+	beforeWalkChunkIndex func()
+	walkChunkIndexCalls  int
 	// onDeleteShard / onDeleteXorb fire before every delete delegation; a
 	// non-nil return short-circuits the delete with that error.
 	onDeleteShard func(ctx context.Context, shardHash string) error
@@ -724,6 +728,18 @@ func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, 
 		cb()
 	}
 	return err
+}
+
+func (h *hookedGCStore) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error {
+	h.walkChunkIndexCalls++
+	if h.beforeWalkChunkIndex != nil {
+		cb := h.beforeWalkChunkIndex
+		h.beforeWalkChunkIndex = nil
+		cb()
+	}
+	return h.GCStore.WalkChunkIndex(ctx, func(chunkHash, shardHash string, modTime time.Time) error {
+		return fn(chunkHash, shardHash, h.walkTime(modTime))
+	})
 }
 
 func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {

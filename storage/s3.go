@@ -449,7 +449,7 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		if live, ok := shardObjectLive[shardHash]; ok {
 			return live, nil
 		}
-		_, live, err := ss.headObject(ctx, ss.objectKey("shards", shardHash))
+		live, err := ss.HasShardObject(ctx, shardHash)
 		if err != nil {
 			return false, err
 		}
@@ -834,6 +834,81 @@ func (ss *S3Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, sha
 		}
 	}
 	return nil
+}
+
+// WalkChunkIndex calls fn for every committed index/chunks entry together
+// with the listing's LastModified time.
+func (ss *S3Storage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error {
+	base := "index/chunks/"
+	if ss.prefix != "" {
+		base = ss.prefix + "/" + base
+	}
+	paginator := s3.NewListObjectsV2Paginator(ss.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(ss.bucket),
+		Prefix: aws.String(base),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("list chunk index: %w", err)
+		}
+		var keys, hashes []string
+		var modTimes []time.Time
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			chunkHash := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
+			if !isHexHash64(chunkHash) {
+				continue
+			}
+			keys = append(keys, key)
+			hashes = append(hashes, chunkHash)
+			modTimes = append(modTimes, aws.ToTime(obj.LastModified))
+		}
+		// Read the page's index objects in parallel; fn stays sequential.
+		bodies := make([][]byte, len(keys))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(fileIndexWalkConcurrency)
+		for i, key := range keys {
+			g.Go(func() error {
+				data, err := ss.getObject(gctx, key)
+				if err != nil {
+					// Deleted between list and read: leave the slot nil.
+					if isS3NotFound(err) {
+						return nil
+					}
+					return fmt.Errorf("read chunk index %s: %w", key, err)
+				}
+				bodies[i] = data
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+		for i, chunkHash := range hashes {
+			if bodies[i] == nil {
+				continue
+			}
+			if err := fn(chunkHash, strings.TrimSpace(string(bodies[i])), modTimes[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// HasShardObject reports whether the shard object is stored, by HEAD only —
+// no body read, no cache. Non-64-hex names read as absent, mirroring
+// FileStorage.
+func (ss *S3Storage) HasShardObject(ctx context.Context, shardHash string) (bool, error) {
+	if !isHexHash64(shardHash) {
+		return false, nil
+	}
+	_, exists, err := ss.headObject(ctx, ss.objectKey("shards", shardHash))
+	if err != nil {
+		return false, fmt.Errorf("check shard object: %w", err)
+	}
+	return exists, nil
 }
 
 // deleteObject removes one object; missing keys are not an error.

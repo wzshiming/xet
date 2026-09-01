@@ -178,7 +178,7 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=&anchor=:
+// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=&anchor=&clean_chunks=:
 // it removes (or, with dry_run, reports) shards and xorbs nothing keeps
 // alive under the chosen anchor: "both" (default; any file or sha256 entry
 // anchors), "files" (file entries only), or "sha256" (sha256 entries only).
@@ -190,8 +190,11 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // full pass. A request matching a half-consumed cycle's window resumes it
 // instead of re-marking. The response's done and remaining_* fields report
 // cycle progress. dry_run always reports a full stateless pass.
-// A step cannot be canceled once started — a client disconnect does not
-// stop it — so bound its size with max or budget.
+// clean_chunks=true adds a whole-index pass over index/chunks once the
+// xorb queue drains, repointing or deleting entries whose shard object
+// vanished out-of-band; it takes part in cycle matching, so switching it
+// re-marks. A step cannot be canceled once started — a client disconnect
+// does not stop it — so bound its size with max or budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -248,14 +251,23 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var cleanChunks bool
+	if v := r.URL.Query().Get("clean_chunks"); v != "" {
+		cleanChunks, err = strconv.ParseBool(v)
+		if err != nil {
+			http.Error(w, "Invalid clean_chunks value", http.StatusBadRequest)
+			return
+		}
+	}
 
 	// A vanished client must not abort deletes mid-step or waste the mark.
 	result, err := h.gc.SweepStep(context.WithoutCancel(r.Context()), storage.SweepOptions{
-		Grace:      grace,
-		DryRun:     dryRun,
-		MaxDeletes: maxDeletes,
-		Budget:     budget,
-		Anchor:     anchor,
+		Grace:           grace,
+		DryRun:          dryRun,
+		MaxDeletes:      maxDeletes,
+		Budget:          budget,
+		Anchor:          anchor,
+		CleanChunkIndex: cleanChunks,
 	})
 	if err != nil {
 		if errors.Is(err, storage.ErrGCBusy) {
@@ -269,9 +281,10 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !dryRun {
-		log.Printf("gc sweep step: swept %d shards, %d xorbs; %d failed deletes; reclaimed %d bytes; done=%t; remaining %d shards, %d xorbs",
+		log.Printf("gc sweep step: swept %d shards, %d xorbs; %d failed deletes; reclaimed %d bytes; chunk entries %d deleted, %d repointed; done=%t; remaining %d shards, %d xorbs",
 			len(result.SweptShards), len(result.SweptXorbs), len(result.FailedDeletes),
-			result.ReclaimedBytes, result.Done, result.RemainingShards, result.RemainingXorbs)
+			result.ReclaimedBytes, result.DeletedChunkEntries, result.RepointedChunkEntries,
+			result.Done, result.RemainingShards, result.RemainingXorbs)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)

@@ -303,6 +303,68 @@ func (fs *FileStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shar
 	})
 }
 
+// WalkChunkIndex calls fn for every committed index/chunks entry together
+// with the entry file's modification time.
+func (fs *FileStorage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string, modTime time.Time) error) error {
+	root := filepath.Join(fs.basePath, "index", "chunks")
+	return filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			// Tolerate concurrent deletion anywhere under the index.
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		chunkHash := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
+		// Skip in-flight temp files and anything that is not a hash name.
+		if !isHexHash64(chunkHash) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		return fn(chunkHash, strings.TrimSpace(string(data)), info.ModTime())
+	})
+}
+
+// HasShardObject reports whether the shard object is stored, by stat only —
+// no decode, no cache. Non-64-hex names read as absent rather than statting
+// the shards root or a fanout directory.
+func (fs *FileStorage) HasShardObject(ctx context.Context, shardHash string) (bool, error) {
+	if !isHexHash64(shardHash) {
+		return false, nil
+	}
+	info, err := os.Stat(fs.objectPath("shards", shardHash))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat shard object: %w", err)
+	}
+	return info.Mode().IsRegular(), nil
+}
+
 // PutXorb stores an xorb
 func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	xorbPath := fs.objectPath("xorbs", xorbHash.String())
@@ -400,11 +462,10 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		if live, ok := shardObjectLive[shardHash]; ok {
 			return live, nil
 		}
-		_, err := os.Stat(fs.objectPath("shards", shardHash))
-		if err != nil && !os.IsNotExist(err) {
+		live, err := fs.HasShardObject(ctx, shardHash)
+		if err != nil {
 			return false, err
 		}
-		live := err == nil
 		shardObjectLive[shardHash] = live
 		return live, nil
 	}
