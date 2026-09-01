@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -901,5 +903,188 @@ func TestDeleteShardEndpoint(t *testing.T) {
 	}
 	if rec, _ := deleteShard("/internal/shards/" + strings.Repeat("ab", 32) + "?force=garbage"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad force status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// waitShardGone polls until the shard object disappears from fs.
+func waitShardGone(t *testing.T, fs *storage.FileStorage, shardHash string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stored, err := fs.HasShardObject(context.Background(), shardHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stored {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shard object still stored, want the loop to sweep it")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRunGCLoop: the loop sweeps dead content with the handler's configured
+// grace and anchor — AnchorFiles plus a disabled window here, so a file
+// unlink alone must suffice and fresh objects must not be shielded — and
+// returns when its context is canceled.
+func TestRunGCLoop(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithGCGrace(-1), WithGCAnchor(storage.AnchorFiles))
+
+	fileHash := putTestFile(t, ctx, fs, []byte("gc loop content"))
+	shardHash, _, err := fs.GetFileIndexEntry(ctx, fileHash)
+	if err != nil || shardHash == "" {
+		t.Fatalf("file index entry = %q, %v", shardHash, err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handler.RunGCLoop(loopCtx, 10*time.Millisecond)
+		close(done)
+	}()
+
+	waitShardGone(t, fs, shardHash)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunGCLoop did not return after context cancellation")
+	}
+}
+
+// TestRunGCLoopNilGC: a storage without GC support makes the loop return
+// immediately instead of ticking forever.
+func TestRunGCLoopNilGC(t *testing.T) {
+	handler := NewHandler(WithStorage(listlessStorage{}))
+	done := make(chan struct{})
+	go func() {
+		handler.RunGCLoop(context.Background(), time.Hour)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunGCLoop did not return for GC-less storage")
+	}
+}
+
+// gcWalkHookedStorage lets a test block the first shard walk, holding the
+// GC busy for as long as it likes.
+type gcWalkHookedStorage struct {
+	*storage.FileStorage
+	onWalkShards func()
+}
+
+func (s *gcWalkHookedStorage) WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error {
+	if s.onWalkShards != nil {
+		s.onWalkShards()
+	}
+	return s.FileStorage.WalkShards(ctx, fn)
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestRunGCLoopBusySkips: while another sweep holds the GC, the loop's
+// ticks are skipped with a log line instead of piling up or aborting, and
+// once the holder releases, the loop still reclaims the dead content.
+func TestRunGCLoopBusySkips(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooked := &gcWalkHookedStorage{FileStorage: fs}
+	handler := NewHandler(WithStorage(hooked), WithGCGrace(-1), WithGCAnchor(storage.AnchorFiles))
+
+	fileHash := putTestFile(t, ctx, fs, []byte("gc loop busy content"))
+	shardHash, _, err := fs.GetFileIndexEntry(ctx, fileHash)
+	if err != nil || shardHash == "" {
+		t.Fatalf("file index entry = %q, %v", shardHash, err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+
+	// The holder: a dry-run step that blocks inside the first shard walk,
+	// keeping the GC mutex held without deleting anything.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	hooked.onWalkShards = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	holderDone := make(chan error, 1)
+	go func() {
+		_, err := handler.gc.SweepStep(context.Background(), storage.SweepOptions{Grace: -1, DryRun: true, Anchor: storage.AnchorFiles})
+		holderDone <- err
+	}()
+	<-entered
+
+	var buf syncBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handler.RunGCLoop(loopCtx, 10*time.Millisecond)
+		close(done)
+	}()
+
+	// The loop must hit the busy holder and skip, not abort or queue.
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "skipping tick") {
+		if time.Now().After(deadline) {
+			t.Fatal("no busy-skip log line while another sweep held the GC")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(release)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("holder dry run: %v", err)
+	}
+	// Only the loop sweeps for real; the shard vanishing proves it recovered.
+	waitShardGone(t, fs, shardHash)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunGCLoop did not return after context cancellation")
 	}
 }

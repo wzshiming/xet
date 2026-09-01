@@ -36,6 +36,12 @@ const defaultPresignExpiry = time.Hour
 // uses the same object layout as FileStorage (xorbs/, shards/, index/files/,
 // index/chunks/, index/sha256/ with a two-character fanout), so a bucket
 // populated by syncing a FileStorage directory is directly usable.
+//
+// Deletes issue plain DeleteObject calls without a VersionId. On a
+// versioned bucket that only writes a delete marker, so noncurrent
+// versions keep accruing storage until a lifecycle rule expires them;
+// SweepResult.ReclaimedBytes is the logical size of the removed current
+// versions, not bytes freed in the bucket.
 type S3Storage struct {
 	client          *s3.Client
 	presignClient   *s3.PresignClient

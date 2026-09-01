@@ -26,6 +26,7 @@ func main() {
 	baseURL := flag.String("base-url", "", "Base URL for serving xorb data (optional)")
 	authToken := flag.String("token", "", "Authentication token; also the secret for minted short-lived tokens (optional, if set, clients must provide this token or a minted one)")
 	internalAPI := flag.Bool("internal", false, "Enable unauthenticated internal management endpoints under /internal/ (use only on trusted networks)")
+	gcInterval := flag.Duration("gc-interval", 0, "Run automatic GC sweeps at this interval (0 disables; requires -internal)")
 	upstream := flag.String("upstream", "", "Upstream hub URL to mirror, e.g. https://huggingface.co (enables mirror mode)")
 	upstreamToken := flag.String("upstream-token", "", "Bearer token the mirror uses against the upstream hub")
 	s3Bucket := flag.String("s3-bucket", "", "S3 bucket for xorbs and shards (enables S3 storage; credentials come from the standard AWS config chain)")
@@ -37,6 +38,15 @@ func main() {
 	s3PresignExpiry := flag.Duration("s3-presign-expiry", time.Hour, "Validity of presigned xorb URLs")
 	s3PresignEndpoint := flag.String("s3-presign-endpoint", "", "Endpoint used in presigned xorb URLs when clients reach the object store at a different address than the server (optional, defaults to -s3-endpoint)")
 	flag.Parse()
+
+	if *gcInterval < 0 {
+		fmt.Fprintln(os.Stderr, "-gc-interval must be zero or positive")
+		os.Exit(1)
+	}
+	if *gcInterval > 0 && !*internalAPI {
+		fmt.Fprintln(os.Stderr, "-gc-interval requires -internal")
+		os.Exit(1)
+	}
 
 	// Create storage: S3 when a bucket is configured, local filesystem otherwise.
 	var stor storage.Storage
@@ -139,13 +149,21 @@ func main() {
 	if *internalAPI {
 		// Internal management endpoints sit in front of the CAS routes and
 		// bypass authentication.
-		next = internalapi.NewHandler(
+		ih := internalapi.NewHandler(
 			internalapi.WithStorage(stor),
 			internalapi.WithGCGrace(1*time.Hour),
 			internalapi.WithGCAnchor(storage.AnchorBoth),
 			internalapi.WithNext(next),
 		)
+		next = ih
 		fmt.Println("Internal management endpoints enabled at /internal/")
+
+		if *gcInterval > 0 {
+			// The loop shares the handler's GC, so it and the sweep endpoint
+			// never run concurrently; the process exit stops it.
+			go ih.RunGCLoop(context.Background(), *gcInterval)
+			fmt.Printf("Automatic GC sweeps enabled, interval: %s\n", *gcInterval)
+		}
 	}
 
 	next = handlers.CombinedLoggingHandler(os.Stdout, next)

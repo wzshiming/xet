@@ -360,3 +360,48 @@ func (h *Handler) handleGCStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(h.gc.Status())
 }
+
+// RunGCLoop runs automatic sweeps every interval (which must be positive)
+// until ctx is done; it blocks, so run it in a goroutine. Each tick steps
+// one full pass to completion with the handler's configured grace and
+// anchor (no chunk pass), sharing the GC — and its busy signal — with the
+// sweep endpoint: an ErrGCBusy tick is skipped, other errors wait for the
+// next tick, and each step's result is logged. Returns immediately when
+// the storage does not support garbage collection.
+func (h *Handler) RunGCLoop(ctx context.Context, interval time.Duration) {
+	if h.gc == nil {
+		log.Printf("gc loop: storage does not support garbage collection")
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for {
+			result, err := h.gc.SweepStep(ctx, storage.SweepOptions{
+				Grace:  h.gcGrace,
+				Anchor: h.gcAnchor,
+			})
+			if err != nil {
+				if errors.Is(err, storage.ErrGCBusy) {
+					log.Printf("gc loop: sweep already running, skipping tick")
+				} else if ctx.Err() != nil {
+					return
+				} else {
+					log.Printf("gc loop: sweep step failed: %v", err)
+				}
+				break
+			}
+			log.Printf("gc loop: swept %d shards, %d xorbs; %d failed deletes; reclaimed %d bytes; done=%t; remaining %d shards, %d xorbs",
+				len(result.SweptShards), len(result.SweptXorbs), len(result.FailedDeletes),
+				result.ReclaimedBytes, result.Done, result.RemainingShards, result.RemainingXorbs)
+			if result.Done {
+				break
+			}
+		}
+	}
+}

@@ -160,7 +160,9 @@ type SweepResult struct {
 	// because a later look — a re-shield walk or an aborted shard delete —
 	// marked them live; like sweeps, they count against MaxDeletes.
 	SkippedRevived int `json:"skipped_revived"`
-	// ReclaimedBytes sums the sizes of swept shards and xorbs.
+	// ReclaimedBytes sums the sizes of swept shards and xorbs; on a
+	// versioned S3 bucket this is logical, not freed bucket bytes — see the
+	// S3Storage docs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 	// ReapedTempFiles counts stranded temp files removed when a real cycle
 	// finished, on backends that support temp reaping.
@@ -188,6 +190,18 @@ func (r *SweepResult) clone() *SweepResult {
 // sweeps fail fast with ErrGCBusy instead of queueing. Nothing
 // serializes sweepers across processes; deployments sharing a store must
 // run at most one sweeper.
+//
+// Typical operation: POST /internal/gc/sweep (bounded by max or budget)
+// from cron or the xetd -gc-interval flag, watching GET /internal/gc/status;
+// dry_run first on a new store. Anchors: AnchorBoth (default) is safest —
+// content reachable by either reference kind survives; AnchorFiles is the
+// historical mode, sha256 entries never anchor; AnchorSHA256 collapses
+// duplicate content stored under different chunkings. Grace must exceed
+// the longest plausible upload-to-commit gap (default one hour).
+// CleanChunkIndex walks the whole chunk index (one GET per entry on S3) —
+// run it occasionally, not on every sweep. UnreadableShards remediation:
+// delete the object (DELETE /internal/shards/{hash}), unlink the dangling
+// entries the next sweep reports, then clean_chunks.
 type GC struct {
 	st    GCStore
 	mu    sync.Mutex
@@ -673,7 +687,10 @@ func (c *sweepCycle) markLive(sh *shard.Shard, shardHash string) {
 
 // markUnreadable records a shard whose stored object cannot be loaded:
 // treated as live so nothing of it is swept, reported for repair, and — its
-// references being unknown — poisoning the cycle's xorb phase.
+// references being unknown — poisoning the cycle's xorb phase. Unlike
+// markLive it contributes no repoint owners, so entries of dead shards
+// sharing its content are deleted rather than repointed, resolving again
+// only once the content is re-uploaded.
 func (c *sweepCycle) markUnreadable(shardHash string) {
 	c.liveShards[shardHash] = true
 	c.res.UnreadableShards = append(c.res.UnreadableShards, shardHash)
