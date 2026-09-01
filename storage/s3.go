@@ -402,22 +402,6 @@ func (ss *S3Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbH
 	return ss.xorbChunkOffsets(ctx, xorbHash)
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (ss *S3Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, error) {
-	ss.fileMut.Lock()
-	_, exists := ss.fileIndex.Get(fileHash)
-	ss.fileMut.Unlock()
-	if exists {
-		return true, nil
-	}
-
-	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
-	if err != nil {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return exists, nil
-}
-
 func (ss *S3Storage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
 	if len(fileBlock.Entries) == 0 {
 		return [32]byte{}, nil
@@ -459,15 +443,45 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		return false, fmt.Errorf("shard has no file blocks")
 	}
 
-	// Check if any file in the shard already exists
+	// One HEAD per distinct target shard; entries in one shard usually share it.
+	shardObjectLive := map[string]bool{}
+	hasShardObject := func(shardHash string) (bool, error) {
+		if live, ok := shardObjectLive[shardHash]; ok {
+			return live, nil
+		}
+		_, live, err := ss.headObject(ctx, ss.objectKey("shards", shardHash))
+		if err != nil {
+			return false, err
+		}
+		shardObjectLive[shardHash] = live
+		return live, nil
+	}
+
+	// Dedup fast path: only a shard whose every file entry is stored and
+	// points at a live shard object counts as existing; the entry reads
+	// bypass the caches so a stale LRU hit cannot suppress the store.
+	// Anything less — a partial commit, a dangling entry — falls through to
+	// the full write path, which heals the missing pieces. Dedup hits write
+	// nothing, leaving stored objects and their LastModified untouched.
+	alreadyExists := true
 	for _, fileBlock := range s.Files {
-		exists, err := ss.hasFile(ctx, fileBlock.FileHash)
+		entry, _, err := ss.GetFileIndexEntry(ctx, fileBlock.FileHash)
 		if err != nil {
 			return false, fmt.Errorf("check shard: %w", err)
 		}
-		if exists {
-			return false, nil // Already exists
+		live := false
+		if entry != "" {
+			if live, err = hasShardObject(entry); err != nil {
+				return false, fmt.Errorf("check shard: %w", err)
+			}
 		}
+		if !live {
+			alreadyExists = false
+			break
+		}
+	}
+	if alreadyExists {
+		return false, nil // Already exists
 	}
 
 	for i := range s.Files {
@@ -508,13 +522,17 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded.Bytes())); err != nil {
 		return false, fmt.Errorf("upload shard: %w", err)
 	}
+	shardObjectLive[shardHash] = true
 
-	// The index/files/ index is written last: hasFile treats it as the commit
-	// marker, so a partial failure leaves a retryable shard instead of one
-	// that reports "already exists" with missing chunk/sha256 indexes. Nothing
-	// is cached here, but putIndexObject overwrites entries the caches may
-	// still hold, so each written key is evicted to keep warm reads from
-	// resolving a mapping the store no longer has.
+	// The index/files/ index is written last: the dedup gate treats it as the
+	// commit marker, so a partial failure leaves a retryable shard instead of
+	// one that reports "already exists" with missing chunk/sha256 indexes.
+	// File and SHA-256 entries are reconciled per key: absent ones are
+	// written, a first writer pointing at a live shard is left alone, and
+	// entries whose target shard object is gone are force-rewritten to this
+	// shard. Chunk entries stay unconditional overwrites, so each written
+	// key is evicted to keep warm reads from resolving a mapping the store
+	// no longer has.
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
@@ -527,21 +545,56 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 		}
 	}
 	for _, file := range s.Files {
-		if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", file.MetadataExt.SHA256Hash.String()), shardHashData); err != nil {
+		if err := ss.commitSHA256Entry(ctx, file.MetadataExt.SHA256Hash.String(), shardHash, hasShardObject); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
-		ss.evictSHA256(file.MetadataExt.SHA256Hash.String())
 	}
 	for _, file := range s.Files {
-		if err := ss.putIndexObject(ctx, ss.objectKey("index/files", file.FileHash.String()), shardHashData); err != nil {
+		if err := ss.commitFileEntry(ctx, file.FileHash, shardHash, hasShardObject); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
-		ss.fileMut.Lock()
-		ss.fileIndex.Remove(file.FileHash)
-		ss.fileMut.Unlock()
 	}
 
 	return wasInserted, nil
+}
+
+// commitFileEntry writes the index/files entry for fileHash unless a first
+// writer's entry still points at a live shard; absent entries are written
+// and entries whose target shard object is missing are force-rewritten,
+// evicting the cached mapping either way.
+func (ss *S3Storage) commitFileEntry(ctx context.Context, fileHash xet.FileHash, shardHash string, hasShardObject func(string) (bool, error)) error {
+	current, _, err := ss.GetFileIndexEntry(ctx, fileHash)
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		live, err := hasShardObject(current)
+		if err != nil {
+			return err
+		}
+		if live {
+			return nil
+		}
+	}
+	return ss.SetFileIndexEntry(ctx, fileHash, shardHash)
+}
+
+// commitSHA256Entry is commitFileEntry for index/sha256 entries.
+func (ss *S3Storage) commitSHA256Entry(ctx context.Context, sha256Hex, shardHash string, hasShardObject func(string) (bool, error)) error {
+	current, err := ss.GetSHA256IndexEntry(ctx, sha256Hex)
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		live, err := hasShardObject(current)
+		if err != nil {
+			return err
+		}
+		if live {
+			return nil
+		}
+	}
+	return ss.SetSHA256IndexEntry(ctx, sha256Hex, shardHash)
 }
 
 func (ss *S3Storage) getShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {

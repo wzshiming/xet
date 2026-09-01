@@ -167,24 +167,6 @@ func (fs *FileStorage) objectPath(kind, name string) string {
 	return filepath.Join(fs.basePath, kind, name[:2], name[2:])
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (fs *FileStorage) hasFile(fileHash xet.FileHash) (bool, error) {
-	fs.fileMut.Lock()
-	_, exists := fs.fileIndex.Get(fileHash)
-	fs.fileMut.Unlock()
-	if exists {
-		return true, nil
-	}
-
-	filePath := fs.objectPath("index/files", fileHash.String())
-	if _, err := os.Stat(filePath); err == nil {
-		return true, nil
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return false, nil
-}
-
 // getShard resolves a file hash through index/files/<file-hash>, whose contents
 // are the hash of the serialized shard stored at shards/<shard-hash>.
 func (fs *FileStorage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
@@ -399,19 +381,44 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		return false, fmt.Errorf("shard has no file blocks")
 	}
 
-	// Check if any file in the shard already exists
-	alreadyExists := false
-	for _, fileBlock := range s.Files {
-		if exists, err := fs.hasFile(fileBlock.FileHash); err == nil {
-			if exists {
-				alreadyExists = true
-				break
-			}
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("check shard: %w", err)
+	// One stat per distinct target shard; entries in one shard usually share it.
+	shardObjectLive := map[string]bool{}
+	hasShardObject := func(shardHash string) (bool, error) {
+		if live, ok := shardObjectLive[shardHash]; ok {
+			return live, nil
 		}
+		_, err := os.Stat(fs.objectPath("shards", shardHash))
+		if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		live := err == nil
+		shardObjectLive[shardHash] = live
+		return live, nil
 	}
 
+	// Dedup fast path: only a shard whose every file entry is stored and
+	// points at a live shard object counts as existing; the entry reads
+	// bypass the caches so a stale LRU hit cannot suppress the store.
+	// Anything less — a partial commit, a dangling entry — falls through to
+	// the full write path, which heals the missing pieces. Dedup hits write
+	// nothing, leaving stored object and entry mtimes untouched.
+	alreadyExists := true
+	for _, fileBlock := range s.Files {
+		entry, _, err := fs.GetFileIndexEntry(ctx, fileBlock.FileHash)
+		if err != nil {
+			return false, fmt.Errorf("check shard: %w", err)
+		}
+		live := false
+		if entry != "" {
+			if live, err = hasShardObject(entry); err != nil {
+				return false, fmt.Errorf("check shard: %w", err)
+			}
+		}
+		if !live {
+			alreadyExists = false
+			break
+		}
+	}
 	if alreadyExists {
 		return false, nil // Already exists
 	}
@@ -485,12 +492,16 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 	} else {
 		removeTemp = false
 	}
+	shardObjectLive[shardHash] = true
 
-	// The index/files/ index is written last: hasFile treats it as the commit
-	// marker, so a partial failure leaves a retryable shard instead of one
-	// that reports "already exists" with missing chunk/sha256 indexes. Nothing
-	// is cached here; the read path populates the caches from the stored
-	// objects, so a warm process serves exactly what a restarted one would.
+	// The index/files/ index is written last: the dedup gate treats it as the
+	// commit marker, so a partial failure leaves a retryable shard instead of
+	// one that reports "already exists" with missing chunk/sha256 indexes.
+	// File and SHA-256 entries are reconciled per key: a first writer
+	// pointing at a live shard is left alone, anything else — absent, empty,
+	// or pointing at a missing shard object — is force-written through the
+	// setters, which evict the cached mapping so a warm process serves
+	// exactly what a restarted one would.
 	shardHashData := []byte(shardHash)
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
@@ -502,19 +513,56 @@ func (fs *FileStorage) PutShard(ctx context.Context, s *shard.Shard) (bool, erro
 		}
 	}
 	for _, file := range s.Files {
-		sha256Path := fs.objectPath("index/sha256", file.MetadataExt.SHA256Hash.String())
-		if err := writeIndexFile(sha256Path, shardHashData); err != nil {
+		if err := fs.commitSHA256Entry(ctx, file.MetadataExt.SHA256Hash.String(), shardHash, hasShardObject); err != nil {
 			return wasInserted, fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
-		indexPath := fs.objectPath("index/files", file.FileHash.String())
-		if err := writeIndexFile(indexPath, shardHashData); err != nil {
+		if err := fs.commitFileEntry(ctx, file.FileHash, shardHash, hasShardObject); err != nil {
 			return wasInserted, fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 
 	return wasInserted, nil
+}
+
+// commitFileEntry writes the index/files entry for fileHash unless a first
+// writer's entry still points at a live shard; absent or empty entries and
+// entries whose target shard object is missing are force-written through the
+// setter, which also evicts the cached mapping.
+func (fs *FileStorage) commitFileEntry(ctx context.Context, fileHash xet.FileHash, shardHash string, hasShardObject func(string) (bool, error)) error {
+	current, _, err := fs.GetFileIndexEntry(ctx, fileHash)
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		live, err := hasShardObject(current)
+		if err != nil {
+			return err
+		}
+		if live {
+			return nil
+		}
+	}
+	return fs.SetFileIndexEntry(ctx, fileHash, shardHash)
+}
+
+// commitSHA256Entry is commitFileEntry for index/sha256 entries.
+func (fs *FileStorage) commitSHA256Entry(ctx context.Context, sha256Hex, shardHash string, hasShardObject func(string) (bool, error)) error {
+	current, err := fs.GetSHA256IndexEntry(ctx, sha256Hex)
+	if err != nil {
+		return err
+	}
+	if current != "" {
+		live, err := hasShardObject(current)
+		if err != nil {
+			return err
+		}
+		if live {
+			return nil
+		}
+	}
+	return fs.SetSHA256IndexEntry(ctx, sha256Hex, shardHash)
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on

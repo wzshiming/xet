@@ -342,8 +342,8 @@ func (o SweepOptions) window() time.Duration {
 // Under AnchorSHA256 one more race matters: a dead shard's file entries can
 // be unlinked and the identical shard recommitted while the sweep runs,
 // recreating byte-identical entry→shard pairs that neither the second look
-// nor plain sha-mode liveness would count (on FileStorage the sha256 index
-// keeps its first writer, so the recommit does not win back sha entries
+// nor plain sha-mode liveness would count (both backends keep a sha256
+// entry's live first writer, so the recommit does not win back sha entries
 // owned by other shards — the file-entry mtimes are its only trace). With a
 // positive grace a fresh file entry, one modified at or after the mark's
 // cutoff, therefore shields the shard it points at, judged at the mark, at
@@ -351,9 +351,10 @@ func (o SweepOptions) window() time.Duration {
 // loop — against the cutoff truncated to whole seconds, since S3 reports
 // entry times at second precision. What stays exposed is a commit landing
 // between an entry's final read and that entry's delete: read-then-delete
-// is not atomic, neither backend has a compare-and-delete, and on
-// FileStorage the recommit's index writes are first-writer-wins no-ops, so
-// such a commit can still be lost undetectably; with the window disabled
+// is not atomic, neither backend has a compare-and-delete, and the
+// recommit's index writes recreate the same entry→shard mapping the delete
+// is about to erase, so such a commit can still be lost undetectably; with
+// the window disabled
 // the whole delete-and-recreate race is accepted like the others above.
 //
 // Sweep always runs to completion: MaxDeletes and Budget only bound

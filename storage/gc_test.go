@@ -397,8 +397,8 @@ func TestSweepRepointsSharedSHA256(t *testing.T) {
 				if f1.sha256Hex != f2.sha256Hex {
 					t.Fatal("test setup: contents must share a SHA-256")
 				}
-				// Which shard owns the shared entry is a backend index-write
-				// detail (FileStorage keeps the first writer, S3 the last).
+				// Both backends keep the first writer whose shard is live;
+				// read the entry anyway so no write-order detail is pinned.
 				owner, err := gcs.GetSHA256IndexEntry(ctx, f1.sha256Hex)
 				if err != nil {
 					t.Fatal(err)
@@ -2239,8 +2239,8 @@ func TestSweepAnchorSHA256CollapsesDuplicateChunkings(t *testing.T) {
 			if f1.sha256Hex != f2.sha256Hex {
 				t.Fatal("test setup: contents must share a SHA-256")
 			}
-			// FileStorage keeps the first writer, S3 the last: read the entry
-			// to learn which shard won.
+			// Both backends keep the first live writer: read the entry to
+			// learn which shard won rather than pinning that detail.
 			ownerHash, err := gcs.GetSHA256IndexEntry(ctx, f1.sha256Hex)
 			if err != nil {
 				t.Fatal(err)
@@ -2613,8 +2613,8 @@ func TestSweepAnchorSHA256RevivesMultiFileRecommit(t *testing.T) {
 // deletes: the loser's file entry is deleted and the identical shard
 // recommitted, recreating byte-identical entry→shard pairs the pair-level
 // second look cannot tell from the pre-mark state. The winner's sha
-// ownership is re-pinned (the recommit overwrites it on backends whose
-// index keeps the last writer) and the recreated entries keep their true
+// ownership is re-pinned (defensively — a recommit leaves a live first
+// writer's entry alone) and the recreated entries keep their true
 // fresh mtimes under an aged wrapper.
 func setupSHA256RecommitRace(t *testing.T, ctx context.Context, st Storage, content []byte) (winner, loser gcFile, hooked *hookedGCStore) {
 	t.Helper()

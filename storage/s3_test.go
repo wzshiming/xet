@@ -503,8 +503,8 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	// The partial shard must not count as existing, in cache or in S3.
-	if exists, err := ss.hasFile(ctx, fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	if entry, _, err := ss.GetFileIndexEntry(ctx, fileHash); err != nil || entry != "" {
+		t.Fatalf("file index entry after partial failure = %q, %v", entry, err)
 	}
 
 	fc.setFail(nil)

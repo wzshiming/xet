@@ -285,8 +285,8 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	// The partial shard must not count as existing.
-	if exists, err := fs.hasFile(fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	if entry, _, err := fs.GetFileIndexEntry(ctx, fileHash); err != nil || entry != "" {
+		t.Fatalf("file index entry after partial failure = %q, %v", entry, err)
 	}
 
 	if err := os.Remove(blocker); err != nil {
