@@ -596,4 +596,155 @@ func TestGCEndpointsNotImplemented(t *testing.T) {
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("sweep status = %d, want %d", rec.Code, http.StatusNotImplemented)
 	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/gc/status", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("gc status = %d, want %d", rec.Code, http.StatusNotImplemented)
+	}
+}
+
+// gcHookedStorage overrides one GC delete call of a FileStorage so tests
+// can observe its context or fail it.
+type gcHookedStorage struct {
+	*storage.FileStorage
+	onDeleteXorb func(ctx context.Context, xorbHash xet.XorbHash) error
+}
+
+func (h *gcHookedStorage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
+	if h.onDeleteXorb != nil {
+		if err := h.onDeleteXorb(ctx, xorbHash); err != nil {
+			return err
+		}
+	}
+	return h.FileStorage.DeleteXorb(ctx, xorbHash)
+}
+
+// TestGCSweepEndpointDetachedFromRequestContext: a client vanishing
+// mid-step must not cancel the sweep — the handler hands SweepStep a
+// context detached from the request's cancellation.
+func TestGCSweepEndpointDetachedFromRequestContext(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooked := &gcHookedStorage{FileStorage: fs}
+	handler := NewHandler(WithStorage(hooked))
+
+	fileHash := putTestFile(t, ctx, fs, []byte("detached sweep content"))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unlink status = %d", rec.Code)
+	}
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deletes := 0
+	var deleteCtxErr error
+	hooked.onDeleteXorb = func(callCtx context.Context, _ xet.XorbHash) error {
+		deletes++
+		cancel() // the client vanishes mid-delete
+		deleteCtxErr = callCtx.Err()
+		return nil
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&anchor=files", nil).WithContext(reqCtx)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if deletes != 1 {
+		t.Fatalf("deletes = %d, want 1", deletes)
+	}
+	if deleteCtxErr != nil {
+		t.Fatalf("backend delete saw context error %v, want the step detached from the request context", deleteCtxErr)
+	}
+	var result storage.SweepResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode sweep: %v", err)
+	}
+	if !result.Done || len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
+		t.Fatalf("sweep result = %+v, want the full pass despite the canceled request", result)
+	}
+}
+
+// TestGCStatusEndpoint: GET /internal/gc/status reports the idle state, a
+// parked cycle with its phase and queues, and the last step's result.
+func TestGCStatusEndpoint(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+
+	getStatus := func() storage.GCStatus {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/gc/status", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status code = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		var s storage.GCStatus
+		if err := json.NewDecoder(rec.Body).Decode(&s); err != nil {
+			t.Fatalf("decode status: %v", err)
+		}
+		return s
+	}
+
+	if s := getStatus(); s.Running || s.Parked || s.LastResult != nil {
+		t.Fatalf("idle status = %+v, want zero state", s)
+	}
+
+	for i, content := range [][]byte{[]byte("status endpoint one"), []byte("status endpoint two")} {
+		fileHash := putTestFile(t, ctx, fs, content)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+fileHash.String(), nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unlink %d status = %d", i, rec.Code)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&max=1&anchor=files", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	s := getStatus()
+	if s.Running || !s.Parked || s.ParkedPhase != "shards" || s.RemainingShards != 1 || s.Marked.IsZero() {
+		t.Fatalf("parked status = %+v, want a parked shard-phase cycle with one shard left", s)
+	}
+	if s.LastResult == nil || s.LastResult.Done || len(s.LastResult.SweptShards) != 1 {
+		t.Fatalf("parked LastResult = %+v, want the first step's progress", s.LastResult)
+	}
+
+	for steps := 0; ; steps++ {
+		if steps > 10 {
+			t.Fatal("cycle not done after 10 steps")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0&max=1&anchor=files", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("step status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var result storage.SweepResult
+		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+			t.Fatalf("decode step: %v", err)
+		}
+		if result.Done {
+			break
+		}
+	}
+	s = getStatus()
+	if s.Running || s.Parked || s.LastResult == nil || !s.LastResult.Done {
+		t.Fatalf("final status = %+v, want idle with a done LastResult", s)
+	}
+	if len(s.LastResult.SweptShards) != 2 || len(s.LastResult.SweptXorbs) != 2 {
+		t.Fatalf("final LastResult = %+v, want the full cycle accumulated", s.LastResult)
+	}
 }

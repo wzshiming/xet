@@ -95,6 +95,13 @@ type SweepResult struct {
 	SweptShards []SweptObject `json:"swept_shards"`
 	SweptXorbs  []SweptObject `json:"swept_xorbs"`
 
+	// FailedDeletes are dead-queue items, in the order consumed, that a
+	// non-dry-run pass could not delete for a non-context reason — a backend
+	// delete error or an unparseable stored name. Each counted against
+	// MaxDeletes and stays stored — a failed shard possibly stripped of some
+	// index entries — for a later pass's mark to re-judge.
+	FailedDeletes []SweptObject `json:"failed_deletes"`
+
 	DeletedChunkEntries  int `json:"deleted_chunk_entries"`
 	DeletedSHA256Entries int `json:"deleted_sha256_entries"`
 	// DeletedFileEntries counts file entries of dead shards removed by the
@@ -141,6 +148,18 @@ type SweepResult struct {
 	RemainingXorbs  int  `json:"remaining_xorbs"`
 }
 
+// clone returns a copy sharing no mutable state with the receiver.
+func (r *SweepResult) clone() *SweepResult {
+	res := *r
+	res.SweptShards = slices.Clone(res.SweptShards)
+	res.SweptXorbs = slices.Clone(res.SweptXorbs)
+	res.FailedDeletes = slices.Clone(res.FailedDeletes)
+	res.DanglingFileEntries = slices.Clone(res.DanglingFileEntries)
+	res.DanglingSHA256Entries = slices.Clone(res.DanglingSHA256Entries)
+	res.UnreadableShards = slices.Clone(res.UnreadableShards)
+	return &res
+}
+
 // GC serializes sweeps over one store within a single process: concurrent
 // sweeps fail fast with ErrGCBusy instead of queueing. Nothing
 // serializes sweepers across processes; deployments sharing a store must
@@ -149,11 +168,74 @@ type GC struct {
 	st    GCStore
 	mu    sync.Mutex
 	cycle *sweepCycle // in-progress stepped sweep, guarded by mu
+
+	// statusMu guards the fields below; Status never takes mu (beyond a
+	// TryLock probe), so it stays non-blocking while a sweep runs.
+	statusMu     sync.Mutex
+	lastResult   *SweepResult // freshest snapshot of the last step that produced a result or parked
+	runningSince time.Time    // start of the running SweepStep; zero when idle
 }
 
 // NewGC creates a GC coordinator over st.
 func NewGC(st GCStore) *GC {
 	return &GC{st: st}
+}
+
+// GCStatus is a point-in-time view of a GC: whether a step is running,
+// whether a half-consumed cycle is parked, and the last step's result.
+type GCStatus struct {
+	Running      bool      `json:"running"`
+	RunningSince time.Time `json:"running_since,omitzero"`
+
+	// Parked reports a half-consumed cycle waiting for its next step, with
+	// the phase it parked in ("shards" or "xorbs") and its queue lengths.
+	Parked          bool      `json:"parked"`
+	ParkedPhase     string    `json:"parked_phase,omitempty"`
+	RemainingShards int       `json:"remaining_shards"`
+	RemainingXorbs  int       `json:"remaining_xorbs"`
+	Marked          time.Time `json:"marked,omitzero"`
+
+	// LastResult is the newest snapshot any step produced — a finished or
+	// parked step's accumulation, or a dry-run report (marked DryRun).
+	LastResult *SweepResult `json:"last_result,omitempty"`
+}
+
+// Status reports the GC's state without blocking on a running sweep: the
+// parked-cycle fields are filled only when the sweep lock is free.
+func (g *GC) Status() GCStatus {
+	g.statusMu.Lock()
+	s := GCStatus{
+		Running:      !g.runningSince.IsZero(),
+		RunningSince: g.runningSince,
+	}
+	if g.lastResult != nil {
+		s.LastResult = g.lastResult.clone()
+	}
+	g.statusMu.Unlock()
+	if g.mu.TryLock() {
+		if c := g.cycle; c != nil {
+			s.Parked = true
+			s.Marked = c.marked
+			s.RemainingShards = len(c.deadShards)
+			s.RemainingXorbs = len(c.deadXorbs)
+			if c.phase == sweepPhaseXorbs {
+				s.ParkedPhase = "xorbs"
+			} else {
+				s.ParkedPhase = "shards"
+			}
+		}
+		g.mu.Unlock()
+	}
+	return s
+}
+
+// setLastResult records the freshest snapshot for Status, cloned so callers
+// mutating their result cannot corrupt or race the GC-owned copy.
+func (g *GC) setLastResult(res *SweepResult) {
+	res = res.clone()
+	g.statusMu.Lock()
+	g.lastResult = res
+	g.statusMu.Unlock()
 }
 
 // Unlink removes the file-index entry for fileHash, reporting whether it
@@ -204,22 +286,37 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 // grace expires after DefaultSweepGrace instead, so an abandoned cycle's
 // queues and shield maps are never pinned for good. A cycle marked with a
 // different Grace or Anchor is discarded and re-marked; dry runs report a
-// full stateless pass and leave the cycle alone; any non-dry-run error
-// discards the cycle, except a canceled or timed-out context, which parks
-// it like an exhausted budget — a disconnected client's progress survives,
-// and the resuming step's result still accumulates everything consumed.
+// full stateless pass and leave the cycle alone. A per-item delete failure
+// does not end the step: the item is consumed and reported in
+// FailedDeletes. Only mark and re-shield errors discard the cycle, except
+// a canceled or timed-out context, which parks it like an exhausted budget
+// — a disconnected client's progress survives, an item mid-delete goes
+// back on its queue, and the resuming step's result still accumulates
+// everything consumed.
 func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, error) {
 	if !g.mu.TryLock() {
 		return nil, ErrGCBusy
 	}
 	defer g.mu.Unlock()
+	g.statusMu.Lock()
+	g.runningSince = time.Now()
+	g.statusMu.Unlock()
+	defer func() {
+		g.statusMu.Lock()
+		g.runningSince = time.Time{}
+		g.statusMu.Unlock()
+	}()
 	// Discarded before the dry-run return too, so even dry-run-only callers
 	// release an expired cycle's shield maps.
 	if g.cycle != nil && g.cycle.expired() {
 		g.cycle = nil
 	}
 	if opts.DryRun {
-		return Sweep(ctx, g.st, opts)
+		res, err := Sweep(ctx, g.st, opts)
+		if err == nil {
+			g.setLastResult(res)
+		}
+		return res, err
 	}
 	c := g.cycle
 	g.cycle = nil
@@ -239,13 +336,16 @@ func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, er
 		// bad, and the next step must not re-pay the mark.
 		if c.phase != sweepPhaseDone && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			g.cycle = c
+			g.setLastResult(c.snapshot())
 		}
 		return nil, err
 	}
 	if c.phase != sweepPhaseDone {
 		g.cycle = c
 	}
-	return c.snapshot(), nil
+	res := c.snapshot()
+	g.setLastResult(res)
+	return res, nil
 }
 
 // SweepAnchor selects which index entries anchor shard liveness during Sweep.
@@ -337,7 +437,10 @@ func (o SweepOptions) window() time.Duration {
 // pass deletes no xorbs at all, since the unreadable shard's references are
 // unknown and any queued xorb might be one of them. Transient errors heal
 // on a later sweep; decode failures keep the shard reported until it is
-// repaired or removed. Context cancellation still aborts the sweep instead.
+// repaired or removed. A delete failing with a non-context backend error is
+// reported in FailedDeletes — the object stays stored for a later pass to
+// re-judge — instead of aborting the pass. Context cancellation still
+// aborts the sweep instead.
 //
 // Under AnchorSHA256 one more race matters: a dead shard's file entries can
 // be unlinked and the identical shard recommitted while the sweep runs,
@@ -457,16 +560,11 @@ func (c *sweepCycle) expired() bool {
 
 // snapshot clones the accumulated result with the progress fields filled in.
 func (c *sweepCycle) snapshot() *SweepResult {
-	res := *c.res
-	res.SweptShards = slices.Clone(res.SweptShards)
-	res.SweptXorbs = slices.Clone(res.SweptXorbs)
-	res.DanglingFileEntries = slices.Clone(res.DanglingFileEntries)
-	res.DanglingSHA256Entries = slices.Clone(res.DanglingSHA256Entries)
-	res.UnreadableShards = slices.Clone(res.UnreadableShards)
+	res := c.res.clone()
 	res.Done = c.phase == sweepPhaseDone
 	res.RemainingShards = len(c.deadShards)
 	res.RemainingXorbs = len(c.deadXorbs)
-	return &res
+	return res
 }
 
 // sweepMark runs the mark phase: one time anchor, the live and dead walks,
@@ -493,6 +591,7 @@ func sweepMark(ctx context.Context, st GCStore, opts SweepOptions) (*sweepCycle,
 			DryRun:                opts.DryRun,
 			SweptShards:           []SweptObject{},
 			SweptXorbs:            []SweptObject{},
+			FailedDeletes:         []SweptObject{},
 			DanglingFileEntries:   []string{},
 			DanglingSHA256Entries: []string{},
 			UnreadableShards:      []string{},
@@ -750,7 +849,10 @@ func (c *sweepCycle) reshieldXorbs(ctx context.Context, st GCStore) error {
 // unlimited. The re-shield runs at the shard-to-xorb transition and again
 // whenever a call starts on a cycle already in the xorb phase, skipped when
 // no dead xorbs are queued; it is never counted as consumption nor charged
-// against the budget.
+// against the budget. A per-item delete failing with a non-context error is
+// recorded in FailedDeletes and consumes the item; a context error aborts
+// with the item put back on its queue, and a re-shield error always aborts
+// — an incomplete shield walk makes every following xorb delete unsafe.
 func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget time.Duration) error {
 	start := time.Now()
 	consumed := 0
@@ -825,7 +927,15 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 		}
 		swept, err := sweepShard(ctx, st, c, obj.Hash)
 		if err != nil {
-			return err
+			if loadAborts(err) {
+				// Put it back so the parked cycle retries it on resume.
+				c.deadShards = append([]SweptObject{obj}, c.deadShards...)
+				return err
+			}
+			// The shard still exists, possibly stripped of some entries; a
+			// later pass's mark re-judges it.
+			c.res.FailedDeletes = append(c.res.FailedDeletes, obj)
+			continue
 		}
 		if !swept {
 			continue
@@ -856,18 +966,29 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 			c.res.SkippedRevived++
 			continue
 		}
-		c.res.SweptXorbs = append(c.res.SweptXorbs, obj)
-		c.res.ReclaimedBytes += obj.Size
 		if dryRun {
+			c.res.SweptXorbs = append(c.res.SweptXorbs, obj)
+			c.res.ReclaimedBytes += obj.Size
 			continue
 		}
 		xorbHash, err := xet.ParseXorbHash(obj.Hash)
 		if err != nil {
-			return fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
+			c.res.FailedDeletes = append(c.res.FailedDeletes, obj)
+			continue
 		}
 		if err := st.DeleteXorb(ctx, xorbHash); err != nil {
-			return err
+			if loadAborts(err) {
+				// Put it back so the parked cycle retries it on resume.
+				c.deadXorbs = append([]SweptObject{obj}, c.deadXorbs...)
+				return err
+			}
+			c.res.FailedDeletes = append(c.res.FailedDeletes, obj)
+			continue
 		}
+		// Accounted only after the delete succeeded, so an aborted step never
+		// reports an object that is still stored.
+		c.res.SweptXorbs = append(c.res.SweptXorbs, obj)
+		c.res.ReclaimedBytes += obj.Size
 	}
 	return nil
 }

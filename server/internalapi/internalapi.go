@@ -3,9 +3,11 @@
 package internalapi
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -83,6 +85,7 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/files/sha256/{hash}", h.handleUnlinkSHA256).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
+	h.root.HandleFunc("/internal/gc/status", h.handleGCStatus).Methods(http.MethodGet)
 
 	h.root.NotFoundHandler = h.next
 }
@@ -187,6 +190,8 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // full pass. A request matching a half-consumed cycle's window resumes it
 // instead of re-marking. The response's done and remaining_* fields report
 // cycle progress. dry_run always reports a full stateless pass.
+// A step cannot be canceled once started — a client disconnect does not
+// stop it — so bound its size with max or budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -244,7 +249,8 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result, err := h.gc.SweepStep(r.Context(), storage.SweepOptions{
+	// A vanished client must not abort deletes mid-step or waste the mark.
+	result, err := h.gc.SweepStep(context.WithoutCancel(r.Context()), storage.SweepOptions{
 		Grace:      grace,
 		DryRun:     dryRun,
 		MaxDeletes: maxDeletes,
@@ -256,9 +262,29 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GC already running", http.StatusConflict)
 			return
 		}
+		if !dryRun {
+			log.Printf("gc sweep step failed: %v", err)
+		}
 		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if !dryRun {
+		log.Printf("gc sweep step: swept %d shards, %d xorbs; %d failed deletes; reclaimed %d bytes; done=%t; remaining %d shards, %d xorbs",
+			len(result.SweptShards), len(result.SweptXorbs), len(result.FailedDeletes),
+			result.ReclaimedBytes, result.Done, result.RemainingShards, result.RemainingXorbs)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// handleGCStatus handles GET /internal/gc/status: whether a sweep step is
+// running, whether a half-consumed cycle is parked (with its phase and
+// remaining queues), and the last step's result.
+func (h *Handler) handleGCStatus(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.gc.Status())
 }
