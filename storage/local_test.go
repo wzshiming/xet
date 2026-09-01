@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -352,6 +354,141 @@ func encodeTestXorb(t *testing.T, withFooter bool, chunks ...[]byte) ([]byte, xe
 		t.Fatal(err)
 	}
 	return encoded.Bytes(), enc.SummoryHash()
+}
+
+// tempFiles returns the temp-named (dot-prefixed or .tmp-suffixed) file names under root.
+func tempFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var names []string
+	err := filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if name := d.Name(); strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".tmp") {
+			names = append(names, name)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return names
+}
+
+// TestPutXorbConcurrentSameXorb races two writers storing the same new xorb:
+// both must succeed, the published object must hold valid bytes, and no temp
+// may survive. The old fixed "<path>.tmp" scheme interleaved both writers
+// into one shared temp file.
+func TestPutXorbConcurrentSameXorb(t *testing.T) {
+	ctx := context.Background()
+	fs, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := range 20 {
+		chunks := make([][]byte, 16)
+		for i := range chunks {
+			chunks[i] = bytes.Repeat([]byte{byte(round), byte(i)}, 4096)
+		}
+		encoded, xorbHash := encodeTestXorb(t, true, chunks...)
+
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		for range 2 {
+			go func() {
+				<-start
+				_, err := fs.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded))
+				errs <- err
+			}()
+		}
+		close(start)
+		for range 2 {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: concurrent PutXorb: %v", round, err)
+			}
+		}
+
+		stored, err := os.ReadFile(fs.objectPath("xorbs", xorbHash.String()))
+		if err != nil {
+			t.Fatalf("round %d: read stored xorb: %v", round, err)
+		}
+		if err := xorb.Validate(bytes.NewReader(stored), xorbHash); err != nil {
+			t.Fatalf("round %d: stored xorb corrupt: %v", round, err)
+		}
+		if temps := tempFiles(t, filepath.Join(fs.basePath, "xorbs")); len(temps) != 0 {
+			t.Fatalf("round %d: temp files left behind: %v", round, temps)
+		}
+	}
+}
+
+// TestPutXorbLeavesNoTempOnFailure rejects invalid xorb bytes and must not
+// strand its temp file.
+func TestPutXorbLeavesNoTempOnFailure(t *testing.T) {
+	fs, err := NewFileStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.PutXorb(context.Background(), "default", xet.XorbHash{1}, bytes.NewReader([]byte("not an xorb"))); err == nil {
+		t.Fatal("PutXorb() accepted invalid xorb bytes")
+	}
+	if temps := tempFiles(t, filepath.Join(fs.basePath, "xorbs")); len(temps) != 0 {
+		t.Fatalf("temp files left behind: %v", temps)
+	}
+}
+
+// TestReapTemps removes only aged temp-named files, keeping fresh temps and
+// hashed objects of any age.
+func TestReapTemps(t *testing.T) {
+	basePath := t.TempDir()
+	fs, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	aged := now.Add(-2 * time.Hour)
+	hashed := strings.Repeat("ab", 32)
+	write := func(rel string, mtime time.Time) string {
+		path := filepath.Join(basePath, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	agedTemps := []string{
+		write("xorbs/ab/.xorb-1", aged),
+		write("shards/.shard-2", aged),
+		write("index/files/cd/.idx-3", aged),
+		write("xorbs/ab/"+hashed[2:]+".tmp", aged), // legacy fixed-path leftover
+	}
+	freshTemp := write("xorbs/ab/.xorb-fresh", now)
+	hashedObj := write("xorbs/"+hashed[:2]+"/"+hashed[2:], aged)
+
+	n, err := fs.ReapTemps(context.Background(), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ReapTemps: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("ReapTemps removed %d files, want 4", n)
+	}
+	for _, path := range agedTemps {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("aged temp %s not reaped: %v", path, err)
+		}
+	}
+	for _, path := range []string{freshTemp, hashedObj} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("kept file %s: %v", path, err)
+		}
+	}
 }
 
 func TestGetXorbDataRangeFromOffsets(t *testing.T) {

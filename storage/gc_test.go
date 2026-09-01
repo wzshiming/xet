@@ -3335,3 +3335,76 @@ func TestFreshCutoffTruncationInvariant(t *testing.T) {
 		}
 	}
 }
+
+// TestSweepReapsTemps: a finished real cycle reaps temps stranded beyond the
+// grace boundary; dry runs leave them and report zero.
+func TestSweepReapsTemps(t *testing.T) {
+	ctx := context.Background()
+	basePath := t.TempDir()
+	st, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := filepath.Join(basePath, "xorbs", "ab", ".xorb-stranded")
+	if err := os.MkdirAll(filepath.Dir(tmpPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmpPath, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	aged := time.Now().Add(-2 * DefaultSweepGrace)
+	if err := os.Chtimes(tmpPath, aged, aged); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Sweep(ctx, st, SweepOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReapedTempFiles != 0 {
+		t.Fatalf("dry run ReapedTempFiles = %d, want 0", res.ReapedTempFiles)
+	}
+	if _, err := os.Stat(tmpPath); err != nil {
+		t.Fatalf("dry run touched the temp: %v", err)
+	}
+
+	res, err = Sweep(ctx, st, SweepOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReapedTempFiles != 1 {
+		t.Fatalf("ReapedTempFiles = %d, want 1", res.ReapedTempFiles)
+	}
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("stranded temp survived the sweep: %v", err)
+	}
+}
+
+// partialReapStore reports temps removed before a reap error hit.
+type partialReapStore struct {
+	GCStore
+	reaped int
+}
+
+func (p *partialReapStore) ReapTemps(ctx context.Context, olderThan time.Time) (int, error) {
+	return p.reaped, errors.New("injected reap failure")
+}
+
+// TestSweepCountsPartialReap: files a failing reap already removed are gone
+// from disk, so the count must land in the result anyway.
+func TestSweepCountsPartialReap(t *testing.T) {
+	ctx := context.Background()
+	basePath := t.TempDir()
+	st, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Sweep(ctx, &partialReapStore{GCStore: st, reaped: 2}, SweepOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ReapedTempFiles != 2 {
+		t.Fatalf("ReapedTempFiles = %d, want 2", res.ReapedTempFiles)
+	}
+}

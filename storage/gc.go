@@ -78,6 +78,12 @@ type GCStore interface {
 	SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error
 }
 
+// tempReaper is implemented by backends that can delete temp files stranded
+// by crashed writes; hashed objects are never touched.
+type tempReaper interface {
+	ReapTemps(ctx context.Context, olderThan time.Time) (int, error)
+}
+
 // SweptObject is one removed (or, in a dry run, removable) stored object.
 type SweptObject struct {
 	Hash string `json:"hash"`
@@ -141,6 +147,9 @@ type SweepResult struct {
 	SkippedRevived int `json:"skipped_revived"`
 	// ReclaimedBytes sums the sizes of swept shards and xorbs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
+	// ReapedTempFiles counts stranded temp files removed when a real cycle
+	// finished, on backends that support temp reaping.
+	ReapedTempFiles int `json:"reaped_temp_files"`
 
 	// Done reports a finished pass; Remaining* are the unconsumed dead-queue lengths, best-effort estimates.
 	Done            bool `json:"done"`
@@ -949,6 +958,15 @@ func (c *sweepCycle) run(ctx context.Context, st GCStore, maxDeletes int, budget
 			c.deadXorbs = nil
 		}
 		if len(c.deadXorbs) == 0 {
+			// Real cycle end: reap temps stranded before the grace boundary;
+			// a reap error never fails the sweep — the next cycle retries.
+			// Files removed before the error are still counted.
+			if !dryRun {
+				if tr, ok := st.(tempReaper); ok {
+					n, _ := tr.ReapTemps(ctx, c.cutoff)
+					c.res.ReapedTempFiles += n
+				}
+			}
 			c.phase = sweepPhaseDone
 			break
 		}

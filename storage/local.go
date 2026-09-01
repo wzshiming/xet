@@ -315,25 +315,38 @@ func (fs *FileStorage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbH
 	if err := os.MkdirAll(filepath.Dir(xorbPath), 0755); err != nil {
 		return false, fmt.Errorf("create xorb directory: %w", err)
 	}
-	// Write xorb to disk using streaming
-	f, err := os.OpenFile(xorbPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Each writer streams into its own unique temp so concurrent same-xorb
+	// uploads cannot interleave into one file; the last rename wins.
+	f, err := os.CreateTemp(filepath.Dir(xorbPath), ".xorb-*")
 	if err != nil {
 		return false, fmt.Errorf("create xorb file: %w", err)
 	}
+	tmpPath := f.Name()
+	removeTemp := true
+	defer func() {
+		if removeTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
 	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
 	if err != nil {
-		f.Close()
-		os.Remove(xorbPath + ".tmp")
+		_ = f.Close()
 		return false, fmt.Errorf("validate xorb: %w", err)
 	}
-	f.Close()
+	if err := f.Chmod(0644); err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("set xorb file permissions: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return false, fmt.Errorf("close xorb file: %w", err)
+	}
 
 	// Atomically rename temp file to final path
-	if err := os.Rename(xorbPath+".tmp", xorbPath); err != nil {
-		os.Remove(xorbPath + ".tmp")
+	if err := os.Rename(tmpPath, xorbPath); err != nil {
 		return false, fmt.Errorf("finalize xorb file: %w", err)
 	}
+	removeTemp = false
 
 	return true, nil
 }
@@ -831,6 +844,58 @@ func (fs *FileStorage) WalkShards(ctx context.Context, fn func(shardHash string,
 // WalkXorbs calls fn for every stored xorb object.
 func (fs *FileStorage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	return fs.walkHashedObjects(ctx, "xorbs", fn)
+}
+
+// ReapTemps removes temp files stranded by crashed writes — names starting
+// with ".xorb-", ".shard-", or ".idx-", or ending in ".tmp" — modified
+// before olderThan under the xorbs, shards, and index roots, returning how
+// many it removed. Only temp-named files are touched, never hashed objects.
+func (fs *FileStorage) ReapTemps(ctx context.Context, olderThan time.Time) (int, error) {
+	reaped := 0
+	for _, kind := range []string{"xorbs", "shards", "index"} {
+		root := filepath.Join(fs.basePath, kind)
+		err := filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+			if err != nil {
+				if errors.Is(err, iofs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			name := d.Name()
+			if !strings.HasPrefix(name, ".xorb-") && !strings.HasPrefix(name, ".shard-") &&
+				!strings.HasPrefix(name, ".idx-") && !strings.HasSuffix(name, ".tmp") {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				if errors.Is(err, iofs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			if !info.Mode().IsRegular() || !info.ModTime().Before(olderThan) {
+				return nil
+			}
+			if err := os.Remove(path); err != nil {
+				if errors.Is(err, iofs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+			reaped++
+			return nil
+		})
+		if err != nil {
+			return reaped, err
+		}
+	}
+	return reaped, nil
 }
 
 // WalkSHA256Index calls fn for every committed index/sha256 entry.
