@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	iofs "io/fs"
 	"log"
 	"net/http"
 	"strconv"
@@ -84,6 +85,7 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/files/sha256/{hash}", h.handleUnlinkSHA256).Methods(http.MethodDelete)
+	h.root.HandleFunc("/internal/shards/{hash}", h.handleDeleteShard).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
 	h.root.HandleFunc("/internal/gc/status", h.handleGCStatus).Methods(http.MethodGet)
 
@@ -175,6 +177,63 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"sha256":  hex.EncodeToString(digest[:]),
 		"removed": true,
+	})
+}
+
+// handleDeleteShard handles DELETE /internal/shards/{hash}?force=: it
+// removes one stored shard object, the remediation for a sweep's
+// UnreadableShards — an undecodable stored object freezes all xorb
+// reclamation and no sweep path deletes it. Unreadable objects are removed
+// without force; readable ones still referenced by their own file or sha256
+// entries answer 409 until force=true. After the deletion the next sweep
+// reports the shard's dangling file and sha256 entries (the unlink
+// endpoints remove them), clean_chunks=true reclaims its chunk entries, and
+// xorb sweeping unfreezes.
+func (h *Handler) handleDeleteShard(w http.ResponseWriter, r *http.Request) {
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
+		return
+	}
+	var force bool
+	var err error
+	if v := r.URL.Query().Get("force"); v != "" {
+		force, err = strconv.ParseBool(v)
+		if err != nil {
+			http.Error(w, "Invalid force value", http.StatusBadRequest)
+			return
+		}
+	}
+	shardHash := mux.Vars(r)["hash"]
+	outcome, err := h.gc.DeleteShardObject(r.Context(), shardHash, force)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrGCBusy):
+			http.Error(w, "GC already running", http.StatusConflict)
+		case errors.Is(err, storage.ErrInvalidShardHash):
+			http.Error(w, "Invalid shard hash", http.StatusBadRequest)
+		case errors.Is(err, iofs.ErrNotExist):
+			http.Error(w, "Shard not found", http.StatusNotFound)
+		default:
+			http.Error(w, "Failed to delete shard: "+err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if !outcome.Removed {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"removed":      false,
+			"was_readable": true,
+			"referenced":   true,
+			"hint":         "shard is readable and still referenced by its file or sha256 entries; repeat with ?force=true to delete anyway",
+		})
+		return
+	}
+	// Deletions must leave a trace in the server log.
+	log.Printf("deleted shard object %s (was_readable=%t, forced=%t)", shardHash, outcome.WasReadable, force)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"removed":      true,
+		"was_readable": outcome.WasReadable,
 	})
 }
 

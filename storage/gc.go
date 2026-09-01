@@ -26,6 +26,9 @@ const DefaultSweepGrace = time.Hour
 // ErrGCBusy is returned when a sweep is already running on the same GC.
 var ErrGCBusy = errors.New("gc already running")
 
+// ErrInvalidShardHash rejects shard hashes that are not 64 hex characters.
+var ErrInvalidShardHash = errors.New("shard hash must be 64 hex characters")
+
 // GCStore is the bare per-backend surface needed to unlink file and SHA-256
 // index entries and sweep unreferenced shards and xorbs; the orchestration
 // lives in GC.Unlink, GC.UnlinkSHA256, and Sweep. The bare backends
@@ -142,7 +145,11 @@ type SweepResult struct {
 	// decode failures or backend errors. Each is treated as live, nothing
 	// of it is deleted, and while any is present the pass sweeps no xorbs:
 	// an unreadable shard's references are unknown, so every queued xorb
-	// might be one of them. Dead-shard cleanup still proceeds.
+	// might be one of them. Dead-shard cleanup still proceeds. Remediation:
+	// delete the stored object (GC.DeleteShardObject, the internal DELETE
+	// shards endpoint, or out-of-band), then unlink the dangling file and
+	// sha256 entries the next sweep reports; CleanChunkIndex reclaims the
+	// chunk entries.
 	UnreadableShards []string `json:"unreadable_shards"`
 
 	// SkippedInGrace counts unreferenced objects left alone because they
@@ -290,6 +297,100 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 		return false, errors.New("all-zero SHA-256 digest is the shared empty-file marker")
 	}
 	return g.st.DeleteSHA256IndexEntry(ctx, shard.NewSHA256Hash(digest).String())
+}
+
+// DeleteShardOutcome reports what DeleteShardObject found and did.
+type DeleteShardOutcome struct {
+	// Removed reports whether the stored shard object was deleted.
+	Removed bool
+	// WasReadable reports whether the stored object decoded as a shard.
+	WasReadable bool
+	// Referenced reports whether any of the shard's own file or sha256 entries still pointed at it.
+	Referenced bool
+}
+
+// DeleteShardObject removes one stored shard object by hash — the
+// remediation for UnreadableShards, whose objects freeze all xorb
+// reclamation and are deletable through no sweep path. An object that
+// exists but cannot be decoded is deleted outright; a readable one is
+// refused (Removed false, nil error) while any of its own file or sha256
+// entries still points at it — the all-zero digest included, more
+// conservative than sweep anchoring — unless force is set. It fails with
+// ErrInvalidShardHash for a non-64-hex hash, ErrGCBusy while a sweep step
+// runs, and an error wrapping io/fs.ErrNotExist when no such object is
+// stored. After a deletion the next sweep reports the shard's dangling
+// file and sha256 entries for unlinking, CleanChunkIndex reclaims its
+// chunk entries, and xorb sweeping unfreezes.
+func (g *GC) DeleteShardObject(ctx context.Context, shardHash string, force bool) (DeleteShardOutcome, error) {
+	if !isHexHash64(shardHash) {
+		return DeleteShardOutcome{}, ErrInvalidShardHash
+	}
+	if !g.mu.TryLock() {
+		return DeleteShardOutcome{}, ErrGCBusy
+	}
+	defer g.mu.Unlock()
+
+	stored, err := g.st.HasShardObject(ctx, shardHash)
+	if err != nil {
+		return DeleteShardOutcome{}, err
+	}
+	if !stored {
+		return DeleteShardOutcome{}, fmt.Errorf("shard %s: %w", shardHash, iofs.ErrNotExist)
+	}
+	sh, err := g.st.LoadShard(ctx, shardHash)
+	if err != nil {
+		if errors.Is(err, iofs.ErrNotExist) || loadAborts(err) {
+			return DeleteShardOutcome{}, err
+		}
+		// Unreadable: the remediation target, deleted without force.
+		return g.deleteShardObject(ctx, shardHash, DeleteShardOutcome{})
+	}
+	out := DeleteShardOutcome{WasReadable: true}
+	for i := range sh.Files {
+		current, _, err := g.st.GetFileIndexEntry(ctx, sh.Files[i].FileHash)
+		if err != nil {
+			return out, err
+		}
+		if current == shardHash {
+			out.Referenced = true
+			break
+		}
+	}
+	if !out.Referenced {
+		for i := range sh.Files {
+			ext := sh.Files[i].MetadataExt
+			if ext == nil {
+				continue
+			}
+			current, err := g.st.GetSHA256IndexEntry(ctx, ext.SHA256Hash.String())
+			if err != nil {
+				return out, err
+			}
+			if current == shardHash {
+				out.Referenced = true
+				break
+			}
+		}
+	}
+	if out.Referenced && !force {
+		return out, nil
+	}
+	return g.deleteShardObject(ctx, shardHash, out)
+}
+
+// deleteShardObject performs the destructive step under g.mu: a dying
+// context must not delete (FileStorage ignores ctx), and a parked cycle is
+// dropped — its owner maps may name the deleted shard as a repoint target.
+func (g *GC) deleteShardObject(ctx context.Context, shardHash string, out DeleteShardOutcome) (DeleteShardOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+	if err := g.st.DeleteShard(ctx, shardHash); err != nil {
+		return out, err
+	}
+	g.cycle = nil
+	out.Removed = true
+	return out, nil
 }
 
 // SweepStep consumes one bounded slice of a sweep cycle, failing with

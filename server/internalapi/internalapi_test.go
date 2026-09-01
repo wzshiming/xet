@@ -664,6 +664,12 @@ func TestGCEndpointsNotImplemented(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/shards/"+strings.Repeat("ab", 32), nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("shard delete status = %d, want %d", rec.Code, http.StatusNotImplemented)
+	}
+
+	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("sweep status = %d, want %d", rec.Code, http.StatusNotImplemented)
@@ -818,5 +824,82 @@ func TestGCStatusEndpoint(t *testing.T) {
 	}
 	if len(s.LastResult.SweptShards) != 2 || len(s.LastResult.SweptXorbs) != 2 {
 		t.Fatalf("final LastResult = %+v, want the full cycle accumulated", s.LastResult)
+	}
+}
+
+// TestDeleteShardEndpoint: DELETE /internal/shards/{hash} removes a corrupt
+// shard object outright, refuses a live referenced one until force=true,
+// and rejects malformed input.
+func TestDeleteShardEndpoint(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs))
+
+	shardOf := func(fileHash xet.FileHash) string {
+		t.Helper()
+		shardHash, _, err := fs.GetFileIndexEntry(ctx, fileHash)
+		if err != nil || shardHash == "" {
+			t.Fatalf("file index entry = %q, %v", shardHash, err)
+		}
+		return shardHash
+	}
+	deleteShard := func(path string) (*httptest.ResponseRecorder, map[string]any) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, path, nil))
+		var resp map[string]any
+		if strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode %s response: %v", path, err)
+			}
+		}
+		return rec, resp
+	}
+
+	// A corrupt stored shard is the remediation target: removed without force.
+	corruptHash := shardOf(putTestFile(t, ctx, fs, []byte("corrupt shard endpoint")))
+	if err := os.WriteFile(filepath.Join(dir, "shards", corruptHash[:2], corruptHash[2:]), bytes.Repeat([]byte{0xff}, 128), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rec, resp := deleteShard("/internal/shards/" + corruptHash)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("corrupt delete status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if resp["removed"] != true || resp["was_readable"] != false {
+		t.Fatalf("corrupt delete response = %v", resp)
+	}
+
+	// A live referenced shard needs force.
+	liveHash := shardOf(putTestFile(t, ctx, fs, []byte("live shard endpoint")))
+	rec, resp = deleteShard("/internal/shards/" + liveHash)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("referenced delete status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if resp["removed"] != false || resp["was_readable"] != true || resp["referenced"] != true || resp["hint"] == nil {
+		t.Fatalf("referenced delete response = %v", resp)
+	}
+	if _, err := fs.LoadShard(ctx, liveHash); err != nil {
+		t.Fatalf("refused shard must stay loadable: %v", err)
+	}
+	rec, resp = deleteShard("/internal/shards/" + liveHash + "?force=true")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("forced delete status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if resp["removed"] != true || resp["was_readable"] != true {
+		t.Fatalf("forced delete response = %v", resp)
+	}
+
+	if rec, _ := deleteShard("/internal/shards/not-a-hash"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad hash status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if rec, _ := deleteShard("/internal/shards/" + strings.Repeat("ab", 32)); rec.Code != http.StatusNotFound {
+		t.Fatalf("absent shard status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if rec, _ := deleteShard("/internal/shards/" + strings.Repeat("ab", 32) + "?force=garbage"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad force status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
 }
