@@ -111,7 +111,11 @@ func (h *Handler) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 // handleUnlinkFile handles DELETE /internal/files/xet/{hash}: it drops the
 // file-index entry only; the shard and its data are collected by the next
-// sweep once nothing references them.
+// sweep once, per its anchor, nothing references them. Under the default
+// "both" anchor a non-empty file's sha256 entry still anchors the shard,
+// so full removal also takes DELETE /internal/files/sha256/{hash}, while a
+// "files" sweep reclaims after this unlink alone; empty files need this
+// unlink alone under every anchor.
 func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -139,9 +143,10 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUnlinkSHA256 handles DELETE /internal/files/sha256/{hash}: it drops
-// the index/sha256 entry only; the content stays reachable by file hash, and
-// space is reclaimed by a later sweep once, per its anchor, nothing
-// references the shard.
+// the index/sha256 entry only: SHA-256 lookups stop resolving at once while
+// the content stays reachable by file hash. Space is reclaimed by a later
+// sweep once, per its anchor, nothing references the shard — a "sha256"
+// sweep reclaims after this unlink alone.
 func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -177,16 +182,18 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 
 // handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=&anchor=:
 // it removes (or, with dry_run, reports) shards and xorbs nothing keeps
-// alive under the chosen anchor: "both" (default; any file or sha256 entry
-// anchors), "files" (file entries only), or "sha256" (sha256 entries only).
-// An omitted anchor uses the server-configured default. An omitted grace
-// uses the server-configured window (the default when none was configured);
-// an explicit zero disables it; negative values are rejected. Every request
-// consumes one step of a resumable cycle;
-// without max or budget the step is unbounded, so a plain request runs a
-// full pass. A request matching a half-consumed cycle's window resumes it
-// instead of re-marking. The response's done and remaining_* fields report
-// cycle progress. dry_run always reports a full stateless pass.
+// alive under the chosen anchor: "both" (default; any file or non-zero
+// sha256 entry anchors — reclaiming takes the file and sha256 unlinks),
+// "files" (file entries only; the file unlink alone reclaims), or "sha256"
+// (non-zero sha256 entries only; the sha256 unlink alone reclaims — for
+// stores managed exclusively by SHA-256, such as LFS backends). An omitted
+// anchor uses the server-configured default. An omitted grace uses the
+// server-configured window (the default when none was configured); an
+// explicit zero disables it; negative values are rejected. Every request
+// runs one independent bounded pass that re-marks from scratch — repeat
+// until the response reports done=true; done and remaining_* describe that
+// pass only, and without max or budget one pass already sweeps everything.
+// dry_run reports a full stateless pass, ignoring max and budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
@@ -243,7 +250,6 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	result, err := h.gc.SweepStep(r.Context(), storage.SweepOptions{
 		Grace:      grace,
 		DryRun:     dryRun,

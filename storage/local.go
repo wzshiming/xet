@@ -843,37 +843,16 @@ func (fs *FileStorage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.Fi
 }
 
 // GetFileIndexEntry returns the shard hash recorded for fileHash, or ""
-// when the entry is absent, bypassing the cache so sweeps see stored state,
-// together with the entry's modification time (the zero time when absent).
-func (fs *FileStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {
-	path := fs.objectPath("index/files", fileHash.String())
-	b, err := os.ReadFile(path)
+// when the entry is absent, bypassing the cache so sweeps see stored state.
+func (fs *FileStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
+	b, err := os.ReadFile(fs.objectPath("index/files", fileHash.String()))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", time.Time{}, nil
+			return "", nil
 		}
-		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
+		return "", fmt.Errorf("read file index: %w", err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		// Deleted between the read and the stat: report absent.
-		if os.IsNotExist(err) {
-			return "", time.Time{}, nil
-		}
-		return "", time.Time{}, fmt.Errorf("stat file index: %w", err)
-	}
-	return strings.TrimSpace(string(b)), info.ModTime(), nil
-}
-
-// SetFileIndexEntry force-writes the index/files entry for fileHash.
-func (fs *FileStorage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
-	if err := overwriteIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write file index: %w", err)
-	}
-	fs.fileMut.Lock()
-	fs.fileIndex.Remove(fileHash)
-	fs.fileMut.Unlock()
-	return nil
+	return strings.TrimSpace(string(b)), nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -931,17 +910,6 @@ func (fs *FileStorage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.
 	return nil
 }
 
-// SetChunkIndexEntry force-writes the index/chunks entry for chunkHash.
-func (fs *FileStorage) SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
-	if err := overwriteIndexFile(fs.objectPath("index/chunks", chunkHash.String()), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write chunk index: %w", err)
-	}
-	fs.chunkMut.Lock()
-	fs.chunkIndex.Remove(chunkHash)
-	fs.chunkMut.Unlock()
-	return nil
-}
-
 // evictSHA256 drops the cached mapping for a hex SHA-256 digest.
 func (fs *FileStorage) evictSHA256(sha256Hex string) {
 	raw, err := hex.DecodeString(sha256Hex)
@@ -980,15 +948,6 @@ func (fs *FileStorage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex str
 		return false, fmt.Errorf("delete SHA-256 index: %w", err)
 	}
 	return true, nil
-}
-
-// SetSHA256IndexEntry force-writes the index/sha256 entry.
-func (fs *FileStorage) SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error {
-	if err := overwriteIndexFile(fs.objectPath("index/sha256", sha256Hex), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write SHA-256 index: %w", err)
-	}
-	fs.evictSHA256(sha256Hex)
-	return nil
 }
 
 // GetXorbURL generates a URL for accessing xorb data

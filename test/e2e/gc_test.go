@@ -23,11 +23,10 @@ import (
 
 // TestGCUnlinkSweepLifecycle runs the whole GC story over the real HTTP
 // stack wired like cmd/xetd (internal endpoints in front of the CAS routes):
-// upload with the xet client, unlink, sweep with and without the grace
-// window, verify the survivors byte for byte, and re-upload the swept
-// content. Its sweeps pin anchor=files (legacy file-entry rooting) so
-// unlinking the file hash alone frees the shard; the default anchor is
-// covered by TestGCSweepDefaultAnchorLifecycle.
+// upload with the xet client, unlink both index entries, sweep with and
+// without the grace window, verify the survivors byte for byte, and
+// re-upload the swept content. The sha256-anchored retention between the
+// two unlinks is covered by TestGCSweepNeedsBothUnlinks.
 func TestGCUnlinkSweepLifecycle(t *testing.T) {
 	for _, backend := range gcBackends() {
 		t.Run(backend.name, func(t *testing.T) {
@@ -36,14 +35,28 @@ func TestGCUnlinkSweepLifecycle(t *testing.T) {
 	}
 }
 
-// TestGCSweepDefaultAnchorLifecycle covers the default-anchor ("both")
-// contract over HTTP: after DELETE /internal/files/xet/{hash} the sha256
-// entry alone keeps the shard alive through a graceless sweep, and only
-// DELETE /internal/files/sha256/{hash} lets the next sweep reclaim it.
-func TestGCSweepDefaultAnchorLifecycle(t *testing.T) {
+// TestGCSweepNeedsBothUnlinks pins the fixed liveness rule over HTTP: after
+// DELETE /internal/files/xet/{hash} the sha256 entry alone keeps the shard
+// alive through a graceless sweep and the content stays fetchable by
+// SHA-256; only DELETE /internal/files/sha256/{hash} lets the next sweep
+// reclaim it.
+func TestGCSweepNeedsBothUnlinks(t *testing.T) {
 	for _, backend := range gcBackends() {
 		t.Run(backend.name, func(t *testing.T) {
-			runGCDefaultAnchorLifecycle(t, backend.newStore(t))
+			runGCNeedsBothUnlinks(t, backend.newStore(t))
+		})
+	}
+}
+
+// TestGCSweepSHA256AnchorLifecycle covers the LFS-style flow over HTTP: for
+// stores managed exclusively by SHA-256, DELETE /internal/files/sha256/{hash}
+// alone lets an ?anchor=sha256 sweep reclaim the shard and xorbs — deleting
+// the stale file entry with the shard — and re-uploading the same content
+// afterwards heals it end to end.
+func TestGCSweepSHA256AnchorLifecycle(t *testing.T) {
+	for _, backend := range gcBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			runGCSHA256AnchorLifecycle(t, backend.newStore(t))
 		})
 	}
 }
@@ -102,7 +115,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	}
 
 	// Unlink removes the file-hash lookup at once; the SHA-256 path keeps
-	// serving until a sweep collects the shard.
+	// serving until its entry is dropped too.
 	resp := doRequest(t, http.MethodDelete, srv.URL+"/internal/files/xet/"+drop.String(), nil)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -114,18 +127,28 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 		t.Fatalf("listed %d files after unlink, want 2", got)
 	}
 
-	// The default grace window shields the freshly written objects.
-	res := gcSweep(t, srv.URL, "?anchor=files")
+	// The sha256 unlink stops SHA-256 lookups at once and leaves the shard
+	// unanchored for the next sweep.
+	dropDigest := sha256.Sum256(dropData)
+	resp = doRequest(t, http.MethodDelete, srv.URL+"/internal/files/sha256/"+hex.EncodeToString(dropDigest[:]), nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sha256 unlink status = %d", resp.StatusCode)
+	}
+	assertBridge(t, srv.URL, dropData, http.StatusNotFound)
+
+	// The default grace window shields the freshly written dead shard; its
+	// xorbs are shielded by the still-present shard itself.
+	res := gcSweep(t, srv.URL, "")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
 		t.Fatalf("in-grace sweep removed objects: %+v", res)
 	}
-	if res.SkippedInGrace < 2 {
-		t.Fatalf("SkippedInGrace = %d, want >= 2", res.SkippedInGrace)
+	if res.SkippedInGrace != 1 {
+		t.Fatalf("SkippedInGrace = %d, want 1", res.SkippedInGrace)
 	}
-	assertBridge(t, srv.URL, dropData, http.StatusOK)
 
 	// A sweep without grace reclaims the dead shard and its xorbs.
-	res = gcSweep(t, srv.URL, "?grace=0&anchor=files")
+	res = gcSweep(t, srv.URL, "?grace=0")
 	if len(res.SweptShards) != 1 || len(res.SweptXorbs) < 1 || res.ReclaimedBytes <= 0 {
 		t.Fatalf("sweep result = %+v, want 1 shard, >= 1 xorbs, bytes > 0", res)
 	}
@@ -149,7 +172,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	assertDownload(t, ctx, srv.URL, small, smallData)
 
 	// A second sweep converges to nothing.
-	res = gcSweep(t, srv.URL, "?grace=0&anchor=files")
+	res = gcSweep(t, srv.URL, "?grace=0")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
 		t.Fatalf("second sweep found leftovers: %+v", res)
 	}
@@ -169,7 +192,7 @@ func runGCLifecycle(t *testing.T, stor storage.Storage) {
 	}
 }
 
-func runGCDefaultAnchorLifecycle(t *testing.T, stor storage.Storage) {
+func runGCNeedsBothUnlinks(t *testing.T, stor storage.Storage) {
 	ctx := context.Background()
 	srv := httptest.NewServer(internalapi.NewHandler(
 		internalapi.WithStorage(stor),
@@ -202,12 +225,11 @@ func runGCDefaultAnchorLifecycle(t *testing.T, stor storage.Storage) {
 		t.Fatalf("listed %d files after unlink, want 0", got)
 	}
 
-	// Under the default anchor the sha256 entry alone keeps the shard
-	// alive even without the grace window, and the content keeps serving
-	// over the SHA-256 bridge.
+	// The sha256 entry alone keeps the shard alive even without the grace
+	// window, and the content keeps serving over the SHA-256 bridge.
 	res := gcSweep(t, srv.URL, "?grace=0")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
-		t.Fatalf("default-anchor sweep removed sha-anchored objects: %+v", res)
+		t.Fatalf("sweep removed sha-anchored objects: %+v", res)
 	}
 	assertBridge(t, srv.URL, content, http.StatusOK)
 
@@ -224,7 +246,7 @@ func runGCDefaultAnchorLifecycle(t *testing.T, stor storage.Storage) {
 	}
 	assertBridge(t, srv.URL, content, http.StatusNotFound)
 
-	// With both anchors gone the same sweep reclaims the shard and xorbs.
+	// With both entries gone the same sweep reclaims the shard and xorbs.
 	res = gcSweep(t, srv.URL, "?grace=0")
 	if len(res.SweptShards) != 1 || len(res.SweptXorbs) < 1 || res.ReclaimedBytes <= 0 {
 		t.Fatalf("sweep result = %+v, want 1 shard, >= 1 xorbs, bytes > 0", res)
@@ -241,6 +263,79 @@ func runGCDefaultAnchorLifecycle(t *testing.T, stor storage.Storage) {
 	res = gcSweep(t, srv.URL, "?grace=0")
 	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
 		t.Fatalf("repeat sweep found leftovers: %+v", res)
+	}
+}
+
+func runGCSHA256AnchorLifecycle(t *testing.T, stor storage.Storage) {
+	ctx := context.Background()
+	srv := httptest.NewServer(internalapi.NewHandler(
+		internalapi.WithStorage(stor),
+		internalapi.WithNext(server.NewHandler(server.WithStorage(stor))),
+	))
+	defer srv.Close()
+
+	// Non-empty on purpose: empty-file shards are exempt under the sha256
+	// anchor and would never be reclaimed this way.
+	content := deterministicData(2*128*1024 + 977)
+	digest := sha256.Sum256(content)
+	shaHex := hex.EncodeToString(digest[:])
+
+	fileHash, err := newGCClient(t, srv.URL).UploadFile(ctx, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	assertDownload(t, ctx, srv.URL, fileHash, content)
+	assertBridge(t, srv.URL, content, http.StatusOK)
+	if got := len(gcListFiles(t, srv.URL)); got != 1 {
+		t.Fatalf("listed %d files, want 1", got)
+	}
+
+	// The sha256 unlink alone marks the shard dead for an anchor=sha256
+	// sweep; the file entry stays, as an LFS-managed store never issues
+	// the file unlink.
+	resp := doRequest(t, http.MethodDelete, srv.URL+"/internal/files/sha256/"+shaHex, nil)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sha256 unlink status = %d", resp.StatusCode)
+	}
+	assertBridge(t, srv.URL, content, http.StatusNotFound)
+
+	// The graceless sweep reclaims the shard and xorbs, deleting the stale
+	// file entry with the shard.
+	res := gcSweep(t, srv.URL, "?grace=0&anchor=sha256")
+	if len(res.SweptShards) != 1 || len(res.SweptXorbs) < 1 || res.ReclaimedBytes <= 0 {
+		t.Fatalf("sweep result = %+v, want 1 shard, >= 1 xorbs, bytes > 0", res)
+	}
+	if res.DeletedFileEntries < 1 {
+		t.Fatalf("DeletedFileEntries = %d, want >= 1", res.DeletedFileEntries)
+	}
+	assertReconstructionStatus(t, srv.URL, fileHash, http.StatusNotFound)
+	if _, err := tryDownload(t, ctx, srv.URL, fileHash); err == nil {
+		t.Fatal("swept file still downloads")
+	}
+	if got := len(gcListFiles(t, srv.URL)); got != 0 {
+		t.Fatalf("listed %d files after sweep, want 0", got)
+	}
+
+	// A repeat sweep converges to nothing.
+	res = gcSweep(t, srv.URL, "?grace=0&anchor=sha256")
+	if len(res.SweptShards) != 0 || len(res.SweptXorbs) != 0 {
+		t.Fatalf("repeat sweep found leftovers: %+v", res)
+	}
+
+	// Deleting the file entry with the shard is what lets the same content
+	// come back: the re-upload succeeds and serves on every path again.
+	again, err := newGCClient(t, srv.URL).UploadFile(ctx, bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("re-upload: %v", err)
+	}
+	if again != fileHash {
+		t.Fatalf("re-upload hash = %s, want %s", again.String(), fileHash.String())
+	}
+	assertDownload(t, ctx, srv.URL, fileHash, content)
+	assertBridge(t, srv.URL, content, http.StatusOK)
+	if got := len(gcListFiles(t, srv.URL)); got != 1 {
+		t.Fatalf("listed %d files after re-upload, want 1", got)
 	}
 }
 

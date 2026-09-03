@@ -816,36 +816,16 @@ func (ss *S3Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.File
 }
 
 // GetFileIndexEntry returns the shard hash recorded for fileHash, or ""
-// when the entry is absent, bypassing the cache so sweeps see stored state,
-// together with the object's LastModified time (the zero time when absent).
-func (ss *S3Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, time.Time, error) {
-	out, err := ss.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(ss.bucket),
-		Key:    aws.String(ss.objectKey("index/files", fileHash.String())),
-	})
+// when the entry is absent, bypassing the cache so sweeps see stored state.
+func (ss *S3Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
+	data, err := ss.getObject(ctx, ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
 		if isS3NotFound(err) {
-			return "", time.Time{}, nil
+			return "", nil
 		}
-		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
+		return "", fmt.Errorf("read file index: %w", err)
 	}
-	defer out.Body.Close()
-	data, err := io.ReadAll(out.Body)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("read file index: %w", err)
-	}
-	return strings.TrimSpace(string(data)), aws.ToTime(out.LastModified), nil
-}
-
-// SetFileIndexEntry force-writes the index/files entry for fileHash.
-func (ss *S3Storage) SetFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
-	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write file index: %w", err)
-	}
-	ss.fileMut.Lock()
-	ss.fileIndex.Remove(fileHash)
-	ss.fileMut.Unlock()
-	return nil
+	return strings.TrimSpace(string(data)), nil
 }
 
 // DeleteShard removes a stored shard object.
@@ -897,17 +877,6 @@ func (ss *S3Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.Ch
 	return nil
 }
 
-// SetChunkIndexEntry force-writes the index/chunks entry for chunkHash.
-func (ss *S3Storage) SetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
-	if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunkHash.String()), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write chunk index: %w", err)
-	}
-	ss.chunkMut.Lock()
-	ss.chunkIndex.Remove(chunkHash)
-	ss.chunkMut.Unlock()
-	return nil
-}
-
 // evictSHA256 drops the cached mapping for a hex SHA-256 digest.
 func (ss *S3Storage) evictSHA256(sha256Hex string) {
 	raw, err := hex.DecodeString(sha256Hex)
@@ -950,15 +919,6 @@ func (ss *S3Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex strin
 	// Evicting after the delete narrows but does not close the re-cache window.
 	ss.evictSHA256(sha256Hex)
 	return exists, nil
-}
-
-// SetSHA256IndexEntry force-writes the index/sha256 entry.
-func (ss *S3Storage) SetSHA256IndexEntry(ctx context.Context, sha256Hex string, shardHash string) error {
-	if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", sha256Hex), []byte(shardHash)); err != nil {
-		return fmt.Errorf("write SHA-256 index: %w", err)
-	}
-	ss.evictSHA256(sha256Hex)
-	return nil
 }
 
 // GetShard retrieves a shard by file hash. The returned error wraps
