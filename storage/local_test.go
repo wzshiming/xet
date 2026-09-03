@@ -435,9 +435,7 @@ func TestOverwriteIndexFileConcurrentSameKey(t *testing.T) {
 	errs := make(chan error, writers)
 	var wg sync.WaitGroup
 	for i := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			value := []byte(fmt.Sprintf("shard-%02d", i))
 			for r := range rounds {
 				if err := overwriteIndexFile(keys[(i+r)%len(keys)], value); err != nil {
@@ -445,7 +443,7 @@ func TestOverwriteIndexFileConcurrentSameKey(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

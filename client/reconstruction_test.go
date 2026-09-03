@@ -77,14 +77,14 @@ func TestGetReconstruction(t *testing.T) {
 
 func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 	testHash := xet.FileHash([32]byte{0x11})
-	var calls int32
+	var calls atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/reconstructions/"+testHash.String() {
 			t.Fatalf("Unexpected path: %s", r.URL.Path)
 		}
 
-		if atomic.AddInt32(&calls, 1) == 1 {
+		if calls.Add(1) == 1 {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			if _, err := w.Write([]byte("temporary backend error")); err != nil {
 				t.Fatalf("write error body: %v", err)
@@ -115,7 +115,7 @@ func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 		t.Fatalf("GetReconstructionV1 failed: %v", err)
 	}
 
-	if got := atomic.LoadInt32(&calls); got != 2 {
+	if got := calls.Load(); got != 2 {
 		t.Fatalf("expected 2 attempts, got %d", got)
 	}
 }
