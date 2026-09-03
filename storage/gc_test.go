@@ -2140,6 +2140,79 @@ func TestSweepAnchorFilesUnlinkAloneReclaims(t *testing.T) {
 	}
 }
 
+// TestSweepAnchorFilesDeletesSharedSHA256Entry: identical content stored
+// under two chunkings shares one sha256 entry, owned by whichever PutShard
+// the backend keeps (FileStorage the first, S3 the last). An AnchorFiles
+// sweep of the owner deletes the entry outright: SHA-256 lookup misses, and
+// re-uploading the live chunking cannot heal it (PutShard's hasFile gate
+// skips every index write), while the live file stays whole by file hash;
+// re-uploading the dead chunking rewrites the entry.
+func TestSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T) {
+	content := []byte("same bytes, two chunkings, one sha256 entry")
+	wholeParts := [][]byte{content}
+	splitParts := [][]byte{content[:16], content[16:]}
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := backend.newStore(t)
+			gcs := st.(GCStore)
+
+			whole := putGCFile(t, ctx, st, wholeParts)
+			split := putGCFile(t, ctx, st, splitParts)
+			if whole.sha256Hex != split.sha256Hex || whole.fileHash == split.fileHash {
+				t.Fatal("test setup: chunkings must share the digest but not the file hash")
+			}
+			owner, err := gcs.GetSHA256IndexEntry(ctx, whole.sha256Hex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dead, live, deadParts, liveParts := whole, split, wholeParts, splitParts
+			if owner == split.shardHash {
+				dead, live, deadParts, liveParts = split, whole, splitParts, wholeParts
+			} else if owner != whole.shardHash {
+				t.Fatalf("sha256 entry owner = %q, want one of the two shards", owner)
+			}
+
+			if _, err := NewGC(gcs).Unlink(ctx, dead.fileHash); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Sweep(ctx, gcs, SweepOptions{Anchor: AnchorFiles, Grace: noGrace})
+			if err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if got, want := sweptHashes(res.SweptShards), []string{dead.shardHash}; !slices.Equal(got, want) {
+				t.Fatalf("SweptShards = %v, want %v", got, want)
+			}
+			if res.DeletedSHA256Entries != 1 {
+				t.Fatalf("DeletedSHA256Entries = %d, want 1 (the shared entry goes with its owner)", res.DeletedSHA256Entries)
+			}
+			if _, err := st.GetShard(ctx, live.fileHash); err != nil {
+				t.Fatalf("GetShard(live): %v", err)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != "" {
+				t.Fatalf("shared sha256 entry = %q, %v; want removed", got, err)
+			}
+			if _, err := st.GetReconstructedFile(ctx, "default", sha256Digest(live.sha256Hex)); err == nil {
+				t.Fatal("SHA-256 lookup still resolves after the entry delete")
+			}
+
+			// The live chunking's re-upload is a no-op behind hasFile.
+			putGCFile(t, ctx, st, liveParts)
+			if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != "" {
+				t.Fatalf("sha256 entry after live re-upload = %q, %v; want still removed", got, err)
+			}
+			// The dead chunking's re-upload rewrites it.
+			if again := putGCFile(t, ctx, st, deadParts); again.shardHash != dead.shardHash {
+				t.Fatalf("re-upload shard = %s, want %s", again.shardHash, dead.shardHash)
+			}
+			if got, err := gcs.GetSHA256IndexEntry(ctx, live.sha256Hex); err != nil || got != dead.shardHash {
+				t.Fatalf("sha256 entry after dead re-upload = %q, %v; want %q", got, err, dead.shardHash)
+			}
+			assertFileIntact(t, ctx, st, live)
+		})
+	}
+}
+
 // TestSweepAnchorFilesSkipsSHAWalk: a dangling sha256 entry is invisible to
 // an AnchorFiles sweep — the sha256 index is not walked at all — while an
 // AnchorBoth sweep over the same store reports it.

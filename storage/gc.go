@@ -120,8 +120,10 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 
 // SweepStep runs one independent, stateless pass bounded by MaxDeletes and
 // Budget, failing with ErrGCBusy while another sweep runs; repeat until Done.
-// Only actual deletions count toward the bounds, so unsweepable items never
-// stall progress. Dry runs ignore the bounds.
+// Only stored shard and xorb deletions count toward the bounds (a shard's
+// index entries go uncounted), so unsweepable items never stall progress.
+// Every step re-marks and reloads every stored shard, so small bounds make
+// a full reclaim cost O(shards) per step. Dry runs ignore the bounds.
 func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, error) {
 	if !g.mu.TryLock() {
 		return nil, ErrGCBusy
@@ -154,7 +156,7 @@ type SweepOptions struct {
 	Anchor     SweepAnchor   // which index entries anchor shard liveness; see SweepAnchor
 	Grace      time.Duration // shields objects written (mtime) within the window; negative disables it — quiescent stores only
 	DryRun     bool          // report removable objects without deleting
-	MaxDeletes int           // max actual deletions per GC.SweepStep; 0 = unlimited, ignored by Sweep and dry runs
+	MaxDeletes int           // max shard and xorb object deletions per GC.SweepStep (index entries uncounted); 0 = unlimited, ignored by Sweep and dry runs
 	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items once anything was swept; 0 = unlimited, ignored by Sweep and dry runs
 }
 
@@ -169,11 +171,17 @@ type SweepOptions struct {
 // Phase 1 re-checks and deletes dead shards; phase 2 re-walks the shards and deletes unreferenced
 // xorbs. An unreadable shard is treated as live, reported, and no xorb is deleted that pass.
 //
+// A dead shard's entries are deleted, never repointed, even when a live shard shares the chunk or
+// (under AnchorFiles) the SHA-256 of identical content — FileStorage keeps an entry's first writer,
+// S3 its last — so that lookup misses until an upload of the content under a chunking with no
+// files entry rewrites it; the live file stays whole and file-hash resolvable.
+//
 // The grace window shields uploads mid-commit (PutShard: xorbs, shard, chunks, sha256, files entry
 // last); negative Grace disables it — quiescent stores only. Guards are read-then-delete without
 // compare-and-delete: a commit landing between a final read and the delete can lose that shard or
-// its entries, and a shard object landing after phase 2's walk can lose a dedup-reused xorb. Run
-// one sweeper per store.
+// its entries, and a shard object landing behind phase 2's walk cursor, or after the walk, can
+// lose a dedup-reused xorb. Run one sweeper per store: an object another actor removes between
+// its load and its delete is still reported and charged as swept.
 func Sweep(ctx context.Context, st GCStore, opts SweepOptions) (*SweepResult, error) {
 	return sweepPass(ctx, st, opts, 0, 0)
 }
@@ -391,9 +399,9 @@ func sweepPass(ctx context.Context, st GCStore, opts SweepOptions, maxDeletes in
 
 // sweepShard deletes one dead shard with the entries it owns, in reverse of PutShard's commit
 // order (files, sha256, chunks, shard), reporting whether it did. An anchoring entry still
-// pointing at the shard aborts before anything is deleted. AnchorSHA256 pre-checks first: it
-// deletes files entries before its sha guard would otherwise run, and spares a file-referenced
-// shard carrying an unanchorable file.
+// pointing at the shard aborts before anything is deleted — except AnchorSHA256's sha re-guard,
+// which runs after its files-entry deletes; AnchorSHA256 therefore pre-checks first, and spares
+// a file-referenced shard carrying an unanchorable file.
 func sweepShard(ctx context.Context, st GCStore, res *SweepResult, anchor SweepAnchor, shardHash string) (bool, error) {
 	sh, err := st.LoadShard(ctx, shardHash)
 	if err != nil {

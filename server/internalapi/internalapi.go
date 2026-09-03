@@ -193,7 +193,8 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // runs one independent bounded pass that re-marks from scratch — repeat
 // until the response reports done=true; done and remaining_* describe that
 // pass only, and without max or budget one pass already sweeps everything.
-// dry_run reports a full stateless pass, ignoring max and budget.
+// dry_run reports a full stateless pass's mark-time upper bound (no
+// per-shard re-checks, no entry counts), ignoring max and budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
