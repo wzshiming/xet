@@ -23,17 +23,44 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
 )
 
 // Handler serves the hub front end routes.
 type Handler struct {
-	mirror    *mirror.Mirror
-	root      *mux.Router
-	next      http.Handler
-	external  string
-	mintToken func(now time.Time) (token string, exp int64)
+	mirror   *mirror.Mirror
+	root     *mux.Router
+	next     http.Handler
+	external string
+	minter   Minter
 }
+
+// TokenRequest describes a CAS credential request with matched repository variables.
+type TokenRequest struct {
+	Permission auth.Permission // Read or Write, as requested by the token route.
+	RepoType   string
+	Repo       string
+	Revision   string
+	// File is the resolved xet hash for the Link token route; zero for repository routes.
+	File xet.FileHash
+}
+
+// Minter returns a CAS credential, ErrNotHandled to delegate to next, or an error answered through auth.Deny.
+type Minter interface {
+	Mint(r *http.Request, req TokenRequest) (token string, exp int64, err error)
+}
+
+// MinterFunc adapts a function to Minter.
+type MinterFunc func(r *http.Request, req TokenRequest) (string, int64, error)
+
+func (f MinterFunc) Mint(r *http.Request, req TokenRequest) (string, int64, error) {
+	return f(r, req)
+}
+
+// ErrNotHandled makes a token route fall through to next.
+var ErrNotHandled = errors.New("token request not handled")
 
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
@@ -62,13 +89,10 @@ func WithExternalURL(external string) Option {
 	}
 }
 
-// WithMintToken sets the function the hub token endpoint uses to mint
-// downstream CAS tokens, typically the Mint of a token.Issuer shared with
-// the CAS server's AuthFunc. When unset the endpoint returns an empty
-// anonymous token, suitable for an unauthenticated CAS.
-func WithMintToken(mint func(now time.Time) (token string, exp int64)) Option {
+// WithMinter sets the hub token minter; when unset, routes return an empty anonymous token for an unauthenticated CAS.
+func WithMinter(m Minter) Option {
 	return func(h *Handler) {
-		h.mintToken = mint
+		h.minter = m
 	}
 }
 
@@ -103,6 +127,7 @@ func (h *Handler) registerRoutes() {
 	if next == nil {
 		next = http.NotFoundHandler()
 	}
+	h.next = next
 
 	h.root.UseEncodedPath()
 	// Path cleaning belongs to the CAS router this handler is composed
@@ -111,13 +136,16 @@ func (h *Handler) registerRoutes() {
 	h.root.NotFoundHandler = next
 	h.root.MethodNotAllowedHandler = next
 
-	h.root.HandleFunc(tokenEndpointPath, h.handleToken).Methods(http.MethodGet)
+	// The resolve response advertises this URL as xet-auth so the token is bound to that file.
+	h.root.HandleFunc(tokenEndpointPath+"/{file_hash}", h.handleToken(auth.Read)).Methods(http.MethodGet)
 	// The hub token refresh route clients construct themselves
 	// ({endpoint}/api/{type}s/{repo}/xet-read-token/{revision}) when the
 	// resolve response carries no xet-auth Link header: clients that skipped
 	// the resolve HEAD (hub tree caches) refresh their CAS credential here;
 	// answer locally so they stay on the mirror instead of the upstream CAS.
-	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/xet-read-token/{rev}", h.handleToken).Methods(http.MethodGet)
+	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/xet-read-token/{rev}", h.handleToken(auth.Read)).Methods(http.MethodGet)
+	// Clients ask for upload credentials here; the reference minter leaves them to the upstream.
+	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/xet-write-token/{rev}", h.handleToken(auth.Write)).Methods(http.MethodGet)
 	// Hub tree listing API paths, with or without a subpath. Their entries
 	// carry per-file xet hashes that would steer downstream clients straight
 	// to the upstream CAS.
@@ -161,7 +189,7 @@ func (h *Handler) serveReady(w http.ResponseWriter, r *http.Request, e *mirror.E
 	base := h.hubExternalBase(r)
 	writeMetadataHeaders(w, e.ETag, e.Size, e.Commit)
 	if e.FileHash != "" {
-		w.Header().Add("Link", fmt.Sprintf("<%s%s>; rel=\"xet-auth\", <%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\"", base, tokenEndpointPath, base, e.FileHash))
+		w.Header().Add("Link", fmt.Sprintf("<%s%s/%s>; rel=\"xet-auth\", <%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\"", base, tokenEndpointPath, e.FileHash, base, e.FileHash))
 		w.Header().Set("X-Xet-Hash", e.FileHash)
 	}
 
@@ -269,23 +297,43 @@ func writeMetadataHeaders(w http.ResponseWriter, etag string, size int64, commit
 // X-Xet-Access-Token / X-Xet-Token-Expiration response headers carry it for
 // huggingface_hub >= 1.29, which reads only these, while the JSON body keeps
 // the hub token endpoint shape older clients read.
-func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
-	now := time.Now()
-	var tok string
-	exp := now.Add(15 * time.Minute).Unix()
-	if h.mintToken != nil {
-		tok, exp = h.mintToken(now)
+func (h *Handler) handleToken(perm auth.Permission) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		req := TokenRequest{Permission: perm, RepoType: vars["type"], Repo: vars["repo"], Revision: vars["rev"]}
+		if vars["file_hash"] != "" {
+			file, err := xet.ParseFileHash(vars["file_hash"])
+			if err != nil || file == (xet.FileHash{}) {
+				http.Error(w, "Invalid file hash", http.StatusBadRequest)
+				return
+			}
+			req.File = file
+		}
+		var tok string
+		exp := time.Now().Add(15 * time.Minute).Unix()
+		if h.minter != nil {
+			var err error
+			tok, exp, err = h.minter.Mint(r, req)
+			if errors.Is(err, ErrNotHandled) {
+				h.next.ServeHTTP(w, r)
+				return
+			}
+			if err != nil {
+				auth.Deny(w, err)
+				return
+			}
+		}
+		casURL := h.hubExternalBase(r)
+		w.Header().Set("X-Xet-Cas-Url", casURL)
+		w.Header().Set("X-Xet-Access-Token", tok)
+		w.Header().Set("X-Xet-Token-Expiration", strconv.FormatInt(exp, 10))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"casUrl":      casURL,
+			"accessToken": tok,
+			"exp":         exp,
+		})
 	}
-	casURL := h.hubExternalBase(r)
-	w.Header().Set("X-Xet-Cas-Url", casURL)
-	w.Header().Set("X-Xet-Access-Token", tok)
-	w.Header().Set("X-Xet-Token-Expiration", strconv.FormatInt(exp, 10))
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"casUrl":      casURL,
-		"accessToken": tok,
-		"exp":         exp,
-	})
 }
 
 // hubExternalBase returns the externally visible base URL used in hub

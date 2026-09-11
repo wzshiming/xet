@@ -140,7 +140,7 @@ func TestListFilesGroupsBySHA256(t *testing.T) {
 			twoChunks, twoStored := putListedFile(t, ctx, st, [][]byte{content[:11], content[11:]})
 			otherHash, otherStored := putListedFile(t, ctx, st, [][]byte{other})
 
-			emptyHash := xet.FileHash{42}
+			emptyHash := xet.FileHash{}
 			emptyShard := shard.NewShard()
 			emptyShard.AddFile(shard.FileBlock{FileHash: emptyHash})
 			if _, err := st.PutShard(ctx, emptyShard); err != nil {

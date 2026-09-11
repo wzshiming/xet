@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/token"
 )
 
 // fakeHub is a configurable plain hub: resolve requests answer metadata
@@ -30,6 +30,7 @@ import (
 type fakeHub struct {
 	mu    sync.Mutex
 	files map[string][]byte
+	api   map[string][]byte // raw JSON answered directly, e.g. hub token routes the mirror delegates upstream
 
 	commit        string // "" omits X-Repo-Commit
 	etagOverride  string // "" uses the real sha256 of the data
@@ -47,7 +48,7 @@ type fakeHub struct {
 }
 
 func newFakeHub() *fakeHub {
-	return &fakeHub{files: map[string][]byte{}, commit: "commit-e2e"}
+	return &fakeHub{files: map[string][]byte{}, api: map[string][]byte{}, commit: "commit-e2e"}
 }
 
 func (u *fakeHub) set(path string, data []byte) {
@@ -72,6 +73,11 @@ func (u *fakeHub) etagFor(data []byte) string {
 }
 
 func (u *fakeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if body, ok := u.api[r.URL.Path]; ok {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/cdn/") {
 		u.serveData(w, r, strings.TrimPrefix(r.URL.Path, "/cdn"))
 		return
@@ -161,7 +167,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
-	issuer, err := token.NewIssuer(nil, 15*time.Minute)
+	issuer, err := auth.NewIssuer(nil, 15*time.Minute, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,11 +187,16 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	}
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),
-		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
+		server.WithAuthorizer(issuer),
 		server.WithNext(hf.NewHandler(
 			hf.WithMirror(m),
 			hf.WithExternalURL(srv.URL),
-			hf.WithMintToken(issuer.Mint),
+			hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
+				if req.Permission != auth.Read {
+					return "", 0, hf.ErrNotHandled
+				}
+				return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
+			})),
 			hf.WithNext(proxy),
 		)),
 	)))

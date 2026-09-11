@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
@@ -21,23 +23,19 @@ import (
 
 // Handler represents an XET CAS server
 type Handler struct {
-	storage storage.Storage
-	root    *mux.Router
-	next    http.Handler
-	authFn  AuthFunc
+	storage    storage.Storage
+	root       *mux.Router
+	next       http.Handler
+	authorizer auth.Authorizer
 }
-
-// AuthFunc is a function that validates authentication tokens
-// It returns true if the token is valid
-type AuthFunc func(token string) bool
 
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
 
-// WithAuthFunc sets the authentication function for the server. If not set, the server will allow all requests.
-func WithAuthFunc(authFn AuthFunc) Option {
+// WithAuthorizer sets the authorizer consulted by the gated routes; unset allows all requests.
+func WithAuthorizer(a auth.Authorizer) Option {
 	return func(h *Handler) {
-		h.authFn = authFn
+		h.authorizer = a
 	}
 }
 
@@ -60,7 +58,6 @@ func NewHandler(opts ...Option) *Handler {
 	s := &Handler{
 		storage: nil,
 		root:    mux.NewRouter(),
-		authFn:  nil,
 	}
 
 	for _, opt := range opts {
@@ -100,6 +97,7 @@ var zeroDigest = sha256.Sum256(nil)
 
 // handleXetBridge reconstructs a complete file addressed by its SHA-256 digest.
 func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
+	// Served without authorization: plain clients follow the resolve redirect here without credentials.
 	sh256Hash := mux.Vars(r)["sha256"]
 	digestBytes, err := hex.DecodeString(sh256Hash)
 	if err != nil || len(digestBytes) != sha256.Size {
@@ -132,8 +130,7 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 
 // handleHasXorb handles HEAD /v1/xorbs/{namespace}/{xorb_hash}
 func (s *Handler) handleHasXorb(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
 
@@ -181,24 +178,15 @@ func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.root.ServeHTTP(w, r)
 }
 
-// authenticate checks if a request is authenticated
-func (s *Handler) authenticate(r *http.Request) bool {
-	if s.authFn == nil {
-		return true // No authentication required
+func (s *Handler) authorize(w http.ResponseWriter, r *http.Request, g auth.Grant) bool {
+	if s.authorizer == nil {
+		return true
 	}
-
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
+	if err := s.authorizer.Authorize(r, g); err != nil {
+		auth.Deny(w, err)
 		return false
 	}
-
-	// Extract Bearer token
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return false
-	}
-
-	return s.authFn(parts[1])
+	return true
 }
 
 // externalBase returns the server's externally visible base URL derived
@@ -250,6 +238,10 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+		return
+	}
+
 	// Get shard for this file
 	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
@@ -270,13 +262,11 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 
 // handleBatchGetReconstruction handles GET /reconstructions?file_id=<hex>&file_id=<hex>&...
 func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
 	fileIDStrs := r.URL.Query()["file_id"]
 	if len(fileIDStrs) == 0 {
+		if !s.authorize(w, r, auth.Grant{Permission: auth.Read}) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(&download.BatchReconstructionResponse{
 			Files:     make(map[string][]download.Term),
@@ -293,6 +283,12 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 			return
 		}
 		fileHashes = append(fileHashes, h)
+	}
+
+	for _, fileHash := range fileHashes {
+		if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+			return
+		}
 	}
 
 	batch := &download.BatchReconstructionResponse{
@@ -335,6 +331,10 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+		return
+	}
+
 	// Get shard for this file
 	shard, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
@@ -355,9 +355,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 
 // handleUploadXorb handles POST /v1/xorbs/{namespace}/{xorb_hash}
 func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
-	// Authenticate
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
 
@@ -400,6 +398,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 
 // handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}
 func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
+	// Served without authorization: xet clients fetch the URLs from reconstruction responses without credentials.
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
@@ -427,9 +426,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 
 // handleUploadShard handles the legacy and v1 shard upload endpoints.
 func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
-	// Authenticate
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
 
@@ -440,7 +437,11 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 
 	wasInserted, status, err := s.storeUploadedShard(r)
 	if err != nil {
-		http.Error(w, err.Error(), status)
+		if status == 0 {
+			auth.Deny(w, err)
+		} else {
+			http.Error(w, err.Error(), status)
+		}
 		return
 	}
 
@@ -468,6 +469,10 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 	if err := shardObj.Validate(); err != nil {
 		return false, http.StatusBadRequest, fmt.Errorf("invalid shard: %w", err)
 	}
+	if err := s.authorizeShardFiles(r, shardObj); err != nil {
+		return false, 0, err
+	}
+
 	for _, casBlock := range shardObj.CASInfos {
 		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
 		if err != nil || !exists {
@@ -477,13 +482,36 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 
 	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
 	if err != nil {
+		if errors.Is(err, storage.ErrInvalidShard) {
+			return false, http.StatusBadRequest, err
+		}
 		return false, http.StatusInternalServerError, fmt.Errorf("failed to store shard")
 	}
 	return wasInserted, http.StatusOK, nil
 }
 
+func (s *Handler) authorizeShardFiles(r *http.Request, sh *shard.Shard) error {
+	if s.authorizer == nil {
+		return nil
+	}
+	for _, fb := range sh.Files {
+		var digest [32]byte
+		if fb.MetadataExt != nil {
+			digest = [32]byte(fb.MetadataExt.SHA256Hash)
+		}
+		if err := s.authorizer.Authorize(r, auth.Grant{Permission: auth.Write, File: fb.FileHash, SHA256: digest, Targeted: true}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}
 func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
+		return
+	}
+
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
@@ -521,6 +549,10 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 
 // handleQueryChunksBatch handles POST /v1/chunks/{namespace}:query.
 func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
+		return
+	}
+
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
 

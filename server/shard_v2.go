@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 )
 
 const shardUploadHeartbeatInterval = 20 * time.Second
@@ -131,8 +133,7 @@ func (s *shardUploadStream) startHeartbeat(interval time.Duration) func() {
 // are validated as their blocks are decoded, and every post-stream failure is
 // reported by a terminal error frame.
 func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
-	if !s.authenticate(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
 	if r.ContentLength <= 0 {
@@ -200,12 +201,20 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 		finishWithError(fmt.Sprintf("invalid shard: %v", err), false)
 		return
 	}
+	if err := s.authorizeShardFiles(r, shardObj); err != nil {
+		finishWithError(err.Error(), false)
+		return
+	}
 
 	if err := stream.committing("uploading"); err != nil {
 		return
 	}
 	if _, err := s.storage.PutShard(r.Context(), shardObj); err != nil {
-		finishWithError("failed to store shard", true)
+		if errors.Is(err, storage.ErrInvalidShard) {
+			finishWithError(err.Error(), false)
+		} else {
+			finishWithError("failed to store shard", true)
+		}
 		return
 	}
 	if err := stream.committing("syncing"); err != nil {

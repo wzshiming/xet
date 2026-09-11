@@ -418,39 +418,44 @@ func (ss *S3Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, 
 	return exists, nil
 }
 
-func (ss *S3Storage) computeFileSHA256(ctx context.Context, fileBlock *shard.FileBlock) ([32]byte, error) {
+func (ss *S3Storage) computeFileHashes(ctx context.Context, fileBlock *shard.FileBlock) (digest [32]byte, fileHash xet.FileHash, err error) {
 	if len(fileBlock.Entries) == 0 {
-		return [32]byte{}, nil
+		return digest, fileHash, nil
 	}
 
 	h := sha256.New()
 	buf := make([]byte, xet.MaxChunkSize)
+	var chunkHashes []xet.ChunkHash
+	var chunkSizes []uint64
 	for _, entry := range fileBlock.Entries {
 		if err := ctx.Err(); err != nil {
-			return [32]byte{}, err
+			return digest, fileHash, err
 		}
 
 		start, end, err := ss.GetXorbDataRange(ctx, "", entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 		if err != nil {
-			return [32]byte{}, fmt.Errorf("locate xorb chunks: %w", err)
+			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
 		rc, err := ss.getObjectRange(ctx, ss.objectKey("xorbs", entry.CASHash.String()), start, end)
 		if err != nil {
-			return [32]byte{}, fmt.Errorf("read xorb chunks: %w", err)
+			return digest, fileHash, fmt.Errorf("read xorb chunks: %w", err)
 		}
 		decoder := xorb.NewDecoder(rc, false)
 		written, err := io.CopyBuffer(h, decoder, buf)
 		rc.Close()
 		if err != nil {
-			return [32]byte{}, fmt.Errorf("decode xorb chunks: %w", err)
+			return digest, fileHash, fmt.Errorf("decode xorb chunks: %w", err)
 		}
 		if written != int64(entry.UnpackedSegBytes) {
-			return [32]byte{}, fmt.Errorf("reconstructed term has %d bytes, expected %d", written, entry.UnpackedSegBytes)
+			return digest, fileHash, fmt.Errorf("reconstructed term has %d bytes, expected %d", written, entry.UnpackedSegBytes)
 		}
+		hashes, sizes := decoder.Chunks()
+		chunkHashes = append(chunkHashes, hashes...)
+		chunkSizes = append(chunkSizes, sizes...)
 	}
-	var digest [32]byte
 	copy(digest[:], h.Sum(nil))
-	return digest, nil
+	fileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
+	return digest, fileHash, nil
 }
 
 // PutShard stores a shard and its file/chunk/sha256 index objects.
@@ -471,12 +476,15 @@ func (ss *S3Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error)
 	}
 
 	for i := range s.Files {
-		computed, err := ss.computeFileSHA256(ctx, &s.Files[i])
+		computed, fileHash, err := ss.computeFileHashes(ctx, &s.Files[i])
 		if err != nil {
 			return false, fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
 		if s.Files[i].MetadataExt != nil && s.Files[i].MetadataExt.SHA256Hash != shard.NewSHA256Hash(computed) {
-			return false, fmt.Errorf("SHA-256 mismatch for file %s", s.Files[i].FileHash.String())
+			return false, fmt.Errorf("%w: SHA-256 mismatch for file %s", ErrInvalidShard, s.Files[i].FileHash.String())
+		}
+		if s.Files[i].FileHash != fileHash {
+			return false, fmt.Errorf("%w: file hash mismatch for file %s", ErrInvalidShard, s.Files[i].FileHash.String())
 		}
 
 		s.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(computed)}

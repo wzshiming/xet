@@ -222,7 +222,7 @@ func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
 	var names []string
 	for _, creationTime := range []uint64{1, 1 << 30} {
 		ss := newTestS3Storage(t)
-		s := newIndexedShard(xet.FileHash{1})
+		s := newIndexedShard(xet.FileHash{})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
 		if inserted, err := ss.PutShard(ctx, s); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)

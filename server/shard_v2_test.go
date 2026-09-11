@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ type shardV2TestStorage struct {
 	storage.Storage
 	putStarted  chan struct{}
 	putContinue chan struct{}
+	putErr      error
 }
 
 func (s *shardV2TestStorage) HasXorb(context.Context, string, xet.XorbHash) (bool, error) {
@@ -32,7 +34,7 @@ func (s *shardV2TestStorage) HasXorb(context.Context, string, xet.XorbHash) (boo
 func (s *shardV2TestStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
 	close(s.putStarted)
 	<-s.putContinue
-	return true, nil
+	return s.putErr == nil, s.putErr
 }
 
 type shardUploadWireEvent struct {
@@ -155,6 +157,39 @@ func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 		if got := readShardUploadWireEvent(t, events); got != want {
 			t.Fatalf("terminal event %d = %+v, want %+v", i, got, want)
 		}
+	}
+}
+
+func TestUploadShardStorageFailureRemainsRetryable(t *testing.T) {
+	_, _, _, _, _, _, body := authorizerFixture(t)
+	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
+		t.Run(endpoint, func(t *testing.T) {
+			stor := &shardV2TestStorage{
+				putStarted:  make(chan struct{}),
+				putContinue: make(chan struct{}),
+				putErr:      fmt.Errorf("backend unavailable"),
+			}
+			close(stor.putContinue)
+			response := httptest.NewRecorder()
+			NewHandler(WithStorage(stor)).ServeHTTP(response, httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body)))
+			if endpoint != "/v2/shards" {
+				if response.Code != http.StatusInternalServerError || response.Body.String() != "failed to store shard\n" {
+					t.Fatalf("response = %d %q", response.Code, response.Body.String())
+				}
+				return
+			}
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", response.Code)
+			}
+			events := bufio.NewReader(response.Body)
+			var last shardUploadWireEvent
+			for _, err := events.Peek(1); err == nil; _, err = events.Peek(1) {
+				last = readShardUploadWireEvent(t, events)
+			}
+			if last.Type != "error" || !last.Retryable || last.Message != "failed to store shard" {
+				t.Fatalf("terminal event = %+v, want retryable storage error", last)
+			}
+		})
 	}
 }
 

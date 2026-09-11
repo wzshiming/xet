@@ -136,6 +136,11 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	return copy(p, uncompressed), nil
 }
 
+// Chunks returns the hashes and unpacked sizes of the chunks decoded so far.
+func (d *Decoder) Chunks() ([]xet.ChunkHash, []uint64) {
+	return d.chunkHashes, d.chunkSizes
+}
+
 // SummoryHash returns the overall xorb hash.
 // When withFooter is true, the hash is taken directly from the footer after Decode returns io.EOF.
 // Otherwise it is computed from all decoded chunks.

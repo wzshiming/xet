@@ -1,5 +1,4 @@
-// Package internalapi serves internal management endpoints that are not
-// part of the CAS protocol surface.
+// Package internalapi serves non-CAS management endpoints with Read or Write permission.
 package internalapi
 
 import (
@@ -12,21 +11,30 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/storage"
 )
 
 // Handler serves the internal management endpoints.
 type Handler struct {
-	storage  storage.Storage
-	gc       *storage.GC
-	gcGrace  time.Duration
-	gcAnchor storage.SweepAnchor
-	root     *mux.Router
-	next     http.Handler
+	authorizer auth.Authorizer
+	storage    storage.Storage
+	gc         *storage.GC
+	gcGrace    time.Duration
+	gcAnchor   storage.SweepAnchor
+	root       *mux.Router
+	next       http.Handler
 }
 
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
+
+// WithAuthorizer sets the route authorizer; unset allows all requests.
+func WithAuthorizer(a auth.Authorizer) Option {
+	return func(h *Handler) {
+		h.authorizer = a
+	}
+}
 
 // WithStorage sets the storage backend for the internal endpoints.
 func WithStorage(storage storage.Storage) Option {
@@ -92,9 +100,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.root.ServeHTTP(w, r)
 }
 
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, g auth.Grant) bool {
+	if h.authorizer == nil {
+		return true
+	}
+	if err := h.authorizer.Authorize(r, g); err != nil {
+		auth.Deny(w, err)
+		return false
+	}
+	return true
+}
+
 // handleListFiles handles GET /internal/files: all stored files grouped by
 // content SHA-256, each carrying its xet file hashes and original size.
 func (h *Handler) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Read}) {
+		return
+	}
 	ls, ok := h.storage.(storage.ListStore)
 	if !ok {
 		http.Error(w, "Storage does not support file listing", http.StatusNotImplemented)
@@ -117,13 +139,16 @@ func (h *Handler) handleListFiles(w http.ResponseWriter, r *http.Request) {
 // "files" sweep reclaims after this unlink alone; empty files need this
 // unlink alone under every anchor.
 func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
-	if h.gc == nil {
-		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
-		return
-	}
 	fileHash, err := xet.ParseFileHash(mux.Vars(r)["hash"])
 	if err != nil {
 		http.Error(w, "Invalid file hash", http.StatusBadRequest)
+		return
+	}
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, File: fileHash, Targeted: true}) {
+		return
+	}
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
 		return
 	}
 	removed, err := h.gc.Unlink(r.Context(), fileHash)
@@ -148,10 +173,6 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 // sweep once, per its anchor, nothing references the shard — a "sha256"
 // sweep reclaims after this unlink alone.
 func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
-	if h.gc == nil {
-		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
-		return
-	}
 	raw, err := hex.DecodeString(mux.Vars(r)["hash"])
 	if err != nil || len(raw) != 32 {
 		http.Error(w, "Invalid SHA-256 digest", http.StatusBadRequest)
@@ -162,6 +183,13 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 		// Mirrors the storage rule: the all-zero digest is the shared
 		// empty-file marker, never a deletable entry.
 		http.Error(w, "Invalid SHA-256 digest: all-zero empty-file marker", http.StatusBadRequest)
+		return
+	}
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, SHA256: digest, Targeted: true}) {
+		return
+	}
+	if h.gc == nil {
+		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
 		return
 	}
 	removed, err := h.gc.UnlinkSHA256(r.Context(), digest)
@@ -196,6 +224,9 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // dry_run reports a full stateless pass's mark-time upper bound (no
 // per-shard re-checks, no entry counts), ignoring max and budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Write}) {
+		return
+	}
 	if h.gc == nil {
 		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
 		return
