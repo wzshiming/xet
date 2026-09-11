@@ -2,11 +2,14 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 )
+
+var ErrInvalidShard = errors.New("invalid shard")
 
 // Storage defines the interface for storing and retrieving XET data
 type Storage interface {

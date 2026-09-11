@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,13 +22,13 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
 	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/token"
 	"github.com/wzshiming/xet/upload"
 )
 
@@ -34,10 +36,12 @@ import (
 // proxy) on an httptest server whose URL is also the storage base URL and
 // external URL.
 type hubFixture struct {
-	srv    *httptest.Server
-	mirror *mirror.Mirror
-	stor   storage.Storage
-	issuer *token.Issuer
+	srv           *httptest.Server
+	mirror        *mirror.Mirror
+	stor          storage.Storage
+	issuer        *auth.Issuer
+	mu            sync.Mutex
+	tokenRequests []TokenRequest
 }
 
 func newHubFixture(t *testing.T, upstream string, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
@@ -63,7 +67,7 @@ func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storage
 		t.Fatal(err)
 	}
 
-	issuer, err := token.NewIssuer(nil, 15*time.Minute)
+	issuer, err := auth.NewIssuer(nil, 15*time.Minute, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,17 +90,26 @@ func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storage
 	// Same composition as cmd/xetd: the CAS server matches its routes first
 	// and falls through to the hub front end; the shared issuer ties minting
 	// to validation.
+	fx := &hubFixture{srv: srv, mirror: m, stor: stor, issuer: issuer}
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),
-		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
+		server.WithAuthorizer(issuer),
 		server.WithNext(NewHandler(
 			WithMirror(m),
 			WithExternalURL(srv.URL),
-			WithMintToken(issuer.Mint),
+			WithMinter(MinterFunc(func(r *http.Request, req TokenRequest) (string, int64, error) {
+				fx.mu.Lock()
+				fx.tokenRequests = append(fx.tokenRequests, req)
+				fx.mu.Unlock()
+				if req.Permission != auth.Read {
+					return "", 0, ErrNotHandled
+				}
+				return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
+			})),
 			WithNext(next),
 		)),
 	)))
-	return &hubFixture{srv: srv, mirror: m, stor: stor, issuer: issuer}
+	return fx
 }
 
 // noRedirect returns a client that surfaces 3xx responses instead of following.
@@ -866,15 +879,36 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 
 func TestMirrorTokenEndpoint(t *testing.T) {
 	upstream := newPlainUpstream()
+	upstream.set("/org/repo/resolve/main/file.bin", []byte("token endpoint bytes"))
 	upstreamSrv := httptest.NewServer(upstream)
 	defer upstreamSrv.Close()
 
 	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	ready := waitReady(t, fx.srv.URL+"/org/repo/resolve/main/file.bin")
+	fileHash, err := xet.ParseFileHash(ready.Header.Get("X-Xet-Hash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenURL := fx.srv.URL + "/xet-token/" + fileHash.String()
+	if links := strings.Join(ready.Header.Values("Link"), ", "); !strings.Contains(links, "<"+tokenURL+">; rel=\"xet-auth\"") {
+		t.Fatalf("xet-auth Link = %q, want %s", links, tokenURL)
+	}
 
-	for _, path := range []string{"/xet-token", "/api/models/org/repo/xet-read-token/main"} {
-		resp, err := http.Get(fx.srv.URL + path)
+	for _, tc := range []struct {
+		path  string
+		grant auth.Grant
+	}{
+		{tokenURL, auth.Grant{Permission: auth.Read, File: fileHash}},
+		{fx.srv.URL + "/api/models/org/repo/xet-read-token/main", auth.Grant{Permission: auth.Read}},
+	} {
+		path := tc.path
+		resp, err := http.Get(path)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("%s: status = %d, want 200", path, resp.StatusCode)
 		}
 		var tok struct {
 			CASURL string `json:"casUrl"`
@@ -892,7 +926,7 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 		if tok.Exp <= time.Now().Unix() {
 			t.Fatalf("%s: exp = %d, want in the future", path, tok.Exp)
 		}
-		if !fx.issuer.Validate(tok.Token, time.Now()) {
+		if grant, ok := fx.issuer.Validate(tok.Token); !ok || grant != tc.grant {
 			t.Fatalf("%s: minted token does not validate", path)
 		}
 		// huggingface_hub >= 1.29 reads the credential only from these
@@ -906,6 +940,134 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 		if got := resp.Header.Get("X-Xet-Token-Expiration"); got != strconv.FormatInt(tok.Exp, 10) {
 			t.Fatalf("%s: X-Xet-Token-Expiration = %q, want %d", path, got, tok.Exp)
 		}
+		otherHash := fileHash
+		otherHash[0] ^= 1
+		for _, target := range []struct {
+			file   xet.FileHash
+			status int
+		}{
+			{fileHash, http.StatusOK},
+			{otherHash, http.StatusForbidden},
+		} {
+			if tc.grant.File == (xet.FileHash{}) && target.file == otherHash {
+				continue
+			}
+			req, err := http.NewRequest(http.MethodGet, fx.srv.URL+"/v1/reconstructions/"+target.file.String(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+tok.Token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != target.status {
+				t.Fatalf("%s token, reconstruction %s: status = %d, want %d", path, target.file, resp.StatusCode, target.status)
+			}
+		}
+	}
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	want := []TokenRequest{
+		{Permission: auth.Read, File: fileHash},
+		{Permission: auth.Read, RepoType: "models", Repo: "org/repo", Revision: "main"},
+	}
+	if !slices.Equal(fx.tokenRequests, want) {
+		t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
+	}
+}
+
+func TestMirrorWriteTokenFallsThrough(t *testing.T) {
+	const path = "/api/models/org/repo/xet-write-token/main"
+	wantBody := []byte(`{"accessToken":"upstream-write-token"}`)
+	upstream := newPlainUpstream()
+	upstream.api[path] = wantBody
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+
+	resp, err := http.Get(fx.srv.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || !bytes.Equal(body, wantBody) {
+		t.Fatalf("status = %d, body = %q, want 200, %q", resp.StatusCode, body, wantBody)
+	}
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	want := []TokenRequest{{Permission: auth.Write, RepoType: "models", Repo: "org/repo", Revision: "main"}}
+	if !slices.Equal(fx.tokenRequests, want) {
+		t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
+	}
+}
+
+func TestMirrorTokenMinterErrors(t *testing.T) {
+	fx := newHubFixtureNext(t, "https://example.com", http.NotFoundHandler(), t.TempDir(), t.TempDir())
+	fileHash := xet.FileHash{1}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		status    int
+		challenge string
+		body      string
+	}{
+		{"unauthenticated", auth.ErrUnauthenticated, http.StatusUnauthorized, "Bearer", "unauthenticated"},
+		{"forbidden", errors.New("nope"), http.StatusForbidden, "", "nope"},
+		{"not handled without next", fmt.Errorf("wrapped: %w", ErrNotHandled), http.StatusNotFound, "", "404 page not found"},
+		{"anonymous", nil, http.StatusOK, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/xet-token/"+fileHash.String(), nil)
+			r.Header.Set("Authorization", "Bearer caller-credential")
+			opts := []Option{WithMirror(fx.mirror)}
+			if tc.err != nil {
+				opts = append(opts, WithMinter(MinterFunc(func(got *http.Request, req TokenRequest) (string, int64, error) {
+					if got.URL != r.URL || got.Header.Get("Authorization") != "Bearer caller-credential" || req != (TokenRequest{Permission: auth.Read, File: fileHash}) {
+						t.Errorf("minter request = %v, %+v, want original request and Read", got, req)
+					}
+					return "", 0, tc.err
+				})))
+			}
+			before := time.Now().Add(15 * time.Minute).Unix()
+			response := httptest.NewRecorder()
+			NewHandler(opts...).ServeHTTP(response, r)
+			if response.Code != tc.status || response.Header().Get("WWW-Authenticate") != tc.challenge || !strings.Contains(response.Body.String(), tc.body) {
+				t.Fatalf("status = %d, headers = %v, body = %q", response.Code, response.Header(), response.Body.String())
+			}
+			if tc.err == nil {
+				var tok struct {
+					Token string `json:"accessToken"`
+					Exp   int64  `json:"exp"`
+				}
+				if err := json.NewDecoder(response.Body).Decode(&tok); err != nil {
+					t.Fatal(err)
+				}
+				if tok.Token != "" || response.Header().Get("X-Xet-Access-Token") != "" || tok.Exp < before || tok.Exp > time.Now().Add(15*time.Minute).Unix() {
+					t.Fatalf("anonymous token = %+v, headers = %v", tok, response.Header())
+				}
+			}
+		})
+	}
+	for _, file := range []string{"nothex", (xet.FileHash{}).String()} {
+		t.Run("invalid file hash/"+file, func(t *testing.T) {
+			called := false
+			handler := NewHandler(WithMinter(MinterFunc(func(r *http.Request, req TokenRequest) (string, int64, error) {
+				called = true
+				return "", 0, nil
+			})))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/xet-token/"+file, nil))
+			if response.Code != http.StatusBadRequest || response.Body.String() != "Invalid file hash\n" || called {
+				t.Fatalf("status = %d, body = %q, minter called = %v", response.Code, response.Body.String(), called)
+			}
+		})
 	}
 }
 
@@ -929,6 +1091,32 @@ func TestHubRouting(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	})
 	fx := newHubFixtureNext(t, upstreamSrv.URL, next, t.TempDir(), t.TempDir())
+	fileHash := xet.FileHash{1}
+
+	t.Run("token routes match locally", func(t *testing.T) {
+		for _, path := range []string{
+			"/xet-token/" + fileHash.String(),
+			"/api/models/org/repo/xet-read-token/main",
+			"/api/models/org/repo/xet-write-token/main",
+		} {
+			resp, err := http.Get(fx.srv.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		fx.mu.Lock()
+		defer fx.mu.Unlock()
+		want := []TokenRequest{
+			{Permission: auth.Read, File: fileHash},
+			{Permission: auth.Read, RepoType: "models", Repo: "org/repo", Revision: "main"},
+			{Permission: auth.Write, RepoType: "models", Repo: "org/repo", Revision: "main"},
+		}
+		if !slices.Equal(fx.tokenRequests, want) {
+			t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
+		}
+	})
 
 	t.Run("escaped rev stays one segment", func(t *testing.T) {
 		resp, err := http.Get(fx.srv.URL + "/org/repo/resolve/refs%2Fpr%2F1/file.bin")
@@ -951,11 +1139,26 @@ func TestHubRouting(t *testing.T) {
 		waitReady(t, fx.srv.URL+"/org/repo/resolve/refs%2Fpr%2F1/file.bin")
 	})
 
+	t.Run("bare token route falls through to next", func(t *testing.T) {
+		before := nextHits.Load()
+		resp, err := http.Get(fx.srv.URL + "/xet-token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusTeapot || nextHits.Load() != before+1 {
+			t.Fatalf("GET /xet-token: status = %d, next hits = %d, want %d and %d", resp.StatusCode, nextHits.Load(), http.StatusTeapot, before+1)
+		}
+	})
+
 	t.Run("wrong method falls through to next", func(t *testing.T) {
 		for _, path := range []string{
 			"/xet-token",
+			"/xet-token/" + fileHash.String(),
 			"/api/models/org/repo/xet-read-token/main",
 			"/api/models/org/repo/tree/main",
+			"/api/models/org/repo/xet-write-token/main",
 			"/org/repo/resolve/main/file.bin",
 		} {
 			before := nextHits.Load()

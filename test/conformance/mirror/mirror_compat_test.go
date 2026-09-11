@@ -26,11 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/token"
 )
 
 // testFile is an LFS-backed file (~27 MiB) present in both test repos.
@@ -145,7 +145,7 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	if err != nil {
 		t.Fatal(err)
 	}
-	issuer, err := token.NewIssuer(nil, 15*time.Minute)
+	issuer, err := auth.NewIssuer(nil, 15*time.Minute, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,12 +166,17 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	hfh := hf.NewHandler(
 		hf.WithMirror(m),
 		hf.WithExternalURL(srv.URL),
-		hf.WithMintToken(issuer.Mint),
+		hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
+			if req.Permission != auth.Read {
+				return "", 0, hf.ErrNotHandled
+			}
+			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
+		})),
 		hf.WithNext(proxy),
 	)
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),
-		server.WithAuthFunc(func(tok string) bool { return issuer.Validate(tok, time.Now()) }),
+		server.WithAuthorizer(issuer),
 		server.WithNext(hfh),
 	)))
 	return srv.URL

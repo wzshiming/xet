@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,13 +21,62 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
+func TestPutShardVerifiesFileHash(t *testing.T) {
+	for _, backend := range listBackends() {
+		t.Run(backend.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name    string
+				wantErr string
+			}{
+				{name: "correct"},
+				{name: "wrong file hash", wantErr: "file hash mismatch"},
+				{name: "wrong SHA-256", wantErr: "SHA-256 mismatch"},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					ctx := context.Background()
+					st := backend.newStore(t)
+					parts := [][]byte{[]byte("first chunk"), []byte("second chunk, different size")}
+					sh := shard.NewShard()
+					addGCFileBlock(t, ctx, st, sh, parts)
+					digest := sha256.Sum256(bytes.Join(parts, nil))
+					sh.Files[0].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(digest)}
+					sh.Files[0].Flags |= shard.FileWithMetadataExt
+					switch test.name {
+					case "wrong file hash":
+						sh.Files[0].FileHash[0] ^= 1
+					case "wrong SHA-256":
+						digest[0] ^= 1
+						sh.Files[0].MetadataExt.SHA256Hash = shard.NewSHA256Hash(digest)
+					}
+					inserted, err := st.PutShard(ctx, sh)
+					if test.wantErr != "" {
+						if inserted || !errors.Is(err, ErrInvalidShard) || !strings.Contains(err.Error(), test.wantErr) {
+							t.Errorf("PutShard() = %v, %v, want %q", inserted, err, test.wantErr)
+						}
+						if _, err := st.GetShard(ctx, sh.Files[0].FileHash); err == nil {
+							t.Error("GetShard() succeeded for rejected shard")
+						}
+						return
+					}
+					if err != nil || !inserted {
+						t.Fatalf("PutShard() = %v, %v", inserted, err)
+					}
+					if _, err := st.GetShard(ctx, sh.Files[0].FileHash); err != nil {
+						t.Fatalf("GetShard(): %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestShardNameIsDeterministicContentHash proves the stored object name is the
 // SHA-256 of the exact stored bytes and does not vary with the creation time
 // embedded in the (unstored) footer.
 func TestShardNameIsDeterministicContentHash(t *testing.T) {
 	newIdenticalShard := func(creationTime uint64) *shard.Shard {
 		s := shard.NewShard()
-		s.AddFile(shard.FileBlock{FileHash: xet.FileHash{1}})
+		s.AddFile(shard.FileBlock{FileHash: xet.FileHash{}})
 		s.AddCASBlock(shard.CASBlock{
 			CASHash: xet.XorbHash{2},
 			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: xet.ChunkHash{3}}},
@@ -136,16 +187,10 @@ func TestChunkIndexPersistsAndShardReloadsAfterEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fileHash := xet.FileHash{1, 2, 3}
-	secondFileHash := xet.FileHash{4, 5, 6}
-	chunkHash := xet.ChunkHash{7, 8, 9}
 	s := shard.NewShard()
-	s.AddFile(shard.FileBlock{FileHash: fileHash})
-	s.AddFile(shard.FileBlock{FileHash: secondFileHash})
-	s.AddCASBlock(shard.CASBlock{
-		CASHash: xet.XorbHash{10},
-		Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash}},
-	})
+	fileHash, _, chunkHashes := addGCFileBlock(t, context.Background(), fs, s, [][]byte{[]byte("first file")})
+	secondFileHash, _, _ := addGCFileBlock(t, context.Background(), fs, s, [][]byte{[]byte("second file")})
+	chunkHash := chunkHashes[0]
 	s.SetFooter(time.Now())
 
 	inserted, err := fs.PutShard(context.Background(), s)

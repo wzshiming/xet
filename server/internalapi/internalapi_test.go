@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -50,6 +53,161 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 		t.Fatal(err)
 	}
 	return fileHash
+}
+
+func TestInternalRoutesRequirePermission(t *testing.T) {
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHash, err := xet.ParseFileHash(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := hex.DecodeString(strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range []struct {
+		method string
+		url    string
+		grants []auth.Grant
+	}{
+		{http.MethodGet, "/internal/files", []auth.Grant{{Permission: auth.Read}}},
+		{http.MethodDelete, "/internal/files/xet/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, File: fileHash, Targeted: true}}},
+		{http.MethodDelete, "/internal/files/sha256/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, SHA256: [32]byte(raw), Targeted: true}}},
+		{http.MethodPost, "/internal/gc/sweep?dry_run=true", []auth.Grant{{Permission: auth.Write}}},
+		{http.MethodDelete, "/internal/files/xet/not-a-hash", nil},
+		{http.MethodDelete, "/internal/files/sha256/not-a-hash", nil},
+	} {
+		t.Run(route.method+" "+route.url, func(t *testing.T) {
+			var calls []auth.Grant
+			handler := NewHandler(WithStorage(fs), WithAuthorizer(auth.AuthorizerFunc(func(r *http.Request, grant auth.Grant) error {
+				calls = append(calls, grant)
+				return nil
+			})))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(route.method, route.url, nil))
+			if !reflect.DeepEqual(calls, route.grants) {
+				t.Fatalf("authorizations = %+v, want %+v", calls, route.grants)
+			}
+			if route.grants == nil && rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rec.Code)
+			}
+		})
+	}
+}
+
+func TestInternalRoutesDenyMapping(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		err       error
+		status    int
+		challenge string
+	}{
+		{"unauthenticated", auth.ErrUnauthenticated, http.StatusUnauthorized, "Bearer"},
+		{"forbidden", errors.New("nope"), http.StatusForbidden, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := NewHandler(WithAuthorizer(auth.AuthorizerFunc(func(r *http.Request, grant auth.Grant) error {
+				return test.err
+			})))
+			for _, route := range []struct{ method, url string }{
+				{http.MethodGet, "/internal/files"},
+				{http.MethodDelete, "/internal/files/xet/" + strings.Repeat("ab", 32)},
+				{http.MethodDelete, "/internal/files/sha256/" + strings.Repeat("ab", 32)},
+				{http.MethodPost, "/internal/gc/sweep?grace=invalid"},
+			} {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(route.method, route.url, nil))
+				if rec.Code != test.status {
+					t.Fatalf("%s: status = %d, want %d", route.url, rec.Code, test.status)
+				}
+				if got := rec.Header().Get("WWW-Authenticate"); got != test.challenge {
+					t.Fatalf("WWW-Authenticate = %q, want %q", got, test.challenge)
+				}
+				if !strings.Contains(rec.Body.String(), test.err.Error()) {
+					t.Fatalf("body = %q, want it to contain %q", rec.Body.String(), test.err.Error())
+				}
+			}
+		})
+	}
+}
+
+func TestInternalDeniedMutations(t *testing.T) {
+	ctx := context.Background()
+	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("denied mutation content")
+	fileHash := putTestFile(t, ctx, fs, content)
+	digest := sha256.Sum256(content)
+	handler := NewHandler(WithStorage(fs), WithAuthorizer(auth.AuthorizerFunc(func(r *http.Request, grant auth.Grant) error {
+		return auth.ErrForbidden
+	})))
+	for _, route := range []struct{ method, url string }{
+		{http.MethodDelete, "/internal/files/xet/" + fileHash.String()},
+		{http.MethodDelete, "/internal/files/sha256/" + hex.EncodeToString(digest[:])},
+		{http.MethodPost, "/internal/gc/sweep?grace=0"},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(route.method, route.url, nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: status = %d", route.url, rec.Code)
+		}
+		if _, err := fs.GetShard(ctx, fileHash); err != nil {
+			t.Fatalf("file entry changed after denied mutation: %v", err)
+		}
+		if _, err := fs.GetFileHashBySHA256(ctx, "default", digest); err != nil {
+			t.Fatalf("SHA256 entry changed after denied mutation: %v", err)
+		}
+	}
+}
+
+func TestBoundTokenCannotUnlinkEmptyFile(t *testing.T) {
+	ctx := context.Background()
+	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := shard.NewShard()
+	empty.AddFile(shard.FileBlock{})
+	if _, err := stor.PutShard(ctx, empty); err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := auth.NewIssuer(nil, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, File: xet.FileHash{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbound, _, err := issuer.Sign(auth.Grant{Permission: auth.Write})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(stor), WithAuthorizer(issuer))
+	for _, test := range []struct {
+		token  string
+		status int
+	}{
+		{token, http.StatusForbidden},
+		{unbound, http.StatusOK},
+	} {
+		request := httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+(xet.FileHash{}).String(), nil)
+		request.Header.Set("Authorization", "Bearer "+test.token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("status = %d, want %d: %s", response.Code, test.status, response.Body)
+		}
+		_, err := stor.GetShard(ctx, xet.FileHash{})
+		if (err == nil) != (test.status == http.StatusForbidden) {
+			t.Fatalf("empty file after status %d: %v", test.status, err)
+		}
+	}
 }
 
 func TestListFilesEndpoint(t *testing.T) {
