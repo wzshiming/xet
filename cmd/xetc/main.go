@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet/cmd/xetc/download"
+	"github.com/wzshiming/xet/cmd/xetc/hash"
 	"github.com/wzshiming/xet/cmd/xetc/upload"
 )
 
@@ -34,6 +35,7 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(
 		upload.NewCommand(),
 		download.NewCommand(),
+		hash.NewCommand(),
 	)
 	return cmd
 }
