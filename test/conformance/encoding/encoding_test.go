@@ -55,20 +55,7 @@ func TestConformance(t *testing.T) {
 			refChunks := getReferenceChunks(t, tt.data)
 
 			t.Run("chunking", func(t *testing.T) {
-				if len(nativeChunks) != len(refChunks) {
-					t.Fatalf("chunk count mismatch: native=%d reference=%d",
-						len(nativeChunks), len(refChunks))
-				}
-				for i := range nativeChunks {
-					if nativeChunks[i].hash != refChunks[i].hash {
-						t.Errorf("chunk[%d] hash mismatch: native=%s reference=%s",
-							i, nativeChunks[i].hash, refChunks[i].hash)
-					}
-					if nativeChunks[i].size != refChunks[i].size {
-						t.Errorf("chunk[%d] size mismatch: native=%d reference=%d",
-							i, nativeChunks[i].size, refChunks[i].size)
-					}
-				}
+				compareChunks(t, nativeChunks, refChunks)
 			})
 
 			t.Run("chunk_hash", func(t *testing.T) {
@@ -188,15 +175,7 @@ func TestXorbConformance(t *testing.T) {
 // the hash and size of each chunk.
 func getNativeChunks(t *testing.T, data []byte) []chunkEntry {
 	t.Helper()
-	var chunks []chunkEntry
-	err := xet.ChunkData(bytes.NewReader(data), func(_ int64, chunk []byte) error {
-		chunks = append(chunks, chunkEntry{hash: xet.ComputeChunkHash(chunk).String(), size: uint64(len(chunk))})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("native ChunkData: %v", err)
-	}
-	return chunks
+	return chunkViaChunkData(t, bytes.NewReader(data))
 }
 
 // getReferenceChunks splits data using the xet-core (Rust) reference implementation
@@ -212,6 +191,35 @@ func getReferenceChunks(t *testing.T, data []byte) []chunkEntry {
 		chunks[i] = chunkEntry{hash: c.Hash, size: c.Size}
 	}
 	return chunks
+}
+
+// chunkSizes returns the size of each chunk in order.
+func chunkSizes(chunks []chunkEntry) []uint64 {
+	sizes := make([]uint64, len(chunks))
+	for i, c := range chunks {
+		sizes[i] = c.size
+	}
+	return sizes
+}
+
+// compareChunks fails unless the native chunk sequence matches the reference
+// one chunk for chunk in both hash and size.
+func compareChunks(t *testing.T, native, reference []chunkEntry) {
+	t.Helper()
+	if len(native) != len(reference) {
+		t.Fatalf("chunk count mismatch: native sizes=%v reference sizes=%v",
+			chunkSizes(native), chunkSizes(reference))
+	}
+	for i := range native {
+		if native[i].hash != reference[i].hash {
+			t.Errorf("chunk[%d] hash mismatch: native=%s reference=%s",
+				i, native[i].hash, reference[i].hash)
+		}
+		if native[i].size != reference[i].size {
+			t.Errorf("chunk[%d] size mismatch: native=%d reference=%d",
+				i, native[i].size, reference[i].size)
+		}
+	}
 }
 
 func compareAggregateHashes(t *testing.T, chunks []chunkEntry) {

@@ -178,8 +178,9 @@ func findChunkBoundary(reader *bufio.Reader, buf []byte) (int, error) {
 		found := false
 
 		i := 0
-		// No boundary checks until the chunk reaches MinChunkSize.
-		for prefix := MinChunkSize - size; i < len(data) && i < prefix; i++ {
+		// No boundary checks while the chunk is shorter than MinChunkSize;
+		// the byte that brings it to exactly MinChunkSize is the first tested.
+		for prefix := MinChunkSize - 1 - size; i < len(data) && i < prefix; i++ {
 			hash = (hash << 1) + lookupTable[data[i]]
 		}
 		for ; i < len(data); i++ {

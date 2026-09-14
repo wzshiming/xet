@@ -78,7 +78,14 @@ fn run() -> Result<()> {
     let command = args.next().context("missing command")?;
 
     match command.as_str() {
-        "chunk" => write_json(&chunk_stdin()?),
+        "chunk" => {
+            let block_size = args
+                .next()
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .context("block_size must be a positive integer")?;
+            write_json(&chunk_stdin(block_size)?)
+        }
         "hash-chunk" => write_json(&hash_chunk_stdin()?),
         "hash-xorb" => write_json(&hash_list(HashKind::Xorb)?),
         "hash-file" => write_json(&hash_list(HashKind::File)?),
@@ -216,8 +223,30 @@ fn chunk_data(data: &[u8]) -> Vec<Chunk> {
     chunks
 }
 
-fn chunk_stdin() -> Result<Vec<ChunkInfo>> {
-    Ok(chunk_data(&read_stdin()?)
+/// Feeds the chunker fixed-size blocks, as a streaming caller would; the
+/// boundaries must not depend on the feed size.
+fn chunk_data_in_blocks(data: &[u8], block_size: usize) -> Vec<Chunk> {
+    let mut chunker = Chunker::default();
+    let mut chunks = Vec::new();
+    for block in data.chunks(block_size) {
+        chunks.extend(chunker.next_block(block, false));
+    }
+    if let Some(chunk) = chunker.finish() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+fn chunk_stdin(block_size: Option<usize>) -> Result<Vec<ChunkInfo>> {
+    let data = read_stdin()?;
+    let chunks = match block_size {
+        Some(block_size) => {
+            ensure!(block_size > 0, "block_size must be positive");
+            chunk_data_in_blocks(&data, block_size)
+        }
+        None => chunk_data(&data),
+    };
+    Ok(chunks
         .into_iter()
         .map(|chunk| ChunkInfo {
             hash: chunk.hash.hex(),

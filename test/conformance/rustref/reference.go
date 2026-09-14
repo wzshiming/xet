@@ -201,6 +201,14 @@ func ChunkData(data []byte) ([]ChunkInfo, error) {
 	return result, err
 }
 
+// ChunkDataInBlocks chunks data with the reference chunker fed blockSize bytes
+// at a time instead of the whole buffer.
+func ChunkDataInBlocks(data []byte, blockSize int) ([]ChunkInfo, error) {
+	var result []ChunkInfo
+	err := runRaw("chunk", []string{fmt.Sprint(blockSize)}, bytes.NewReader(data), &result)
+	return result, err
+}
+
 func HashChunk(data []byte) (string, error) {
 	var result string
 	err := runRaw("hash-chunk", nil, bytes.NewReader(data), &result)
