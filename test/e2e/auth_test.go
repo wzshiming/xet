@@ -137,7 +137,7 @@ func TestAuthCASClientFlows(t *testing.T) {
 	// written while the server reads it.
 	readToken := sign(auth.Grant{Permission: auth.Read})
 	writeToken := sign(auth.Grant{Permission: auth.Write})
-	shaWriteToken := sign(auth.Grant{Permission: auth.Write, SHA256: digestC})
+	shaWriteToken := sign(auth.Grant{Permission: auth.Write, SHA256: hex.EncodeToString(digestC[:])})
 	clock = clock.Add(-2 * time.Minute)
 	expiredToken := sign(auth.Grant{Permission: auth.Read})
 	clock = clock.Add(2 * time.Minute)
@@ -196,7 +196,7 @@ func TestAuthCASClientFlows(t *testing.T) {
 	})
 
 	t.Run("file-bound read token", func(t *testing.T) {
-		boundToken := sign(auth.Grant{Permission: auth.Read, File: hashA})
+		boundToken := sign(auth.Grant{Permission: auth.Read, File: &hashA})
 		bound := static(boundToken)
 		assertDownloadAs(t, c.DownloadFileV1WithAuthProvider, bound, hashA, fileA)
 		assertDownloadAs(t, c.DownloadFileV2WithAuthProvider, bound, hashA, fileA)

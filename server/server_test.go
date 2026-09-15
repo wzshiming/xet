@@ -96,18 +96,18 @@ func TestRoutesConsultAuthorizer(t *testing.T) {
 		body   []byte
 		want   []auth.Grant
 	}{
-		{"read v1", "GET", "/v1/reconstructions/" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: fileHash, Targeted: true}}},
-		{"read v2", "GET", "/v2/reconstructions/" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: fileHash, Targeted: true}}},
-		{"read batch", "GET", "/reconstructions?file_id=" + fileHash.String() + "&file_id=" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: fileHash, Targeted: true}, {Permission: auth.Read, File: fileHash, Targeted: true}}},
+		{"read v1", "GET", "/v1/reconstructions/" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: &fileHash}}},
+		{"read v2", "GET", "/v2/reconstructions/" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: &fileHash}}},
+		{"read batch", "GET", "/reconstructions?file_id=" + fileHash.String() + "&file_id=" + fileHash.String(), nil, []auth.Grant{{Permission: auth.Read, File: &fileHash}, {Permission: auth.Read, File: &fileHash}}},
 		{"read empty batch", "GET", "/reconstructions", nil, []auth.Grant{{Permission: auth.Read}}},
-		{"read unknown batch", "GET", "/reconstructions?file_id=" + unknown.String(), nil, []auth.Grant{{Permission: auth.Read, File: unknown, Targeted: true}}},
+		{"read unknown batch", "GET", "/reconstructions?file_id=" + unknown.String(), nil, []auth.Grant{{Permission: auth.Read, File: &unknown}}},
 		{"has xorb", "HEAD", "/v1/xorbs/default/" + xorbHash.String(), nil, []auth.Grant{{Permission: auth.Write}}},
 		{"upload xorb", "POST", "/v1/xorbs/default/" + xorbHash.String(), xorbBytes, []auth.Grant{{Permission: auth.Write}}},
 		{"query chunk", "GET", "/v1/chunks/default/" + chunkHash.String(), nil, []auth.Grant{{Permission: auth.Write}}},
 		{"query chunks batch", "POST", "/v1/chunks/default:query", fmt.Appendf(nil, `{"chunk_hashes":[%q,"nothex"]}`, chunkHash.String()), []auth.Grant{{Permission: auth.Write}}},
-		{"write v1", "POST", "/v1/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: fileHash, SHA256: digest, Targeted: true}}},
-		{"write legacy", "POST", "/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: fileHash, SHA256: digest, Targeted: true}}},
-		{"write v2", "POST", "/v2/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: fileHash, SHA256: digest, Targeted: true}}},
+		{"write v1", "POST", "/v1/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
+		{"write legacy", "POST", "/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
+		{"write v2", "POST", "/v2/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
 		{"download xorb", "GET", "/v1/xorbs/default/" + xorbHash.String(), nil, nil},
 		{"bridge get", "GET", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
 		{"bridge head", "HEAD", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
@@ -155,7 +155,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Read, File: fileHash})
+	readToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Read, File: &fileHash})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 		})
 	}
 
-	writeToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, SHA256: digest})
+	writeToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, SHA256: hex.EncodeToString(digest[:])})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 		}
 	})
 
-	fileToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, File: fileHash})
+	fileToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, File: &fileHash})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestAuthorizerDenialMapping(t *testing.T) {
 	} {
 		// Denying only targeted grants passes the untargeted pre-body shard gate and reaches the per-file check.
 		handler := NewHandler(WithStorage(stor), WithAuthorizer(auth.AuthorizerFunc(func(r *http.Request, grant auth.Grant) error {
-			if grant.File == (xet.FileHash{}) {
+			if grant.File == nil {
 				return nil
 			}
 			return test.err

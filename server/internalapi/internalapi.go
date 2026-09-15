@@ -144,7 +144,7 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid file hash", http.StatusBadRequest)
 		return
 	}
-	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, File: fileHash, Targeted: true}) {
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, File: &fileHash}) {
 		return
 	}
 	if h.gc == nil {
@@ -185,7 +185,7 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid SHA-256 digest: all-zero empty-file marker", http.StatusBadRequest)
 		return
 	}
-	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, SHA256: digest, Targeted: true}) {
+	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, SHA256: hex.EncodeToString(digest[:])}) {
 		return
 	}
 	if h.gc == nil {

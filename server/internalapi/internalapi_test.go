@@ -64,18 +64,14 @@ func TestInternalRoutesRequirePermission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := hex.DecodeString(strings.Repeat("ab", 32))
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, route := range []struct {
 		method string
 		url    string
 		grants []auth.Grant
 	}{
 		{http.MethodGet, "/internal/files", []auth.Grant{{Permission: auth.Read}}},
-		{http.MethodDelete, "/internal/files/xet/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, File: fileHash, Targeted: true}}},
-		{http.MethodDelete, "/internal/files/sha256/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, SHA256: [32]byte(raw), Targeted: true}}},
+		{http.MethodDelete, "/internal/files/xet/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, File: &fileHash}}},
+		{http.MethodDelete, "/internal/files/sha256/" + strings.Repeat("ab", 32), []auth.Grant{{Permission: auth.Write, SHA256: strings.Repeat("ab", 32)}}},
 		{http.MethodPost, "/internal/gc/sweep?dry_run=true", []auth.Grant{{Permission: auth.Write}}},
 		{http.MethodDelete, "/internal/files/xet/not-a-hash", nil},
 		{http.MethodDelete, "/internal/files/sha256/not-a-hash", nil},
@@ -180,7 +176,7 @@ func TestBoundTokenCannotUnlinkEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, File: xet.FileHash{1}})
+	token, _, err := issuer.Sign(auth.Grant{Permission: auth.Write, File: &xet.FileHash{1}})
 	if err != nil {
 		t.Fatal(err)
 	}
