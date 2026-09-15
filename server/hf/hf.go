@@ -43,8 +43,8 @@ type TokenRequest struct {
 	RepoType   string
 	Repo       string
 	Revision   string
-	// File is the resolved xet hash for the Link token route; zero for repository routes.
-	File xet.FileHash
+	// File is the resolved xet hash for the Link token route; nil for repository routes.
+	File *xet.FileHash
 }
 
 // Minter returns a CAS credential, ErrNotHandled to delegate to next, or an error answered through auth.Deny.
@@ -307,7 +307,7 @@ func (h *Handler) handleToken(perm auth.Permission) http.HandlerFunc {
 				http.Error(w, "Invalid file hash", http.StatusBadRequest)
 				return
 			}
-			req.File = file
+			req.File = &file
 		}
 		var tok string
 		exp := time.Now().Add(15 * time.Minute).Unix()

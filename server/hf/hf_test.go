@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"slices"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -898,7 +898,7 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 		path  string
 		grant auth.Grant
 	}{
-		{tokenURL, auth.Grant{Permission: auth.Read, File: fileHash}},
+		{tokenURL, auth.Grant{Permission: auth.Read, File: &fileHash}},
 		{fx.srv.URL + "/api/models/org/repo/xet-read-token/main", auth.Grant{Permission: auth.Read}},
 	} {
 		path := tc.path
@@ -926,7 +926,7 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 		if tok.Exp <= time.Now().Unix() {
 			t.Fatalf("%s: exp = %d, want in the future", path, tok.Exp)
 		}
-		if grant, ok := fx.issuer.Validate(tok.Token); !ok || grant != tc.grant {
+		if grant, ok := fx.issuer.Validate(tok.Token); !ok || !reflect.DeepEqual(grant, tc.grant) {
 			t.Fatalf("%s: minted token does not validate", path)
 		}
 		// huggingface_hub >= 1.29 reads the credential only from these
@@ -949,7 +949,7 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 			{fileHash, http.StatusOK},
 			{otherHash, http.StatusForbidden},
 		} {
-			if tc.grant.File == (xet.FileHash{}) && target.file == otherHash {
+			if tc.grant.File == nil && target.file == otherHash {
 				continue
 			}
 			req, err := http.NewRequest(http.MethodGet, fx.srv.URL+"/v1/reconstructions/"+target.file.String(), nil)
@@ -971,10 +971,10 @@ func TestMirrorTokenEndpoint(t *testing.T) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 	want := []TokenRequest{
-		{Permission: auth.Read, File: fileHash},
+		{Permission: auth.Read, File: &fileHash},
 		{Permission: auth.Read, RepoType: "models", Repo: "org/repo", Revision: "main"},
 	}
-	if !slices.Equal(fx.tokenRequests, want) {
+	if !reflect.DeepEqual(fx.tokenRequests, want) {
 		t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
 	}
 }
@@ -1003,7 +1003,7 @@ func TestMirrorWriteTokenFallsThrough(t *testing.T) {
 	fx.mu.Lock()
 	defer fx.mu.Unlock()
 	want := []TokenRequest{{Permission: auth.Write, RepoType: "models", Repo: "org/repo", Revision: "main"}}
-	if !slices.Equal(fx.tokenRequests, want) {
+	if !reflect.DeepEqual(fx.tokenRequests, want) {
 		t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
 	}
 }
@@ -1029,7 +1029,7 @@ func TestMirrorTokenMinterErrors(t *testing.T) {
 			opts := []Option{WithMirror(fx.mirror)}
 			if tc.err != nil {
 				opts = append(opts, WithMinter(MinterFunc(func(got *http.Request, req TokenRequest) (string, int64, error) {
-					if got.URL != r.URL || got.Header.Get("Authorization") != "Bearer caller-credential" || req != (TokenRequest{Permission: auth.Read, File: fileHash}) {
+					if got.URL != r.URL || got.Header.Get("Authorization") != "Bearer caller-credential" || !reflect.DeepEqual(req, TokenRequest{Permission: auth.Read, File: &fileHash}) {
 						t.Errorf("minter request = %v, %+v, want original request and Read", got, req)
 					}
 					return "", 0, tc.err
@@ -1109,11 +1109,11 @@ func TestHubRouting(t *testing.T) {
 		fx.mu.Lock()
 		defer fx.mu.Unlock()
 		want := []TokenRequest{
-			{Permission: auth.Read, File: fileHash},
+			{Permission: auth.Read, File: &fileHash},
 			{Permission: auth.Read, RepoType: "models", Repo: "org/repo", Revision: "main"},
 			{Permission: auth.Write, RepoType: "models", Repo: "org/repo", Revision: "main"},
 		}
-		if !slices.Equal(fx.tokenRequests, want) {
+		if !reflect.DeepEqual(fx.tokenRequests, want) {
 			t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
 		}
 	})

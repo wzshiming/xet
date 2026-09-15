@@ -238,7 +238,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: &fileHash}) {
 		return
 	}
 
@@ -286,7 +286,7 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 	}
 
 	for _, fileHash := range fileHashes {
-		if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+		if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: &fileHash}) {
 			return
 		}
 	}
@@ -331,7 +331,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: fileHash, Targeted: true}) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Read, File: &fileHash}) {
 		return
 	}
 
@@ -495,11 +495,11 @@ func (s *Handler) authorizeShardFiles(r *http.Request, sh *shard.Shard) error {
 		return nil
 	}
 	for _, fb := range sh.Files {
-		var digest [32]byte
+		g := auth.Grant{Permission: auth.Write, File: &fb.FileHash}
 		if fb.MetadataExt != nil {
-			digest = [32]byte(fb.MetadataExt.SHA256Hash)
+			g.SHA256 = fb.MetadataExt.SHA256Hash.String()
 		}
-		if err := s.authorizer.Authorize(r, auth.Grant{Permission: auth.Write, File: fb.FileHash, SHA256: digest, Targeted: true}); err != nil {
+		if err := s.authorizer.Authorize(r, g); err != nil {
 			return err
 		}
 	}

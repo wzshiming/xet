@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -33,11 +34,10 @@ func TestIssuerTokenFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	var file xet.FileHash
-	var digest [32]byte
 	for index := range file {
 		file[index] = 0x11
-		digest[index] = 0x22
 	}
+	digest := strings.Repeat("22", 32)
 	for _, test := range []struct {
 		name     string
 		grant    Grant
@@ -52,7 +52,7 @@ func TestIssuerTokenFormat(t *testing.T) {
 		},
 		{
 			name:     "bound",
-			grant:    Grant{Permission: Read, File: file, SHA256: digest},
+			grant:    Grant{Permission: Read, File: &file, SHA256: digest},
 			payload:  `{"permission":"read","exp":1800000060,"file":"1111111111111111111111111111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}`,
 			expected: "eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MCwiZmlsZSI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGEyNTYiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0.by-PDp7AAvzdldlFpQ0pKZMuw1WYLkSna4COvI651RI",
 		},
@@ -87,26 +87,13 @@ func TestIssuerTokenFormat(t *testing.T) {
 			if err := json.Unmarshal(decoded, &keys); err != nil {
 				t.Fatal(err)
 			}
-			if test.grant.File == (xet.FileHash{}) && (keys["file"] != nil || keys["sha256"] != nil) {
+			if test.grant.File == nil && (keys["file"] != nil || keys["sha256"] != nil) {
 				t.Fatal("unbound payload contains file or sha256")
 			}
-			if got, ok := issuer.Validate(token); !ok || got != test.grant {
+			if got, ok := issuer.Validate(token); !ok || !reflect.DeepEqual(got, test.grant) {
 				t.Fatalf("Validate() = (%+v, %v), want (%+v, true)", got, ok, test.grant)
 			}
 		})
-	}
-}
-
-func TestIssuerRejectsZeroTarget(t *testing.T) {
-	issuer, err := NewIssuer(nil, 0, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, permission := range []Permission{Read, Write} {
-		token, exp, err := issuer.Sign(Grant{Permission: permission, Targeted: true})
-		if err == nil || token != "" || exp != 0 {
-			t.Fatalf("Sign(%q, zero target) = (%q, %d, %v), want rejection", permission, token, exp, err)
-		}
 	}
 }
 
@@ -221,8 +208,8 @@ func TestIssuer(t *testing.T) {
 	for _, grant := range []Grant{
 		{Permission: Read},
 		{Permission: Write},
-		{Permission: Read, File: xet.FileHash{1}},
-		{Permission: Write, SHA256: [32]byte{2}},
+		{Permission: Read, File: &xet.FileHash{1}},
+		{Permission: Write, SHA256: strings.Repeat("02", 32)},
 	} {
 		t.Run(fmt.Sprintf("%+v", grant), func(t *testing.T) {
 			clock = now
@@ -233,7 +220,7 @@ func TestIssuer(t *testing.T) {
 			if exp != now.Add(ttl).Unix() {
 				t.Fatalf("exp = %d, want %d", exp, now.Add(ttl).Unix())
 			}
-			if got, ok := issuer.Validate(token); !ok || got != grant {
+			if got, ok := issuer.Validate(token); !ok || !reflect.DeepEqual(got, grant) {
 				t.Fatalf("Validate() = (%+v, %v), want (%+v, true)", got, ok, grant)
 			}
 			clock = time.Unix(exp, 0).Add(-time.Nanosecond)
@@ -255,6 +242,23 @@ func TestIssuer(t *testing.T) {
 			t.Fatalf("Sign(%q) = (%q, %d, %v), want unsupported permission error", perm, token, exp, err)
 		}
 	}
+	for _, digest := range []string{"ab", strings.Repeat("a", 63), strings.Repeat("a", 66), strings.Repeat("z", 64)} {
+		token, exp, err := issuer.Sign(Grant{Permission: Write, SHA256: digest})
+		if err == nil || err.Error() != fmt.Sprintf("invalid sha256 %q", digest) || token != "" || exp != 0 {
+			t.Fatalf("Sign(sha256 %q) = (%q, %d, %v), want invalid sha256 error", digest, token, exp, err)
+		}
+	}
+
+	t.Run("uppercase sha256 canonicalized", func(t *testing.T) {
+		clock = now
+		token, _, err := issuer.Sign(Grant{Permission: Write, SHA256: strings.Repeat("AB", 32)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := issuer.Validate(token); !ok || got.SHA256 != strings.Repeat("ab", 32) {
+			t.Fatalf("Validate() = (%+v, %v), want lowercase sha256", got, ok)
+		}
+	})
 
 	t.Run("fixed secret shared across issuers", func(t *testing.T) {
 		secret := []byte("0123456789abcdef0123456789abcdef")
@@ -327,10 +331,12 @@ func TestIssuerAuthorize(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock = clock.Add(2 * time.Minute)
-	file := xet.FileHash{1}
-	other := xet.FileHash{2}
-	digest := [32]byte{3}
-	otherDigest := [32]byte{4}
+	file := &xet.FileHash{1}
+	other := &xet.FileHash{2}
+	digest := strings.Repeat("03", 32)
+	otherDigest := strings.Repeat("04", 32)
+	zeroFile := &xet.FileHash{}
+	zeroDigest := strings.Repeat("00", 32)
 	for _, test := range []struct {
 		name     string
 		issuer   *Issuer
@@ -360,9 +366,9 @@ func TestIssuerAuthorize(t *testing.T) {
 		{"file match", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read, File: file}, nil},
 		{"file mismatch", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read, File: other}, ErrForbidden},
 		{"file untargeted", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read}, nil},
-		{"file zero target", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read, Targeted: true}, ErrForbidden},
-		{"sha256 zero target", issuer, "", Grant{Permission: Write, SHA256: digest}, Grant{Permission: Write, Targeted: true}, ErrForbidden},
-		{"unbound zero target", issuer, "", Grant{Permission: Read}, Grant{Permission: Read, Targeted: true}, nil},
+		{"file zero target", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read, File: zeroFile}, ErrForbidden},
+		{"sha256 zero target", issuer, "", Grant{Permission: Write, SHA256: digest}, Grant{Permission: Write, SHA256: zeroDigest}, ErrForbidden},
+		{"unbound zero target", issuer, "", Grant{Permission: Read}, Grant{Permission: Read, File: zeroFile}, nil},
 		{"file wrong permission", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Write, File: file}, ErrForbidden},
 		{"file unavailable", issuer, "", Grant{Permission: Read, File: file}, Grant{Permission: Read, SHA256: digest}, ErrForbidden},
 		{"sha256 xorb", issuer, "", Grant{Permission: Write, SHA256: digest}, Grant{Permission: Write}, nil},

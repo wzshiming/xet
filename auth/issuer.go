@@ -53,19 +53,20 @@ func (t *Issuer) Sign(g Grant) (token string, exp int64, err error) {
 	default:
 		return "", 0, fmt.Errorf("unsupported permission %q", g.Permission)
 	}
-	if g.Targeted && g.File == (xet.FileHash{}) && g.SHA256 == [32]byte{} {
-		return "", 0, fmt.Errorf("cannot sign a zero target")
-	}
 	exp = t.now().Add(t.ttl).Unix()
 	claim := claims{
 		Permission: g.Permission,
 		ExpiresAt:  &exp,
 	}
-	if g.File != (xet.FileHash{}) {
+	if g.File != nil {
 		claim.File = g.File.String()
 	}
-	if g.SHA256 != [32]byte{} {
-		claim.SHA256 = hex.EncodeToString(g.SHA256[:])
+	if g.SHA256 != "" {
+		digest, ok := canonicalSHA256(g.SHA256)
+		if !ok {
+			return "", 0, fmt.Errorf("invalid sha256 %q", g.SHA256)
+		}
+		claim.SHA256 = digest
 	}
 	payload, err := json.Marshal(claim)
 	if err != nil {
@@ -79,6 +80,15 @@ func (t *Issuer) mac(input string) []byte {
 	mac := hmac.New(sha256.New, t.secret)
 	mac.Write([]byte(input))
 	return mac.Sum(nil)
+}
+
+// canonicalSHA256 returns the lowercase form of a 64-digit hex digest.
+func canonicalSHA256(digest string) (string, bool) {
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", false
+	}
+	return hex.EncodeToString(decoded), true
 }
 
 // Validate returns the Grant carried by a valid, unexpired token signed with this issuer's secret.
@@ -114,21 +124,22 @@ func (t *Issuer) Validate(token string) (Grant, bool) {
 		if err := json.Unmarshal(claim.File, &file); err != nil {
 			return Grant{}, false
 		}
-		grant.File, err = xet.ParseFileHash(file)
+		parsed, err := xet.ParseFileHash(file)
 		if err != nil {
 			return Grant{}, false
 		}
+		grant.File = &parsed
 	}
 	if claim.SHA256 != nil {
 		var digest string
 		if err := json.Unmarshal(claim.SHA256, &digest); err != nil {
 			return Grant{}, false
 		}
-		decoded, err := hex.DecodeString(digest)
-		if err != nil || len(decoded) != len(grant.SHA256) {
+		canonical, ok := canonicalSHA256(digest)
+		if !ok {
 			return Grant{}, false
 		}
-		copy(grant.SHA256[:], decoded)
+		grant.SHA256 = canonical
 	}
 	return grant, true
 }
@@ -147,13 +158,13 @@ func (t *Issuer) Authorize(r *http.Request, required Grant) error {
 		return ErrForbidden
 	}
 	// Untargeted routes (xorbs, chunks, listing, gc) check permission only; targeted routes must match every binding the token carries.
-	if !required.Targeted && required.File == (xet.FileHash{}) && required.SHA256 == [32]byte{} {
+	if required.File == nil && required.SHA256 == "" {
 		return nil
 	}
-	if granted.File != (xet.FileHash{}) && granted.File != required.File {
+	if granted.File != nil && (required.File == nil || *granted.File != *required.File) {
 		return ErrForbidden
 	}
-	if granted.SHA256 != [32]byte{} && granted.SHA256 != required.SHA256 {
+	if granted.SHA256 != "" && granted.SHA256 != required.SHA256 {
 		return ErrForbidden
 	}
 	return nil

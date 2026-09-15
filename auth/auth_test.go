@@ -72,7 +72,7 @@ func TestDeny(t *testing.T) {
 
 func TestAuthorizerFunc(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
-	grant := Grant{Permission: Read, File: xet.FileHash{1}, SHA256: [32]byte{2}}
+	grant := Grant{Permission: Read, File: &xet.FileHash{1}, SHA256: strings.Repeat("22", 32)}
 	for _, wantErr := range []error{nil, ErrForbidden} {
 		called := false
 		authorizer := AuthorizerFunc(func(gotRequest *http.Request, gotGrant Grant) error {
