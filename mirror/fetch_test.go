@@ -540,8 +540,7 @@ func TestFetchXetStalledUpstreamRetries(t *testing.T) {
 	}
 }
 
-// Two mirrors share one xet client: the trickling ingest's reads must not keep the silent one alive,
-// and neither attempt may mutate the shared client.
+// Two mirrors share one xet client: the trickling ingest's reads must not keep the silent one alive.
 func TestFetchXetSharedClientIndependentAttempts(t *testing.T) {
 	xc := newTestXetClient(t)
 	modes := []string{"trickle", "headless"}

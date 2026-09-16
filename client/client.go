@@ -72,6 +72,23 @@ func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
 	}
 }
 
+// WithProgressObserver adds a progress callback that runs after any one already set, where WithProgressFunc would replace it; nil adds nothing.
+func WithProgressObserver(observer progress.ProgressFunc) Options {
+	return func(c *Client) {
+		prev := c.progressFunc
+		switch {
+		case observer == nil:
+		case prev == nil:
+			c.progressFunc = observer
+		default:
+			c.progressFunc = func(name string, current, total int64) {
+				prev(name, current, total)
+				observer(name, current, total)
+			}
+		}
+	}
+}
+
 // WithConcurrency sets the concurrency level for uploads and downloads, allowing multiple parts of a file to be processed in parallel for improved performance.
 func WithConcurrency(concurrency int) Options {
 	return func(c *Client) {

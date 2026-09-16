@@ -36,7 +36,7 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
 		}
 		// Attempt-scoped copy: the raw-read callback must not be set on the shared client.
 		xc := *m.xetClient
-		client.WithProgressFunc(w.progressFunc)(&xc)
+		client.WithProgressObserver(w.progressFunc)(&xc)
 		return xc.DownloadFileWithAuthProvider(ctx, provider, fileHash, &progressSpool{spool: t.spool, progress: w})
 	})
 }

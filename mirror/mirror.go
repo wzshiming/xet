@@ -143,9 +143,7 @@ func WithCacheDir(dir string) Option {
 
 // WithClient sets the xet client used for upstream xet downloads, letting
 // the caller configure it (chunk cache location, concurrency, ...). When
-// unset a default client is created. Ingest downloads run on a per-attempt
-// copy whose progress callback feeds the stall watchdog, so a progress
-// function set on the client does not observe them.
+// unset a default client is created.
 func WithClient(c *client.Client) Option {
 	return func(m *Mirror) { m.xetClient = c }
 }
