@@ -560,6 +560,9 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// maxChunkQueryBodyBytes caps a batch query body; 1 MiB is roughly 15k chunk hashes.
+const maxChunkQueryBodyBytes = 1 << 20
+
 // handleQueryChunksBatch handles POST /v1/chunks/{namespace}:query.
 func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
@@ -569,8 +572,14 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 	vars := mux.Vars(r)
 	namespace := vars["namespace"]
 
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChunkQueryBodyBytes))
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	var reqBody batchChunkDedupQueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+	if err != nil || json.Unmarshal(body, &reqBody) != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}

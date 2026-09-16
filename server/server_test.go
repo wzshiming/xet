@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -773,5 +774,74 @@ func TestXetBridgeServesEmptyDigest(t *testing.T) {
 		if resp.ContentLength != 0 {
 			t.Fatalf("%s Content-Length = %d, want 0", method, resp.ContentLength)
 		}
+	}
+}
+
+type chunkQueryTestStorage struct {
+	storage.Storage
+	lookups int
+}
+
+func (s *chunkQueryTestStorage) GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
+	s.lookups++
+	return s.Storage.GetShardByChunkHash(ctx, namespace, chunkHash)
+}
+
+func TestQueryChunksBatchBodyLimit(t *testing.T) {
+	stor, _, _, chunkHash, _, _, _ := authorizerFixture(t)
+	const limit = 1 << 20
+	valid := fmt.Sprintf(`{"chunk_hashes":[%q]}`, chunkHash.String())
+	padded := valid + strings.Repeat(" ", limit-len(valid))
+	oversized, err := json.Marshal(batchChunkDedupQueryRequest{ChunkHashes: slices.Repeat([]string{chunkHash.String()}, limit/64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name          string
+		body          string
+		unknownLength bool
+		status        int
+		lookups       int
+	}{
+		{"small", valid, false, http.StatusOK, 1},
+		{"empty", "", false, http.StatusBadRequest, 0},
+		{"malformed", `{"chunk_hashes":[`, false, http.StatusBadRequest, 0},
+		{"exact limit", padded, false, http.StatusOK, 1},
+		{"one over limit", padded + " ", false, http.StatusRequestEntityTooLarge, 0},
+		{"trailing value over limit", padded + valid, false, http.StatusRequestEntityTooLarge, 0},
+		{"oversized hashes", string(oversized), false, http.StatusRequestEntityTooLarge, 0},
+		{"oversized hashes unknown length", string(oversized), true, http.StatusRequestEntityTooLarge, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probe := &chunkQueryTestStorage{Storage: stor}
+			request := httptest.NewRequest("POST", "/v1/chunks/default:query", strings.NewReader(test.body))
+			if test.unknownLength {
+				request.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+			NewHandler(WithStorage(probe)).ServeHTTP(rec, request)
+			if rec.Code != test.status {
+				t.Fatalf("status = %d, want %d: %.80s", rec.Code, test.status, rec.Body)
+			}
+			if probe.lookups != test.lookups {
+				t.Fatalf("lookups = %d, want %d", probe.lookups, test.lookups)
+			}
+		})
+	}
+}
+
+func TestQueryChunksBatchDeniedBeforeBody(t *testing.T) {
+	stor, _, _, _, _, _, _ := authorizerFixture(t)
+	probe := &chunkQueryTestStorage{Storage: stor}
+	authorizer := &recordingAuthorizer{err: auth.ErrForbidden}
+	request := httptest.NewRequest("POST", "/v1/chunks/default:query", &unreadBody{t: t})
+	request.ContentLength = 16 << 20
+	rec := httptest.NewRecorder()
+	NewHandler(WithStorage(probe), WithAuthorizer(authorizer)).ServeHTTP(rec, request)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Write}}) || probe.lookups != 0 {
+		t.Fatalf("authorizations = %v, lookups = %d", authorizer.calls, probe.lookups)
 	}
 }
