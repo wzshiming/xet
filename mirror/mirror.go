@@ -102,6 +102,7 @@ type Mirror struct {
 	indexDir           string
 	spoolDir           string
 	revalidateInterval time.Duration
+	idleTimeout        time.Duration // per fetch attempt, see fetchIdleTimeout
 
 	probeClient  *http.Client // does not follow redirects; used for metadata probes
 	fetchClient  *http.Client // follows redirects; body drops resume via httpseek
@@ -159,6 +160,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	m := &Mirror{
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
+		idleTimeout:        fetchIdleTimeout,
 		entries:            map[resolveKey]*fileEntry{},
 		tasks:              map[resolveKey]*task{},
 	}

@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/wzshiming/xet/client/hf"
 )
+
+// fetchIdleTimeout bounds how long one fetch attempt may go without upstream
+// bytes before it is cut and retried; flowing transfers are never cut.
+const fetchIdleTimeout = 60 * time.Second
+
+// errFetchStalled reports an attempt cut by the idle watchdog.
+var errFetchStalled = errors.New("upstream stalled")
 
 // fetchXet downloads the file through the upstream xet CAS into the spool,
 // resuming from the current spool offset on retries. Resolve and token
