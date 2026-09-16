@@ -72,7 +72,7 @@ func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
 	}
 }
 
-// WithProgressObserver adds a progress callback that runs after any one already set, where WithProgressFunc would replace it; nil adds nothing.
+// WithProgressObserver adds a callback without replacing the current one.
 func WithProgressObserver(observer progress.ProgressFunc) Options {
 	return func(c *Client) {
 		prev := c.progressFunc
