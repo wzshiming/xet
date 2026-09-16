@@ -405,8 +405,80 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 type unreadBody struct{ t *testing.T }
 
 func (body *unreadBody) Read([]byte) (int, error) {
-	body.t.Error("request body read before authorization")
+	body.t.Error("request body read before the request was accepted")
 	return 0, io.EOF
+}
+
+type untouchedStorage struct {
+	storage.Storage
+	t *testing.T
+}
+
+func (s *untouchedStorage) HasXorb(context.Context, string, xet.XorbHash) (bool, error) {
+	s.t.Error("HasXorb called for a rejected shard upload")
+	return false, errors.New("rejected upload")
+}
+
+func (s *untouchedStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
+	s.t.Error("PutShard called for a rejected shard upload")
+	return false, errors.New("rejected upload")
+}
+
+func TestShardUploadRejectsContentLengthBeforeBody(t *testing.T) {
+	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
+		for _, test := range []struct {
+			name   string
+			length int64
+			status int
+		}{
+			{"missing", 0, http.StatusLengthRequired},
+			{"unknown", -1, http.StatusLengthRequired},
+			{"oversize", 256<<20 + 1, http.StatusRequestEntityTooLarge},
+		} {
+			t.Run(endpoint+"/"+test.name, func(t *testing.T) {
+				authorizer := &recordingAuthorizer{}
+				request := httptest.NewRequest(http.MethodPost, endpoint, &unreadBody{t: t})
+				request.ContentLength = test.length
+				rec := httptest.NewRecorder()
+				NewHandler(WithStorage(&untouchedStorage{t: t}), WithAuthorizer(authorizer)).ServeHTTP(rec, request)
+				if rec.Code != test.status || rec.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+					t.Fatalf("response = %d %v %q, want %d plain text", rec.Code, rec.Header(), rec.Body.String(), test.status)
+				}
+				if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Write}}) {
+					t.Fatalf("authorizations = %v", authorizer.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestShardUploadAtSizeLimitIsDecoded(t *testing.T) {
+	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
+		t.Run(endpoint, func(t *testing.T) {
+			// Declared length exactly at the cap must reach the decoder, which rejects the malformed body.
+			request := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader("x"))
+			request.ContentLength = 256 << 20
+			rec := httptest.NewRecorder()
+			NewHandler(WithStorage(&shardV2TestStorage{})).ServeHTTP(rec, request)
+			if endpoint != "/v2/shards" {
+				if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid shard format") {
+					t.Fatalf("response = %d %q, want 400 invalid shard format", rec.Code, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			events := bufio.NewReader(rec.Body)
+			var last shardUploadWireEvent
+			for _, err := events.Peek(1); err == nil; _, err = events.Peek(1) {
+				last = readShardUploadWireEvent(t, events)
+			}
+			if last.Type != "error" || last.Retryable || !strings.Contains(last.Message, "invalid shard format") {
+				t.Fatalf("terminal event = %+v, want non-retryable decode error", last)
+			}
+		})
+	}
 }
 
 func TestUnknownReconstructionRequiresAuthorization(t *testing.T) {
