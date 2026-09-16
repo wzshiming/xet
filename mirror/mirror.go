@@ -199,6 +199,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.ResponseHeaderTimeout = fetchIdleTimeout // body stalls are the fetch watchdog's job
 	injecting := &authInjector{inner: baseTransport, host: u.Host, token: m.upstreamToken}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -248,6 +249,74 @@ func TestFetchSlowProgressCompletes(t *testing.T) {
 	if got := up.rangeOffsets(); !slices.Equal(got, []int{0}) {
 		t.Fatalf("range offsets = %v, want a single attempt", got)
 	}
+}
+
+// fetchAttempt cuts only silence and releases the attempt context however the fetch ends.
+func TestFetchAttempt(t *testing.T) {
+	const idle = 100 * time.Millisecond
+	block := func(ctx context.Context, _ io.Writer) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return errors.New("attempt context never canceled")
+		}
+	}
+
+	t.Run("silence is cut and reported", func(t *testing.T) {
+		start := time.Now()
+		err := fetchAttempt(context.Background(), idle, block)
+		if !errors.Is(err, errFetchStalled) {
+			t.Fatalf("err = %v, want errFetchStalled", err)
+		}
+		if d := time.Since(start); d < idle {
+			t.Fatalf("cut after %s, before the idle timeout %s", d, idle)
+		}
+	})
+
+	t.Run("progress re-arms the timer", func(t *testing.T) {
+		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress io.Writer) error {
+			for range 12 { // three idle timeouts in total, gaps of a quarter each
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(idle / 4):
+				}
+				_, _ = progress.Write([]byte{0})
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("flowing attempt cut: %v", err)
+		}
+	})
+
+	t.Run("parent cancel is not a stall", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		err := fetchAttempt(ctx, time.Hour, func(ctx context.Context, w io.Writer) error {
+			cancel()
+			return block(ctx, w)
+		})
+		if !errors.Is(err, context.Canceled) || errors.Is(err, errFetchStalled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("outcome passes through and the attempt context is released", func(t *testing.T) {
+		for _, want := range []error{nil, errors.New("boom")} {
+			var attempt context.Context
+			err := fetchAttempt(context.Background(), time.Hour, func(ctx context.Context, _ io.Writer) error {
+				attempt = ctx
+				return want
+			})
+			if err != want {
+				t.Fatalf("err = %v, want %v", err, want)
+			}
+			if attempt.Err() == nil {
+				t.Fatal("attempt context still live after return")
+			}
+		}
+	})
 }
 
 // xetStallUpstream is a xet hub over a real CAS whose first xorb GET goes silent after its headers.

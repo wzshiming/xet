@@ -13,8 +13,7 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 )
 
-// fetchIdleTimeout bounds how long one fetch attempt may go without upstream
-// bytes before it is cut and retried; flowing transfers are never cut.
+// fetchIdleTimeout cuts a fetch attempt that receives no upstream bytes for this long.
 const fetchIdleTimeout = 60 * time.Second
 
 // errFetchStalled reports an attempt cut by the idle watchdog.
@@ -28,30 +27,30 @@ var errFetchStalled = errors.New("upstream stalled")
 // itself runs inside the retry loop so a transient failure there does not
 // fail the whole task.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
-	return fetchWithRetries(ctx, "xet download", func() error {
+	return m.fetchWithRetries(ctx, "xet download", func(ctx context.Context, progress io.Writer) error {
 		fileHash, provider, err := hf.ResolveDownload(ctx, m.probeClient, m.upstreamURL(key))
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return m.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, t.spool)
+		return m.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, &progressSpool{spool: t.spool, progress: progress})
 	})
 }
 
 // fetchPlain downloads the file bytes over plain HTTP into the spool, resuming
 // from the current spool offset with Range requests on retries.
 func (m *Mirror) fetchPlain(ctx context.Context, t *task, key string) error {
-	return fetchWithRetries(ctx, "plain download", func() error {
-		return m.fetchPlainOnce(ctx, t, key)
+	return m.fetchWithRetries(ctx, "plain download", func(ctx context.Context, progress io.Writer) error {
+		return m.fetchPlainOnce(ctx, t, key, progress)
 	})
 }
 
-func fetchWithRetries(ctx context.Context, operation string, fetch func() error) error {
+func (m *Mirror) fetchWithRetries(ctx context.Context, operation string, fetch func(context.Context, io.Writer) error) error {
 	var lastErr error
 	for attempt := range maxFetchAttempts {
 		if err := sleepBackoff(ctx, attempt); err != nil {
 			return err
 		}
-		lastErr = fetch()
+		lastErr = fetchAttempt(ctx, m.idleTimeout, fetch)
 		if lastErr == nil {
 			return nil
 		}
@@ -59,7 +58,46 @@ func fetchWithRetries(ctx context.Context, operation string, fetch func() error)
 	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxFetchAttempts, lastErr)
 }
 
-func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, key string) error {
+// fetchAttempt cuts the attempt after idle without a progress write; flow of any speed re-arms it.
+func fetchAttempt(ctx context.Context, idle time.Duration, fetch func(context.Context, io.Writer) error) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	w := &idleTimer{idle: idle}
+	w.timer = time.AfterFunc(idle, func() { cancel(errFetchStalled) })
+	defer w.timer.Stop()
+	err := fetch(ctx, w)
+	if err != nil && context.Cause(ctx) == errFetchStalled {
+		return fmt.Errorf("%w: no data for %s", errFetchStalled, idle)
+	}
+	return err
+}
+
+// idleTimer is the attempt's progress writer: each write re-arms the stall timer.
+type idleTimer struct {
+	timer *time.Timer
+	idle  time.Duration
+}
+
+func (w *idleTimer) Write(p []byte) (int, error) {
+	w.timer.Reset(w.idle)
+	return len(p), nil
+}
+
+// progressSpool reports the bytes landing in the spool to the attempt's progress writer.
+type progressSpool struct {
+	*spool
+	progress io.Writer
+}
+
+func (s *progressSpool) Write(p []byte) (int, error) {
+	n, err := s.spool.Write(p)
+	if n > 0 {
+		_, _ = s.progress.Write(p[:n])
+	}
+	return n, err
+}
+
+func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, key string, progress io.Writer) error {
 	offset := t.spool.size()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.upstreamURL(key), nil)
 	if err != nil {
@@ -78,7 +116,7 @@ func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, key string) error 
 		_ = resp.Body.Close()
 	}()
 
-	body := io.Reader(resp.Body)
+	body := io.TeeReader(resp.Body, progress)
 	switch {
 	case offset == 0 && resp.StatusCode == http.StatusOK:
 		if resp.ContentLength >= 0 {
