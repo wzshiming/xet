@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/client/hf"
 )
 
@@ -27,24 +29,27 @@ var errFetchStalled = errors.New("upstream stalled")
 // itself runs inside the retry loop so a transient failure there does not
 // fail the whole task.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
-	return m.fetchWithRetries(ctx, "xet download", func(ctx context.Context, progress io.Writer) error {
+	return m.fetchWithRetries(ctx, "xet download", func(ctx context.Context, w *idleTimer) error {
 		fileHash, provider, err := hf.ResolveDownload(ctx, m.probeClient, m.upstreamURL(key))
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return m.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, &progressSpool{spool: t.spool, progress: progress})
+		// Attempt-scoped copy: the raw-read callback must not be set on the shared client.
+		xc := *m.xetClient
+		client.WithProgressFunc(w.progressFunc)(&xc)
+		return xc.DownloadFileWithAuthProvider(ctx, provider, fileHash, &progressSpool{spool: t.spool, progress: w})
 	})
 }
 
 // fetchPlain downloads the file bytes over plain HTTP into the spool, resuming
 // from the current spool offset with Range requests on retries.
 func (m *Mirror) fetchPlain(ctx context.Context, t *task, key string) error {
-	return m.fetchWithRetries(ctx, "plain download", func(ctx context.Context, progress io.Writer) error {
-		return m.fetchPlainOnce(ctx, t, key, progress)
+	return m.fetchWithRetries(ctx, "plain download", func(ctx context.Context, w *idleTimer) error {
+		return m.fetchPlainOnce(ctx, t, key, w)
 	})
 }
 
-func (m *Mirror) fetchWithRetries(ctx context.Context, operation string, fetch func(context.Context, io.Writer) error) error {
+func (m *Mirror) fetchWithRetries(ctx context.Context, operation string, fetch func(context.Context, *idleTimer) error) error {
 	var lastErr error
 	for attempt := range maxFetchAttempts {
 		if err := sleepBackoff(ctx, attempt); err != nil {
@@ -58,13 +63,13 @@ func (m *Mirror) fetchWithRetries(ctx context.Context, operation string, fetch f
 	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxFetchAttempts, lastErr)
 }
 
-// fetchAttempt cuts the attempt after idle without a progress write; flow of any speed re-arms it.
-func fetchAttempt(ctx context.Context, idle time.Duration, fetch func(context.Context, io.Writer) error) error {
+// fetchAttempt cuts the attempt after idle without positive progress; flow of any speed re-arms it.
+func fetchAttempt(ctx context.Context, idle time.Duration, fetch func(context.Context, *idleTimer) error) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	w := &idleTimer{idle: idle}
 	w.timer = time.AfterFunc(idle, func() { cancel(errFetchStalled) })
-	defer w.timer.Stop()
+	defer w.stop()
 	err := fetch(ctx, w)
 	if err != nil && context.Cause(ctx) == errFetchStalled {
 		return fmt.Errorf("%w: no data for %s", errFetchStalled, idle)
@@ -72,15 +77,42 @@ func fetchAttempt(ctx context.Context, idle time.Duration, fetch func(context.Co
 	return err
 }
 
-// idleTimer is the attempt's progress writer: each write re-arms the stall timer.
+// idleTimer is the attempt's progress observer: bytes landing anywhere re-arm the stall timer.
 type idleTimer struct {
-	timer *time.Timer
-	idle  time.Duration
+	mu      sync.Mutex
+	timer   *time.Timer
+	idle    time.Duration
+	stopped bool
 }
 
 func (w *idleTimer) Write(p []byte) (int, error) {
-	w.timer.Reset(w.idle)
+	if len(p) > 0 {
+		w.touch()
+	}
 	return len(p), nil
+}
+
+// progressFunc is the xet client's per-read callback; current == 0 only announces a pending fetch.
+func (w *idleTimer) progressFunc(_ string, current, _ int64) {
+	if current > 0 {
+		w.touch()
+	}
+}
+
+func (w *idleTimer) touch() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped {
+		w.timer.Reset(w.idle)
+	}
+}
+
+// stop ends the watch for good: prefetch workers still draining after the attempt returned must not re-arm it.
+func (w *idleTimer) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stopped = true
+	w.timer.Stop()
 }
 
 // progressSpool reports the bytes landing in the spool to the attempt's progress writer.

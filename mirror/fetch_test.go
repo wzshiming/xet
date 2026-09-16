@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -259,7 +258,7 @@ func TestFetchSlowProgressCompletes(t *testing.T) {
 // fetchAttempt cuts only silence and releases the attempt context however the fetch ends.
 func TestFetchAttempt(t *testing.T) {
 	const idle = 100 * time.Millisecond
-	block := func(ctx context.Context, _ io.Writer) error {
+	block := func(ctx context.Context, _ *idleTimer) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -280,7 +279,7 @@ func TestFetchAttempt(t *testing.T) {
 	})
 
 	t.Run("progress re-arms the timer", func(t *testing.T) {
-		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress io.Writer) error {
+		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress *idleTimer) error {
 			for range 12 { // three idle timeouts in total, gaps of a quarter each
 				select {
 				case <-ctx.Done():
@@ -297,7 +296,7 @@ func TestFetchAttempt(t *testing.T) {
 	})
 
 	t.Run("empty writes do not re-arm the timer", func(t *testing.T) {
-		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress io.Writer) error {
+		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress *idleTimer) error {
 			for range 12 { // bounded: three idle timeouts of zero-byte writes
 				select {
 				case <-ctx.Done():
@@ -313,9 +312,22 @@ func TestFetchAttempt(t *testing.T) {
 		}
 	})
 
+	t.Run("late progress cannot re-arm a finished attempt", func(t *testing.T) {
+		var late *idleTimer
+		_ = fetchAttempt(context.Background(), idle, func(_ context.Context, w *idleTimer) error {
+			late = w
+			return nil
+		})
+		_, _ = late.Write([]byte{0})
+		late.progressFunc("xorb", 1, 2)
+		if late.timer.Stop() {
+			t.Fatal("progress after the attempt returned re-armed the stall timer")
+		}
+	})
+
 	t.Run("parent cancel is not a stall", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		err := fetchAttempt(ctx, time.Hour, func(ctx context.Context, w io.Writer) error {
+		err := fetchAttempt(ctx, time.Hour, func(ctx context.Context, w *idleTimer) error {
 			cancel()
 			return block(ctx, w)
 		})
@@ -327,7 +339,7 @@ func TestFetchAttempt(t *testing.T) {
 	t.Run("outcome passes through and the attempt context is released", func(t *testing.T) {
 		for _, want := range []error{nil, errors.New("boom")} {
 			var attempt context.Context
-			err := fetchAttempt(context.Background(), time.Hour, func(ctx context.Context, _ io.Writer) error {
+			err := fetchAttempt(context.Background(), time.Hour, func(ctx context.Context, _ *idleTimer) error {
 				attempt = ctx
 				return want
 			})
