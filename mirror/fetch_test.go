@@ -576,3 +576,38 @@ func TestFetchXetSharedClientIndependentAttempts(t *testing.T) {
 		t.Fatalf("headless xorb GETs = %d, want the stalled attempt retried once", gets)
 	}
 }
+
+// A progress function set on the mirror's client keeps observing the reads of every ingest sharing it,
+// including a trickling first chunk that the watchdog is also watching.
+func TestFetchXetPreservesClientProgress(t *testing.T) {
+	var positive atomic.Int64
+	xc, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithProgressFunc(func(_ string, current, _ int64) {
+		if current > 0 {
+			positive.Add(1)
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"", "trickle"} {
+		data := randomData(t, 256*1024)
+		up, hubURL := newXetStallUpstream(t, data)
+		up.mode, up.pieces, up.gap = mode, 8, testIdleTimeout/4
+		m, stor := newStallTestMirror(t, hubURL, WithClient(xc))
+		before := positive.Load()
+		in, err := m.Ingest("org/repo", "main", "weights.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, err := waitIngest(t, in, up.release)
+		if err != nil {
+			t.Fatalf("%q ingest: %v", mode, err)
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+			t.Fatalf("%q ingest stored bytes mismatch", mode)
+		}
+		if positive.Load() == before {
+			t.Fatalf("%q ingest: the client's progress function saw none of its reads", mode)
+		}
+	}
+}
