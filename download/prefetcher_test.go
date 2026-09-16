@@ -15,9 +15,6 @@ import (
 	"github.com/wzshiming/xet/internal/flock"
 )
 
-// gatedClient serves one body: data up to stallAt, then it blocks until
-// release is closed or ctx ends. stalled fires at the first blocked read and
-// closed when the body is closed.
 type gatedClient struct {
 	data    []byte
 	stallAt int
@@ -115,8 +112,6 @@ func assertReleased(t *testing.T, c *chunkCache) {
 	assertEntryUnlocked(t, c.path)
 }
 
-// readerV2Fixture builds an n-chunk xorb and a single-term reconstruction
-// covering all of it under testCacheHash.
 func readerV2Fixture(t *testing.T, n int) (chunks [][]byte, encoded []byte, recon *ReconstructionResponseV2) {
 	t.Helper()
 	chunks = make([][]byte, n)
