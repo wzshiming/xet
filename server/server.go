@@ -29,6 +29,8 @@ type Handler struct {
 	authorizer auth.Authorizer
 }
 
+const maxShardUploadBytes = 256 << 20
+
 // Option defines a functional option for configuring the Handler.
 type Option func(*Handler)
 
@@ -430,8 +432,7 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.ContentLength <= 0 {
-		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+	if !checkShardUploadLength(w, r) {
 		return
 	}
 
@@ -457,6 +458,18 @@ func (s *Handler) handleUploadShard(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func checkShardUploadLength(w http.ResponseWriter, r *http.Request) bool {
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return false
+	}
+	if r.ContentLength > maxShardUploadBytes {
+		http.Error(w, "Shard too large", http.StatusRequestEntityTooLarge)
+		return false
+	}
+	return true
 }
 
 func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {

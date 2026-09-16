@@ -62,27 +62,31 @@ func (s *Shard) decode(r io.Reader, withFooter bool, onCASBlock func(CASBlock) e
 		numEntries := binary.LittleEndian.Uint32(buf[36:40])
 		// buf[40:48] reserved
 
-		fb.Entries = make([]FileDataSequenceEntry, numEntries)
+		// Counts are untrusted: grow as entries actually arrive.
+		fb.Entries = make([]FileDataSequenceEntry, 0)
 		for i := range numEntries {
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
 				return fmt.Errorf("failed to read file entry %d: %w", i, err)
 			}
-			entry := &fb.Entries[i]
+			var entry FileDataSequenceEntry
 			copy(entry.CASHash[:], buf[:32])
 			entry.CASFlags = binary.LittleEndian.Uint32(buf[32:36])
 			entry.UnpackedSegBytes = binary.LittleEndian.Uint32(buf[36:40])
 			entry.ChunkIndexStart = binary.LittleEndian.Uint32(buf[40:44])
 			entry.ChunkIndexEnd = binary.LittleEndian.Uint32(buf[44:48])
+			fb.Entries = append(fb.Entries, entry)
 		}
 
 		if fb.Flags&FileWithVerification != 0 {
-			fb.Verification = make([]xet.VerificationHash, numEntries)
+			fb.Verification = make([]xet.VerificationHash, 0, len(fb.Entries))
 			for i := range numEntries {
 				if _, err := io.ReadFull(r, buf[:]); err != nil {
 					return fmt.Errorf("failed to read verification entry %d: %w", i, err)
 				}
-				copy(fb.Verification[i][:], buf[:32])
+				var verification xet.VerificationHash
+				copy(verification[:], buf[:32])
 				// buf[32:48] reserved
+				fb.Verification = append(fb.Verification, verification)
 			}
 		}
 
@@ -117,17 +121,18 @@ func (s *Shard) decode(r io.Reader, withFooter bool, onCASBlock func(CASBlock) e
 		cb.NumBytesInCAS = binary.LittleEndian.Uint32(buf[40:44])
 		cb.NumBytesOnDisk = binary.LittleEndian.Uint32(buf[44:48])
 
-		cb.Chunks = make([]CASChunkSequenceEntry, numEntries)
+		cb.Chunks = make([]CASChunkSequenceEntry, 0)
 		for i := range numEntries {
 			if _, err := io.ReadFull(r, buf[:]); err != nil {
 				return fmt.Errorf("failed to read chunk entry %d: %w", i, err)
 			}
-			chunk := &cb.Chunks[i]
+			var chunk CASChunkSequenceEntry
 			copy(chunk.ChunkHash[:], buf[:32])
 			chunk.ByteRangeStart = binary.LittleEndian.Uint32(buf[32:36])
 			chunk.UnpackedSegBytes = binary.LittleEndian.Uint32(buf[36:40])
 			chunk.Flags = ChunkFlags(binary.LittleEndian.Uint32(buf[40:44]))
 			// buf[44:48] reserved
+			cb.Chunks = append(cb.Chunks, chunk)
 		}
 
 		s.CASInfos = append(s.CASInfos, cb)

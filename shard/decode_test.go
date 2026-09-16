@@ -42,9 +42,6 @@ func heapBytesAllocated(fn func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
-// TestDecodeDoesNotPreallocateUnreadEntries feeds block headers that declare
-// far more entries than the stream carries; the count alone must not drive
-// memory use.
 func TestDecodeDoesNotPreallocateUnreadEntries(t *testing.T) {
 	const declared = 1 << 18
 	empty := encodedBytes(t, NewShard()) // header, file bookend, CAS bookend

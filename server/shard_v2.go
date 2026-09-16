@@ -136,8 +136,7 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
-	if r.ContentLength <= 0 {
-		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+	if !checkShardUploadLength(w, r) {
 		return
 	}
 
