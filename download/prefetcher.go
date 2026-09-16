@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"sort"
 	"sync"
@@ -254,11 +255,9 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		return
 	}
 	p.publishEntry(entry, cache)
-	err = cache.LoadAll()
-	if err != nil {
+	if err := cache.LoadAll(); err != nil {
+		// The published result stays; consumers see the failure through the closed cache.
 		cache.Done()
-		p.failEntry(entry, err)
-		return
 	}
 }
 
@@ -271,11 +270,17 @@ func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
 }
 
 func (p *prefetcher) completeEntry(entry *prefetchEntry, cache *chunkCache, err error) {
-	entry.cache = cache
-	entry.err = err
+	done := false
 	entry.once.Do(func() {
+		entry.cache = cache
+		entry.err = err
+		done = true
 		close(entry.ready)
 	})
+	if !done && cache != nil {
+		// Lost to an earlier completion or Close; nobody else will release it.
+		cache.Done()
+	}
 }
 
 func (p *prefetcher) reportProgress(key fetchKey, current, total int64) {
@@ -284,9 +289,11 @@ func (p *prefetcher) reportProgress(key fetchKey, current, total int64) {
 	}
 }
 
-// Close releases all caches owned by the prefetcher.
+// Close also rejects unpublished entries so late results cannot retain caches.
 func (p *prefetcher) Close() {
 	for _, entry := range p.entries {
+		// once.Do orders any concurrent publication before the read below.
+		p.failEntry(entry, fs.ErrClosed)
 		if entry.cache != nil {
 			entry.cache.Done()
 		}
