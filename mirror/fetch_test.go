@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -205,8 +206,12 @@ func TestFetchStalledUpstreamFailsTask(t *testing.T) {
 	if len(spools) != 1 {
 		t.Fatalf("spool files after failure = %v, want one", spools)
 	}
-	if st, err := os.Stat(spools[0]); err != nil || st.Size() != int64(p) {
-		t.Fatalf("partial spool not retained: size %d, err %v, want %d bytes", st.Size(), err, p)
+	st, err := os.Stat(spools[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != int64(p) {
+		t.Fatalf("partial spool not retained: size %d, want %d bytes", st.Size(), p)
 	}
 
 	clearBackoff(m, "/org/repo/resolve/main/dead.bin")
@@ -291,6 +296,23 @@ func TestFetchAttempt(t *testing.T) {
 		}
 	})
 
+	t.Run("empty writes do not re-arm the timer", func(t *testing.T) {
+		err := fetchAttempt(context.Background(), idle, func(ctx context.Context, progress io.Writer) error {
+			for range 12 { // bounded: three idle timeouts of zero-byte writes
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(idle / 4):
+				}
+				_, _ = progress.Write(nil)
+			}
+			return errors.New("zero-byte writes kept the attempt alive")
+		})
+		if !errors.Is(err, errFetchStalled) {
+			t.Fatalf("err = %v, want errFetchStalled", err)
+		}
+	})
+
 	t.Run("parent cancel is not a stall", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		err := fetchAttempt(ctx, time.Hour, func(ctx context.Context, w io.Writer) error {
@@ -319,38 +341,51 @@ func TestFetchAttempt(t *testing.T) {
 	})
 }
 
-// xetStallUpstream is a xet hub over a real CAS whose first xorb GET goes silent after its headers.
+// xetStallUpstream is a xet hub over a real CAS that plays the first xorb GET per mode and serves the rest normally.
 type xetStallUpstream struct {
-	casURL   string
-	fileHash string
-	sha      string
-	size     int
-	xorbGETs atomic.Int64
-	release  chan struct{}
+	casURL    string
+	fileHash  string
+	sha       string
+	size      int
+	mode      string // "" serves; "headless" headers only; "chunk" one encoded chunk, then silence; "trickle" the first chunk in pieces
+	pieces    int
+	gap       time.Duration
+	release   chan struct{}
+	firstDone chan struct{} // closed when the first xorb GET handler returns
+
+	mu            sync.Mutex
+	xorbGETs      int
+	resumes       []string // Range header of every reconstruction GET
+	firstUnpacked int      // decoded bytes of the chunk sent before the "chunk" stall
 }
 
 func newXetStallUpstream(t *testing.T, data []byte) (*xetStallUpstream, string) {
 	t.Helper()
-	u := &xetStallUpstream{release: make(chan struct{})}
+	u := &xetStallUpstream{release: make(chan struct{}), firstDone: make(chan struct{})}
 
 	var cas atomic.Pointer[server.Handler]
 	casSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v1/xorbs/") || u.xorbGETs.Add(1) != 1 {
+		u.mu.Lock()
+		if strings.Contains(r.URL.Path, "/reconstructions/") {
+			u.resumes = append(u.resumes, r.Header.Get("Range"))
+		}
+		first := false
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/xorbs/") {
+			u.xorbGETs++
+			first = u.xorbGETs == 1 && u.mode != ""
+		}
+		u.mu.Unlock()
+		if !first {
 			cas.Load().ServeHTTP(w, r)
 			return
 		}
+		defer close(u.firstDone)
 		rec := httptest.NewRecorder()
 		cas.Load().ServeHTTP(rec, r)
-		for k, v := range rec.Header() {
-			w.Header()[k] = v
-		}
+		maps.Copy(w.Header(), rec.Header())
 		w.Header().Set("Content-Length", fmt.Sprint(rec.Body.Len()))
 		w.WriteHeader(rec.Code)
-		w.(http.Flusher).Flush()
-		select {
-		case <-r.Context().Done():
-		case <-u.release:
-		}
+		u.serveFirst(w, r, rec.Body.Bytes())
 	}))
 	t.Cleanup(casSrv.Close)
 
@@ -372,6 +407,45 @@ func newXetStallUpstream(t *testing.T, data []byte) (*xetStallUpstream, string) 
 	return u, hubSrv.URL
 }
 
+// le24 decodes the little-endian 3-byte sizes of an xorb chunk header.
+func le24(b []byte) int {
+	return int(b[0]) | int(b[1])<<8 | int(b[2])<<16
+}
+
+// serveFirst writes the first xorb body per mode; headless and chunk then hold the response until the client is gone.
+func (u *xetStallUpstream) serveFirst(w http.ResponseWriter, r *http.Request, body []byte) {
+	flusher := w.(http.Flusher)
+	flusher.Flush()
+	first := 8 + le24(body[1:4]) // header bytes 1-3: packed size of chunk 0
+	switch u.mode {
+	case "chunk":
+		u.mu.Lock()
+		u.firstUnpacked = le24(body[5:8]) // header bytes 5-7: unpacked size of chunk 0
+		u.mu.Unlock()
+		_, _ = w.Write(body[:first])
+		flusher.Flush()
+	case "trickle":
+		piece := (first + u.pieces - 1) / u.pieces
+		for sent := 0; sent < first; sent += piece {
+			_, _ = w.Write(body[sent:min(sent+piece, first)])
+			flusher.Flush()
+			time.Sleep(u.gap)
+		}
+		_, _ = w.Write(body[first:])
+		return
+	}
+	select {
+	case <-r.Context().Done():
+	case <-u.release:
+	}
+}
+
+func (u *xetStallUpstream) counts() (gets int, resumes []string, firstUnpacked int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.xorbGETs, slices.Clone(u.resumes), u.firstUnpacked
+}
+
 func (u *xetStallUpstream) serveHub(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/api/xet-read-token" {
 		w.Header().Set("Content-Type", "application/json")
@@ -390,28 +464,103 @@ func (u *xetStallUpstream) serveHub(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Link", fmt.Sprintf("<http://%s/api/xet-read-token>; rel=\"xet-auth\"", r.Host))
 }
 
-// The xet path runs under the same watchdog: a silent xorb GET is cut and the retry completes.
-func TestFetchXetStalledUpstreamRetries(t *testing.T) {
-	data := randomData(t, 256*1024)
-	up, hubURL := newXetStallUpstream(t, data)
+func newTestXetClient(t *testing.T) *client.Client {
+	t.Helper()
 	xc, err := client.NewClient(client.WithCacheDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, stor := newStallTestMirror(t, hubURL, WithClient(xc))
+	return xc
+}
 
-	in, err := m.Ingest("org/repo", "main", "weights.bin")
-	if err != nil {
-		t.Fatal(err)
+// The xet path runs under the same watchdog: silence after the first xorb GET's headers or first chunk
+// is cut and retried, while a first chunk that keeps trickling in is left alone.
+func TestFetchXetStalledUpstreamRetries(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		gets int
+	}{
+		{"headless", 2},
+		{"chunk", 2},
+		{"trickle", 1},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			data := randomData(t, 256*1024)
+			up, hubURL := newXetStallUpstream(t, data)
+			up.mode, up.pieces, up.gap = tc.mode, 8, testIdleTimeout/4 // trickle spreads chunk 0 over two idle timeouts
+			m, stor := newStallTestMirror(t, hubURL, WithClient(newTestXetClient(t)))
+
+			in, err := m.Ingest("org/repo", "main", "weights.bin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, err := waitIngest(t, in, up.release)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+				t.Fatalf("stored bytes mismatch: got %d bytes, want %d", len(got), len(data))
+			}
+			select {
+			case <-up.firstDone:
+			case <-time.After(ingestGuard):
+				t.Fatal("the first xorb GET is still being served: its body was never released")
+			}
+			gets, resumes, unpacked := up.counts()
+			if gets != tc.gets {
+				t.Fatalf("xorb GETs = %d, want %d", gets, tc.gets)
+			}
+			allowed := []string{""}
+			if tc.mode == "chunk" {
+				// chunk 0 reaches the spool only if the reader beats the worker's blocking read to the cache mutex.
+				allowed = append(allowed, fmt.Sprintf("bytes=%d-", unpacked))
+			}
+			if len(resumes) != tc.gets || resumes[0] != "" || (tc.gets > 1 && !slices.Contains(allowed, resumes[1])) {
+				t.Fatalf("reconstruction Range headers = %q, want a first attempt without Range and a retry in %q", resumes, allowed)
+			}
+			m.mu.Lock()
+			tasks := len(m.tasks)
+			m.mu.Unlock()
+			if tasks != 0 {
+				t.Fatalf("%d tasks still registered after the ingest", tasks)
+			}
+		})
 	}
-	entry, err := waitIngest(t, in, up.release)
-	if err != nil {
-		t.Fatal(err)
+}
+
+// Two mirrors share one xet client: the trickling ingest's reads must not keep the silent one alive,
+// and neither attempt may mutate the shared client.
+func TestFetchXetSharedClientIndependentAttempts(t *testing.T) {
+	xc := newTestXetClient(t)
+	modes := []string{"trickle", "headless"}
+	ups := make([]*xetStallUpstream, len(modes))
+	ins := make([]*Ingestion, len(modes))
+	datas := make([][]byte, len(modes))
+	stors := make([]storage.Storage, len(modes))
+	for i, mode := range modes {
+		datas[i] = randomData(t, 256*1024)
+		up, hubURL := newXetStallUpstream(t, datas[i])
+		up.mode, up.pieces, up.gap = mode, 8, testIdleTimeout/4
+		m, stor := newStallTestMirror(t, hubURL, WithClient(xc))
+		in, err := m.Ingest("org/repo", "main", "weights.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ups[i], ins[i], stors[i] = up, in, stor
 	}
-	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
-		t.Fatalf("stored bytes mismatch: got %d bytes, want %d", len(got), len(data))
+	for i := range modes {
+		entry, err := waitIngest(t, ins[i], ups[i].release)
+		if err != nil {
+			t.Fatalf("%s ingest: %v", modes[i], err)
+		}
+		if got := readStored(t, stors[i], entry.SHA256); !bytes.Equal(got, datas[i]) {
+			t.Fatalf("%s ingest stored bytes mismatch", modes[i])
+		}
 	}
-	if n := up.xorbGETs.Load(); n < 2 {
-		t.Fatalf("xorb GETs = %d, want the stalled attempt retried", n)
+	if gets, _, _ := ups[0].counts(); gets != 1 {
+		t.Fatalf("trickle xorb GETs = %d, want a single attempt", gets)
+	}
+	if gets, _, _ := ups[1].counts(); gets != 2 {
+		t.Fatalf("headless xorb GETs = %d, want the stalled attempt retried once", gets)
 	}
 }
