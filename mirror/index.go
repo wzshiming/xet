@@ -4,8 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io/fs"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -18,115 +17,162 @@ const (
 	stateFailed entryState = "failed"
 )
 
-// fileEntry is the per-(repo, rev, path) state record. Only ready entries are
-// persisted; failures and in-flight ingests are process-local.
+// fileEntry is the per-(repo, commit, path) record; only ready entries persist, inside their commit manifest.
 type fileEntry struct {
-	Key   string     `json:"key"`
-	State entryState `json:"state"`
-
 	FileHash string `json:"file_hash,omitempty"`
 	SHA256   string `json:"sha256,omitempty"`
 	Size     int64  `json:"size"`
 	ETag     string `json:"etag,omitempty"`
-	Commit   string `json:"commit,omitempty"`
 
 	CheckedAt time.Time `json:"checked_at"`
 
 	// in-memory only
+	State     entryState `json:"-"`
 	failures  int
 	nextRetry time.Time
 	lastErr   error
 	notFound  bool
+	source    string
 }
 
-// indexEntryPath returns the on-disk location of an entry, fanned out as
-// <hash[:2]>/<hash[2:4]>/<hash[4:]>.json of the key hash and grouped under
-// the commit directory when the commit is a 40-hex id.
-func indexEntryPath(dir, commit, key string) string {
-	sum := sha256.Sum256([]byte(key))
-	h := hex.EncodeToString(sum[:])
-	if commitRevRe.MatchString(commit) {
-		dir = filepath.Join(dir, commit)
+// commitManifest is the persisted record of every ready file of one commit.
+type commitManifest struct {
+	Repo   string                `json:"repo"`
+	Commit string                `json:"commit"`
+	Source string                `json:"source,omitempty"` // branch rev a pseudo commit stands in for
+	Files  map[string]*fileEntry `json:"files"`
+}
+
+// commitState is the in-memory view of one (repo, commit) manifest; source is set once and never cleared.
+type commitState struct {
+	source string
+	files  map[string]*fileEntry // shares ready entries with m.entries
+	loaded bool                  // read or confirmed absent
+}
+
+// The caller holds m.mu.
+func (cs *commitState) publish(path string, e *fileEntry) {
+	if cs.files == nil {
+		cs.files = map[string]*fileEntry{}
 	}
-	return filepath.Join(dir, h[:2], h[2:4], h[4:]+".json")
+	cs.files[path] = e
 }
 
-// persistEntry writes a ready entry to disk so it survives restarts.
-func persistEntry(dir string, e *fileEntry) error {
-	data, err := json.Marshal(e)
+var errManifestUnread = errors.New("mirror: commit manifest unreadable")
+
+// Hashing keeps request-derived names out of the filesystem namespace.
+func repoDir(dir, repo string) string {
+	sum := sha256.Sum256([]byte(repo))
+	return filepath.Join(dir, hex.EncodeToString(sum[:]))
+}
+
+// commitPath is the manifest location; commit must be a validated 40-hex.
+func commitPath(dir, repo, commit string) string {
+	return filepath.Join(repoDir(dir, repo), "commits", commit+".json")
+}
+
+// The caller holds m.mu; failed loads remain retryable.
+func (m *Mirror) loadCommit(repo, commit string) *commitState {
+	name := repo + "\x00" + commit
+	cs := m.commits[name]
+	if cs == nil {
+		cs = &commitState{}
+		m.commits[name] = cs
+	}
+	if cs.loaded {
+		return cs
+	}
+	data, err := os.ReadFile(commitPath(m.indexDir, repo, commit))
 	if err != nil {
-		return fmt.Errorf("marshal index entry: %w", err)
+		cs.loaded = errors.Is(err, os.ErrNotExist)
+		return cs
 	}
-	path := indexEntryPath(dir, e.Commit, e.Key)
+	var man commitManifest
+	if err := json.Unmarshal(data, &man); err != nil || man.Repo != repo || man.Commit != commit ||
+		(man.Source != "" && pseudoCommit(repo, man.Source) != commit) {
+		return cs
+	}
+	cs.loaded = true
+	if cs.source == "" {
+		cs.source = man.Source
+	}
+	for path, e := range man.Files {
+		k := resolveKey{repo: repo, rev: commit, path: path}
+		if e == nil || m.entries[k] != nil || m.tasks[k] != nil {
+			continue // memory, including an in-flight task, outranks a late load
+		}
+		e.State = stateReady
+		m.entries[k] = e
+		cs.publish(path, e)
+	}
+	return cs
+}
+
+// Source must reach disk before the branch pointer.
+func (m *Mirror) ensureSource(repo, commit, source string) {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+
+	m.mu.Lock()
+	cs := m.loadCommit(repo, commit)
+	changed := cs.source == ""
+	if changed {
+		cs.source = source
+	}
+	m.mu.Unlock()
+	if changed {
+		_ = m.persistCommitLocked(repo, commit)
+	}
+}
+
+// persistCommit rewrites one manifest from the ready entries in memory; persistMu serializes snapshots and writes.
+func (m *Mirror) persistCommit(repo, commit string) error {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	return m.persistCommitLocked(repo, commit)
+}
+
+func (m *Mirror) persistCommitLocked(repo, commit string) error {
+	m.mu.Lock()
+	cs := m.loadCommit(repo, commit)
+	if !cs.loaded {
+		m.mu.Unlock()
+		return errManifestUnread
+	}
+	man := commitManifest{Repo: repo, Commit: commit, Source: cs.source, Files: make(map[string]*fileEntry, len(cs.files))}
+	for path, e := range cs.files {
+		c := *e
+		man.Files[path] = &c
+	}
+	m.mu.Unlock()
+
+	path := commitPath(m.indexDir, repo, commit)
+	if len(man.Files) == 0 && man.Source == "" {
+		err := os.Remove(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return writeJSON(path, man)
+}
+
+// writeJSON replaces path atomically through a same-directory temp file.
+func writeJSON(path string, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("create index dir: %w", err)
+		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return fmt.Errorf("write index entry: %w", err)
+	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
+	err = os.WriteFile(tmp, data, 0644)
+	if err == nil {
+		err = os.Rename(tmp, path)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("finalize index entry: %w", err)
 	}
-	return nil
-}
-
-// readEntry loads one persisted entry, returning nil for anything unreadable
-// or not ready.
-func readEntry(path string) *fileEntry {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var e fileEntry
-	if err := json.Unmarshal(data, &e); err != nil || e.Key == "" || e.State != stateReady {
-		return nil
-	}
-	return &e
-}
-
-// loadIndex reads all persisted entries under dir, skipping the branches
-// subtree. Only entries found at their canonical fanout path are loaded, so
-// later removal always targets the file that was read.
-func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
-	files := make(map[resolveKey]*fileEntry)
-	resolvedDir, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return files, nil
-		}
-		return nil, fmt.Errorf("read index dir: %w", err)
-	}
-	dir = resolvedDir
-	branches := filepath.Join(dir, "branches")
-	err = filepath.WalkDir(dir, func(path string, de fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if os.IsNotExist(walkErr) {
-				return nil
-			}
-			return walkErr
-		}
-		if de.IsDir() {
-			if path == branches {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(de.Name()) != ".json" {
-			return nil
-		}
-		e := readEntry(path)
-		if e == nil || indexEntryPath(dir, e.Commit, e.Key) != path {
-			return nil
-		}
-		if k, ok := parseResolveKey(e.Key); ok {
-			files[k] = e
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("read index dir: %w", err)
-	}
-	return files, nil
+	return err
 }

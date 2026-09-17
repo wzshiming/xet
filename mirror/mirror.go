@@ -108,11 +108,13 @@ type Mirror struct {
 	xetClient    *client.Client
 	localAdapter *localCAS
 
-	mu       sync.Mutex
-	flight   singleflight.Group
-	entries  map[resolveKey]*fileEntry
-	branches map[string]*branchEntry
-	tasks    map[resolveKey]*task
+	mu        sync.Mutex
+	persistMu sync.Mutex // orders index snapshots and writes
+	flight    singleflight.Group
+	entries   map[resolveKey]*fileEntry
+	branches  map[string]*branchEntry // repo NUL rev, loaded lazily from disk
+	commits   map[string]*commitState // repo NUL commit, loaded lazily from disk
+	tasks     map[resolveKey]*task
 }
 
 // Option configures the Mirror.
@@ -160,6 +162,8 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
 		entries:            map[resolveKey]*fileEntry{},
+		branches:           map[string]*branchEntry{},
+		commits:            map[string]*commitState{},
 		tasks:              map[resolveKey]*task{},
 	}
 	for _, opt := range opts {
@@ -180,20 +184,10 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 
 	m.indexDir = filepath.Join(m.cacheDir, "index")
 	m.spoolDir = filepath.Join(m.cacheDir, "spool")
-	branchDir := m.branchDir()
-	for _, dir := range []string{m.indexDir, branchDir, m.spoolDir} {
+	for _, dir := range []string{m.indexDir, m.spoolDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("mirror: create %s: %w", dir, err)
 		}
-	}
-
-	m.entries, err = loadIndex(m.indexDir)
-	if err != nil {
-		return nil, fmt.Errorf("mirror: load index: %w", err)
-	}
-	m.branches, err = loadBranches(branchDir)
-	if err != nil {
-		return nil, fmt.Errorf("mirror: load branches: %w", err)
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()

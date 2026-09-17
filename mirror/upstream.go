@@ -38,18 +38,22 @@ func (m *Mirror) upstreamURL(key string) string {
 // probeResult captures upstream metadata for one resolve path. Everything is
 // taken from response headers only, so no platform-specific adapters exist.
 type probeResult struct {
-	status int
-	size   int64 // -1 when unknown
-	etag   string
-	sha256 string // set when the upstream etag looks like a SHA-256
-	commit string
-	// realCommit records that commit came from the upstream rather than
-	// being synthesized; only real commits may pin branch revisions.
-	realCommit bool
-	xet        bool // upstream advertised xet link headers on the resolve response
+	status    int
+	size      int64 // -1 when unknown
+	etag      string
+	sha256    string // set when the upstream etag looks like a SHA-256
+	commit    string // always a 40-hex: the upstream's own or a synthesized one
+	synthetic bool   // commit is the pseudo commit of the requested branch
+	xet       bool   // upstream advertised xet link headers on the resolve response
 }
 
 var hexSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// pseudoCommit is the stable stand-in commit for a branch of an upstream that sends no 40-hex X-Repo-Commit.
+func pseudoCommit(repo, rev string) string {
+	sum := sha256.Sum256([]byte("xet-mirror-pseudo-commit\x00" + repo + "\x00" + rev))
+	return hex.EncodeToString(sum[:20])
+}
 
 // probe issues HEAD requests for the resolve key, following redirects
 // manually so that metadata headers from the hub hop are retained while later
@@ -57,10 +61,10 @@ var hexSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // carry no size at all (e.g. modelscope.cn) leave size at -1; the ingest
 // download learns it from its first response headers and resolve replies wait
 // for that (task.sized).
-func (m *Mirror) probe(ctx context.Context, key string) (*probeResult, error) {
+func (m *Mirror) probe(ctx context.Context, key resolveKey) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
-	cur := m.upstreamURL(key)
+	cur := m.upstreamURL(key.String())
 	for range 8 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {
@@ -101,20 +105,13 @@ func (m *Mirror) probe(ctx context.Context, key string) (*probeResult, error) {
 	if hexSHA256Re.MatchString(res.etag) {
 		res.sha256 = res.etag
 	}
-	res.realCommit = res.commit != ""
-	if res.commit == "" {
-		// Hub clients (huggingface_hub) refuse to download when the resolve
-		// response has no X-Repo-Commit; synthesize one for upstreams (e.g.
-		// modelscope.cn) that omit it: the revision itself when it already is
-		// a commit hash, otherwise a stable hash of repo identity + revision.
-		if seg := resolveRe.FindStringSubmatch(key); seg != nil {
-			if commitRevRe.MatchString(seg[2]) {
-				res.commit = seg[2]
-			} else {
-				sum := sha256.Sum256([]byte("xet-mirror-pseudo-commit\x00" + seg[1] + "\x00" + seg[2]))
-				res.commit = hex.EncodeToString(sum[:20])
-			}
+	// Hub clients refuse resolves without a 40-hex X-Repo-Commit; synthesize one when the upstream sends none.
+	if commitRevRe.MatchString(key.rev) {
+		if !commitRevRe.MatchString(res.commit) {
+			res.commit = key.rev
 		}
+	} else if pseudo := pseudoCommit(key.repo, key.rev); !commitRevRe.MatchString(res.commit) || res.commit == pseudo {
+		res.commit, res.synthetic = pseudo, true // an equal header is a chained mirror's own pseudo commit
 	}
 	return res, nil
 }
