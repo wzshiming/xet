@@ -165,7 +165,7 @@ func (m *CacheManager) release(path string) {
 func (m *CacheManager) noteMergeCandidate(hash string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(hash) < 2 {
+	if len(hash) < minCacheHashLen {
 		return
 	}
 	if m.pendingMerge == nil {
@@ -339,49 +339,64 @@ func (m *CacheManager) reconcileLocked() {
 	if err != nil && !os.IsNotExist(err) {
 		return
 	}
-	for _, prefix := range prefixes {
-		if !prefix.IsDir() {
+	// Hash directories sit exactly two fanout levels below the root; anything
+	// not shaped like a two-character prefix there is foreign and left alone.
+	var hashDirs []string
+	for _, p1 := range prefixes {
+		if !p1.IsDir() || len(p1.Name()) != 2 {
 			continue
 		}
-		hashDirs, err := os.ReadDir(filepath.Join(m.dir, prefix.Name()))
+		p1Dir := filepath.Join(m.dir, p1.Name())
+		seconds, err := os.ReadDir(p1Dir)
 		if err != nil {
 			continue
 		}
-		for _, hd := range hashDirs {
-			if !hd.IsDir() {
+		for _, p2 := range seconds {
+			if !p2.IsDir() || len(p2.Name()) != 2 {
 				continue
 			}
-			dir := filepath.Join(m.dir, prefix.Name(), hd.Name())
-			entries, err := os.ReadDir(dir)
+			p2Dir := filepath.Join(p1Dir, p2.Name())
+			hds, err := os.ReadDir(p2Dir)
 			if err != nil {
 				continue
 			}
-			for _, de := range entries {
-				name := de.Name()
-				if de.IsDir() {
-					continue
+			for _, hd := range hds {
+				if hd.IsDir() {
+					hashDirs = append(hashDirs, filepath.Join(p2Dir, hd.Name()))
 				}
-				cs, ce, _, _, ok := parseCacheFileName(name)
-				if !ok {
-					continue
-				}
-				info, err := de.Info()
-				if err != nil {
-					continue
-				}
-				path := filepath.Join(dir, name)
-				if !isCompleteCacheFile(path, cs, ce, info.Size()) {
-					// Either an active download (protected by its flock) or a
-					// crashed leftover; only the latter can be removed.
-					removeIncompleteCacheEntry(path, cs, ce)
-					continue
-				}
-				found = append(found, diskEntry{
-					path:    path,
-					size:    info.Size(),
-					modTime: info.ModTime(),
-				})
 			}
+		}
+	}
+	for _, dir := range hashDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, de := range entries {
+			name := de.Name()
+			if de.IsDir() {
+				continue
+			}
+			cs, ce, _, _, ok := parseCacheFileName(name)
+			if !ok {
+				continue
+			}
+			info, err := de.Info()
+			if err != nil {
+				continue
+			}
+			path := filepath.Join(dir, name)
+			if !isCompleteCacheFile(path, cs, ce, info.Size()) {
+				// Either an active download (protected by its flock) or a
+				// crashed leftover; only the latter can be removed.
+				removeIncompleteCacheEntry(path, cs, ce)
+				continue
+			}
+			found = append(found, diskEntry{
+				path:    path,
+				size:    info.Size(),
+				modTime: info.ModTime(),
+			})
 		}
 	}
 
@@ -499,12 +514,14 @@ func removeIncompleteCacheEntry(path string, chunkStart, chunkEnd uint32) {
 }
 
 // removeEmptyCacheDirs opportunistically removes the hash directory and its
-// two-character parent once they become empty. Removal fails harmlessly while
-// they still contain entries.
+// two fanout parents once they become empty, never the cache root. Removal
+// fails harmlessly while they still contain entries.
 func removeEmptyCacheDirs(path string) {
-	hashDir := filepath.Dir(path)
-	if os.Remove(hashDir) != nil {
-		return
+	dir := filepath.Dir(path)
+	for range 3 {
+		if os.Remove(dir) != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
 	}
-	os.Remove(filepath.Dir(hashDir)) //nolint:errcheck
 }

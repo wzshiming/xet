@@ -51,7 +51,7 @@ func cacheEntryFileSize(payload string) int64 {
 
 func findFinalFile(t *testing.T, dir, hash string) string {
 	t.Helper()
-	hashDir := filepath.Join(dir, hash[:2], hash[2:])
+	hashDir := filepath.Join(dir, hash[:2], hash[2:4], hash[4:])
 	entries, err := os.ReadDir(hashDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -360,7 +360,7 @@ func TestCacheScanAdoptsExistingEntriesAndCleansOrphans(t *testing.T) {
 	}
 
 	// A crashed download leaves an incomplete entry with no lock holder.
-	orphanDir := filepath.Join(dir, testHashC[:2], testHashC[2:])
+	orphanDir := filepath.Join(dir, testHashC[:2], testHashC[2:4], testHashC[4:])
 	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -383,6 +383,32 @@ func TestCacheScanAdoptsExistingEntriesAndCleansOrphans(t *testing.T) {
 	}
 	if got := findFinalFile(t, dir, testHashB); got != pathB {
 		t.Fatalf("got %q, want %q", got, pathB)
+	}
+}
+
+func TestCacheScanLeavesForeignDirsAlone(t *testing.T) {
+	dir := t.TempDir()
+	// Well-formed entry names outside the 2/2 prefix shape are not ours and
+	// must not be cleaned up as crashed leftovers.
+	foreign := []string{
+		filepath.Join(dir, "tmp", "aa", "bb", cacheFileName(0, 1, 0, 10)),
+		filepath.Join(dir, "aa", "tmp", "bb", cacheFileName(0, 1, 0, 10)),
+	}
+	for _, p := range foreign {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("junk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	NewCacheManager(dir, 0).prepare()
+
+	for _, p := range foreign {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("file outside the fanout shape was removed: %v", err)
+		}
 	}
 }
 
@@ -417,13 +443,36 @@ func TestCacheScanKeepsLockedIncompleteEntry(t *testing.T) {
 func TestCacheEvictionRemovesEmptyDirs(t *testing.T) {
 	dir := t.TempDir()
 	payload := "0123456789"
+	entrySize := cacheEntryFileSize(payload)
 	m := NewCacheManager(dir, 0)
-	writeCacheEntry(t, m, testHashA, payload)
+	// Both share the first fanout level "aa"; only the second level differs.
+	pathA := writeCacheEntry(t, m, testHashA, payload)
+	sibling := "aa22222222222222"
+	writeCacheEntry(t, m, sibling, payload)
+
+	// Room for one entry: only the older A goes.
+	setCapacity(m, entrySize)
+	m.evaluate()
+	if entryExists(t, dir, testHashA) {
+		t.Fatal("older entry was not evicted")
+	}
+	if _, err := os.Stat(filepath.Dir(filepath.Dir(pathA))); !os.IsNotExist(err) {
+		t.Fatalf("emptied second-level prefix dir was not removed: %v", err)
+	}
+	if !entryExists(t, dir, sibling) {
+		t.Fatal("sibling sharing the first-level prefix was evicted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "aa")); err != nil {
+		t.Fatalf("shared first-level prefix dir was removed: %v", err)
+	}
 
 	setCapacity(m, 1)
 	m.evaluate()
-	if _, err := os.Stat(filepath.Join(dir, testHashA[:2])); !os.IsNotExist(err) {
-		t.Fatalf("empty hash prefix dir was not removed: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "aa")); !os.IsNotExist(err) {
+		t.Fatalf("empty first-level prefix dir was not removed: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("cache root was removed: %v", err)
 	}
 }
 

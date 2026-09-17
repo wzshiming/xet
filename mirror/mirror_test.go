@@ -412,8 +412,28 @@ func TestBranchEntryPath(t *testing.T) {
 	})
 }
 
+// TestIndexEntryPath: file entries fan out as <hash[:2]>/<hash[2:4]>/<hash[4:]>.json
+// of the key hash, under the commit directory when the commit is a 40-hex id.
+func TestIndexEntryPath(t *testing.T) {
+	dir := "idx"
+	commit := strings.Repeat("ab", 20)
+	key := "/org/repo/resolve/" + commit + "/f.bin"
+	sum := sha256.Sum256([]byte(key))
+	h := hex.EncodeToString(sum[:])
+	leaf := filepath.Join(h[:2], h[2:4], h[4:]+".json")
+
+	if got, want := indexEntryPath(dir, commit, key), filepath.Join(dir, commit, leaf); got != want {
+		t.Errorf("grouped = %q, want %q", got, want)
+	}
+	for _, c := range []string{"", "commit-1", strings.Repeat("ab", 19)} {
+		if got, want := indexEntryPath(dir, c, key), filepath.Join(dir, leaf); got != want {
+			t.Errorf("ungrouped (commit %q) = %q, want %q", c, got, want)
+		}
+	}
+}
+
 // TestMirrorIndexLayout: branch mappings land at human-readable nested paths
-// and file entries group under their commit directory.
+// and file entries fan out under their commit directory.
 func TestMirrorIndexLayout(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
@@ -452,15 +472,112 @@ func TestMirrorIndexLayout(t *testing.T) {
 
 	key := "/Qwen/Qwen3-0.6B/resolve/" + commit + "/f.bin"
 	sum := sha256.Sum256([]byte(key))
-	entryPath := filepath.Join(cacheDir, "index", commit, hex.EncodeToString(sum[:])+".json")
+	h := hex.EncodeToString(sum[:])
+	entryPath := filepath.Join(cacheDir, "index", commit, h[:2], h[2:4], h[4:]+".json")
 	if _, err := os.Stat(entryPath); err != nil {
-		t.Fatalf("file entry not grouped under commit dir: %v", err)
+		t.Fatalf("file entry not fanned out under commit dir: %v", err)
 	}
 }
 
-// TestMirrorIndexMigration: entries persisted by older layouts (hashed branch
-// mapping names, flat file entries) move to their canonical locations on
-// startup and stay loaded.
+// TestMirrorIndexRestart: a fresh engine over the same cache dir loads the
+// grouped and ungrouped fanout entries without refetching, ignores unfinished
+// writes and the branches subtree, and invalidation removes the fanout leaf.
+func TestMirrorIndexRestart(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	cacheDir := t.TempDir()
+	indexDir := filepath.Join(cacheDir, "index")
+	commit := strings.Repeat("ef", 20)
+	grouped := &fileEntry{Key: "/org/repo/resolve/" + commit + "/g.bin", State: stateReady, Size: 1, ETag: "e1", Commit: commit, CheckedAt: time.Now()}
+	ungrouped := &fileEntry{Key: "/org/repo/resolve/main/u.bin", State: stateReady, Size: 1, ETag: "e2", Commit: "commit-1", CheckedAt: time.Now()}
+	for _, e := range []*fileEntry{grouped, ungrouped} {
+		if err := persistEntry(indexDir, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Decoys: an unfinished write beside a leaf, and a ready entry at its
+	// fanout position under the branches subtree.
+	decoy := &fileEntry{Key: "/org/repo/resolve/main/decoy.bin", State: stateReady, Size: 1, Commit: "commit-1", CheckedAt: time.Now()}
+	rawDecoy, err := json.Marshal(decoy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(indexEntryPath(indexDir, ungrouped.Commit, ungrouped.Key)+".tmp", rawDecoy, 0644); err != nil {
+		t.Fatal(err)
+	}
+	inBranches := indexEntryPath(filepath.Join(indexDir, "branches"), decoy.Commit, decoy.Key)
+	if err := os.MkdirAll(filepath.Dir(inBranches), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inBranches, rawDecoy, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, _ := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
+	m.mu.Lock()
+	loaded := len(m.entries)
+	m.mu.Unlock()
+	if loaded != 2 {
+		t.Fatalf("loaded %d entries, want exactly the 2 fanout entries", loaded)
+	}
+	res, err := m.Resolve(context.Background(), "org/repo", commit, "g.bin")
+	if err != nil || res.Entry == nil {
+		t.Fatalf("Resolve after restart = %+v, %v; want ready entry", res, err)
+	}
+	if n := upstream.dataGETs.Load(); n != 0 {
+		t.Fatalf("restart refetched %d times", n)
+	}
+
+	for _, e := range []*fileEntry{grouped, ungrouped} {
+		k, _ := parseResolveKey(e.Key)
+		m.mu.Lock()
+		le := m.entries[k]
+		m.mu.Unlock()
+		if le == nil || le.ETag != e.ETag {
+			t.Fatalf("entry %q not loaded: %+v", e.Key, le)
+		}
+		m.dropEntry(k, le)
+		if _, err := os.Stat(indexEntryPath(indexDir, e.Commit, e.Key)); !os.IsNotExist(err) {
+			t.Fatalf("fanout leaf for %q not removed: %v", e.Key, err)
+		}
+	}
+}
+
+func TestMirrorIndexSymlinkRoot(t *testing.T) {
+	cacheDir := t.TempDir()
+	indexDir := filepath.Join(cacheDir, "index")
+	if err := os.Symlink(t.TempDir(), indexDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	commit := strings.Repeat("ab", 20)
+	entries := []*fileEntry{
+		{Key: "/org/repo/resolve/" + commit + "/grouped.bin", State: stateReady, Commit: commit},
+		{Key: "/org/repo/resolve/main/ungrouped.bin", State: stateReady},
+	}
+	for _, entry := range entries {
+		if err := persistEntry(indexDir, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	engine, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), cacheDir)
+	if len(engine.entries) != len(entries) {
+		t.Fatalf("loaded %d entries through symlink, want %d", len(engine.entries), len(entries))
+	}
+	for _, entry := range entries {
+		key, _ := parseResolveKey(entry.Key)
+		loaded := engine.entries[key]
+		if loaded == nil || loaded.Commit != entry.Commit {
+			t.Fatalf("entry %q not loaded through symlink: %+v", entry.Key, loaded)
+		}
+	}
+}
+
+// TestMirrorIndexMigration: branch mappings persisted under legacy hashed
+// names move to their canonical location on startup and stay loaded; legacy
+// flat file entries are neither moved nor loaded.
 func TestMirrorIndexMigration(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
@@ -508,12 +625,8 @@ func TestMirrorIndexMigration(t *testing.T) {
 		t.Fatalf("migrated branch mapping missing: %v", err)
 	}
 
-	if _, err := os.Stat(flatEntry); !os.IsNotExist(err) {
-		t.Fatalf("legacy flat entry still present: %v", err)
-	}
-	moved := filepath.Join(cacheDir, "index", commit, hex.EncodeToString(eSum[:])+".json")
-	if _, err := os.Stat(moved); err != nil {
-		t.Fatalf("migrated file entry missing: %v", err)
+	if _, err := os.Stat(flatEntry); err != nil {
+		t.Fatalf("legacy flat entry was moved: %v", err)
 	}
 
 	m.mu.Lock()
@@ -521,8 +634,8 @@ func TestMirrorIndexMigration(t *testing.T) {
 	loadedEntry := m.entries[k]
 	loadedBranch := m.branches["org/repo\x00main"]
 	m.mu.Unlock()
-	if loadedEntry == nil {
-		t.Fatal("migrated file entry not loaded")
+	if loadedEntry != nil {
+		t.Fatalf("legacy flat file entry loaded: %+v", loadedEntry)
 	}
 	if loadedBranch == nil || loadedBranch.Commit != commit {
 		t.Fatalf("migrated branch mapping not loaded: %+v", loadedBranch)

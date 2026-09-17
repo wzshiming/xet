@@ -44,10 +44,10 @@ func (r *cachedChunkReader) Read(p []byte) (int, error) {
 // mid-pass are left to normal eviction; sources kept because they are in use
 // or locked elsewhere re-arm the merge hint so a later pass retries.
 func mergeHashDir(m *CacheManager, hash string) error {
-	if len(hash) < 2 {
+	if len(hash) < minCacheHashLen {
 		return nil
 	}
-	hashDir := filepath.Join(m.dir, hash[:2], hash[2:])
+	hashDir := cacheHashDir(m.dir, hash)
 	files, err := os.ReadDir(hashDir)
 	if err != nil {
 		if os.IsNotExist(err) || os.IsPermission(err) {

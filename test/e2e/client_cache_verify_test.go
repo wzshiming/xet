@@ -138,17 +138,23 @@ func countMultiEntryXorbDirs(t *testing.T, cacheDir string) int {
 		if !p.IsDir() {
 			continue
 		}
-		hashDirs, err := os.ReadDir(filepath.Join(cacheDir, p.Name()))
+		secondPrefixes, err := os.ReadDir(filepath.Join(cacheDir, p.Name()))
 		if err != nil {
 			continue
 		}
-		for _, hd := range hashDirs {
-			entries, err := os.ReadDir(filepath.Join(cacheDir, p.Name(), hd.Name()))
+		for _, secondPrefix := range secondPrefixes {
+			hashDirs, err := os.ReadDir(filepath.Join(cacheDir, p.Name(), secondPrefix.Name()))
 			if err != nil {
 				continue
 			}
-			if len(entries) > 1 {
-				count++
+			for _, hashDir := range hashDirs {
+				entries, err := os.ReadDir(filepath.Join(cacheDir, p.Name(), secondPrefix.Name(), hashDir.Name()))
+				if err != nil {
+					continue
+				}
+				if len(entries) > 1 {
+					count++
+				}
 			}
 		}
 	}

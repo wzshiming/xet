@@ -19,6 +19,47 @@ import (
 
 const testCacheHash = "0123456789abcdef"
 
+func TestChunkCacheRejectsEmptyHashSuffix(t *testing.T) {
+	dir := t.TempDir()
+	manager := NewCacheManager(dir, 1)
+	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), manager, "aa11", 0, 1, 10, 20)
+	if cache != nil {
+		cache.Done()
+	}
+	if err == nil {
+		t.Fatal("accepted a hash with an empty directory suffix")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid hash created cache directories: %v", entries)
+	}
+}
+
+func TestChunkCacheEntryPathUsesTwoLevelFanout(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	hash := strings.Repeat("0123456789abcdef", 4)
+	cache, err := newChunkCache(bytes.NewReader([]byte("chunk")), m, hash, 0, 1, 10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	cache.Done()
+
+	want := filepath.Join(dir, hash[:2], hash[2:4], hash[4:], cacheFileName(0, 1, 10, 20))
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("entry not at <root>/2/2/60 path: %v", err)
+	}
+	if got := cacheFilePath(dir, hash, 0, 1, 10, 20); got != want {
+		t.Fatalf("cacheFilePath = %q, want %q", got, want)
+	}
+}
+
 func TestChunkCacheSealsEntryInPlace(t *testing.T) {
 	dir := t.TempDir()
 	m := NewCacheManager(dir, 0)
@@ -31,7 +72,7 @@ func TestChunkCacheSealsEntryInPlace(t *testing.T) {
 	}
 	cache.Done()
 
-	entries, err := os.ReadDir(filepath.Join(dir, testCacheHash[:2], testCacheHash[2:]))
+	entries, err := os.ReadDir(filepath.Join(dir, testCacheHash[:2], testCacheHash[2:4], testCacheHash[4:]))
 	if err != nil {
 		t.Fatal(err)
 	}

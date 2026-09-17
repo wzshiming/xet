@@ -34,8 +34,8 @@ const defaultPresignExpiry = time.Hour
 
 // S3Storage implements Storage backed by an S3-compatible object store. It
 // uses the same object layout as FileStorage (xorbs/, shards/, index/files/,
-// index/chunks/, index/sha256/ with a two-character fanout), so a bucket
-// populated by syncing a FileStorage directory is directly usable.
+// index/chunks/, index/sha256/ with a two-level 2/2/60 hash fanout), so a
+// bucket populated by syncing a FileStorage directory is directly usable.
 type S3Storage struct {
 	client          *s3.Client
 	presignClient   *s3.PresignClient
@@ -201,14 +201,14 @@ func NewS3Storage(ctx context.Context, opts ...S3Option) (*S3Storage, error) {
 	return ss, nil
 }
 
-// objectKey returns the same git-style fanout layout FileStorage uses on
-// disk: <prefix>/<kind>/<name[:2]>/<name[2:]>.
+// objectKey returns the same two-level fanout layout FileStorage uses on
+// disk: <prefix>/<kind>/<name[:2]>/<name[2:4]>/<name[4:]>.
 func (ss *S3Storage) objectKey(kind, name string) string {
 	var key string
-	if len(name) <= 2 {
+	if len(name) <= 4 {
 		key = kind + "/" + name
 	} else {
-		key = kind + "/" + name[:2] + "/" + name[2:]
+		key = kind + "/" + name[:2] + "/" + name[2:4] + "/" + name[4:]
 	}
 	if ss.prefix != "" {
 		return ss.prefix + "/" + key
