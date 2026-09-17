@@ -22,6 +22,7 @@ func NewCommand() *cobra.Command {
 		hfRevision  string
 		namespace   string
 		concurrency int
+		cacheDir    string
 	)
 
 	cmd := &cobra.Command{
@@ -75,7 +76,7 @@ func NewCommand() *cobra.Command {
 
 			provider := client.StaticAuthProvider(casURL, casToken)
 
-			if err := common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr); err != nil {
+			if err := common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr); err != nil {
 				return err
 			}
 
@@ -102,6 +103,7 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of upload tasks to run concurrently")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for temporary upload files (default: <os temp dir>)")
 	return cmd
 }
 

@@ -12,6 +12,7 @@ import (
 func NewCommand() *cobra.Command {
 	var (
 		concurrency int
+		cacheDir    string
 		resume      bool
 	)
 
@@ -27,11 +28,12 @@ func NewCommand() *cobra.Command {
 			if _, err := fmt.Fprintf(os.Stderr, "%s Resolved Hugging Face file hash: %s\n", args[1], hash.String()); err != nil {
 				return err
 			}
-			return common.ExecuteDownload(cmd.Context(), hash, args[1], provider, "default", concurrency, resume, os.Stderr)
+			return common.ExecuteDownload(cmd.Context(), hash, args[1], provider, "default", concurrency, cacheDir, resume, os.Stderr)
 		},
 	}
 
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of xorb ranges to prefetch concurrently")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for the chunk cache (default: <os temp dir>/xet-cache)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }
