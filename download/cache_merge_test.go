@@ -50,7 +50,7 @@ func writeRangeEntry(t *testing.T, m *CacheManager, hash string, cs, ce uint32, 
 // listEntryNames returns the names of all files in hash's cache directory.
 func listEntryNames(t *testing.T, dir, hash string) []string {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, hash[:2], hash[2:]))
+	entries, err := os.ReadDir(filepath.Join(dir, hash[:2], hash[2:4], hash[4:]))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

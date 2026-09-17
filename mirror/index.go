@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,15 +39,16 @@ type fileEntry struct {
 	notFound  bool
 }
 
-// indexEntryPath returns the on-disk location of an entry: grouped under its
-// commit directory when the commit is a 40-hex id, flat otherwise.
+// indexEntryPath returns the on-disk location of an entry, fanned out as
+// <hash[:2]>/<hash[2:4]>/<hash[4:]>.json of the key hash and grouped under
+// the commit directory when the commit is a 40-hex id.
 func indexEntryPath(dir, commit, key string) string {
 	sum := sha256.Sum256([]byte(key))
-	name := hex.EncodeToString(sum[:]) + ".json"
+	h := hex.EncodeToString(sum[:])
 	if commitRevRe.MatchString(commit) {
-		return filepath.Join(dir, commit, name)
+		dir = filepath.Join(dir, commit)
 	}
-	return filepath.Join(dir, name)
+	return filepath.Join(dir, h[:2], h[2:4], h[4:]+".json")
 }
 
 // persistEntry writes a ready entry to disk so it survives restarts.
@@ -84,55 +86,47 @@ func readEntry(path string) *fileEntry {
 	return &e
 }
 
-// loadIndex reads all persisted entries from dir: entries grouped under
-// per-commit directories plus legacy flat files, which are moved under their
-// commit directory as they are seen.
+// loadIndex reads all persisted entries under dir, skipping the branches
+// subtree. Only entries found at their canonical fanout path are loaded, so
+// later removal always targets the file that was read.
 func loadIndex(dir string) (map[resolveKey]*fileEntry, error) {
 	files := make(map[resolveKey]*fileEntry)
-	dirEntries, err := os.ReadDir(dir)
+	resolvedDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return files, nil
 		}
 		return nil, fmt.Errorf("read index dir: %w", err)
 	}
-	for _, de := range dirEntries {
+	dir = resolvedDir
+	branches := filepath.Join(dir, "branches")
+	err = filepath.WalkDir(dir, func(path string, de fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
 		if de.IsDir() {
-			// Commit directories only; skips branches/ and strays.
-			if !commitRevRe.MatchString(de.Name()) {
-				continue
+			if path == branches {
+				return fs.SkipDir
 			}
-			subEntries, err := os.ReadDir(filepath.Join(dir, de.Name()))
-			if err != nil {
-				continue
-			}
-			for _, se := range subEntries {
-				if se.IsDir() || filepath.Ext(se.Name()) != ".json" {
-					continue
-				}
-				if e := readEntry(filepath.Join(dir, de.Name(), se.Name())); e != nil {
-					if k, ok := parseResolveKey(e.Key); ok {
-						files[k] = e
-					}
-				}
-			}
-			continue
+			return nil
 		}
 		if filepath.Ext(de.Name()) != ".json" {
-			continue
+			return nil
 		}
-		path := filepath.Join(dir, de.Name())
 		e := readEntry(path)
-		if e == nil {
-			continue
+		if e == nil || indexEntryPath(dir, e.Commit, e.Key) != path {
+			return nil
 		}
 		if k, ok := parseResolveKey(e.Key); ok {
 			files[k] = e
 		}
-		// Legacy flat entry: move it under its commit directory.
-		if indexEntryPath(dir, e.Commit, e.Key) != path && persistEntry(dir, e) == nil {
-			_ = os.Remove(path)
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read index dir: %w", err)
 	}
 	return files, nil
 }

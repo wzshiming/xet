@@ -123,7 +123,7 @@ func TestCacheDirRoundTrip(t *testing.T) {
 		t.Fatalf("downloaded %d bytes differ from uploaded %d bytes", len(got), len(content))
 	}
 
-	entryPattern := regexp.MustCompile(`^[0-9a-f]{2}/[0-9a-f]{62}/\d+-\d+_\d+-\d+$`)
+	entryPattern := regexp.MustCompile(`^[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/\d+-\d+_\d+-\d+$`)
 	var entries []string
 	err = filepath.WalkDir(downloadDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {

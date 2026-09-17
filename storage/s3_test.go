@@ -382,6 +382,42 @@ func listObjectKeys(t *testing.T, ss *S3Storage) map[string]struct{} {
 	return keys
 }
 
+// TestS3StorageTwoLevelFanoutLayout pins object keys to
+// [<prefix>/]<kind>/<hash[:2]>/<hash[2:4]>/<hash[4:]> and proves a fresh
+// S3Storage over the bucket resolves and enumerates full hashes.
+func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
+	for _, prefix := range []string{"", "some/prefix"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			ctx := context.Background()
+			ss := newTestS3Storage(t, WithS3Prefix(prefix))
+			content := []byte("fan me out")
+			shardObj, fileHash := putTestShard(t, ctx, ss, [][]byte{content})
+			if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+				t.Fatalf("PutShard() = %v, %v", inserted, err)
+			}
+
+			fresh, err := NewS3Storage(ctx, WithS3Client(ss.client), WithS3Bucket(ss.bucket), WithS3Prefix(prefix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := checkFanoutStore(t, ctx, fresh, shardObj, fileHash, content)
+			keys := listObjectKeys(t, ss)
+			for kind, h := range want {
+				key := kind + "/" + h[:2] + "/" + h[2:4] + "/" + h[4:]
+				if prefix != "" {
+					key = prefix + "/" + key
+				}
+				if _, ok := keys[key]; !ok {
+					t.Errorf("missing key %q; stored: %v", key, keys)
+				}
+			}
+			if len(keys) != len(want) {
+				t.Errorf("stored %d objects, want %d: %v", len(keys), len(want), keys)
+			}
+		})
+	}
+}
+
 func TestS3StorageGetXorbURL(t *testing.T) {
 	ctx := context.Background()
 	ss := newTestS3Storage(t)

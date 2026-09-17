@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -364,23 +365,146 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 
 func fanoutEntries(dir string) ([]string, error) {
 	var names []string
-	buckets, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	for _, bucket := range buckets {
-		if !bucket.IsDir() {
-			return nil, fmt.Errorf("unexpected flat entry %q", bucket.Name())
+	err := filepath.WalkDir(dir, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
 		}
-		sub, err := os.ReadDir(filepath.Join(dir, bucket.Name()))
+		rel, err := filepath.Rel(dir, path)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for _, e := range sub {
-			names = append(names, bucket.Name()+e.Name())
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		// Every object must sit at exactly <2>/<2>/<rest>.
+		if len(parts) != 3 || len(parts[0]) != 2 || len(parts[1]) != 2 {
+			return fmt.Errorf("unexpected entry %q", rel)
+		}
+		names = append(names, strings.Join(parts, ""))
+		return nil
+	})
+	return names, err
+}
+
+// TestFileStorageTwoLevelFanoutLayout pins the on-disk layout to
+// <kind>/<hash[:2]>/<hash[2:4]>/<hash[4:]> for every hash-named object and
+// proves a store reopened over that layout resolves and enumerates full hashes.
+func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
+	ctx := context.Background()
+	basePath := t.TempDir()
+	fs, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("fan me out")
+	shardObj, fileHash := putFileTestShard(t, ctx, fs, [][]byte{content})
+	if inserted, err := fs.PutShard(ctx, shardObj); err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+
+	fresh, err := NewFileStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := checkFanoutStore(t, ctx, fresh, shardObj, fileHash, content)
+	wantPaths := make(map[string]bool, len(want))
+	for kind, hash := range want {
+		wantPaths[filepath.Join(kind, hash[:2], hash[2:4], hash[4:])] = true
+	}
+	if err := filepath.WalkDir(basePath, func(entryPath string, entry iofs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(basePath, entryPath)
+		if err != nil {
+			return err
+		}
+		if !wantPaths[relative] {
+			t.Errorf("unexpected stored file: %s", relative)
+		}
+		delete(wantPaths, relative)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for entryPath := range wantPaths {
+		t.Errorf("missing stored file: %s", entryPath)
+	}
+}
+
+// checkFanoutStore verifies that st, opened over data another instance wrote,
+// resolves the one-file shard sh through every index and that each walker
+// reports the full 64-hex hash. It returns each stored kind mapped to its hash.
+func checkFanoutStore(t *testing.T, ctx context.Context, st interface {
+	Storage
+	GCStore
+}, sh *shard.Shard, fileHash xet.FileHash, content []byte) map[string]string {
+	t.Helper()
+	xorbHash := sh.CASInfos[0].CASHash
+	chunkHash := xet.ComputeChunkHash(content)
+	digest := sha256.Sum256(content)
+	shardHash, err := st.GetFileIndexEntry(ctx, fileHash)
+	if err != nil || len(shardHash) != 64 {
+		t.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
+	}
+	if ok, err := st.HasXorb(ctx, "default", xorbHash); err != nil || !ok {
+		t.Fatalf("HasXorb() = %v, %v", ok, err)
+	}
+	if _, err := st.GetShard(ctx, fileHash); err != nil {
+		t.Fatalf("GetShard(): %v", err)
+	}
+	if _, err := st.GetShardByChunkHash(ctx, "default", chunkHash); err != nil {
+		t.Fatalf("GetShardByChunkHash(): %v", err)
+	}
+	if got, err := st.GetFileHashBySHA256(ctx, "default", digest); err != nil || got != fileHash {
+		t.Fatalf("GetFileHashBySHA256() = %s, %v", got, err)
+	}
+
+	want := map[string]string{
+		"xorbs":        xorbHash.String(),
+		"shards":       shardHash,
+		"index/files":  fileHash.String(),
+		"index/chunks": chunkHash.String(),
+		"index/sha256": hex.EncodeToString(digest[:]),
+	}
+	walked := map[string][]string{}
+	collect := func(kind string) func(hash string, _ int64, _ time.Time) error {
+		return func(hash string, _ int64, _ time.Time) error {
+			walked[kind] = append(walked[kind], hash)
+			return nil
 		}
 	}
-	return names, nil
+	collectIndex := func(kind string) func(hash, gotShard string) error {
+		return func(hash, gotShard string) error {
+			if gotShard != shardHash {
+				return fmt.Errorf("%s/%s -> %q, want %q", kind, hash, gotShard, shardHash)
+			}
+			walked[kind] = append(walked[kind], hash)
+			return nil
+		}
+	}
+	if err := st.WalkXorbs(ctx, collect("xorbs")); err != nil {
+		t.Fatalf("WalkXorbs(): %v", err)
+	}
+	if err := st.WalkShards(ctx, collect("shards")); err != nil {
+		t.Fatalf("WalkShards(): %v", err)
+	}
+	if err := st.WalkFileIndex(ctx, collectIndex("index/files")); err != nil {
+		t.Fatalf("WalkFileIndex(): %v", err)
+	}
+	if err := st.WalkSHA256Index(ctx, collectIndex("index/sha256")); err != nil {
+		t.Fatalf("WalkSHA256Index(): %v", err)
+	}
+	for kind, h := range want {
+		if kind == "index/chunks" {
+			continue // no walker exists for the chunk index
+		}
+		if got := walked[kind]; len(got) != 1 || got[0] != h {
+			t.Errorf("walk %s = %q, want [%s]", kind, got, h)
+		}
+	}
+	return want
 }
 
 // encodeTestXorb serializes chunks as an xorb, with or without footer.

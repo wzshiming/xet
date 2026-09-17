@@ -157,14 +157,15 @@ func NewFileStorage(opts ...Option) (*FileStorage, error) {
 	return fs, nil
 }
 
-// objectPath returns the git-style fanout path for a hash-named object:
-// basePath/<kind>/<name[:2]>/<name[2:]>. The fanout keeps directory sizes
-// bounded; a flat layout accumulates tens of thousands of entries per model.
+// objectPath returns the two-level fanout path for a hash-named object:
+// basePath/<kind>/<name[:2]>/<name[2:4]>/<name[4:]>. The fanout keeps
+// directory sizes bounded; a flat layout accumulates tens of thousands of
+// entries per model.
 func (fs *FileStorage) objectPath(kind, name string) string {
-	if len(name) <= 2 {
+	if len(name) <= 4 {
 		return filepath.Join(fs.basePath, kind, name)
 	}
-	return filepath.Join(fs.basePath, kind, name[:2], name[2:])
+	return filepath.Join(fs.basePath, kind, name[:2], name[2:4], name[4:])
 }
 
 // hasFile checks whether a file hash already has a shard mapping.

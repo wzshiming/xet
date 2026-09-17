@@ -32,7 +32,7 @@ type cacheRange struct {
 }
 
 func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (cacheRange, error) {
-	if len(hash) < 2 || chunkEnd < chunkStart || bytesEnd < bytesStart {
+	if len(hash) < minCacheHashLen || chunkEnd < chunkStart || bytesEnd < bytesStart {
 		return cacheRange{}, fmt.Errorf("invalid cache range for hash %q", hash)
 	}
 	return cacheRange{
@@ -46,7 +46,16 @@ func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStar
 }
 
 func (r cacheRange) dir() string {
-	return filepath.Join(r.cacheDir, r.hash[:2], r.hash[2:])
+	return cacheHashDir(r.cacheDir, r.hash)
+}
+
+// Keep the hash suffix nonempty so cleanup cannot reach the cache root.
+const minCacheHashLen = 5
+
+// cacheHashDir returns the two-level fanout directory holding hash's entries:
+// cacheDir/<hash[:2]>/<hash[2:4]>/<hash[4:]>.
+func cacheHashDir(cacheDir, hash string) string {
+	return filepath.Join(cacheDir, hash[:2], hash[2:4], hash[4:])
 }
 
 func (r cacheRange) path() string {
@@ -57,7 +66,7 @@ func (r cacheRange) path() string {
 //
 // Each entry is stored as a single file at:
 //
-//	cacheDir/<hash[:2]>/<hash[2:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>
+//	cacheDir/<hash[:2]>/<hash[2:4]>/<hash[4:]>/<chunkStart>-<chunkEnd>_<bytesStart>-<bytesEnd>
 //
 // where bytesStart and bytesEnd identify the source xorb byte range.
 //
@@ -108,7 +117,7 @@ func cacheFileName(start, end uint32, bytesStart, bytesEnd int64) string {
 }
 
 func cacheFilePath(cacheDir, hash string, start, end uint32, bytesStart, bytesEnd int64) string {
-	return filepath.Join(cacheDir, hash[:2], hash[2:], cacheFileName(start, end, bytesStart, bytesEnd))
+	return filepath.Join(cacheHashDir(cacheDir, hash), cacheFileName(start, end, bytesStart, bytesEnd))
 }
 
 // parseCacheFileName parses a filename of the form
@@ -263,10 +272,10 @@ func defaultCacheDir(cacheDir string) string {
 // [chunkStart, chunkEnd). It scans the hash directory and assembles metas
 // from cached files. Returns nil if the range cannot be fully covered.
 func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) (*chunkCache, error) {
-	if len(hash) < 2 {
+	if len(hash) < minCacheHashLen {
 		return nil, nil
 	}
-	hashDir := filepath.Join(m.dir, hash[:2], hash[2:])
+	hashDir := cacheHashDir(m.dir, hash)
 	files, err := os.ReadDir(hashDir)
 	if err != nil {
 		if os.IsNotExist(err) || os.IsPermission(err) {
