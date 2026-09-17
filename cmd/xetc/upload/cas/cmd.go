@@ -14,6 +14,7 @@ func NewCommand() *cobra.Command {
 		token       string
 		namespace   string
 		concurrency int
+		cacheDir    string
 	)
 
 	cmd := &cobra.Command{
@@ -22,7 +23,7 @@ func NewCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			provider := client.StaticAuthProvider(baseURL, token)
-			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr)
+			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
 		},
 	}
 
@@ -30,5 +31,6 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of upload tasks to run concurrently")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for temporary upload files (default: <os temp dir>)")
 	return cmd
 }

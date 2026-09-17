@@ -16,6 +16,7 @@ func NewCommand() *cobra.Command {
 		token       string
 		namespace   string
 		concurrency int
+		cacheDir    string
 		resume      bool
 	)
 
@@ -30,7 +31,7 @@ func NewCommand() *cobra.Command {
 			}
 
 			provider := client.StaticAuthProvider(baseURL, token)
-			return common.ExecuteDownload(cmd.Context(), hash, args[0], provider, namespace, concurrency, resume, os.Stderr)
+			return common.ExecuteDownload(cmd.Context(), hash, args[0], provider, namespace, concurrency, cacheDir, resume, os.Stderr)
 		},
 	}
 
@@ -38,6 +39,7 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of download tasks to run concurrently")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for the chunk cache (default: <os temp dir>/xet-cache)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }

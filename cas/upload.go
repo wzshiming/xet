@@ -11,7 +11,7 @@ import (
 )
 
 // Upload uploads a file to the CAS server and returns the resulting file hash.
-func Upload(ctx context.Context, filename string, provider client.AuthProvider, namespace string, concurrency int, progressFunc progress.ProgressFunc) (fileHash xet.FileHash, err error) {
+func Upload(ctx context.Context, filename string, provider client.AuthProvider, namespace string, concurrency int, cacheDir string, progressFunc progress.ProgressFunc) (fileHash xet.FileHash, err error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return xet.FileHash{}, fmt.Errorf("open input file: %w", err)
@@ -22,6 +22,7 @@ func Upload(ctx context.Context, filename string, provider client.AuthProvider, 
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(progressFunc),
 		client.WithConcurrency(concurrency),
+		client.WithCacheDir(cacheDir),
 	}
 
 	cli, err := client.NewClient(opts...)

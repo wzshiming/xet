@@ -18,6 +18,7 @@ func NewCommand() *cobra.Command {
 		hfRevision  string
 		namespace   string
 		concurrency int
+		cacheDir    string
 	)
 
 	cmd := &cobra.Command{
@@ -40,7 +41,7 @@ func NewCommand() *cobra.Command {
 			}
 
 			provider := hf.NewWriteTokenProvider(nil, target, hfToken)
-			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, os.Stderr)
+			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
 		},
 	}
 
@@ -51,5 +52,6 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of xorb ranges to prefetch concurrently")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for temporary upload files (default: <os temp dir>)")
 	return cmd
 }
