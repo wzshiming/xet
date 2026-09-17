@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
-	xetcas "github.com/wzshiming/xet/cas"
 	"github.com/wzshiming/xet/client"
 )
 
@@ -36,11 +35,27 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.AuthPro
 		return err
 	}
 
+	f, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("upload failed: open input file: %w", err)
+	}
+	defer f.Close()
+
 	progressSummary := newProgressSummary()
-	fileHash, err := xetcas.Upload(ctx, filename, provider, namespace, concurrency, cacheDir, func(name string, current, total int64) {
-		progressSummary.Update(baseName(name), current, total)
-		progressSummary.Output(out)
-	})
+	cli, err := client.NewClient(
+		client.WithNamespace(namespace),
+		client.WithProgressFunc(func(name string, current, total int64) {
+			progressSummary.Update(baseName(name), current, total)
+			progressSummary.Output(out)
+		}),
+		client.WithConcurrency(concurrency),
+		client.WithCacheDir(cacheDir),
+	)
+	if err != nil {
+		return fmt.Errorf("upload failed: create client: %w", err)
+	}
+
+	fileHash, err := cli.UploadFileWithAuthProvider(ctx, provider, f)
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
@@ -57,11 +72,34 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.AuthPro
 
 func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, cacheDir string, resume bool, out io.Writer) (err error) {
 	progressSummary := newProgressSummary()
-	err = xetcas.Download(ctx, fileHash, outputFile, provider, namespace, concurrency, cacheDir, resume, func(name string, current, total int64) {
-		progressSummary.Update(baseName(name), current, total)
-		progressSummary.Output(out)
-	})
+	cli, err := client.NewClient(
+		client.WithNamespace(namespace),
+		client.WithProgressFunc(func(name string, current, total int64) {
+			progressSummary.Update(baseName(name), current, total)
+			progressSummary.Output(out)
+		}),
+		client.WithConcurrency(concurrency),
+		client.WithCacheDir(cacheDir),
+	)
 	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
+
+	var file *os.File
+	if resume {
+		file, err = os.OpenFile(outputFile, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			return fmt.Errorf("open output file: %w", err)
+		}
+	} else {
+		file, err = os.Create(outputFile)
+		if err != nil {
+			return fmt.Errorf("create output file: %w", err)
+		}
+	}
+	defer file.Close()
+
+	if err := cli.DownloadFileWithAuthProvider(ctx, provider, fileHash, file); err != nil {
 		return err
 	}
 
