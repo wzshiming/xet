@@ -359,16 +359,34 @@ func TestMirrorPlainUpstream(t *testing.T) {
 	})
 
 	t.Run("HEAD answered from metadata", func(t *testing.T) {
-		resp, err := noRedirect().Head(resolveURL)
+		waitReady(t, resolveURL)
+		resp, err := http.DefaultClient.Head(resolveURL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD status = %d, want 200", resp.StatusCode)
+		}
+		if resp.Request.URL.String() != resolveURL || resp.Header.Get("Location") != "" {
+			t.Fatalf("HEAD redirected: URL %q, Location %q", resp.Request.URL, resp.Header.Get("Location"))
+		}
+		if resp.ContentLength != int64(len(data)) {
+			t.Fatalf("Content-Length = %d, want %d", resp.ContentLength, len(data))
+		}
 		if got := resp.Header.Get("X-Linked-Size"); got != fmt.Sprint(len(data)) {
 			t.Fatalf("X-Linked-Size = %q, want %d", got, len(data))
 		}
 		if got := resp.Header.Get("X-Repo-Commit"); got != "commit-1" {
 			t.Fatalf("X-Repo-Commit = %q, want commit-1", got)
+		}
+		links := strings.Join(resp.Header.Values("Link"), ", ")
+		if resp.Header.Get("X-Xet-Hash") == "" || !strings.Contains(links, "xet-auth") || !strings.Contains(links, "xet-reconstruction-info") {
+			t.Fatalf("missing xet metadata: %v", resp.Header)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil || len(body) != 0 {
+			t.Fatalf("HEAD body = %q, %v; want empty", body, err)
 		}
 	})
 
@@ -413,6 +431,40 @@ func TestMirrorPlainUpstream(t *testing.T) {
 			t.Fatalf("restart refetched upstream: %d -> %d", before, got)
 		}
 	})
+}
+
+func TestMirrorEmptyFileHead(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	const resolvePath = "/org/repo/resolve/main/empty.bin"
+	upstream.set(resolvePath, []byte{})
+
+	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	resolveURL := fx.srv.URL + resolvePath
+	waitReady(t, resolveURL)
+
+	resp, err := http.DefaultClient.Head(resolveURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Request.URL.String() != resolveURL || resp.Header.Get("Location") != "" {
+		t.Fatalf("HEAD status %d at %q, Location %q; want 200 at %q", resp.StatusCode, resp.Request.URL, resp.Header.Get("Location"), resolveURL)
+	}
+	if resp.ContentLength != 0 || resp.Header.Get("X-Linked-Size") != "0" {
+		t.Fatalf("Content-Length = %d, X-Linked-Size = %q; want 0", resp.ContentLength, resp.Header.Get("X-Linked-Size"))
+	}
+	if got := resp.Header.Get("X-Repo-Commit"); got != "commit-1" {
+		t.Fatalf("X-Repo-Commit = %q, want commit-1", got)
+	}
+	if resp.Header.Get("X-Xet-Hash") != "" || len(resp.Header.Values("Link")) != 0 {
+		t.Fatalf("empty file must carry no xet metadata: %v", resp.Header)
+	}
+	if body, err := io.ReadAll(resp.Body); err != nil || len(body) != 0 {
+		t.Fatalf("HEAD body = %q, %v; want empty", body, err)
+	}
 }
 
 // TestMirrorReingestsAfterStorageUnlink covers the self-healing resolve: a

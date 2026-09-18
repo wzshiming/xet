@@ -11,6 +11,8 @@
 package mirror_test
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -71,11 +73,9 @@ func runMirrorCompat(t *testing.T, upstream, repo string) {
 	})
 
 	resp := waitReady(t, resolveURL)
-	if resp.Header.Get("X-Xet-Hash") == "" {
-		t.Error("ready resolve response is missing X-Xet-Hash")
-	}
-	if loc := resp.Header.Get("Location"); !strings.HasSuffix(loc, "/xet-bridge/"+wantSHA256) {
-		t.Errorf("ready resolve redirect = %q, want suffix %q", loc, "/xet-bridge/"+wantSHA256)
+	// Same-host HEAD redirects discard the resolve response's metadata.
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("ready HEAD redirected to %q, want a direct answer", loc)
 	}
 	// Metadata hub clients refuse to download without, mirrored from the
 	// upstream or synthesized (modelscope omits size on HEAD and may omit
@@ -83,8 +83,8 @@ func runMirrorCompat(t *testing.T, upstream, repo string) {
 	if got := trimETag(resp.Header.Get("ETag")); got != wantSHA256 {
 		t.Errorf("ready ETag = %q, want upstream sha256 %q", got, wantSHA256)
 	}
-	if size, err := strconv.ParseInt(resp.Header.Get("X-Linked-Size"), 10, 64); err != nil || size <= 0 {
-		t.Errorf("ready X-Linked-Size = %q, want a positive size", resp.Header.Get("X-Linked-Size"))
+	if size, err := strconv.ParseInt(resp.Header.Get("X-Linked-Size"), 10, 64); err != nil || size <= 0 || size != resp.ContentLength {
+		t.Errorf("ready X-Linked-Size = %q, Content-Length = %d; want equal positive sizes", resp.Header.Get("X-Linked-Size"), resp.ContentLength)
 	}
 	if commit := resp.Header.Get("X-Repo-Commit"); !commitRe.MatchString(commit) {
 		t.Errorf("ready X-Repo-Commit = %q, want a 40-hex commit", commit)
@@ -114,6 +114,60 @@ func runMirrorCompat(t *testing.T, upstream, repo string) {
 
 	t.Run("hf cli plain warm after restart, upstream down", func(t *testing.T) {
 		verifyDownload(t, hfBin, restartedURL, repo, wantSHA256, true)
+	})
+}
+
+func TestLocalPinnedCommitDownload(t *testing.T) {
+	hfBin, err := exec.LookPath("hf")
+	if err != nil {
+		t.Skip(`hf CLI not found on PATH; install with: pip install -U "huggingface_hub[cli,hf_xet]"`)
+	}
+
+	const repo, commit = "org/repo", "0123456789abcdef0123456789abcdef01234567"
+	resolvePath := "/" + repo + "/resolve/" + commit + "/" + testFile
+	data := make([]byte, 128*1024)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	sum := sha256.Sum256(data)
+	wantSHA256 := hex.EncodeToString(sum[:])
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != resolvePath {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"`+wantSHA256+`"`)
+		w.Header().Set("X-Repo-Commit", commit)
+		http.ServeContent(w, r, testFile, time.Time{}, bytes.NewReader(data))
+	}))
+	defer upstream.Close()
+
+	mirrorURL := startMirror(t, upstream.URL, t.TempDir(), t.TempDir())
+	resp := waitReady(t, mirrorURL+resolvePath)
+	if got := resp.Header.Get("X-Repo-Commit"); got != commit {
+		t.Fatalf("ready X-Repo-Commit = %q, want %q", got, commit)
+	}
+	if resp.Header.Get("Location") != "" || resp.ContentLength != int64(len(data)) {
+		t.Fatalf("ready HEAD Location = %q, Content-Length = %d; want direct answer of %d bytes", resp.Header.Get("Location"), resp.ContentLength, len(data))
+	}
+
+	pinned := []string{"--revision", commit, "--force-download"}
+	t.Run("hf cli xet", func(t *testing.T) {
+		if !hasHFXet(hfBin) {
+			t.Skip("hf CLI has no hf_xet; xet downstream path unavailable")
+		}
+		verifyDownload(t, hfBin, mirrorURL, repo, wantSHA256, false, pinned...)
+	})
+	t.Run("hf cli plain", func(t *testing.T) {
+		verifyDownload(t, hfBin, mirrorURL, repo, wantSHA256, true, pinned...)
+	})
+	t.Run("hf cli dry run", func(t *testing.T) {
+		localDir := t.TempDir()
+		runHF(t, hfBin, mirrorURL, false, append([]string{"download", repo, testFile, "--local-dir", localDir, "--dry-run"}, pinned...)...)
+		if _, err := os.Stat(filepath.Join(localDir, testFile)); !os.IsNotExist(err) {
+			t.Fatalf("dry run left %s behind: %v", testFile, err)
+		}
 	})
 }
 
@@ -182,17 +236,25 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	return srv.URL
 }
 
-// verifyDownload runs `hf download` against the mirror into a fresh local dir
-// with a fresh HF_HOME, then checks the bytes against the upstream sha256.
-func verifyDownload(t *testing.T, hfBin, endpoint, repo, wantSHA256 string, disableXet bool) {
+func runHF(t *testing.T, hfBin, endpoint string, disableXet bool, args ...string) []byte {
 	t.Helper()
-	localDir := t.TempDir()
-	cmd := exec.CommandContext(t.Context(), hfBin, "download", repo, testFile, "--local-dir", localDir)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, hfBin, args...)
 	cmd.Env = hfEnv(t, endpoint, disableXet)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("hf download failed: %v\n%s", err, out)
+		t.Fatalf("hf %s failed: %v\n%s", strings.Join(args, " "), err, out)
 	}
+	return out
+}
+
+// verifyDownload runs `hf download` against the mirror into a fresh local dir
+// with a fresh HF_HOME, then checks the bytes against the upstream sha256.
+func verifyDownload(t *testing.T, hfBin, endpoint, repo, wantSHA256 string, disableXet bool, extra ...string) {
+	t.Helper()
+	localDir := t.TempDir()
+	runHF(t, hfBin, endpoint, disableXet, append([]string{"download", repo, testFile, "--local-dir", localDir}, extra...)...)
 	if got := sha256File(t, filepath.Join(localDir, testFile)); got != wantSHA256 {
 		t.Fatalf("downloaded sha256 = %s, want %s", got, wantSHA256)
 	}
@@ -273,8 +335,7 @@ func trimETag(etag string) string {
 	return strings.Trim(strings.TrimPrefix(strings.TrimSpace(etag), "W/"), `"`)
 }
 
-// waitReady polls the resolve URL with HEAD until the mirror answers with the
-// ready-state redirect, meaning ingestion completed into local storage.
+// An in-flight HEAD is already 200, but has no local Xet hash yet.
 func waitReady(t *testing.T, resolveURL string) *http.Response {
 	t.Helper()
 	c := &http.Client{
@@ -290,7 +351,7 @@ func waitReady(t *testing.T, resolveURL string) *http.Response {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusFound {
+		if resp.StatusCode == http.StatusOK && resp.Header.Get("X-Xet-Hash") != "" {
 			return resp
 		}
 		last = resp.Status

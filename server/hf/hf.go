@@ -182,9 +182,7 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "File not found", http.StatusNotFound)
 }
 
-// serveReady answers a resolve request for a fully cached file: metadata plus
-// xet Link headers for capable clients, and a redirect to the sha256 bridge
-// for everyone else.
+// The content-addressed bridge cannot supply revision-specific HEAD metadata.
 func (h *Handler) serveReady(w http.ResponseWriter, r *http.Request, e *mirror.Entry) {
 	base := h.hubExternalBase(r)
 	writeMetadataHeaders(w, e.ETag, e.Size, e.Commit)
@@ -192,11 +190,12 @@ func (h *Handler) serveReady(w http.ResponseWriter, r *http.Request, e *mirror.E
 		w.Header().Add("Link", fmt.Sprintf("<%s%s/%s>; rel=\"xet-auth\", <%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\"", base, tokenEndpointPath, e.FileHash, base, e.FileHash))
 		w.Header().Set("X-Xet-Hash", e.FileHash)
 	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Length", strconv.FormatInt(e.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
-	// The Location must be absolute: hub clients follow relative redirects
-	// before reading metadata, which would strip the xet headers off the
-	// response they end up looking at. Empty files redirect too: the bridge
-	// serves the well-known zero-byte digest without storage.
 	http.Redirect(w, r, base+"/xet-bridge/"+e.SHA256, http.StatusFound)
 }
 
