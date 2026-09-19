@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -377,8 +378,9 @@ func TestMirrorPlainUpstream(t *testing.T) {
 		if got := resp.Header.Get("X-Linked-Size"); got != fmt.Sprint(len(data)) {
 			t.Fatalf("X-Linked-Size = %q, want %d", got, len(data))
 		}
-		if got := resp.Header.Get("X-Repo-Commit"); got != "commit-1" {
-			t.Fatalf("X-Repo-Commit = %q, want commit-1", got)
+		const wantCommit = "4dddf896b78f84b58402ab0da2c89514b0e17d1f"
+		if got := resp.Header.Get("X-Repo-Commit"); got != wantCommit {
+			t.Fatalf("X-Repo-Commit = %q, want %q", got, wantCommit)
 		}
 		links := strings.Join(resp.Header.Values("Link"), ", ")
 		if resp.Header.Get("X-Xet-Hash") == "" || !strings.Contains(links, "xet-auth") || !strings.Contains(links, "xet-reconstruction-info") {
@@ -456,8 +458,9 @@ func TestMirrorEmptyFileHead(t *testing.T) {
 	if resp.ContentLength != 0 || resp.Header.Get("X-Linked-Size") != "0" {
 		t.Fatalf("Content-Length = %d, X-Linked-Size = %q; want 0", resp.ContentLength, resp.Header.Get("X-Linked-Size"))
 	}
-	if got := resp.Header.Get("X-Repo-Commit"); got != "commit-1" {
-		t.Fatalf("X-Repo-Commit = %q, want commit-1", got)
+	const wantCommit = "4dddf896b78f84b58402ab0da2c89514b0e17d1f"
+	if got := resp.Header.Get("X-Repo-Commit"); got != wantCommit {
+		t.Fatalf("X-Repo-Commit = %q, want %q", got, wantCommit)
 	}
 	if resp.Header.Get("X-Xet-Hash") != "" || len(resp.Header.Values("Link")) != 0 {
 		t.Fatalf("empty file must carry no xet metadata: %v", resp.Header)
@@ -1353,7 +1356,11 @@ func TestMirrorTreeRewrite(t *testing.T) {
 
 func TestMirrorBranchPinning(t *testing.T) {
 	upstream := newPlainUpstream()
-	upstreamSrv := httptest.NewServer(upstream)
+	var requests atomic.Int64 // every upstream request, HEAD probes included
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		upstream.ServeHTTP(w, r)
+	}))
 	defer upstreamSrv.Close()
 
 	commit1 := strings.Repeat("11", 20)
@@ -1366,11 +1373,12 @@ func TestMirrorBranchPinning(t *testing.T) {
 	upstream.set("/org/repo/resolve/"+commit1+"/f.bin", data1)
 
 	// Zero interval: the branch mapping is re-checked on every request.
-	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), mirror.WithRevalidateInterval(0))
-	resolveURL := fx.srv.URL + "/org/repo/resolve/main/f.bin"
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	fx := newHubFixture(t, upstreamSrv.URL, storageDir, cacheDir, mirror.WithRevalidateInterval(0))
 
-	fetch := func(url string) []byte {
+	serves := func(hub *hubFixture, rev, wantCommit string, want []byte) {
 		t.Helper()
+		url := hub.srv.URL + "/org/repo/resolve/" + rev + "/f.bin"
 		resp, err := http.Get(url)
 		if err != nil {
 			t.Fatal(err)
@@ -1380,21 +1388,27 @@ func TestMirrorBranchPinning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK || !bytes.Equal(body, want) {
+			t.Fatalf("%s: status %d, %d bytes; want 200 and %d bytes", rev, resp.StatusCode, len(body), len(want))
 		}
-		return body
+		ready := waitReady(t, url)
+		if got := ready.Header.Get("X-Repo-Commit"); got != wantCommit {
+			t.Fatalf("%s: X-Repo-Commit = %q, want %s", rev, got, wantCommit)
+		}
+		if got := ready.Header.Get("X-Linked-Size"); got != strconv.Itoa(len(want)) {
+			t.Fatalf("%s: X-Linked-Size = %q, want %d", rev, got, len(want))
+		}
 	}
 
-	if got := fetch(resolveURL); !bytes.Equal(got, data1) {
-		t.Fatal("initial branch fetch mismatch")
+	serves(fx, "main", commit1, data1)
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream data GETs = %d, want 1", got)
 	}
-	waitReady(t, resolveURL)
 
-	// The entry is keyed by the pinned commit, so a commit-pinned request
-	// serves from cache without touching the branch.
-	if got := fetch(fx.srv.URL + "/org/repo/resolve/" + commit1 + "/f.bin"); !bytes.Equal(got, data1) {
-		t.Fatal("commit-pinned fetch mismatch")
+	before := requests.Load()
+	serves(fx, commit1, commit1, data1)
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("commit-pinned fetch made %d upstream requests, want 0", got)
 	}
 
 	// Move the branch upstream: the next branch request re-pins and ingests
@@ -1403,12 +1417,45 @@ func TestMirrorBranchPinning(t *testing.T) {
 	upstream.set("/org/repo/resolve/main/f.bin", data2)
 	upstream.set("/org/repo/resolve/"+commit2+"/f.bin", data2)
 
-	if got := fetch(resolveURL); !bytes.Equal(got, data2) {
-		t.Fatal("branch fetch after move mismatch")
+	serves(fx, "main", commit2, data2)
+	if got := upstream.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs after the move = %d, want 2", got)
 	}
-	waitReady(t, resolveURL)
-	if got := fetch(fx.srv.URL + "/org/repo/resolve/" + commit1 + "/f.bin"); !bytes.Equal(got, data1) {
-		t.Fatal("old commit no longer served after branch move")
+	before = requests.Load()
+	serves(fx, commit1, commit1, data1)
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("old commit fetch made %d upstream requests, want 0", got)
+	}
+
+	// HTTP readiness precedes manifest persistence.
+	repoHash := sha256.Sum256([]byte("org/repo"))
+	for _, commit := range []string{commit1, commit2} {
+		manifestPath := filepath.Join(cacheDir, "index", hex.EncodeToString(repoHash[:]), "commits", commit+".json")
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var manifest struct {
+				Files map[string]json.RawMessage `json:"files"`
+			}
+			data, err := os.ReadFile(manifestPath)
+			if err == nil && json.Unmarshal(data, &manifest) == nil && manifest.Files["f.bin"] != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s/f.bin was not persisted before restart: %v", commit, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	fx2 := newHubFixture(t, upstreamSrv.URL, storageDir, cacheDir, mirror.WithRevalidateInterval(-1))
+	before = requests.Load()
+	serves(fx2, "main", commit2, data2)
+	serves(fx2, commit1, commit1, data1)
+	serves(fx2, commit2, commit2, data2)
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("restart made %d upstream requests, want 0", got)
+	}
+	if got := upstream.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs after restart = %d, want 2", got)
 	}
 }
 

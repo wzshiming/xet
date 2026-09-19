@@ -19,13 +19,15 @@ import (
 // task tracks one in-flight ingestion. All concurrent requests for the same
 // key attach to it, so the upstream is downloaded exactly once per file.
 type task struct {
+	key      resolveKey    // pinned (repo, commit, path) the entry publishes under
+	src      resolveKey    // upstream resolve key: the source branch for pseudo commits
+	prev     *fileEntry    // src failure this task retries, retired on success
 	spool    *spool        // set by runTask before probed closes (when the probe succeeded)
 	probed   chan struct{} // closed once probe metadata (or probeErr) is set
 	sized    chan struct{} // closed once size is known or no early source remains
 	done     chan struct{} // closed once the task finished and its entry is published
 	sizeOnce sync.Once
 	probeErr error
-	notFound bool
 	probe    *probeResult
 	size     atomic.Int64 // final content length, -1 until known
 }
@@ -44,13 +46,14 @@ func (t *task) setSize(n int64) {
 // startup itself runs inside the singleflight, so the task is registered
 // exactly once per key. A pre-probe result from the branch mapping refresh is
 // handed to the task so the upstream is not probed twice.
-func (m *Mirror) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry, error) {
+func (m *Mirror) startTask(key, src resolveKey, pre *probeResult) (*task, *fileEntry, error) {
 	v, err, _ := m.flight.Do(key.String(), func() (any, error) {
 		// A previous flight may have registered a task, or finished the whole
 		// ingest, between the caller's check and this one.
 		m.mu.Lock()
 		t := m.tasks[key]
-		e := m.entries[key]
+		e := m.lookup(key, src)
+		prev := m.entries[src]
 		m.mu.Unlock()
 		if t != nil {
 			return t, nil
@@ -63,12 +66,12 @@ func (m *Mirror) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry,
 				return e, nil
 			}
 		}
-		nt := &task{probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
+		nt := &task{key: key, src: src, prev: prev, probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
 		nt.size.Store(-1)
 		m.mu.Lock()
 		m.tasks[key] = nt
 		m.mu.Unlock()
-		go m.runTask(key, nt, pre)
+		go m.runTask(nt, pre)
 		return nt, nil
 	})
 	if err != nil {
@@ -88,18 +91,24 @@ func (m *Mirror) startTask(key resolveKey, pre *probeResult) (*task, *fileEntry,
 // the returned task and entry is non-nil; the returned key carries the branch
 // pin. ctx bounds only the revalidation probe.
 func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task, *fileEntry, error) {
-	var preProbe *probeResult
+	var pre *probeResult
 	if !commitRevRe.MatchString(key.rev) {
-		commit, pr, ok := m.branchCommit(key)
-		preProbe = pr
-		if ok {
-			key.rev = commit
+		commit, pr, fe := m.branchCommit(key)
+		if fe != nil {
+			return key, nil, fe, nil
 		}
+		key.rev, pre = commit, pr
 	}
 
 	m.mu.Lock()
+	src := key
+	if cs := m.loadCommit(key.repo, key.rev); cs.source != "" {
+		src.rev = cs.source
+	}
 	t := m.tasks[key]
-	e := m.entries[key]
+	e := m.lookup(key, src)
+	stale := e != nil && e.State == stateReady && src != key && m.revalidateInterval >= 0 &&
+		time.Since(e.CheckedAt) >= m.revalidateInterval && !m.branchBackoff(src)
 	m.mu.Unlock()
 
 	if t != nil {
@@ -108,8 +117,8 @@ func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task
 	if e != nil {
 		switch e.State {
 		case stateReady:
-			if m.needsRevalidate(e, key.rev) {
-				e = m.revalidate(ctx, key, e)
+			if stale && !m.revalidate(ctx, key, src, e, pre) {
+				e = nil
 			}
 			if e != nil && !m.entryLive(ctx, e) {
 				m.dropEntry(key, e)
@@ -126,36 +135,41 @@ func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task
 		}
 	}
 
-	t, e, err := m.startTask(key, preProbe)
+	t, e, err := m.startTask(key, src, pre)
 	return key, t, e, err
+}
+
+// probeErr maps a non-2xx probe status to the ingest error; not-found matches ErrUpstreamNotFound.
+func probeErr(pr *probeResult) error {
+	switch {
+	case pr.status == http.StatusNotFound:
+		return ErrUpstreamNotFound
+	case pr.status < 200 || pr.status >= 300:
+		return fmt.Errorf("upstream status %d", pr.status)
+	}
+	return nil
 }
 
 // runTask executes one ingestion end to end on a background context; client
 // disconnects never cancel it. The spool opens after the probe so partial
 // bytes from a previous failed task (or a previous process) are resumed when
 // the upstream etag still matches. A non-nil pre stands in for the probe.
-func (m *Mirror) runTask(key resolveKey, t *task, pre *probeResult) {
+func (m *Mirror) runTask(t *task, pre *probeResult) {
 	ctx := context.Background()
-	upath := key.String()
+	upath := t.src.String()
 	defer close(t.done) // the entry is published by then, on every path
 
 	pr, err := pre, error(nil)
 	if pr == nil {
-		pr, err = m.probe(ctx, upath)
+		pr, err = m.probe(ctx, t.src)
 	}
 	if err == nil {
-		switch {
-		case pr.status == http.StatusNotFound:
-			err = ErrUpstreamNotFound
-		case pr.status < 200 || pr.status >= 300:
-			err = fmt.Errorf("upstream status %d", pr.status)
-		}
+		err = probeErr(pr)
 	}
 	if err != nil {
 		t.probeErr = err
-		t.notFound = errors.Is(err, ErrUpstreamNotFound)
 		close(t.probed)
-		m.failTask(key, t, err)
+		m.failTask(t, err)
 		return
 	}
 
@@ -163,7 +177,7 @@ func (m *Mirror) runTask(key resolveKey, t *task, pre *probeResult) {
 	if err != nil {
 		t.probeErr = err
 		close(t.probed)
-		m.failTask(key, t, err)
+		m.failTask(t, err)
 		return
 	}
 	t.spool = sp
@@ -199,53 +213,88 @@ func (m *Mirror) runTask(key resolveKey, t *task, pre *probeResult) {
 	}
 	if err != nil {
 		t.spool.finish(err)
-		m.failTask(key, t, err)
+		m.failTask(t, err)
 		return
 	}
 	t.size.Store(t.spool.size())
 	t.setSize(-1) // definitive size stored above; signal any waiters
 	t.spool.finish(nil)
 
-	entry, err := m.ingestSpool(ctx, t, key)
+	entry, err := m.ingestSpool(ctx, t)
 	if err != nil {
 		if errors.Is(err, errSpoolCorrupt) {
 			t.spool.markRemove()
 		}
-		m.failTask(key, t, err)
+		m.failTask(t, err)
 		return
 	}
 
 	m.mu.Lock()
-	m.entries[key] = entry
-	delete(m.tasks, key)
+	if m.entries[t.src] == t.prev {
+		delete(m.entries, t.src)
+	}
+	m.entries[t.key] = entry
+	m.loadCommit(t.key.repo, t.key.rev).publish(t.key.path, entry)
+	delete(m.tasks, t.key)
 	m.mu.Unlock()
-	t.spool.markRemove() // bytes now live in storage; drop the spool when drained
+	_ = m.persistCommit(t.key.repo, t.key.rev) // memory is authoritative; disk is best effort
+	t.spool.markRemove()                       // bytes now live in storage; drop the spool when drained
 }
 
-// failTask records a failure with exponential backoff and clears the task.
-func (m *Mirror) failTask(key resolveKey, t *task, err error) {
+// The caller holds m.mu; a newly discovered source invalidates source-less failures.
+func (m *Mirror) lookup(key, src resolveKey) *fileEntry {
+	e := m.entries[key]
+	if src != key && e != nil && e.State == stateFailed && e.source != src.rev {
+		return m.entries[src]
+	}
+	return e
+}
+
+// A late failure must not replace the failure state of a newer branch pin.
+func (m *Mirror) failTask(t *task, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.tasks, t.key)
+	if t.src != t.key {
+		if b := m.loadBranch(t.src.repo, t.src.rev); b == nil || b.Commit == t.key.rev {
+			failure := m.recordFailure(t.src, err)
+			failure.source = t.src.rev
+			m.entries[t.key] = failure
+			return
+		}
+	}
+	m.recordFailure(t.key, err).source = t.src.rev
+}
+
+// recordFailure stores a process-local failed entry under key with exponential backoff. The caller holds m.mu.
+func (m *Mirror) recordFailure(key resolveKey, err error) *fileEntry {
 	failures := 1
 	if prev := m.entries[key]; prev != nil && prev.State == stateFailed {
 		failures = prev.failures + 1
 	}
-	shift := min(failures-1, maxFailureShift)
-	backoff := min(failureBackoffBase<<shift, failureBackoffCap)
-	m.entries[key] = &fileEntry{
-		Key:       key.String(),
+	e := &fileEntry{
 		State:     stateFailed,
 		failures:  failures,
-		nextRetry: time.Now().Add(backoff),
+		nextRetry: time.Now().Add(retryBackoff(failures)),
 		lastErr:   err,
-		notFound:  t.notFound,
+		notFound:  errors.Is(err, ErrUpstreamNotFound),
 	}
-	delete(m.tasks, key)
+	m.entries[key] = e
+	return e
+}
+
+func retryBackoff(failures int) time.Duration {
+	shift := min(failures-1, maxFailureShift)
+	return min(failureBackoffBase<<shift, failureBackoffCap)
+}
+
+func (e *fileEntry) inBackoff() bool {
+	return e != nil && e.State == stateFailed && time.Now().Before(e.nextRetry)
 }
 
 // ingestSpool verifies the spooled bytes and runs the standard upload pipeline
-// against local storage, then returns the ready index entry.
-func (m *Mirror) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fileEntry, error) {
+// against local storage, then returns the ready entry.
+func (m *Mirror) ingestSpool(ctx context.Context, t *task) (*fileEntry, error) {
 	f, err := os.Open(t.spool.f.Name())
 	if err != nil {
 		return nil, fmt.Errorf("open spool: %w", err)
@@ -265,12 +314,10 @@ func (m *Mirror) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fil
 	}
 
 	entry := &fileEntry{
-		Key:       key.String(),
 		State:     stateReady,
 		SHA256:    digest,
 		Size:      size,
 		ETag:      t.probe.etag,
-		Commit:    t.probe.commit,
 		CheckedAt: time.Now(),
 	}
 
@@ -286,10 +333,6 @@ func (m *Mirror) ingestSpool(ctx context.Context, t *task, key resolveKey) (*fil
 			return nil, fmt.Errorf("ingest into storage: %w", err)
 		}
 		entry.FileHash = fileHash.String()
-	}
-
-	if err := persistEntry(m.indexDir, entry); err != nil {
-		return nil, err
 	}
 	return entry, nil
 }
