@@ -100,4 +100,9 @@ type Storage interface {
 
 	// DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether it existed.
 	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error)
+
+	// Store-wide usage.
+
+	// Usage excludes temporary objects and is not an atomic snapshot.
+	Usage(ctx context.Context) (Usage, error)
 }

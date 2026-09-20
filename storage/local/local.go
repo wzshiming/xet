@@ -570,6 +570,10 @@ func (fs *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash str
 	return fs.walkHashedObjects(ctx, "xorbs", fn)
 }
 
+func (fs *Storage) Usage(ctx context.Context) (storage.Usage, error) {
+	return storage.ComputeUsage(ctx, fs.walkHashedObjects)
+}
+
 // WalkSHA256Index calls fn for every committed index/sha256 entry.
 func (fs *Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
 	root := filepath.Join(fs.basePath, "index", "sha256")

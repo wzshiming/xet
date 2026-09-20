@@ -74,4 +74,5 @@ var cases = []struct {
 	{"TestListFilesComputesUniqueAndShared", testListFilesComputesUniqueAndShared},
 	{"TestListFilesMarksInvalidChunkMetadata", testListFilesMarksInvalidChunkMetadata},
 	{"TestPutShardVerifiesFileHash", testPutShardVerifiesFileHash},
+	{"TestUsageCountsObjectsByKind", testUsageCountsObjectsByKind},
 }

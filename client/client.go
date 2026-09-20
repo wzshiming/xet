@@ -146,6 +146,11 @@ func NewClient(opts ...Options) (*Client, error) {
 	return c, nil
 }
 
+// CacheUsage includes temporary and incomplete files in the cache directory.
+func (c *Client) CacheUsage(ctx context.Context) (download.CacheUsage, error) {
+	return c.cacheManager.Usage(ctx)
+}
+
 // getToken calls the configured tokenFunc and returns the bearer token string.
 // If no tokenFunc is set it returns an empty string.
 func (c *Client) getToken(ctx context.Context, provider AuthProvider) (string, error) {
