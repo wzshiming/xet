@@ -392,7 +392,7 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u, err := ss.GetXorbURL("default", xorbHash)
+	u, err := ss.GetXorbURL(ctx, "default", xorbHash)
 	if err != nil {
 		t.Fatalf("GetXorbURL() error: %v", err)
 	}
@@ -425,18 +425,42 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 
 	// Disabled presigning falls back to the server-served xorb path.
 	plain := newTestS3Storage(t, WithPresign(false))
-	if got, err := plain.GetXorbURL("ns", xorbHash); err != nil || got != "/v1/xorbs/ns/"+xorbHash.String() {
+	if got, err := plain.GetXorbURL(ctx, "ns", xorbHash); err != nil || got != "/v1/xorbs/ns/"+xorbHash.String() {
 		t.Fatalf("GetXorbURL() with presign disabled = %q, %v", got, err)
 	}
 
 	// A distinct presign endpoint moves only the URL host, not the API client.
 	public := newTestS3Storage(t, WithPresignEndpoint("http://public.example:9000"))
-	got, err := public.GetXorbURL("default", xorbHash)
+	got, err := public.GetXorbURL(ctx, "default", xorbHash)
 	if err != nil {
 		t.Fatalf("GetXorbURL() with presign endpoint error: %v", err)
 	}
 	if !strings.HasPrefix(got, "http://public.example:9000/") || !strings.Contains(got, "X-Amz-Signature") {
 		t.Fatalf("GetXorbURL() with presign endpoint = %q, want presigned URL at public.example", got)
+	}
+}
+
+func TestS3StorageGetXorbURLPresignsWithCallerContext(t *testing.T) {
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "request")
+	var seen context.Context
+	client := awss3.New(awss3.Options{
+		Region: "us-east-1",
+		Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+			seen = ctx
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+	})
+	ss, err := NewStorage(context.Background(), WithS3Client(client), WithBucket("test-bucket"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var xorbHash xet.XorbHash
+	if _, err := ss.GetXorbURL(ctx, "default", xorbHash); err != nil {
+		t.Fatalf("GetXorbURL() error: %v", err)
+	}
+	if seen == nil || seen.Value(ctxKey{}) != "request" {
+		t.Fatalf("presign resolved credentials with %v, want the caller's context", seen)
 	}
 }
 

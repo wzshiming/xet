@@ -243,18 +243,6 @@ func TestListFilesEndpoint(t *testing.T) {
 	}
 }
 
-// listlessStorage implements storage.Storage but not storage.ListStore.
-type listlessStorage struct{ storage.Storage }
-
-func TestListFilesEndpointNotImplemented(t *testing.T) {
-	handler := NewHandler(WithStorage(listlessStorage{}))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/files", nil))
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotImplemented)
-	}
-}
-
 func TestHandlerFallsThroughToNext(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
@@ -895,27 +883,5 @@ func TestGCSweepEndpointBusy(t *testing.T) {
 	close(blocking.release)
 	if code := <-first; code != http.StatusOK {
 		t.Fatalf("first sweep status = %d, want %d", code, http.StatusOK)
-	}
-}
-
-func TestGCEndpointsNotImplemented(t *testing.T) {
-	handler := NewHandler(WithStorage(listlessStorage{}))
-
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/xet/"+strings.Repeat("ab", 32), nil))
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("unlink status = %d, want %d", rec.Code, http.StatusNotImplemented)
-	}
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/internal/files/sha256/"+strings.Repeat("ab", 32), nil))
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("sha256 unlink status = %d, want %d", rec.Code, http.StatusNotImplemented)
-	}
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep", nil))
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("sweep status = %d, want %d", rec.Code, http.StatusNotImplemented)
 	}
 }

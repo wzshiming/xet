@@ -98,8 +98,7 @@ func PutFile(t *testing.T, ctx context.Context, st storage.Storage, parts [][]by
 	digest := sha256.Sum256(f.Content)
 	f.SHA256Hex = hex.EncodeToString(digest[:])
 
-	gcs := st.(storage.GCStore)
-	if err := gcs.WalkFileIndex(ctx, func(fileHash, shardHash string) error {
+	if err := st.WalkFileIndex(ctx, func(fileHash, shardHash string) error {
 		if fileHash == f.FileHash.String() {
 			f.ShardHash = shardHash
 		}
@@ -115,7 +114,7 @@ func PutFile(t *testing.T, ctx context.Context, st storage.Storage, parts [][]by
 
 // UnlinkFile removes both of f's index entries — file and SHA-256 — so a
 // sweep can prove the shard dead. Not for empty files (zero digest).
-func UnlinkFile(t *testing.T, ctx context.Context, gcs storage.GCStore, f File) {
+func UnlinkFile(t *testing.T, ctx context.Context, gcs storage.Storage, f File) {
 	t.Helper()
 	if _, err := storage.NewGC(gcs).Unlink(ctx, f.FileHash); err != nil {
 		t.Fatal(err)
@@ -129,11 +128,10 @@ func UnlinkFile(t *testing.T, ctx context.Context, gcs storage.GCStore, f File) 
 // both its entries, leaving its shard and xorb unreferenced.
 func PutUnlinkedFiles(t *testing.T, ctx context.Context, st storage.Storage, contents ...string) []File {
 	t.Helper()
-	gcs := st.(storage.GCStore)
 	files := make([]File, 0, len(contents))
 	for _, content := range contents {
 		f := PutFile(t, ctx, st, [][]byte{[]byte(content)})
-		UnlinkFile(t, ctx, gcs, f)
+		UnlinkFile(t, ctx, st, f)
 		files = append(files, f)
 	}
 	return files
@@ -181,7 +179,7 @@ func sortedSwept(objs []storage.SweptObject) []storage.SweptObject {
 
 // assertChunkEntriesIntact fails when an aborted shard deletion touched the
 // chunk entries a racing commit relies on for dedup.
-func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs storage.GCStore, f File, res *storage.SweepResult) {
+func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs storage.Storage, f File, res *storage.SweepResult) {
 	t.Helper()
 	if res.DeletedChunkEntries != 0 {
 		t.Fatalf("racing commit's chunk entries touched: %+v", res)
@@ -209,12 +207,12 @@ func AssertFileIntact(t *testing.T, ctx context.Context, st storage.Storage, f F
 	}
 }
 
-// hookedGCStore wraps a GCStore with callbacks fired at sweep-visible points,
+// hookedGCStore wraps a Storage with callbacks fired at sweep-visible points,
 // simulating uploads that commit while a sweep is running. A non-zero age
 // backdates every modTime the object walks report, simulating aged objects
 // on backends whose timestamps cannot be set (S3).
 type hookedGCStore struct {
-	storage.GCStore
+	storage.Storage
 	age                time.Duration
 	shardModTimes      map[string]time.Time // per-shard walk mtime overrides
 	beforeFileEntryGet func()               // consumed on first fire
@@ -235,8 +233,8 @@ type hookedGCStore struct {
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
-func agedStore(st storage.GCStore) *hookedGCStore {
-	return &hookedGCStore{GCStore: st, age: 2 * time.Hour}
+func agedStore(st storage.Storage) *hookedGCStore {
+	return &hookedGCStore{Storage: st, age: 2 * time.Hour}
 }
 
 // walkTime substitutes the aged modTime when aging is enabled.
@@ -252,7 +250,7 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	if h.beforeWalkShards != nil {
 		h.beforeWalkShards()
 	}
-	return h.GCStore.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
 		if t, ok := h.shardModTimes[shardHash]; ok {
 			return fn(shardHash, size, t)
 		}
@@ -260,11 +258,11 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	})
 }
 
-func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (h *hookedGCStore) WalkXorbs(ctx context.Context, namespace string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.GCStore.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkXorbs(ctx, namespace, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
 }
@@ -279,7 +277,7 @@ func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.File
 		h.fileEntryGets++
 		h.onFileEntryGet(h.fileEntryGets)
 	}
-	return h.GCStore.GetFileIndexEntry(ctx, fileHash)
+	return h.Storage.GetFileIndexEntry(ctx, fileHash)
 }
 
 func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error) {
@@ -287,12 +285,12 @@ func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex strin
 		h.sha256EntryGets++
 		h.onSHA256EntryGet(h.sha256EntryGets)
 	}
-	return h.GCStore.GetSHA256IndexEntry(ctx, sha256Hex)
+	return h.Storage.GetSHA256IndexEntry(ctx, sha256Hex)
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
 	h.cachedShardGets++
-	return h.GCStore.GetShardByHash(ctx, shardHash)
+	return h.Storage.GetShardByHash(ctx, shardHash)
 }
 
 func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -305,7 +303,7 @@ func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard
 	if err, ok := h.loadShardErrs[shardHash]; ok {
 		return nil, err
 	}
-	return h.GCStore.LoadShard(ctx, shardHash)
+	return h.Storage.LoadShard(ctx, shardHash)
 }
 
 // SortEntries orders expectations the way ListFiles sorts its result:
@@ -363,10 +361,7 @@ func PutListedFile(t *testing.T, ctx context.Context, st storage.Storage, parts 
 // CheckFanoutStore verifies that st, opened over data another instance wrote,
 // resolves the one-file shard sh through every index and that each walker
 // reports the full 64-hex hash. It returns each stored kind mapped to its hash.
-func CheckFanoutStore(t *testing.T, ctx context.Context, st interface {
-	storage.Storage
-	storage.GCStore
-}, sh *shard.Shard, fileHash xet.FileHash, content []byte) map[string]string {
+func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard, fileHash xet.FileHash, content []byte) map[string]string {
 	t.Helper()
 	xorbHash := sh.CASInfos[0].CASHash
 	chunkHash := xet.ComputeChunkHash(content)
@@ -411,7 +406,7 @@ func CheckFanoutStore(t *testing.T, ctx context.Context, st interface {
 			return nil
 		}
 	}
-	if err := st.WalkXorbs(ctx, collect("xorbs")); err != nil {
+	if err := st.WalkXorbs(ctx, "", collect("xorbs")); err != nil {
 		t.Fatalf("WalkXorbs(): %v", err)
 	}
 	if err := st.WalkShards(ctx, collect("shards")); err != nil {

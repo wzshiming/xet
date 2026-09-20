@@ -25,10 +25,10 @@ import (
 func TestGetXorbURLUsesBaseURL(t *testing.T) {
 	var xorbHash xet.XorbHash
 	want := "/v1/xorbs/default/" + xorbHash.String()
-	if got, err := NewStorage().GetXorbURL("default", xorbHash); err != nil || got != want {
+	if got, err := NewStorage().GetXorbURL(context.Background(), "default", xorbHash); err != nil || got != want {
 		t.Fatalf("GetXorbURL() = %q, %v; want %q", got, err, want)
 	}
-	if got, err := NewStorage(WithBaseURL("http://cas.test")).GetXorbURL("default", xorbHash); err != nil || got != "http://cas.test"+want {
+	if got, err := NewStorage(WithBaseURL("http://cas.test")).GetXorbURL(context.Background(), "default", xorbHash); err != nil || got != "http://cas.test"+want {
 		t.Fatalf("GetXorbURL() = %q, %v; want %q", got, err, "http://cas.test"+want)
 	}
 }
@@ -86,19 +86,19 @@ func TestXorbRangesMatchScanner(t *testing.T) {
 	if err != nil || start != wantStart || end != wantEnd {
 		t.Fatalf("GetXorbDataRange() = [%d, %d], %v; want [%d, %d]", start, end, err, wantStart, wantEnd)
 	}
-	offsets, err := st.GetXorbChunkOffsets(ctx, xorbHash)
+	offsets, err := st.GetXorbChunkOffsets(ctx, "default", xorbHash)
 	if err != nil || len(offsets) != len(chunks) || int64(offsets[2]) != wantEnd+1 {
 		t.Fatalf("GetXorbChunkOffsets() = %v, %v; want %d chunks ending at %d", offsets, err, len(chunks), wantEnd+1)
 	}
 
-	rc, err := st.ReadXorbRange(ctx, xorbHash, start, end)
+	rc, err := st.GetXorbRangeReadCloser(ctx, "default", xorbHash, start, end)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(got, encoded[start:end+1]) {
-		t.Fatalf("ReadXorbRange() = %x, %v; want inclusive range %x", got, err, encoded[start:end+1])
+		t.Fatalf("GetXorbRangeReadCloser() = %x, %v; want inclusive range %x", got, err, encoded[start:end+1])
 	}
 
 	if _, _, err := st.GetXorbDataRange(ctx, "default", xorbHash, 0, 4); err == nil {
@@ -128,7 +128,7 @@ func TestWalksHonorCancellationAndCallbackErrors(t *testing.T) {
 	}
 
 	sentinel := errors.New("stop walking")
-	if err := st.WalkXorbs(ctx, func(string, int64, time.Time) error { return sentinel }); !errors.Is(err, sentinel) {
+	if err := st.WalkXorbs(ctx, "", func(string, int64, time.Time) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("WalkXorbs() = %v, want the callback error", err)
 	}
 	if err := st.WalkSHA256Index(ctx, func(string, string) error { return sentinel }); !errors.Is(err, sentinel) {

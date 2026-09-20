@@ -10,6 +10,8 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -132,6 +134,47 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// recordingStorageAdapter captures what GetXorbURL receives.
+type recordingStorageAdapter struct {
+	ctx       context.Context
+	namespace string
+}
+
+func (r *recordingStorageAdapter) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
+	r.ctx, r.namespace = ctx, namespace
+	return "/v1/xorbs/" + namespace + "/" + xorbHash.String(), nil
+}
+
+func (r *recordingStorageAdapter) GetXorbDataRange(context.Context, string, xet.XorbHash, uint32, uint32) (int64, int64, error) {
+	return 0, 0, nil
+}
+
+func TestBuildReconstructionForwardsContextAndNamespace(t *testing.T) {
+	type ctxKey struct{}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "request")
+	var fileHash xet.FileHash
+	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash, Entries: []shard.FileDataSequenceEntry{{UnpackedSegBytes: 1, ChunkIndexEnd: 1}}}}}
+	build := map[string]func(StorageAdapter) error{
+		"v1": func(st StorageAdapter) error {
+			_, err := BuildReconstructionResponseV1(ctx, st, "tenant", sh, fileHash, "")
+			return err
+		},
+		"v2": func(st StorageAdapter) error {
+			_, err := BuildReconstructionResponseV2(ctx, st, "tenant", sh, fileHash, "")
+			return err
+		},
+	}
+	for name, fn := range build {
+		st := &recordingStorageAdapter{}
+		if err := fn(st); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if st.ctx != ctx || st.namespace != "tenant" {
+			t.Fatalf("%s: GetXorbURL got ctx %v, namespace %q; want the caller's ctx and %q", name, st.ctx, st.namespace, "tenant")
 		}
 	}
 }

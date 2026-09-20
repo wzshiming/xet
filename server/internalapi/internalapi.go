@@ -77,9 +77,7 @@ func NewHandler(opts ...Option) *Handler {
 		opt(h)
 	}
 
-	if gcs, ok := h.storage.(storage.GCStore); ok {
-		h.gc = storage.NewGC(gcs)
-	}
+	h.gc = storage.NewGC(h.storage)
 
 	h.registerRoutes()
 	return h
@@ -117,12 +115,7 @@ func (h *Handler) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Read}) {
 		return
 	}
-	ls, ok := h.storage.(storage.ListStore)
-	if !ok {
-		http.Error(w, "Storage does not support file listing", http.StatusNotImplemented)
-		return
-	}
-	entries, err := storage.ListFiles(r.Context(), ls)
+	entries, err := storage.ListFiles(r.Context(), h.storage)
 	if err != nil {
 		http.Error(w, "Failed to list files: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -145,10 +138,6 @@ func (h *Handler) handleUnlinkFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, File: &fileHash}) {
-		return
-	}
-	if h.gc == nil {
-		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
 		return
 	}
 	removed, err := h.gc.Unlink(r.Context(), fileHash)
@@ -188,10 +177,6 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write, SHA256: hex.EncodeToString(digest[:])}) {
 		return
 	}
-	if h.gc == nil {
-		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
-		return
-	}
 	removed, err := h.gc.UnlinkSHA256(r.Context(), digest)
 	if err != nil {
 		http.Error(w, "Failed to unlink SHA-256: "+err.Error(), http.StatusInternalServerError)
@@ -225,10 +210,6 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // per-shard re-checks, no entry counts), ignoring max and budget.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write}) {
-		return
-	}
-	if h.gc == nil {
-		http.Error(w, "Storage does not support garbage collection", http.StatusNotImplemented)
 		return
 	}
 
