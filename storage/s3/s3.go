@@ -956,4 +956,3 @@ func (o *s3Opener) Size(string) (httpseek.SizeResult, error) {
 }
 
 var _ storage.Storage = (*Storage)(nil)
-var _ storage.GCStore = (*Storage)(nil)

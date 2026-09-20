@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -42,4 +43,52 @@ type Storage interface {
 
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest.
 	GetFileHashBySHA256(ctx context.Context, namespace string, sha256 [32]byte) (xet.FileHash, error)
+
+	// WalkFileIndex calls fn for every index/files entry, passing the hex
+	// file hash and the owning shard hash.
+	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error
+
+	// GetShardByHash loads a stored shard by the hash of its serialized
+	// bytes; the error wraps fs.ErrNotExist when the shard is absent.
+	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
+
+	// GetXorbChunkOffsets returns the cumulative packed end-offset of every
+	// chunk in the stored xorb; the error wraps fs.ErrNotExist when the xorb is absent.
+	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)
+
+	// WalkShards calls fn for every stored shard object.
+	WalkShards(ctx context.Context, fn func(shardHash string, size int64, modTime time.Time) error) error
+
+	// WalkXorbs calls fn for every stored xorb object.
+	WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error
+
+	// WalkSHA256Index calls fn for every index/sha256 entry.
+	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error
+
+	// LoadShard reads a stored shard bypassing the read cache, which a whole-store sweep would evict.
+	LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error)
+
+	// GetFileIndexEntry returns the shard hash recorded for fileHash, "" when absent, bypassing caches.
+	GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error)
+
+	// DeleteFileIndexEntry removes the index/files entry for fileHash, reporting whether it existed.
+	DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error)
+
+	// DeleteShard removes a stored shard object.
+	DeleteShard(ctx context.Context, shardHash string) error
+
+	// DeleteXorb removes a stored xorb object.
+	DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error
+
+	// GetChunkIndexEntry returns the shard hash recorded for chunkHash, "" when absent, bypassing caches.
+	GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (string, error)
+
+	// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
+	DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error
+
+	// GetSHA256IndexEntry returns the shard hash recorded for sha256Hex, "" when absent, bypassing caches.
+	GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error)
+
+	// DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether it existed.
+	DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error)
 }

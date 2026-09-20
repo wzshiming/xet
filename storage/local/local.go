@@ -753,4 +753,3 @@ func (fs *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash)
 }
 
 var _ storage.Storage = (*Storage)(nil)
-var _ storage.GCStore = (*Storage)(nil)

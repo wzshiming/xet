@@ -38,7 +38,7 @@ func testListFilesGroupsBySHA256(t *testing.T, b Backend) {
 		t.Fatalf("PutShard(empty file): %v", err)
 	}
 
-	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -72,7 +72,7 @@ func testListFilesMarksDanglingEntries(t *testing.T, b Backend) {
 	danglingHash := strings.Repeat("ab", 32)
 	b.SetIndexEntry(t, st, "index/files", danglingHash, strings.Repeat("cd", 32))
 
-	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -99,11 +99,11 @@ func testListFilesToleratesVanishedXorb(t *testing.T, b Backend) {
 	partB := []byte("the chunk whose xorb vanishes")
 	f := PutFile(t, ctx, st, [][]byte{partA, partB})
 	vanished := f.XorbHashes[1]
-	if err := st.(storage.GCStore).DeleteXorb(ctx, vanished); err != nil {
+	if err := st.DeleteXorb(ctx, vanished); err != nil {
 		t.Fatalf("DeleteXorb: %v", err)
 	}
 
-	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -144,7 +144,7 @@ func testListFilesComputesUniqueAndShared(t *testing.T, b Backend) {
 		t.Fatalf("PutShard: %v", err)
 	}
 
-	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
@@ -184,11 +184,11 @@ func testListFilesMarksInvalidChunkMetadata(t *testing.T, b Backend) {
 	b.PutRawShardObject(t, ctx, st, shardHash, raw)
 	b.SetIndexEntry(t, st, "index/files", fileHash.String(), shardHash)
 	// The shard loads fine, so a missing flag can only come from the chunk index.
-	if _, err := st.(storage.ListStore).GetShardByHash(ctx, shardHash); err != nil {
+	if _, err := st.GetShardByHash(ctx, shardHash); err != nil {
 		t.Fatalf("test setup: GetShardByHash: %v", err)
 	}
 
-	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}

@@ -39,22 +39,6 @@ type FileListEntry struct {
 	Missing bool `json:"missing,omitempty"`
 }
 
-// ListStore is the thin per-backend surface needed to enumerate stored
-// files; the aggregation lives in ListFiles.
-type ListStore interface {
-	// WalkFileIndex calls fn for every index/files entry, passing the hex
-	// file hash and the owning shard hash.
-	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error
-
-	// GetShardByHash loads a stored shard by the hash of its serialized
-	// bytes; the error wraps fs.ErrNotExist when the shard is absent.
-	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
-
-	// GetXorbChunkOffsets returns the xorb's chunk offset table: the
-	// cumulative packed end-offset of every chunk in the stored xorb.
-	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)
-}
-
 // listFilesConcurrency bounds parallel shard and xorb offset-table reads
 // while building the listing.
 const listFilesConcurrency = 4
@@ -68,7 +52,7 @@ type chunkRange struct {
 // ListFiles enumerates every file recorded in the file index, grouped by
 // content: one entry per SHA-256 carrying all file hashes that map to it.
 // The result is deterministically sorted and never nil.
-func ListFiles(ctx context.Context, st ListStore) ([]FileListEntry, error) {
+func ListFiles(ctx context.Context, st Storage) ([]FileListEntry, error) {
 	// Group by shard first so each shard is loaded exactly once and can be
 	// released after its group; only the flattened terms are retained.
 	byShard := map[string][]string{} // shard hash -> file hashes
@@ -161,7 +145,7 @@ type resolvedFile struct {
 // resolveShardFiles loads one shard and resolves its file-index entries; a
 // missing shard is not an error, its files come back marked missing, as do
 // files whose chunk metadata is out of bounds.
-func resolveShardFiles(ctx context.Context, st ListStore, shardHash string, fileHashes []string) ([]resolvedFile, error) {
+func resolveShardFiles(ctx context.Context, st Storage, shardHash string, fileHashes []string) ([]resolvedFile, error) {
 	sh, err := st.GetShardByHash(ctx, shardHash)
 	if err != nil {
 		if !errors.Is(err, iofs.ErrNotExist) {
@@ -236,7 +220,7 @@ func (u *xorbUsage) grow(n int) {
 // unique vs shared; consecutive chunks with the same classification are
 // coalesced into one range. Chunks whose xorb is gone or inconsistent with
 // the shard contribute nothing.
-func computeStoredSizes(ctx context.Context, st ListStore, entries []FileListEntry, entryTerms [][]chunkRange) error {
+func computeStoredSizes(ctx context.Context, st Storage, entries []FileListEntry, entryTerms [][]chunkRange) error {
 	usage := map[xet.XorbHash]*xorbUsage{}
 	for e := range entries {
 		for _, term := range entryTerms[e] {

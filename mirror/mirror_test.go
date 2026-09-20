@@ -1112,7 +1112,7 @@ func TestMirrorIndexRestart(t *testing.T) {
 
 	// Unlinked storage drops one file from the manifest and leaves the
 	// sibling; dropping the last file removes the manifest.
-	gc := storage.NewGC(stor2.(storage.GCStore))
+	gc := storage.NewGC(stor2)
 	manifestPath := commitPath(indexDir, "org/repo", commit)
 	for i, p := range []string{"a.bin", "b.bin"} {
 		hash := entryA.FileHash
@@ -1161,7 +1161,7 @@ func TestMirrorIndexRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if removed, err := storage.NewGC(stor.(storage.GCStore)).Unlink(ctx, fileHash); err != nil || !removed {
+		if removed, err := storage.NewGC(stor).Unlink(ctx, fileHash); err != nil || !removed {
 			t.Fatalf("unlink = %v, %v", removed, err)
 		}
 
@@ -1287,7 +1287,7 @@ func TestMirrorIndexUnreadableManifest(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if removed, err := storage.NewGC(stor2.(storage.GCStore)).Unlink(context.Background(), fileHash); err != nil || !removed {
+			if removed, err := storage.NewGC(stor2).Unlink(context.Background(), fileHash); err != nil || !removed {
 				t.Fatalf("unlink = %v, %v", removed, err)
 			}
 			if _, err := ingestWait(t, m2, "org/repo", "main", "c.bin"); err != nil {

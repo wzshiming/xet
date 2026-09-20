@@ -355,4 +355,3 @@ func (s *Storage) DeleteSHA256IndexEntry(_ context.Context, sha256Hex string) (b
 }
 
 var _ storage.Storage = (*Storage)(nil)
-var _ storage.GCStore = (*Storage)(nil)

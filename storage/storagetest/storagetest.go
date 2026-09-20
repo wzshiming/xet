@@ -11,7 +11,7 @@ import (
 // Backend adapts one storage implementation to the suite.
 type Backend struct {
 	Name string
-	// New returns a fresh store; it must also implement storage.GCStore.
+	// New returns a fresh store.
 	New func(t *testing.T) storage.Storage
 	// SetIndexEntry writes, overwriting any existing value, the index entry kind/name directly on the backend.
 	SetIndexEntry func(t *testing.T, st storage.Storage, kind, name, shardHash string)

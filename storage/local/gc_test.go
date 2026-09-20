@@ -17,11 +17,11 @@ import (
 	"github.com/wzshiming/xet/storage/storagetest"
 )
 
-// hookedGCStore wraps a GCStore with callbacks fired at sweep-visible points,
+// hookedGCStore wraps a Storage with callbacks fired at sweep-visible points,
 // simulating uploads that commit while a sweep is running. A non-zero age
 // backdates every modTime the object walks report.
 type hookedGCStore struct {
-	storage.GCStore
+	storage.Storage
 	age                time.Duration
 	beforeFileEntryGet func() // consumed on first fire
 	beforeShardLoad    func() // consumed on first fire
@@ -46,7 +46,7 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	if h.beforeWalkShards != nil {
 		h.beforeWalkShards()
 	}
-	return h.GCStore.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkShards(ctx, func(shardHash string, size int64, modTime time.Time) error {
 		return fn(shardHash, size, h.walkTime(modTime))
 	})
 }
@@ -55,7 +55,7 @@ func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, 
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.GCStore.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
 }
@@ -70,7 +70,7 @@ func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.File
 		h.fileEntryGets++
 		h.onFileEntryGet(h.fileEntryGets)
 	}
-	return h.GCStore.GetFileIndexEntry(ctx, fileHash)
+	return h.Storage.GetFileIndexEntry(ctx, fileHash)
 }
 
 func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -82,7 +82,7 @@ func (h *hookedGCStore) LoadShard(ctx context.Context, shardHash string) (*shard
 	if err, ok := h.loadShardErrs[shardHash]; ok {
 		return nil, err
 	}
-	return h.GCStore.LoadShard(ctx, shardHash)
+	return h.Storage.LoadShard(ctx, shardHash)
 }
 
 // TestSweepSkipsReuploadCommittedDuringMark: a re-upload commits between the
@@ -99,7 +99,7 @@ func TestSweepSkipsReuploadCommittedDuringMark(t *testing.T) {
 	f := storagetest.PutFile(t, ctx, st, parts)
 	storagetest.UnlinkFile(t, ctx, st, f)
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	committed := false
 	hooked.beforeWalkShards = func() {
 		if committed {
@@ -140,7 +140,7 @@ func TestSweepSkipsReuploadCommittedBeforeDelete(t *testing.T) {
 	f := storagetest.PutFile(t, ctx, st, parts)
 	storagetest.UnlinkFile(t, ctx, st, f)
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	hooked.beforeFileEntryGet = func() { storagetest.PutFile(t, ctx, writer, parts) }
 	res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: storagetest.NoGrace})
 	if err != nil {
@@ -170,7 +170,7 @@ func TestSweepShardVanishedBeforeDelete(t *testing.T) {
 	f := storagetest.PutFile(t, ctx, st, [][]byte{[]byte("vanishes before the delete")})
 	storagetest.UnlinkFile(t, ctx, st, f)
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	hooked.beforeShardLoad = func() {
 		if err := os.Remove(st.objectPath("shards", f.ShardHash)); err != nil {
 			t.Fatal(err)
@@ -296,7 +296,7 @@ func TestSweepStepPhase2WalkNotChargedToBudget(t *testing.T) {
 	}
 	storagetest.PutUnlinkedFiles(t, ctx, st, "budgeted walk one", "budgeted walk two")
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	g := storage.NewGC(hooked)
 	res, err := g.SweepStep(ctx, storage.SweepOptions{Grace: storagetest.NoGrace, MaxDeletes: 2})
 	if err != nil {
@@ -331,7 +331,7 @@ func TestSweepStepAbortsOnContextCancel(t *testing.T) {
 	}
 	files := storagetest.PutUnlinkedFiles(t, ctx, st, "canceled step one", "canceled step two")
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	g := storage.NewGC(hooked)
 	opts := storage.SweepOptions{Grace: storagetest.NoGrace}
 
@@ -386,7 +386,7 @@ func TestSweepLeavesShardCacheCold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := storage.Sweep(ctx, &hookedGCStore{GCStore: sweeper, age: 2 * time.Hour}, storage.SweepOptions{Grace: time.Hour})
+	res, err := storage.Sweep(ctx, &hookedGCStore{Storage: sweeper, age: 2 * time.Hour}, storage.SweepOptions{Grace: time.Hour})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestSweepLoadContextErrorAborts(t *testing.T) {
 	f := storagetest.PutFile(t, ctx, st, [][]byte{[]byte("canceled mid-load")})
 	storagetest.UnlinkFile(t, ctx, st, f)
 
-	hooked := &hookedGCStore{GCStore: st}
+	hooked := &hookedGCStore{Storage: st}
 	hooked.loadShardErrs = map[string]error{f.ShardHash: fmt.Errorf("get object: %w", context.Canceled)}
 	if _, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: storagetest.NoGrace}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Sweep = %v, want context.Canceled", err)
