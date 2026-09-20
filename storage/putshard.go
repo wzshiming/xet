@@ -11,15 +11,8 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-type XorbChunkReader interface {
-	// GetXorbChunkOffsets returns the xorb's cumulative packed chunk end-offsets.
-	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)
-	// ReadXorbRange streams the [start, end] byte range (inclusive) of a stored xorb.
-	ReadXorbRange(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error)
-}
-
 // Empty files use zero digests instead of the SHA-256 of an empty stream.
-func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs XorbChunkReader) (digest [32]byte, fileHash xet.FileHash, err error) {
+func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Storage) (digest [32]byte, fileHash xet.FileHash, err error) {
 	if len(fileBlock.Entries) == 0 {
 		return digest, fileHash, nil
 	}
@@ -33,7 +26,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Xo
 			return digest, fileHash, err
 		}
 
-		offsets, err := xorbs.GetXorbChunkOffsets(ctx, entry.CASHash)
+		offsets, err := xorbs.GetXorbChunkOffsets(ctx, "", entry.CASHash)
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
@@ -41,7 +34,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Xo
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
-		rc, err := xorbs.ReadXorbRange(ctx, entry.CASHash, start, end)
+		rc, err := xorbs.GetXorbRangeReadCloser(ctx, "", entry.CASHash, start, end)
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("read xorb chunks: %w", err)
 		}
@@ -63,7 +56,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Xo
 	return digest, fileHash, nil
 }
 
-func PrepareShard(ctx context.Context, s *shard.Shard, xorbs XorbChunkReader) error {
+func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	if len(s.Files) == 0 {
 		return fmt.Errorf("shard has no file blocks")
 	}

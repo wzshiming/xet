@@ -245,7 +245,7 @@ func computeStoredSizes(ctx context.Context, st Storage, entries []FileListEntry
 	g.SetLimit(listFilesConcurrency)
 	for hash := range usage {
 		g.Go(func() error {
-			offs, err := st.GetXorbChunkOffsets(gctx, hash)
+			offs, err := st.GetXorbChunkOffsets(gctx, "", hash)
 			if err != nil {
 				// A vanished xorb has no stored bytes to attribute.
 				if errors.Is(err, iofs.ErrNotExist) {

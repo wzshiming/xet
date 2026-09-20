@@ -338,9 +338,9 @@ func (ss *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash)
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
 // the xorb, from the in-memory cache, the xorb footer, or a full scan for
 // footer-less xorbs.
-func (ss *Storage) xorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+func (ss *Storage) xorbChunkOffsets(ctx context.Context, namespace string, xorbHash xet.XorbHash) ([]uint64, error) {
 	return ss.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
-		f, err := ss.GetXorbReadSeekCloser(ctx, "", xorbHash)
+		f, err := ss.GetXorbReadSeekCloser(ctx, namespace, xorbHash)
 		if err != nil {
 			return nil, err
 		}
@@ -355,8 +355,8 @@ func (ss *Storage) xorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) 
 
 // GetXorbDataRange returns the [start, end] byte range (inclusive) within
 // the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
-func (ss *Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := ss.xorbChunkOffsets(ctx, xorbHash)
+func (ss *Storage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
+	offsets, err := ss.xorbChunkOffsets(ctx, namespace, xorbHash)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
@@ -365,8 +365,8 @@ func (ss *Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.
 
 // GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
 // the first read.
-func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
-	return ss.xorbChunkOffsets(ctx, xorbHash)
+func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, namespace string, xorbHash xet.XorbHash) ([]uint64, error) {
+	return ss.xorbChunkOffsets(ctx, namespace, xorbHash)
 }
 
 // hasFile checks whether a file hash already has a shard mapping.
@@ -382,8 +382,8 @@ func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, er
 	return exists, nil
 }
 
-// ReadXorbRange streams the [start, end] byte range (inclusive) of a stored xorb.
-func (ss *Storage) ReadXorbRange(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+// GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
+func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, _ string, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
 	return ss.getObjectRange(ctx, ss.objectKey("xorbs", xorbHash.String()), start, end)
 }
 
@@ -608,7 +608,7 @@ func (ss *Storage) WalkShards(ctx context.Context, fn func(shardHash string, siz
 }
 
 // WalkXorbs calls fn for every stored xorb object.
-func (ss *Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (ss *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	return ss.walkHashedObjects(ctx, "xorbs", fn)
 }
 
@@ -727,7 +727,7 @@ func (ss *Storage) DeleteShard(ctx context.Context, shardHash string) error {
 }
 
 // DeleteXorb removes a stored xorb object.
-func (ss *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
+func (ss *Storage) DeleteXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) error {
 	err := ss.deleteObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
 	ss.caches.Offsets.Remove(xorbHash)
 	if err != nil {
@@ -889,9 +889,9 @@ func (ss *Storage) GetReconstructedFile(ctx context.Context, namespace string, s
 // presigned S3 GET URL so clients fetch xorb ranges straight from the object
 // store; with presigning disabled the URL routes through the CAS server's
 // xorb endpoint like FileStorage.
-func (ss *Storage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error) {
+func (ss *Storage) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
 	if ss.presign {
-		req, err := ss.presignClient.PresignGetObject(context.Background(), &awss3.GetObjectInput{
+		req, err := ss.presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
 			Bucket: aws.String(ss.bucket),
 			Key:    aws.String(ss.objectKey("xorbs", xorbHash.String())),
 		}, awss3.WithPresignExpires(ss.presignExpiry))

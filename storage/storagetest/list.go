@@ -99,7 +99,7 @@ func testListFilesToleratesVanishedXorb(t *testing.T, b Backend) {
 	partB := []byte("the chunk whose xorb vanishes")
 	f := PutFile(t, ctx, st, [][]byte{partA, partB})
 	vanished := f.XorbHashes[1]
-	if err := st.DeleteXorb(ctx, vanished); err != nil {
+	if err := st.DeleteXorb(ctx, "default", vanished); err != nil {
 		t.Fatalf("DeleteXorb: %v", err)
 	}
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -211,8 +212,8 @@ type requestBaseStorage struct {
 	base string
 }
 
-func (s requestBaseStorage) GetXorbURL(namespace string, xorbHash xet.XorbHash) (string, error) {
-	u, err := s.StorageAdapter.GetXorbURL(namespace, xorbHash)
+func (s requestBaseStorage) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
+	u, err := s.StorageAdapter.GetXorbURL(ctx, namespace, xorbHash)
 	if err != nil {
 		return "", err
 	}

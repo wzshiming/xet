@@ -258,11 +258,11 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	})
 }
 
-func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (h *hookedGCStore) WalkXorbs(ctx context.Context, namespace string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkXorbs(ctx, namespace, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
 }
@@ -406,7 +406,7 @@ func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh 
 			return nil
 		}
 	}
-	if err := st.WalkXorbs(ctx, collect("xorbs")); err != nil {
+	if err := st.WalkXorbs(ctx, "", collect("xorbs")); err != nil {
 		t.Fatalf("WalkXorbs(): %v", err)
 	}
 	if err := st.WalkShards(ctx, collect("shards")); err != nil {

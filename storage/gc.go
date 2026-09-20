@@ -323,7 +323,7 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 	}
 
 	var deadXorbs []SweptObject
-	err = st.WalkXorbs(ctx, func(hash string, size int64, modTime time.Time) error {
+	err = st.WalkXorbs(ctx, "", func(hash string, size int64, modTime time.Time) error {
 		if refXorbs[hash] {
 			return nil
 		}
@@ -355,7 +355,7 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 			if err != nil {
 				return nil, fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
 			}
-			if err := st.DeleteXorb(ctx, xorbHash); err != nil {
+			if err := st.DeleteXorb(ctx, "", xorbHash); err != nil {
 				return nil, err
 			}
 			sweptCount++
