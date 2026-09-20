@@ -321,7 +321,7 @@ func (ss *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash
 		return nil, fmt.Errorf("check xorb object: %w", err)
 	}
 	if !exists {
-		return nil, fmt.Errorf("xorb not found")
+		return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
 	}
 	return httpseek.NewOpenSeeker(&s3Opener{ctx: ctx, storage: ss, key: key, size: size}), nil
 }

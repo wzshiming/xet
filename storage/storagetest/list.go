@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	iofs "io/fs"
 	"reflect"
 	"slices"
 	"strings"
@@ -82,5 +84,37 @@ func testListFilesMarksDanglingEntries(t *testing.T, b Backend) {
 	SortEntries(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ListFiles() = %+v, want %+v", got, want)
+	}
+}
+
+// testListFilesToleratesVanishedXorb covers a reconstruction term whose xorb
+// is gone: the entry stays listed and the vanished chunks contribute no
+// stored bytes.
+func testListFilesToleratesVanishedXorb(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+
+	partA := []byte("the chunk that stays")
+	partB := []byte("the chunk whose xorb vanishes")
+	f := PutFile(t, ctx, st, [][]byte{partA, partB})
+	vanished := f.XorbHashes[1]
+	if err := st.(storage.GCStore).DeleteXorb(ctx, vanished); err != nil {
+		t.Fatalf("DeleteXorb: %v", err)
+	}
+
+	got, err := storage.ListFiles(ctx, st.(storage.ListStore))
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	storedA, _ := EncodeXorb(t, false, partA)
+	want := []storage.FileListEntry{
+		{SHA256: f.SHA256Hex, FileHashes: []string{f.FileHash.String()}, OriginalSize: uint64(len(f.Content)), UniqueSize: uint64(len(storedA))},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListFiles() = %+v, want %+v", got, want)
+	}
+
+	if _, err := st.GetXorbReadSeekCloser(ctx, "default", vanished); !errors.Is(err, iofs.ErrNotExist) {
+		t.Fatalf("GetXorbReadSeekCloser(vanished) = %v, want fs.ErrNotExist", err)
 	}
 }

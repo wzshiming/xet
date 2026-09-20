@@ -264,7 +264,7 @@ func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash
 	f, err := os.Open(xorbPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("xorb not found")
+			return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
 		}
 		return nil, fmt.Errorf("open xorb file: %w", err)
 	}

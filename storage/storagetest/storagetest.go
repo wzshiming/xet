@@ -70,5 +70,6 @@ var cases = []struct {
 	{"TestSweepCanceledContextFailsBeforeWork", testSweepCanceledContextFailsBeforeWork},
 	{"TestListFilesGroupsBySHA256", testListFilesGroupsBySHA256},
 	{"TestListFilesMarksDanglingEntries", testListFilesMarksDanglingEntries},
+	{"TestListFilesToleratesVanishedXorb", testListFilesToleratesVanishedXorb},
 	{"TestPutShardVerifiesFileHash", testPutShardVerifiesFileHash},
 }
