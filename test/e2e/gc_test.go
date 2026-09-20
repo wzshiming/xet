@@ -19,6 +19,8 @@ import (
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/storage/s3"
 )
 
 // TestGCUnlinkSweepLifecycle runs the whole GC story over the real HTTP
@@ -69,7 +71,7 @@ type gcBackend struct {
 func gcBackends() []gcBackend {
 	return []gcBackend{
 		{name: "file", newStore: func(t *testing.T) storage.Storage {
-			stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+			stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -358,11 +360,11 @@ func newGofakeS3Storage(t *testing.T) storage.Storage {
 	t.Setenv("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
 	t.Setenv("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
 
-	stor, err := storage.NewS3Storage(context.Background(),
-		storage.WithS3Bucket(bucket),
-		storage.WithS3Prefix("xet-data"),
-		storage.WithS3Endpoint(s3Server.URL),
-		storage.WithS3PathStyle(true),
+	stor, err := s3.NewStorage(context.Background(),
+		s3.WithBucket(bucket),
+		s3.WithPrefix("xet-data"),
+		s3.WithEndpoint(s3Server.URL),
+		s3.WithPathStyle(true),
 	)
 	if err != nil {
 		t.Fatal(err)

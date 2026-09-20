@@ -17,6 +17,7 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -56,7 +57,7 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 }
 
 func TestInternalRoutesRequirePermission(t *testing.T) {
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +133,7 @@ func TestInternalRoutesDenyMapping(t *testing.T) {
 
 func TestInternalDeniedMutations(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +164,7 @@ func TestInternalDeniedMutations(t *testing.T) {
 
 func TestBoundTokenCannotUnlinkEmptyFile(t *testing.T) {
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +209,7 @@ func TestBoundTokenCannotUnlinkEmptyFile(t *testing.T) {
 
 func TestListFilesEndpoint(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +269,7 @@ func TestHandlerFallsThroughToNext(t *testing.T) {
 
 func TestUnlinkFileEndpoint(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +307,7 @@ func TestUnlinkFileEndpoint(t *testing.T) {
 
 func TestUnlinkSHA256Endpoint(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +375,7 @@ func TestUnlinkSHA256Endpoint(t *testing.T) {
 }
 
 func TestUnlinkSHA256EndpointRejectsBadDigests(t *testing.T) {
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +403,7 @@ func TestUnlinkSHA256EndpointRejectsBadDigests(t *testing.T) {
 
 func TestGCSweepEndpoint(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +481,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 // the whole store.
 func TestGCSweepEndpointStepped(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +551,7 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 }
 
 func TestGCSweepEndpointRejectsInvalidStepParams(t *testing.T) {
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +571,7 @@ func TestGCSweepEndpointRejectsInvalidStepParams(t *testing.T) {
 // TestGCSweepEndpointRejectsInvalidAnchor: unknown or misspelled anchor
 // values are rejected at the boundary before any store access.
 func TestGCSweepEndpointRejectsInvalidAnchor(t *testing.T) {
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +606,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	}
 
 	// Disabled server default: a plain request reclaims fresh objects.
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +628,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 
 	// Unset option: a plain request keeps the default window and shields
 	// the fresh objects.
-	fs2, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs2, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,7 +669,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 // anchors the shard through a graceless sweep.
 func TestGCSweepEndpointNeedsBothUnlinks(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +721,7 @@ func TestGCSweepEndpointNeedsBothUnlinks(t *testing.T) {
 // overrides it back to needing both unlinks.
 func TestGCSweepEndpointServerAnchor(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -799,7 +800,7 @@ func TestGCSweepEndpointServerAnchor(t *testing.T) {
 // the shard and xorbs, deleting the stale file entry with the shard.
 func TestGCSweepEndpointSHA256AnchorLFS(t *testing.T) {
 	ctx := context.Background()
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,7 +853,7 @@ func TestGCSweepEndpointSHA256AnchorLFS(t *testing.T) {
 // blockingGCStorage parks a sweep inside its first mark walk until released
 // so a concurrent request can observe the busy GC.
 type blockingGCStorage struct {
-	*storage.FileStorage
+	*local.Storage
 	enter   chan struct{}
 	release chan struct{}
 }
@@ -860,20 +861,20 @@ type blockingGCStorage struct {
 func (b *blockingGCStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
 	b.enter <- struct{}{}
 	<-b.release
-	return b.FileStorage.WalkFileIndex(ctx, fn)
+	return b.Storage.WalkFileIndex(ctx, fn)
 }
 
 // TestGCSweepEndpointBusy: while one sweep runs, a concurrent request fails
 // fast with 409 instead of queueing.
 func TestGCSweepEndpointBusy(t *testing.T) {
-	fs, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	blocking := &blockingGCStorage{
-		FileStorage: fs,
-		enter:       make(chan struct{}),
-		release:     make(chan struct{}),
+		Storage: fs,
+		enter:   make(chan struct{}),
+		release: make(chan struct{}),
 	}
 	handler := NewHandler(WithStorage(blocking))
 

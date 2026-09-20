@@ -1,4 +1,4 @@
-package storage
+package s3
 
 import (
 	"bytes"
@@ -17,16 +17,17 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
 
 // newTestS3Storage returns an S3Storage backed by an in-process gofakes3.
-func newTestS3Storage(t *testing.T, opts ...S3Option) *S3Storage {
+func newTestS3Storage(t *testing.T, opts ...Option) *Storage {
 	t.Helper()
 	backend := s3mem.New()
 	if err := backend.CreateBucket("test-bucket"); err != nil {
@@ -35,7 +36,7 @@ func newTestS3Storage(t *testing.T, opts ...S3Option) *S3Storage {
 	srv := httptest.NewServer(gofakes3.New(backend).Server())
 	t.Cleanup(srv.Close)
 
-	client := s3.New(s3.Options{
+	client := awss3.New(awss3.Options{
 		BaseEndpoint: aws.String(srv.URL),
 		Region:       "us-east-1",
 		Credentials:  credentials.NewStaticCredentialsProvider("test", "test", ""),
@@ -44,9 +45,9 @@ func newTestS3Storage(t *testing.T, opts ...S3Option) *S3Storage {
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	ss, err := NewS3Storage(context.Background(), append([]S3Option{
+	ss, err := NewStorage(context.Background(), append([]Option{
 		WithS3Client(client),
-		WithS3Bucket("test-bucket"),
+		WithBucket("test-bucket"),
 	}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +64,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 		[]byte("second chunk"),
 		bytes.Repeat([]byte("abc"), 700),
 	}
-	encoded, xorbHash := encodeTestXorb(t, true, chunks...)
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, chunks...)
 
 	if ok, err := ss.HasXorb(ctx, "default", xorbHash); err != nil || ok {
 		t.Fatalf("HasXorb() before put = %v, %v", ok, err)
@@ -122,7 +123,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	}
 
 	// Chunk ranges must match those scanned from the raw chunk data.
-	reference, _ := encodeTestXorb(t, false, chunks...)
+	reference, _ := storagetest.EncodeXorb(t, false, chunks...)
 	numChunks := uint32(len(chunks))
 	for start := range numChunks {
 		for end := start + 1; end <= numChunks; end++ {
@@ -145,44 +146,6 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	}
 }
 
-// putTestShard uploads one single-chunk xorb per part and returns a shard
-// describing the concatenation of parts as one file.
-func putTestShard(t *testing.T, ctx context.Context, ss *S3Storage, parts [][]byte) (*shard.Shard, xet.FileHash) {
-	t.Helper()
-	shardObj := shard.NewShard()
-	fileBlock := shard.FileBlock{}
-	var chunkHashes []xet.ChunkHash
-	var chunkSizes []uint64
-	for _, part := range parts {
-		var encoded bytes.Buffer
-		encoder := xorb.NewEncoder(&encoded, true)
-		if _, err := encoder.Write(part); err != nil {
-			t.Fatal(err)
-		}
-		if err := encoder.Close(); err != nil {
-			t.Fatal(err)
-		}
-		xorbHash := encoder.SummoryHash()
-		if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
-			t.Fatal(err)
-		}
-		chunkHash := xet.ComputeChunkHash(part)
-		chunkHashes = append(chunkHashes, chunkHash)
-		chunkSizes = append(chunkSizes, uint64(len(part)))
-		fileBlock.Entries = append(fileBlock.Entries, shard.FileDataSequenceEntry{
-			CASHash: xorbHash, UnpackedSegBytes: uint32(len(part)), ChunkIndexEnd: 1,
-		})
-		shardObj.AddCASBlock(shard.CASBlock{
-			CASHash: xorbHash,
-			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(part))}},
-		})
-	}
-	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
-	fileBlock.FileHash = fileHash
-	shardObj.AddFile(fileBlock)
-	return shardObj, fileHash
-}
-
 // newIndexedShard returns a shard with one file and one CAS block.
 func newIndexedShard(fileHash xet.FileHash) *shard.Shard {
 	s := shard.NewShard()
@@ -195,7 +158,7 @@ func newIndexedShard(fileHash xet.FileHash) *shard.Shard {
 }
 
 // shardObjectKey returns the single stored shard key.
-func shardObjectKey(t *testing.T, ss *S3Storage) string {
+func shardObjectKey(t *testing.T, ss *Storage) string {
 	t.Helper()
 	var found string
 	for key := range listObjectKeys(t, ss) {
@@ -256,7 +219,7 @@ func TestS3FooteredShardObjectStaysReadable(t *testing.T) {
 
 	fileHash := xet.FileHash{7}
 	const creationTime = 1700000000
-	data, name := legacyShardBytes(t, newIndexedShard(fileHash), creationTime)
+	data, name := storagetest.LegacyShardBytes(t, newIndexedShard(fileHash), creationTime)
 
 	if err := ss.putObject(ctx, ss.objectKey("shards", name), bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
@@ -279,11 +242,12 @@ func TestS3FooteredShardObjectStaysReadable(t *testing.T) {
 
 func TestS3StorageShardRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	ss := newTestS3Storage(t, WithS3Prefix("some/prefix"))
+	ss := newTestS3Storage(t, WithPrefix("some/prefix"))
 
 	parts := [][]byte{[]byte("first part "), []byte("and the second part")}
 	fileData := bytes.Join(parts, nil)
-	shardObj, fileHash := putTestShard(t, ctx, ss, parts)
+	shardObj := shard.NewShard()
+	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
 	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
@@ -300,10 +264,10 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 
 	// A fresh storage over the same bucket must resolve everything without
 	// any in-memory state.
-	fresh, err := NewS3Storage(ctx,
+	fresh, err := NewStorage(ctx,
 		WithS3Client(ss.client),
-		WithS3Bucket(ss.bucket),
-		WithS3Prefix(ss.prefix),
+		WithBucket(ss.bucket),
+		WithPrefix(ss.prefix),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -364,9 +328,9 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	}
 }
 
-func listObjectKeys(t *testing.T, ss *S3Storage) map[string]struct{} {
+func listObjectKeys(t *testing.T, ss *Storage) map[string]struct{} {
 	t.Helper()
-	out, err := ss.client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+	out, err := ss.client.ListObjectsV2(context.Background(), &awss3.ListObjectsV2Input{
 		Bucket: aws.String(ss.bucket),
 	})
 	if err != nil {
@@ -389,18 +353,19 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 	for _, prefix := range []string{"", "some/prefix"} {
 		t.Run("prefix="+prefix, func(t *testing.T) {
 			ctx := context.Background()
-			ss := newTestS3Storage(t, WithS3Prefix(prefix))
+			ss := newTestS3Storage(t, WithPrefix(prefix))
 			content := []byte("fan me out")
-			shardObj, fileHash := putTestShard(t, ctx, ss, [][]byte{content})
+			shardObj := shard.NewShard()
+			fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, [][]byte{content})
 			if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
-			fresh, err := NewS3Storage(ctx, WithS3Client(ss.client), WithS3Bucket(ss.bucket), WithS3Prefix(prefix))
+			fresh, err := NewStorage(ctx, WithS3Client(ss.client), WithBucket(ss.bucket), WithPrefix(prefix))
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := checkFanoutStore(t, ctx, fresh, shardObj, fileHash, content)
+			want := storagetest.CheckFanoutStore(t, ctx, fresh, shardObj, fileHash, content)
 			keys := listObjectKeys(t, ss)
 			for kind, h := range want {
 				key := kind + "/" + h[:2] + "/" + h[2:4] + "/" + h[4:]
@@ -422,7 +387,7 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 	ctx := context.Background()
 	ss := newTestS3Storage(t)
 
-	encoded, xorbHash := encodeTestXorb(t, true, []byte("presign me"))
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("presign me"))
 	if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
 		t.Fatal(err)
 	}
@@ -459,13 +424,13 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 	}
 
 	// Disabled presigning falls back to the server-served xorb path.
-	plain := newTestS3Storage(t, WithS3Presign(false))
+	plain := newTestS3Storage(t, WithPresign(false))
 	if got, err := plain.GetXorbURL("ns", xorbHash); err != nil || got != "/v1/xorbs/ns/"+xorbHash.String() {
 		t.Fatalf("GetXorbURL() with presign disabled = %q, %v", got, err)
 	}
 
 	// A distinct presign endpoint moves only the URL host, not the API client.
-	public := newTestS3Storage(t, WithS3PresignEndpoint("http://public.example:9000"))
+	public := newTestS3Storage(t, WithPresignEndpoint("http://public.example:9000"))
 	got, err := public.GetXorbURL("default", xorbHash)
 	if err != nil {
 		t.Fatalf("GetXorbURL() with presign endpoint error: %v", err)
@@ -511,7 +476,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	fc := &flakyHTTPClient{}
-	client := s3.New(s3.Options{
+	client := awss3.New(awss3.Options{
 		BaseEndpoint:               aws.String(srv.URL),
 		Region:                     "us-east-1",
 		Credentials:                credentials.NewStaticCredentialsProvider("test", "test", ""),
@@ -521,13 +486,14 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	ss, err := NewS3Storage(ctx, WithS3Client(client), WithS3Bucket("test-bucket"))
+	ss, err := NewStorage(ctx, WithS3Client(client), WithBucket("test-bucket"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	parts := [][]byte{[]byte("retry me")}
-	shardObj, fileHash := putTestShard(t, ctx, ss, parts)
+	shardObj := shard.NewShard()
+	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
 	// First attempt dies while writing SHA-256 indexes, after the shard
 	// object and chunk indexes are already stored.
@@ -549,7 +515,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	// A fresh storage must resolve every index written by the retry.
-	fresh, err := NewS3Storage(ctx, WithS3Client(client), WithS3Bucket("test-bucket"))
+	fresh, err := NewStorage(ctx, WithS3Client(client), WithBucket("test-bucket"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,33 +544,33 @@ func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
 	ss := newTestS3Storage(t)
 
 	shared := []byte("chunk shared by both shards")
-	f1 := putGCFile(t, ctx, ss, [][]byte{shared, []byte("unique to file one")})
+	f1 := storagetest.PutFile(t, ctx, ss, [][]byte{shared, []byte("unique to file one")})
 
 	// Warm the chunk cache: the shared chunk resolves to f1's shard.
-	sh, err := ss.GetShardByChunkHash(ctx, "default", f1.chunkHashes[0])
+	sh, err := ss.GetShardByChunkHash(ctx, "default", f1.ChunkHashes[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sh.Files[0].FileHash; got != f1.fileHash {
-		t.Fatalf("chunk resolves to file %s, want %s", got.String(), f1.fileHash.String())
+	if got := sh.Files[0].FileHash; got != f1.FileHash {
+		t.Fatalf("chunk resolves to file %s, want %s", got.String(), f1.FileHash.String())
 	}
 
 	// A second shard carrying the same chunk (a different file, so PutShard
 	// commits it) overwrites the chunk index object.
-	f2 := putGCFile(t, ctx, ss, [][]byte{shared, []byte("unique to file two")})
-	if f1.chunkHashes[0] != f2.chunkHashes[0] {
+	f2 := storagetest.PutFile(t, ctx, ss, [][]byte{shared, []byte("unique to file two")})
+	if f1.ChunkHashes[0] != f2.ChunkHashes[0] {
 		t.Fatal("test setup: shared part must map to one chunk hash")
 	}
-	if got, err := ss.GetChunkIndexEntry(ctx, f2.chunkHashes[0]); err != nil || got != f2.shardHash {
-		t.Fatalf("stored chunk entry = %q, %v; want %q", got, err, f2.shardHash)
+	if got, err := ss.GetChunkIndexEntry(ctx, f2.ChunkHashes[0]); err != nil || got != f2.ShardHash {
+		t.Fatalf("stored chunk entry = %q, %v; want %q", got, err, f2.ShardHash)
 	}
 
 	// A fresh resolution must follow the overwritten entry, not the cache.
-	sh, err = ss.GetShardByChunkHash(ctx, "default", f2.chunkHashes[0])
+	sh, err = ss.GetShardByChunkHash(ctx, "default", f2.ChunkHashes[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sh.Files[0].FileHash; got != f2.fileHash {
-		t.Fatalf("chunk resolves to file %s, want %s (stale cache)", got.String(), f2.fileHash.String())
+	if got := sh.Files[0].FileHash; got != f2.FileHash {
+		t.Fatalf("chunk resolves to file %s, want %s (stale cache)", got.String(), f2.FileHash.String())
 	}
 }

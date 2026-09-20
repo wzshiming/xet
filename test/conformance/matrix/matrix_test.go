@@ -25,7 +25,7 @@ import (
 	xetdownload "github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/testutil"
 	"github.com/wzshiming/xet/test/conformance/utils"
@@ -252,9 +252,9 @@ func startGoServer(t *testing.T) runningServer {
 	httpServer := httptest.NewServer(proxy)
 	t.Cleanup(httpServer.Close)
 
-	stor, err := storage.NewFileStorage(
-		storage.WithBasePath(t.TempDir()),
-		storage.WithBaseURL(httpServer.URL),
+	stor, err := local.NewStorage(
+		local.WithBasePath(t.TempDir()),
+		local.WithBaseURL(httpServer.URL),
 	)
 	if err != nil {
 		t.Fatalf("create Go server storage: %v", err)

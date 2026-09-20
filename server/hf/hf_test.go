@@ -30,6 +30,7 @@ import (
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/upload"
 )
 
@@ -60,9 +61,9 @@ func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storage
 	}))
 	t.Cleanup(srv.Close)
 
-	stor, err := storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(srv.URL),
+	stor, err := local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(srv.URL),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -653,9 +654,9 @@ func newXetUpstream(t *testing.T) *xetUpstream {
 	}))
 	t.Cleanup(casSrv.Close)
 
-	stor, err := storage.NewFileStorage(
-		storage.WithBasePath(t.TempDir()),
-		storage.WithBaseURL(casSrv.URL),
+	stor, err := local.NewStorage(
+		local.WithBasePath(t.TempDir()),
+		local.WithBaseURL(casSrv.URL),
 	)
 	if err != nil {
 		t.Fatal(err)

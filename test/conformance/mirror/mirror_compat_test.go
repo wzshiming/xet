@@ -32,7 +32,7 @@ import (
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // testFile is an LFS-backed file (~27 MiB) present in both test repos.
@@ -192,9 +192,9 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	}))
 	t.Cleanup(srv.Close)
 
-	stor, err := storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(srv.URL),
+	stor, err := local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(srv.URL),
 	)
 	if err != nil {
 		t.Fatal(err)

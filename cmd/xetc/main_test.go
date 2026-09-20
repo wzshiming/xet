@@ -15,7 +15,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/server"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 func TestCacheDirFlag(t *testing.T) {
@@ -61,7 +61,7 @@ func TestCacheDirFlag(t *testing.T) {
 }
 
 func TestCacheDirRoundTrip(t *testing.T) {
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

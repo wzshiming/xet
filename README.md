@@ -15,7 +15,7 @@ Implemented in this repository:
 - Core hash / gearhash / merkle primitives
 - Shard and xorb encode/decode paths
 - Upload and download client workflows with streaming wrappers (upload from any `io.ReadSeeker`, download to an `io.WriteSeeker` or as `io.ReadCloser` streams)
-- Server storage backends: local filesystem or S3-compatible object stores (MinIO etc.), with optional presigned xorb download URLs
+- Server storage backends: local filesystem, in-memory, or S3-compatible object stores, with optional presigned xorb download URLs
 - Mirror mode: full-cache middle layer bridging xet and plain hubs
 - Hugging Face token/LFS based integration helpers
 - Conformance and unit tests for key protocol paths

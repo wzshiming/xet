@@ -13,7 +13,7 @@ import (
 
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // TestXetBridgeUploadRestartAndDownload exercises the public HTTP upload path,
@@ -21,7 +21,7 @@ import (
 // the bridge's complete-file, HEAD, conditional, and byte-range responses.
 func TestXetBridgeUploadRestartAndDownload(t *testing.T) {
 	storagePath := t.TempDir()
-	uploadStorage, err := storage.NewFileStorage(storage.WithBasePath(storagePath))
+	uploadStorage, err := local.NewStorage(local.WithBasePath(storagePath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestXetBridgeUploadRestartAndDownload(t *testing.T) {
 	uploadServer.Close()
 
 	// Reopen storage so bridge lookup cannot be satisfied by an in-memory cache.
-	downloadStorage, err := storage.NewFileStorage(storage.WithBasePath(storagePath))
+	downloadStorage, err := local.NewStorage(local.WithBasePath(storagePath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestXetBridgeUploadRestartAndDownload(t *testing.T) {
 // TestXetBridgeNotFound tests that the bridge returns 404 for non-existent files
 func TestXetBridgeNotFound(t *testing.T) {
 	storagePath := t.TempDir()
-	downloadStorage, err := storage.NewFileStorage(storage.WithBasePath(storagePath))
+	downloadStorage, err := local.NewStorage(local.WithBasePath(storagePath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestXetBridgeNotFound(t *testing.T) {
 // TestXetBridgeInvalidHash tests that the bridge returns 400 for invalid SHA-256 hashes
 func TestXetBridgeInvalidHash(t *testing.T) {
 	storagePath := t.TempDir()
-	downloadStorage, err := storage.NewFileStorage(storage.WithBasePath(storagePath))
+	downloadStorage, err := local.NewStorage(local.WithBasePath(storagePath))
 	if err != nil {
 		t.Fatal(err)
 	}
