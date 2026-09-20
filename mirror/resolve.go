@@ -9,7 +9,6 @@ import (
 	"io"
 	iofs "io/fs"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -46,7 +45,7 @@ func (m *Mirror) Resolve(ctx context.Context, repo, rev, path string) (*Resoluti
 		return nil, fmt.Errorf("mirror: invalid resolve components repo=%q rev=%q path=%q", repo, rev, path)
 	}
 	key := resolveKey{repo: repo, rev: rev, path: path}
-	_, t, e, err := m.acquire(ctx, key)
+	key, t, e, err := m.acquire(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +53,7 @@ func (m *Mirror) Resolve(ctx context.Context, repo, rev, path string) (*Resoluti
 		return &Resolution{Stream: &Stream{t: t}}, nil
 	}
 	if e.State == stateReady {
-		return &Resolution{Entry: exportEntry(e)}, nil
+		return &Resolution{Entry: exportEntry(key, e)}, nil
 	}
 	return nil, entryErr(e)
 }
@@ -67,10 +66,7 @@ type Stream struct {
 	t *task
 }
 
-// WaitMeta blocks until the upstream probe settled or ctx is done, and
-// returns the upstream metadata the ingest runs against. Probe failures are
-// returned as errors, with not-found matching ErrUpstreamNotFound. The
-// remaining Stream methods may only be used after WaitMeta returned nil.
+// WaitMeta must succeed before calling the remaining Stream methods.
 func (st *Stream) WaitMeta(ctx context.Context) (etag, commit string, err error) {
 	select {
 	case <-st.t.probed:
@@ -80,7 +76,7 @@ func (st *Stream) WaitMeta(ctx context.Context) (etag, commit string, err error)
 	if st.t.probeErr != nil {
 		return "", "", st.t.probeErr
 	}
-	return st.t.probe.etag, st.t.probe.commit, nil
+	return st.t.probe.etag, st.t.key.rev, nil
 }
 
 // WaitSize blocks until the content length is known — some hubs carry no
@@ -142,35 +138,23 @@ func (m *Mirror) FetchUpstream(ctx context.Context, pathAndQuery string) (*http.
 	return m.fetchClient.Do(req)
 }
 
-// needsRevalidate reports whether a ready entry must be re-checked upstream.
-func (m *Mirror) needsRevalidate(e *fileEntry, rev string) bool {
-	if m.revalidateInterval < 0 || commitRevRe.MatchString(rev) {
+// revalidate re-probes a source-backed entry's branch: a changed etag drops it for re-ingest, upstream errors keep it.
+func (m *Mirror) revalidate(ctx context.Context, key, src resolveKey, e *fileEntry, pr *probeResult) bool {
+	if pr == nil {
+		var err error
+		if pr, err = m.probe(ctx, src); err != nil || probeErr(pr) != nil {
+			return true
+		}
+	}
+	if pr.etag != e.ETag {
+		m.dropEntry(key, e)
 		return false
 	}
-	return time.Since(e.CheckedAt) >= m.revalidateInterval
-}
-
-// revalidate re-probes the upstream. It returns the entry to serve, or nil
-// when the entry went stale and must be re-ingested. Upstream errors keep
-// serving the cached copy.
-func (m *Mirror) revalidate(ctx context.Context, key resolveKey, e *fileEntry) *fileEntry {
-	pr, err := m.probe(ctx, key.String())
-	if err != nil || pr.status < 200 || pr.status >= 300 {
-		return e
-	}
-	if pr.etag == e.ETag {
-		e.CheckedAt = time.Now()
-		_ = persistEntry(m.indexDir, e)
-		return e
-	}
-
 	m.mu.Lock()
-	if m.entries[key] == e {
-		delete(m.entries, key)
-	}
+	e.CheckedAt = time.Now()
 	m.mu.Unlock()
-	_ = os.Remove(indexEntryPath(m.indexDir, e.Commit, e.Key))
-	return nil
+	_ = m.persistCommit(key.repo, key.rev)
+	return true
 }
 
 // entryLive reports whether a ready entry's file is still in storage; an
@@ -190,12 +174,14 @@ func (m *Mirror) entryLive(ctx context.Context, e *fileEntry) bool {
 	return true
 }
 
-// dropEntry forgets a dead entry in memory and on disk.
+// dropEntry forgets a dead entry in memory and rewrites its commit manifest without it.
 func (m *Mirror) dropEntry(key resolveKey, e *fileEntry) {
 	m.mu.Lock()
 	if m.entries[key] == e {
+		cs := m.loadCommit(key.repo, key.rev)
 		delete(m.entries, key)
+		delete(cs.files, key.path)
 	}
 	m.mu.Unlock()
-	_ = os.Remove(indexEntryPath(m.indexDir, e.Commit, e.Key))
+	_ = m.persistCommit(key.repo, key.rev)
 }

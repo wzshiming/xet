@@ -24,13 +24,13 @@ type Entry struct {
 
 // exportEntry copies the persisted fields of a ready entry into the exported
 // form.
-func exportEntry(e *fileEntry) *Entry {
+func exportEntry(key resolveKey, e *fileEntry) *Entry {
 	return &Entry{
 		SHA256:   e.SHA256,
 		FileHash: e.FileHash,
 		Size:     e.Size,
 		ETag:     e.ETag,
-		Commit:   e.Commit,
+		Commit:   key.rev,
 	}
 }
 
@@ -121,7 +121,7 @@ func (m *Mirror) ingest(key resolveKey) (*Entry, error) {
 		}
 	}
 	if e.State == stateReady {
-		return exportEntry(e), nil
+		return exportEntry(key, e), nil
 	}
 	return nil, entryErr(e)
 }

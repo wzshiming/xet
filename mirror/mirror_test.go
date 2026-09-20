@@ -10,16 +10,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/storage"
 )
 
@@ -165,16 +169,22 @@ type plainUpstream struct {
 	seenAuth sync.Map // Authorization values observed on any request
 	gate     chan struct{}
 	gateHit  chan struct{}
+	gateOnce sync.Once
 }
 
 func newPlainUpstream() *plainUpstream {
 	return &plainUpstream{files: map[string][]byte{}, api: map[string][]byte{}, commit: "commit-1"}
 }
 
+// set publishes data at path; like a hub, the branch head is also served at
+// the current commit when that is a real 40-hex commit.
 func (u *plainUpstream) set(path string, data []byte) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.files[path] = data
+	if seg := resolveRe.FindStringSubmatch(path); seg != nil && commitRevRe.MatchString(u.commit) {
+		u.files["/"+seg[1]+"/resolve/"+u.commit+"/"+seg[3]] = data
+	}
 }
 
 func (u *plainUpstream) get(path string) ([]byte, bool) {
@@ -221,7 +231,7 @@ func (u *plainUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			w.(http.Flusher).Flush()
-			close(u.gateHit)
+			u.gateOnce.Do(func() { close(u.gateHit) })
 			<-u.gate
 			_, _ = w.Write(data[half:])
 			return
@@ -259,6 +269,7 @@ func TestResolveStream(t *testing.T) {
 	if _, err := rand.Read(data); err != nil {
 		t.Fatal(err)
 	}
+	upstream.commit = strings.Repeat("ab", 20)
 	upstream.set("/org/repo/resolve/main/model.bin", data)
 
 	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
@@ -280,8 +291,8 @@ func TestResolveStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WaitMeta: %v", err)
 	}
-	if commit != "commit-1" {
-		t.Fatalf("commit = %q, want commit-1", commit)
+	if commit != upstream.commit {
+		t.Fatalf("commit = %q, want %s", commit, upstream.commit)
 	}
 	if etag == "" {
 		t.Fatal("empty etag from WaitMeta")
@@ -328,7 +339,7 @@ func TestResolveStream(t *testing.T) {
 	if entry == nil {
 		t.Fatal("resolve never returned a ready entry")
 	}
-	if entry.Size != int64(len(data)) || entry.Commit != "commit-1" {
+	if entry.Size != int64(len(data)) || entry.Commit != upstream.commit {
 		t.Fatalf("entry = %+v", entry)
 	}
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
@@ -359,81 +370,98 @@ func TestResolveStream(t *testing.T) {
 	}
 }
 
-func TestBranchEntryPath(t *testing.T) {
-	dir := filepath.Join("idx", "branches")
+func hashHex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
 
-	cases := []struct {
-		repo, rev string
-		want      string // relative to dir
-	}{
-		{"Qwen/Qwen3-0.6B", "main", "Qwen/Qwen3-0.6B/main.json"},
-		{"gpt2", "main", "gpt2/main.json"},
-		{"datasets/org/repo", "refs%2Fpr%2F1", "datasets/org/repo/refs%252Fpr%252F1.json"},
-		// Traversal and hostile names stay escaped.
-		{"..", "main", "%2E./main.json"},
-		{"org/..", "..", "org/%2E./%2E..json"},
-		{".hidden/repo", ".rev", "%2Ehidden/repo/%2Erev.json"},
-		{"a%b", "r", "a%25b/r.json"},
-		{"org/", "r", "org/%00/r.json"},
-		// A repo segment ending in .json cannot collide with mapping files.
-		{"org/main.json", "x", "org/main%2Ejson/x.json"},
+func TestBranchEntryPath(t *testing.T) {
+	dir := "idx"
+
+	cases := []struct{ repo, rev string }{
+		{"Qwen/Qwen3-0.6B", "main"},
+		{"datasets/org/repo", "refs%2Fpr%2F1"},
+		{"..", ".."},
+		{"org/main.json", "x.json.tmp"},
+		{".hidden/repo", ".rev"},
+		{"a%b\\c", "r:s\x01"},
+		{"org/", ""},
+		{strings.Repeat("x", 300), strings.Repeat("r", 300)},
 	}
+	wantLen := len(filepath.Join(hashHex(""), "branches", hashHex("")+".json"))
 	for _, c := range cases {
-		want := filepath.Join(dir, filepath.FromSlash(c.want))
-		if got := branchEntryPath(dir, c.repo, c.rev); got != want {
+		want := filepath.Join(dir, hashHex(c.repo), "branches", hashHex(c.rev)+".json")
+		got := branchEntryPath(dir, c.repo, c.rev)
+		if got != want {
 			t.Errorf("branchEntryPath(%q, %q) = %q, want %q", c.repo, c.rev, got, want)
 		}
+		if rel, _ := filepath.Rel(dir, got); len(rel) != wantLen {
+			t.Errorf("branchEntryPath(%q, %q) suffix length %d, want %d", c.repo, c.rev, len(rel), wantLen)
+		}
 	}
 
-	t.Run("never escapes the branch dir", func(t *testing.T) {
-		hostile := []struct{ repo, rev string }{
-			{"../../etc", "passwd"},
-			{"..", ".."},
-			{"a/../../b", "r"},
-			{"", ""},
-			{"./.", "."},
+	t.Run("distinct identities never share a path", func(t *testing.T) {
+		pairs := [][2][2]string{
+			{{"org/repo", "main"}, {"datasets/org/repo", "main"}},
+			{{"Org/Repo", "Main"}, {"org/repo", "main"}},
+			{{"org/repo", "main"}, {"org/repo", "main.json"}},
 		}
-		for _, c := range hostile {
-			p := branchEntryPath(dir, c.repo, c.rev)
-			rel, err := filepath.Rel(dir, p)
-			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-				t.Errorf("branchEntryPath(%q, %q) = %q escapes %q", c.repo, c.rev, p, dir)
+		for _, p := range pairs {
+			a := branchEntryPath(dir, p[0][0], p[0][1])
+			b := branchEntryPath(dir, p[1][0], p[1][1])
+			if a == b || strings.EqualFold(a, b) {
+				t.Errorf("%v and %v map to %q and %q", p[0], p[1], a, b)
+			}
+		}
+	})
+}
+
+func TestCommitPath(t *testing.T) {
+	dir := "idx"
+	commit := strings.Repeat("ab", 20)
+
+	for _, repo := range []string{
+		"Qwen/Qwen3-0.6B",
+		"gpt2",
+		"datasets/org/repo",
+		"..",
+		".hidden/repo",
+		"a%b\\c",
+		"org/main.json",
+		strings.Repeat("x", 300),
+	} {
+		want := filepath.Join(dir, hashHex(repo), "commits", commit+".json")
+		if got := commitPath(dir, repo, commit); got != want {
+			t.Errorf("commitPath(%q) = %q, want %q", repo, got, want)
+		}
+	}
+
+	t.Run("one repo dir holds branches and commits", func(t *testing.T) {
+		prefix := filepath.Join(dir, hashHex("org/repo")) + string(filepath.Separator)
+		for _, p := range []string{
+			branchEntryPath(dir, "org/repo", "main"),
+			commitPath(dir, "org/repo", commit),
+		} {
+			if !strings.HasPrefix(p, prefix) {
+				t.Errorf("%q not under %q", p, prefix)
 			}
 		}
 	})
 
-	t.Run("overlong segment falls back to hashed name", func(t *testing.T) {
-		repo := strings.Repeat("x", 300)
-		sum := sha256.Sum256([]byte(repo + "@main"))
-		want := filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
-		if got := branchEntryPath(dir, repo, "main"); got != want {
-			t.Errorf("branchEntryPath overlong = %q, want hashed fallback %q", got, want)
+	t.Run("distinct repos never share a manifest", func(t *testing.T) {
+		for _, p := range [][2]string{
+			{"org/repo", "datasets/org/repo"},
+			{"Org/Repo", "org/repo"},
+			{"org/repo", "org/repo.json"},
+		} {
+			a, b := commitPath(dir, p[0], commit), commitPath(dir, p[1], commit)
+			if a == b || strings.EqualFold(a, b) {
+				t.Errorf("%q and %q map to %q and %q", p[0], p[1], a, b)
+			}
 		}
 	})
 }
 
-// TestIndexEntryPath: file entries fan out as <hash[:2]>/<hash[2:4]>/<hash[4:]>.json
-// of the key hash, under the commit directory when the commit is a 40-hex id.
-func TestIndexEntryPath(t *testing.T) {
-	dir := "idx"
-	commit := strings.Repeat("ab", 20)
-	key := "/org/repo/resolve/" + commit + "/f.bin"
-	sum := sha256.Sum256([]byte(key))
-	h := hex.EncodeToString(sum[:])
-	leaf := filepath.Join(h[:2], h[2:4], h[4:]+".json")
-
-	if got, want := indexEntryPath(dir, commit, key), filepath.Join(dir, commit, leaf); got != want {
-		t.Errorf("grouped = %q, want %q", got, want)
-	}
-	for _, c := range []string{"", "commit-1", strings.Repeat("ab", 19)} {
-		if got, want := indexEntryPath(dir, c, key), filepath.Join(dir, leaf); got != want {
-			t.Errorf("ungrouped (commit %q) = %q, want %q", c, got, want)
-		}
-	}
-}
-
-// TestMirrorIndexLayout: branch mappings land at human-readable nested paths
-// and file entries fan out under their commit directory.
 func TestMirrorIndexLayout(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
@@ -453,95 +481,1140 @@ func TestMirrorIndexLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-in.Done()
-	if _, err := in.Entry(); err != nil {
-		t.Fatal(err)
-	}
-
-	mappingPath := filepath.Join(cacheDir, "index", "branches", "Qwen", "Qwen3-0.6B", "main.json")
-	raw, err := os.ReadFile(mappingPath)
+	entry, err := in.Entry()
 	if err != nil {
-		t.Fatalf("read branch mapping: %v", err)
-	}
-	var b branchEntry
-	if err := json.Unmarshal(raw, &b); err != nil {
 		t.Fatal(err)
 	}
-	if b.Repo != "Qwen/Qwen3-0.6B" || b.Rev != "main" || b.Commit != commit {
-		t.Fatalf("branch mapping = %+v, want repo Qwen/Qwen3-0.6B rev main commit %s", b, commit)
+	if entry.Commit != commit {
+		t.Fatalf("exported commit = %q, want %s", entry.Commit, commit)
 	}
 
-	key := "/Qwen/Qwen3-0.6B/resolve/" + commit + "/f.bin"
-	sum := sha256.Sum256([]byte(key))
-	h := hex.EncodeToString(sum[:])
-	entryPath := filepath.Join(cacheDir, "index", commit, h[:2], h[2:4], h[4:]+".json")
-	if _, err := os.Stat(entryPath); err != nil {
-		t.Fatalf("file entry not fanned out under commit dir: %v", err)
+	repoDir := filepath.Join(cacheDir, "index", hashHex("Qwen/Qwen3-0.6B"))
+	pointerPath := filepath.Join(repoDir, "branches", hashHex("main")+".json")
+	manifestPath := filepath.Join(repoDir, "commits", commit+".json")
+
+	if got, want := indexFiles(t, filepath.Join(cacheDir, "index")), []string{pointerPath, manifestPath}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("index files = %q, want %q", got, want)
+	}
+
+	pointer := jsonKeys(t, pointerPath)
+	if got := sortedKeys(pointer); strings.Join(got, ",") != "checked_at,commit" {
+		t.Fatalf("branch pointer keys = %v, want only checked_at and commit", got)
+	}
+	if got := string(pointer["commit"]); got != `"`+commit+`"` {
+		t.Fatalf("branch pointer commit = %s, want %s", got, commit)
+	}
+
+	manifest := jsonKeys(t, manifestPath)
+	if got := sortedKeys(manifest); strings.Join(got, ",") != "commit,files,repo" {
+		t.Fatalf("manifest keys = %v, want commit,files,repo", got)
+	}
+	if string(manifest["repo"]) != `"Qwen/Qwen3-0.6B"` || string(manifest["commit"]) != `"`+commit+`"` {
+		t.Fatalf("manifest identity = %s %s, want repo Qwen/Qwen3-0.6B commit %s", manifest["repo"], manifest["commit"], commit)
+	}
+	var files map[string]json.RawMessage
+	if err := json.Unmarshal(manifest["files"], &files); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files["f.bin"] == nil {
+		t.Fatalf("manifest files = %s, want exactly f.bin", manifest["files"])
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(files["f.bin"], &record); err != nil {
+		t.Fatal(err)
+	}
+	if got := sortedKeys(record); strings.Join(got, ",") != "checked_at,etag,file_hash,sha256,size" {
+		t.Fatalf("file record keys = %v, want checked_at,etag,file_hash,sha256,size", got)
+	}
+	if got := string(record["size"]); got != fmt.Sprint(len(data)) {
+		t.Fatalf("file record size = %s, want %d", got, len(data))
 	}
 }
 
-// TestMirrorIndexRestart: a fresh engine over the same cache dir loads the
-// grouped and ungrouped fanout entries without refetching, ignores unfinished
-// writes and the branches subtree, and invalidation removes the fanout leaf.
+// indexFiles lists every regular file under dir, sorted.
+func indexFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func jsonKeys(t *testing.T, path string) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return obj
+}
+
+func sortedKeys(obj map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func writeRaw(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readManifest(t *testing.T, path string) commitManifest {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var man commitManifest
+	if err := json.Unmarshal(raw, &man); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return man
+}
+
+// rawSource reads the manifest's source field from disk, "" when absent.
+func rawSource(t *testing.T, path string) string {
+	t.Helper()
+	var src string
+	if raw := jsonKeys(t, path)["source"]; raw != nil {
+		if err := json.Unmarshal(raw, &src); err != nil {
+			t.Fatalf("%s: source %s: %v", path, raw, err)
+		}
+	}
+	return src
+}
+
+func ingestWait(t *testing.T, m *Mirror, repo, rev, path string) (*Entry, error) {
+	t.Helper()
+	in, err := m.Ingest(repo, rev, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-in.Done()
+	return in.Entry()
+}
+
+// wantPseudo spells out the pseudo-commit scheme the index must keep using.
+func wantPseudo(repo, rev string) string {
+	sum := sha256.Sum256([]byte("xet-mirror-pseudo-commit\x00" + repo + "\x00" + rev))
+	return hex.EncodeToString(sum[:20])
+}
+
+// countingServer serves upstream, counting requests and recording their paths.
+func countingServer(t *testing.T, upstream http.Handler) (*httptest.Server, *atomic.Int64, *sync.Map) {
+	t.Helper()
+	var requests atomic.Int64
+	var paths sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		paths.Store(r.URL.Path, true)
+		upstream.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &requests, &paths
+}
+
+func deadServer(t *testing.T) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	return srv, requests
+}
+
+// HTTP handlers cannot use t.Fatal to release a blocked gate.
+func gateWait(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	case <-time.After(10 * time.Second):
+		return false
+	}
+}
+
+func TestMirrorSyntheticPin(t *testing.T) {
+	pseudo := wantPseudo("org/repo", "main")
+	for _, tc := range []struct{ name, header string }{{"absent", ""}, {"invalid", "not-a-commit"}, {"own pseudo", pseudo}} {
+		t.Run("X-Repo-Commit "+tc.name, func(t *testing.T) {
+			upstream := newPlainUpstream()
+			upstream.commit = tc.header
+			dataA, dataB := []byte("synthetic a v1"), []byte("synthetic b")
+			upstream.set("/org/repo/resolve/main/a.bin", dataA)
+			upstream.set("/org/repo/resolve/main/b.bin", dataB)
+			srv, _, paths := countingServer(t, upstream)
+
+			storageDir, cacheDir := t.TempDir(), t.TempDir()
+			indexDir := filepath.Join(cacheDir, "index")
+			m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir, WithRevalidateInterval(0))
+			manifestPath := commitPath(indexDir, "org/repo", pseudo)
+
+			for _, p := range []string{"a.bin", "b.bin"} {
+				entry, err := ingestWait(t, m, "org/repo", "main", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if entry.Commit != pseudo {
+					t.Fatalf("%s: Commit = %q, want pseudo %s", p, entry.Commit, pseudo)
+				}
+			}
+			if got := sortedKeys(jsonKeys(t, manifestPath)); strings.Join(got, ",") != "commit,files,repo,source" {
+				t.Errorf("manifest keys = %v, want commit,files,repo,source", got)
+			}
+			if src := rawSource(t, manifestPath); src != "main" {
+				t.Errorf("manifest source = %q, want main", src)
+			}
+			if man := readManifest(t, manifestPath); len(man.Files) != 2 {
+				t.Fatalf("manifest = %+v, want a.bin and b.bin", man)
+			}
+			pointer := jsonKeys(t, branchEntryPath(indexDir, "org/repo", "main"))
+			if got := sortedKeys(pointer); strings.Join(got, ",") != "checked_at,commit" || string(pointer["commit"]) != `"`+pseudo+`"` {
+				t.Fatalf("branch pointer = %s, want commit %s and checked_at only", pointer, pseudo)
+			}
+
+			// a.bin changes upstream: its etag revalidation re-downloads it,
+			// while the untouched sibling keeps serving from cache.
+			dataA2 := []byte("synthetic a v2")
+			upstream.set("/org/repo/resolve/main/a.bin", dataA2)
+			before := upstream.dataGETs.Load()
+			entry, err := ingestWait(t, m, "org/repo", "main", "a.bin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, dataA2) {
+				t.Fatal("changed file not re-downloaded")
+			}
+			if got := upstream.dataGETs.Load(); got != before+1 {
+				t.Fatalf("data GETs after change = %d, want %d", got, before+1)
+			}
+			if entry, err = ingestWait(t, m, "org/repo", "main", "b.bin"); err != nil || entry.Commit != pseudo {
+				t.Fatalf("sibling = %+v, %v", entry, err)
+			}
+			if got := upstream.dataGETs.Load(); got != before+1 {
+				t.Fatalf("sibling revalidation downloaded: data GETs = %d, want %d", got, before+1)
+			}
+			if man := readManifest(t, manifestPath); len(man.Files) != 2 || rawSource(t, manifestPath) != "main" {
+				t.Errorf("manifest after refresh = %+v", man)
+			}
+
+			// Restart: the saved source serves direct pseudo-commit misses and revalidations from the branch.
+			m2, stor2 := newTestMirror(t, srv.URL, storageDir, cacheDir, WithRevalidateInterval(0))
+			dataC := []byte("synthetic c")
+			upstream.set("/org/repo/resolve/main/c.bin", dataC)
+			if entry, err = ingestWait(t, m2, "org/repo", pseudo, "c.bin"); err != nil || entry.Commit != pseudo {
+				t.Fatalf("direct pseudo c.bin after restart = %+v, %v", entry, err)
+			}
+			if _, ok := paths.Load("/org/repo/resolve/main/c.bin"); !ok {
+				t.Fatal("c.bin was not fetched through the source branch")
+			}
+			dataA3 := []byte("synthetic a v3")
+			upstream.set("/org/repo/resolve/main/a.bin", dataA3)
+			if entry, err = ingestWait(t, m2, "org/repo", pseudo, "a.bin"); err != nil {
+				t.Fatal(err)
+			}
+			if got := readStored(t, stor2, entry.SHA256); !bytes.Equal(got, dataA3) {
+				t.Fatal("direct pseudo request served the stale a.bin")
+			}
+
+			paths.Range(func(p, _ any) bool {
+				if strings.Contains(p.(string), pseudo) {
+					t.Errorf("upstream requested by pseudo commit: %s", p)
+				}
+				return true
+			})
+		})
+	}
+
+	t.Run("source pinned before first publish", func(t *testing.T) {
+		upstream := newPlainUpstream()
+		upstream.commit = ""
+		upstream.set("/org/repo/resolve/main/held.bin", []byte("held"))
+		upstream.set("/org/repo/resolve/main/other.bin", []byte("other"))
+		hold := make(chan struct{})
+		var release sync.Once
+		defer release.Do(func() { close(hold) })
+		srv, _, paths := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/held.bin") {
+				<-hold
+			}
+			upstream.ServeHTTP(w, r)
+		}))
+
+		storageDir, cacheDir := t.TempDir(), t.TempDir()
+		indexDir := filepath.Join(cacheDir, "index")
+		manifestPath := commitPath(indexDir, "org/repo", pseudo)
+		m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		res, err := m.Resolve(context.Background(), "org/repo", "main", "held.bin")
+		if err != nil || res.Stream == nil {
+			t.Fatalf("Resolve = %+v, %v; want an in-flight stream", res, err)
+		}
+		if man := readManifest(t, manifestPath); len(man.Files) != 0 || rawSource(t, manifestPath) != "main" {
+			t.Fatalf("manifest at pin time = %+v, source %q; want source main and no files", man, rawSource(t, manifestPath))
+		}
+		if _, err := os.Stat(branchEntryPath(indexDir, "org/repo", "main")); err != nil {
+			t.Fatalf("branch pointer missing at pin time: %v", err)
+		}
+
+		m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		entry, err := ingestWait(t, m2, "org/repo", pseudo, "other.bin")
+		if err != nil || entry.Commit != pseudo {
+			t.Fatalf("direct pseudo other.bin before any publish = %+v, %v", entry, err)
+		}
+		if _, ok := paths.Load("/org/repo/resolve/main/other.bin"); !ok {
+			t.Fatal("other.bin was not fetched through the source branch")
+		}
+		release.Do(func() { close(hold) })
+		if _, _, err := res.Stream.WaitMeta(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("concurrent source pin waits for persistence", func(t *testing.T) {
+		engine := &Mirror{
+			indexDir: t.TempDir(),
+			commits: map[string]*commitState{
+				"org/repo\x00" + pseudo: {source: "main"},
+			},
+		}
+		engine.persistMu.Lock()
+		var release sync.Once
+		unlock := func() { release.Do(engine.persistMu.Unlock) }
+		defer unlock()
+		started, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			close(started)
+			engine.ensureSource("org/repo", pseudo, "main")
+			close(done)
+		}()
+		<-started
+		select {
+		case <-done:
+			t.Error("source pin returned before the pending manifest write")
+		case <-time.After(50 * time.Millisecond):
+		}
+		manifestPath := commitPath(engine.indexDir, "org/repo", pseudo)
+		if err := writeJSON(manifestPath, commitManifest{
+			Repo: "org/repo", Commit: pseudo, Source: "main", Files: map[string]*fileEntry{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		unlock()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("source pin did not finish after persistence")
+		}
+		if source := rawSource(t, manifestPath); source != "main" {
+			t.Fatalf("source = %q, want main", source)
+		}
+	})
+
+	t.Run("real commit never revalidates", func(t *testing.T) {
+		upstream := newPlainUpstream()
+		commit := strings.Repeat("ab", 20)
+		upstream.commit = commit
+		data := []byte("real v1")
+		upstream.set("/org/repo/resolve/main/f.bin", data)
+		srv, requests, _ := countingServer(t, upstream)
+
+		cacheDir := t.TempDir()
+		m, _ := newTestMirror(t, srv.URL, t.TempDir(), cacheDir, WithRevalidateInterval(0))
+		entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+		if err != nil || entry.Commit != commit {
+			t.Fatalf("entry = %+v, %v", entry, err)
+		}
+		if got := sortedKeys(jsonKeys(t, commitPath(filepath.Join(cacheDir, "index"), "org/repo", commit))); strings.Join(got, ",") != "commit,files,repo" {
+			t.Fatalf("real commit manifest keys = %v, want commit,files,repo", got)
+		}
+
+		// Same commit, new etag: the pinned content is immutable, so the
+		// branch probe is the only upstream traffic and nothing re-downloads.
+		upstream.set("/org/repo/resolve/main/f.bin", []byte("real v2"))
+		before, gets := requests.Load(), upstream.dataGETs.Load()
+		res, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+		if err != nil || res.Entry == nil || res.Entry.SHA256 != entry.SHA256 {
+			t.Fatalf("branch resolve = %+v, %v; want the cached entry", res, err)
+		}
+		if got := requests.Load() - before; got != 2 { // hub HEAD + redirect hop
+			t.Fatalf("branch resolve made %d upstream requests, want the branch probe only", got)
+		}
+		if upstream.dataGETs.Load() != gets {
+			t.Fatal("real commit entry was re-downloaded")
+		}
+		before = requests.Load()
+		if res, err = m.Resolve(context.Background(), "org/repo", commit, "f.bin"); err != nil || res.Entry == nil {
+			t.Fatalf("commit resolve = %+v, %v", res, err)
+		}
+		if got := requests.Load() - before; got != 0 {
+			t.Fatalf("commit resolve made %d upstream requests, want 0", got)
+		}
+	})
+}
+
+func TestMirrorUnpinnableBranch(t *testing.T) {
+	upstream := newPlainUpstream()
+	commit := strings.Repeat("11", 20)
+	upstream.commit = commit
+	upstream.set("/org/repo/resolve/main/ok.bin", []byte("ok"))
+	upstream.set("/org/repo/resolve/"+commit+"/other.bin", []byte("other"))
+	var down atomic.Bool
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/down.bin") || (down.Load() && strings.HasPrefix(r.URL.Path, "/org/repo/resolve/main/")) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+
+	cacheDir := t.TempDir()
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), cacheDir, WithRevalidateInterval(0))
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		path     string
+		notFound bool
+	}{{"down.bin", false}, {"missing.bin", true}} {
+		before := requests.Load()
+		_, err := m.Resolve(ctx, "org/repo", "main", tc.path)
+		if err == nil || errors.Is(err, ErrUpstreamNotFound) != tc.notFound {
+			t.Fatalf("%s: err = %v, want not-found %v", tc.path, err, tc.notFound)
+		}
+		if _, err := ingestWait(t, m, "org/repo", "main", tc.path); err == nil {
+			t.Fatalf("%s: Ingest succeeded against an unpinnable branch", tc.path)
+		}
+		if _, err := m.Resolve(ctx, "org/repo", "main", tc.path); err == nil {
+			t.Fatalf("%s: repeated Resolve succeeded", tc.path)
+		}
+		if got := requests.Load() - before; got != 1 {
+			t.Fatalf("%s: %d upstream requests for three failing calls, want 1", tc.path, got)
+		}
+	}
+	m.mu.Lock()
+	tasks := len(m.tasks)
+	fe := m.entries[resolveKey{repo: "org/repo", rev: "main", path: "down.bin"}]
+	m.mu.Unlock()
+	if tasks != 0 || fe == nil || fe.State != stateFailed || fe.failures != 1 {
+		t.Fatalf("tasks = %d, failure record = %+v; want no task and one recorded failure", tasks, fe)
+	}
+	if files := indexFiles(t, filepath.Join(cacheDir, "index")); len(files) != 0 {
+		t.Fatalf("unpinnable probes persisted %v", files)
+	}
+	if spools, _ := os.ReadDir(filepath.Join(cacheDir, "spool")); len(spools) != 0 {
+		t.Fatalf("unpinnable probes spooled %d files", len(spools))
+	}
+
+	// Once the backoff expires the probe is retried and the backoff grows.
+	m.mu.Lock()
+	fe.nextRetry = time.Time{}
+	m.mu.Unlock()
+	if _, err := m.Resolve(ctx, "org/repo", "main", "down.bin"); err == nil {
+		t.Fatal("retry succeeded")
+	}
+	m.mu.Lock()
+	fe = m.entries[resolveKey{repo: "org/repo", rev: "main", path: "down.bin"}]
+	m.mu.Unlock()
+	if fe.failures != 2 || time.Until(fe.nextRetry) <= failureBackoffBase {
+		t.Fatalf("second failure = %+v, want failures 2 with a longer backoff", fe)
+	}
+
+	// A pinned branch keeps serving its cached commit while the upstream is
+	// down, and new files ingest from the pinned commit, not from the failed
+	// branch probe.
+	if entry, err := ingestWait(t, m, "org/repo", "main", "ok.bin"); err != nil || entry.Commit != commit {
+		t.Fatalf("ok.bin = %+v, %v", entry, err)
+	}
+	down.Store(true)
+	res, err := m.Resolve(ctx, "org/repo", "main", "ok.bin")
+	if err != nil || res.Entry == nil || res.Entry.Commit != commit {
+		t.Fatalf("stale branch resolve = %+v, %v; want the cached entry", res, err)
+	}
+	entry, err := ingestWait(t, m, "org/repo", "main", "other.bin")
+	if err != nil || entry.Commit != commit || entry.Size != int64(len("other")) {
+		t.Fatalf("other.bin through stale pin = %+v, %v", entry, err)
+	}
+
+	// The pinned branch never bypasses a file's active failure: no probe, same record.
+	before := requests.Load()
+	if _, err := m.Resolve(ctx, "org/repo", "main", "down.bin"); err == nil {
+		t.Fatal("down.bin resolved inside its backoff")
+	}
+	m.mu.Lock()
+	again := m.entries[resolveKey{repo: "org/repo", rev: "main", path: "down.bin"}]
+	m.mu.Unlock()
+	if got := requests.Load() - before; got != 0 || again != fe {
+		t.Fatalf("backoff bypassed: %d upstream requests, record = %+v, want 0 and %+v", got, again, fe)
+	}
+	m.mu.Lock()
+	fe.nextRetry = time.Time{}
+	m.mu.Unlock()
+	if _, err := ingestWait(t, m, "org/repo", "main", "down.bin"); err == nil {
+		t.Fatal("down.bin ingested from a failing upstream")
+	}
+	if requests.Load() == before {
+		t.Fatal("expired backoff did not probe the upstream")
+	}
+}
+
+func TestMirrorConcurrentPublish(t *testing.T) {
+	const n = 16
+	for _, tc := range []struct{ name, header string }{{"real", strings.Repeat("ab", 20)}, {"synthetic", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newPlainUpstream()
+			upstream.commit = tc.header
+			commit, wantSource := tc.header, ""
+			if commit == "" {
+				commit, wantSource = wantPseudo("org/repo", "main"), "main"
+			}
+			hold := make(chan struct{})
+			srv, _, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/slow.bin") {
+					<-hold
+				}
+				upstream.ServeHTTP(w, r)
+			}))
+			upstream.set("/org/repo/resolve/main/slow.bin", []byte("slow"))
+
+			storageDir, cacheDir := t.TempDir(), t.TempDir()
+			manifestPath := commitPath(filepath.Join(cacheDir, "index"), "org/repo", commit)
+			ingestAll := func(m *Mirror, prefix string) {
+				t.Helper()
+				var wg sync.WaitGroup
+				for i := range n {
+					name := fmt.Sprintf("%s%02d.bin", prefix, i)
+					upstream.set("/org/repo/resolve/main/"+name, []byte(name))
+					wg.Go(func() {
+						if _, err := ingestWait(t, m, "org/repo", "main", name); err != nil {
+							t.Error(err)
+						}
+					})
+				}
+				wg.Wait()
+			}
+			check := func(want int) {
+				t.Helper()
+				man := readManifest(t, manifestPath)
+				if src := rawSource(t, manifestPath); len(man.Files) != want || src != wantSource || man.Commit != commit {
+					t.Fatalf("manifest has %d files, source %q, commit %s; want %d, %q, %s", len(man.Files), src, man.Commit, want, wantSource, commit)
+				}
+				for p := range man.Files {
+					if p == "slow.bin" || p == "missing.bin" {
+						t.Fatalf("manifest lists %s, which never became ready", p)
+					}
+				}
+			}
+
+			m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+			var release sync.Once
+			t.Cleanup(func() { release.Do(func() { close(hold) }) })
+			slow, err := m.Ingest("org/repo", "main", "slow.bin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ingestWait(t, m, "org/repo", "main", "missing.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+				t.Fatalf("missing.bin err = %v", err)
+			}
+			ingestAll(m, "f")
+			check(n)
+			release.Do(func() { close(hold) })
+			<-slow.Done()
+			if _, err := slow.Entry(); err != nil {
+				t.Fatal(err)
+			}
+			if man := readManifest(t, manifestPath); man.Files["slow.bin"] == nil || len(man.Files) != n+1 {
+				t.Fatalf("manifest after the slow ingest has %d files, want %d with slow.bin", len(man.Files), n+1)
+			}
+
+			m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+			ingestAll(m2, "g")
+			m2.mu.Lock()
+			loaded := len(m2.entries)
+			m2.mu.Unlock()
+			if loaded != 2*n+1 {
+				t.Fatalf("restarted engine holds %d entries, want %d loaded + %d published", loaded, n+1, n)
+			}
+			if man, src := readManifest(t, manifestPath), rawSource(t, manifestPath); len(man.Files) != 2*n+1 || src != wantSource {
+				t.Fatalf("manifest after restart has %d files, source %q; want %d, %q", len(man.Files), src, 2*n+1, wantSource)
+			}
+		})
+	}
+}
+
 func TestMirrorIndexRestart(t *testing.T) {
 	upstream := newPlainUpstream()
+	commit := strings.Repeat("ef", 20)
+	upstream.commit = commit
+	upstream.set("/org/repo/resolve/main/a.bin", []byte("restart a"))
+	upstream.set("/org/repo/resolve/main/b.bin", []byte("restart b"))
 	upstreamSrv := httptest.NewServer(upstream)
 	defer upstreamSrv.Close()
 
-	cacheDir := t.TempDir()
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
 	indexDir := filepath.Join(cacheDir, "index")
-	commit := strings.Repeat("ef", 20)
-	grouped := &fileEntry{Key: "/org/repo/resolve/" + commit + "/g.bin", State: stateReady, Size: 1, ETag: "e1", Commit: commit, CheckedAt: time.Now()}
-	ungrouped := &fileEntry{Key: "/org/repo/resolve/main/u.bin", State: stateReady, Size: 1, ETag: "e2", Commit: "commit-1", CheckedAt: time.Now()}
-	for _, e := range []*fileEntry{grouped, ungrouped} {
-		if err := persistEntry(indexDir, e); err != nil {
+	m, _ := newTestMirror(t, upstreamSrv.URL, storageDir, cacheDir)
+	for _, p := range []string{"a.bin", "b.bin"} {
+		if _, err := ingestWait(t, m, "org/repo", "main", p); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// Decoys: an unfinished write beside a leaf, and a ready entry at its
-	// fanout position under the branches subtree.
-	decoy := &fileEntry{Key: "/org/repo/resolve/main/decoy.bin", State: stateReady, Size: 1, Commit: "commit-1", CheckedAt: time.Now()}
-	rawDecoy, err := json.Marshal(decoy)
+	dead, requests := deadServer(t)
+	m2, stor2 := newTestMirror(t, dead.URL, storageDir, cacheDir, WithRevalidateInterval(-1))
+	ctx := context.Background()
+	m2.mu.Lock()
+	preloaded := len(m2.entries) + len(m2.branches) + len(m2.commits)
+	m2.mu.Unlock()
+	if preloaded != 0 {
+		t.Fatalf("restart preloaded %d records, want lazy maps", preloaded)
+	}
+	res, err := m2.Resolve(ctx, "org/repo", "main", "a.bin")
+	if err != nil || res.Entry == nil || res.Entry.Commit != commit {
+		t.Fatalf("Resolve after restart = %+v, %v; want the pinned entry", res, err)
+	}
+	entryA := res.Entry
+	m2.mu.Lock()
+	sibling := m2.entries[resolveKey{repo: "org/repo", rev: commit, path: "b.bin"}]
+	m2.mu.Unlock()
+	if sibling == nil {
+		t.Fatal("sibling not loaded with the manifest")
+	}
+	for _, rev := range []string{"main", commit} {
+		if res, err = m2.Resolve(ctx, "org/repo", rev, "b.bin"); err != nil || res.Entry == nil || res.Entry.Commit != commit {
+			t.Fatalf("Resolve %s/b.bin = %+v, %v", rev, res, err)
+		}
+	}
+	if count := requests.Load(); count != 0 {
+		t.Fatalf("restart made %d upstream requests", count)
+	}
+
+	// Unlinked storage drops one file from the manifest and leaves the
+	// sibling; dropping the last file removes the manifest.
+	gc := storage.NewGC(stor2.(storage.GCStore))
+	manifestPath := commitPath(indexDir, "org/repo", commit)
+	for i, p := range []string{"a.bin", "b.bin"} {
+		hash := entryA.FileHash
+		if p == "b.bin" {
+			hash = sibling.FileHash
+		}
+		fileHash, err := xet.ParseFileHash(hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed, err := gc.Unlink(ctx, fileHash); err != nil || !removed {
+			t.Fatalf("unlink %s = %v, %v", p, removed, err)
+		}
+		if _, err := ingestWait(t, m2, "org/repo", "main", p); err == nil {
+			t.Fatalf("%s re-ingested from a dead upstream", p)
+		}
+		if i == 0 {
+			if man := readManifest(t, manifestPath); len(man.Files) != 1 || man.Files["b.bin"] == nil {
+				t.Fatalf("manifest after dropping a.bin = %+v, want only b.bin", man)
+			}
+		}
+	}
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Fatalf("empty manifest not removed: %v", err)
+	}
+	if _, err := os.Stat(branchEntryPath(indexDir, "org/repo", "main")); err != nil {
+		t.Fatalf("branch pointer lost: %v", err)
+	}
+
+	t.Run("synthetic last drop keeps source", func(t *testing.T) {
+		upstream := newPlainUpstream()
+		upstream.commit = ""
+		data := []byte("synthetic restart a")
+		upstream.set("/org/repo/resolve/main/a.bin", data)
+		srv, _, paths := countingServer(t, upstream)
+
+		storageDir, cacheDir := t.TempDir(), t.TempDir()
+		pseudo := wantPseudo("org/repo", "main")
+		manifestPath := commitPath(filepath.Join(cacheDir, "index"), "org/repo", pseudo)
+		m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		entry, err := ingestWait(t, m, "org/repo", "main", "a.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileHash, err := xet.ParseFileHash(entry.FileHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if removed, err := storage.NewGC(stor.(storage.GCStore)).Unlink(ctx, fileHash); err != nil || !removed {
+			t.Fatalf("unlink = %v, %v", removed, err)
+		}
+
+		dead, _ := deadServer(t)
+		m2, _ := newTestMirror(t, dead.URL, storageDir, cacheDir, WithRevalidateInterval(-1))
+		if _, err := ingestWait(t, m2, "org/repo", "main", "a.bin"); err == nil {
+			t.Fatal("a.bin re-ingested from a dead upstream")
+		}
+		if man, src := readManifest(t, manifestPath), rawSource(t, manifestPath); len(man.Files) != 0 || src != "main" {
+			t.Fatalf("manifest after dropping the last file = %+v, source %q; want no files and source main", man, src)
+		}
+
+		m3, stor3 := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		if entry, err = ingestWait(t, m3, "org/repo", pseudo, "a.bin"); err != nil || entry.Commit != pseudo {
+			t.Fatalf("direct pseudo a.bin after restart = %+v, %v", entry, err)
+		}
+		if got := readStored(t, stor3, entry.SHA256); !bytes.Equal(got, data) {
+			t.Fatal("re-ingested bytes mismatch")
+		}
+		if _, ok := paths.Load("/org/repo/resolve/main/a.bin"); !ok {
+			t.Fatal("a.bin was not fetched through the source branch")
+		}
+		paths.Range(func(p, _ any) bool {
+			if strings.Contains(p.(string), pseudo) {
+				t.Errorf("upstream requested by pseudo commit: %s", p)
+			}
+			return true
+		})
+	})
+}
+
+func TestMirrorIndexRejectsMismatchedManifest(t *testing.T) {
+	commit, other := strings.Repeat("ab", 20), strings.Repeat("cd", 20)
+	pseudo := wantPseudo("org/repo", "main")
+	record := `{"size":1,"etag":"e","checked_at":"2026-01-01T00:00:00Z"}`
+	for _, live := range []bool{false, true} {
+		t.Run(fmt.Sprintf("live upstream %v", live), func(t *testing.T) {
+			cacheDir := t.TempDir()
+			indexDir := filepath.Join(cacheDir, "index")
+			for rev, c := range map[string]string{"main": commit, "dev": other} {
+				writeRaw(t, branchEntryPath(indexDir, "org/repo", rev), []byte(`{"commit":"`+c+`","checked_at":"2026-01-01T00:00:00Z"}`))
+			}
+			manifests := map[string][]byte{
+				commitPath(indexDir, "org/repo", commit): []byte(`{"repo":"org/other","commit":"` + commit + `","files":{"f.bin":` + record + `}}`),
+				commitPath(indexDir, "org/repo", other):  []byte(`{"repo":"org/repo","commit":"` + commit + `","files":{"f.bin":` + record + `}}`),
+				commitPath(indexDir, "org/repo", pseudo): []byte(`{"repo":"org/repo","commit":"` + pseudo + `","source":"dev","files":{"f.bin":` + record + `}}`),
+			}
+			for p, raw := range manifests {
+				writeRaw(t, p, raw)
+			}
+			before := indexFiles(t, indexDir)
+
+			srv, _ := deadServer(t)
+			if live {
+				upstream := newPlainUpstream()
+				upstream.commit = commit
+				upstream.set("/org/repo/resolve/main/f.bin", []byte("live f"))
+				upstream.set("/org/repo/resolve/"+other+"/f.bin", []byte("live other f"))
+				srv, _, _ = countingServer(t, upstream)
+			}
+			m, _ := newTestMirror(t, srv.URL, t.TempDir(), cacheDir, WithRevalidateInterval(-1))
+			for _, rev := range []string{"main", "dev", commit, other, pseudo} {
+				entry, err := ingestWait(t, m, "org/repo", rev, "f.bin")
+				if served := err == nil; served != (live && rev != pseudo) { // the pseudo commit's source is unknown
+					t.Fatalf("%s/f.bin = %+v, %v; want served %v", rev, entry, err, !served)
+				}
+			}
+			for p, raw := range manifests {
+				if got, err := os.ReadFile(p); err != nil || !bytes.Equal(got, raw) {
+					t.Fatalf("mismatched manifest %s rewritten: %q, %v", p, got, err)
+				}
+			}
+			if after := indexFiles(t, indexDir); strings.Join(after, "\n") != strings.Join(before, "\n") {
+				t.Fatalf("index files changed: %q -> %q", before, after)
+			}
+		})
+	}
+}
+
+func TestMirrorIndexUnreadableManifest(t *testing.T) {
+	for _, tc := range []struct{ name, header string }{{"real", strings.Repeat("ab", 20)}, {"synthetic", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newPlainUpstream()
+			upstream.commit = tc.header
+			commit, wantSource := tc.header, ""
+			if commit == "" {
+				commit, wantSource = wantPseudo("org/repo", "main"), "main"
+			}
+			files := []string{"a.bin", "b.bin", "c.bin", "d.bin"}
+			for _, p := range files {
+				upstream.set("/org/repo/resolve/main/"+p, []byte("unreadable "+p))
+			}
+			srv, _, _ := countingServer(t, upstream)
+			storageDir, cacheDir := t.TempDir(), t.TempDir()
+			indexDir := filepath.Join(cacheDir, "index")
+			manifestPath := commitPath(indexDir, "org/repo", commit)
+			m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir, WithRevalidateInterval(0))
+			for _, p := range files[:2] {
+				if _, err := ingestWait(t, m, "org/repo", "main", p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			orig, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A directory in the manifest's place fails every read without ENOENT.
+			aside := manifestPath + ".aside"
+			if err := os.Rename(manifestPath, aside); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(manifestPath, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			m2, stor2 := newTestMirror(t, srv.URL, storageDir, cacheDir, WithRevalidateInterval(0))
+			entry, err := ingestWait(t, m2, "org/repo", "main", "c.bin")
+			if err != nil || entry.Commit != commit {
+				t.Fatalf("c.bin under an unreadable manifest = %+v, %v", entry, err)
+			}
+			// Dropping the only file in memory must not take the empty-manifest removal path.
+			fileHash, err := xet.ParseFileHash(entry.FileHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if removed, err := storage.NewGC(stor2.(storage.GCStore)).Unlink(context.Background(), fileHash); err != nil || !removed {
+				t.Fatalf("unlink = %v, %v", removed, err)
+			}
+			if _, err := ingestWait(t, m2, "org/repo", "main", "c.bin"); err != nil {
+				t.Fatal(err)
+			}
+			if fi, err := os.Lstat(manifestPath); err != nil || !fi.IsDir() {
+				t.Fatalf("unreadable manifest path replaced: %v, %v", fi, err)
+			}
+			if got, err := os.ReadFile(aside); err != nil || !bytes.Equal(got, orig) {
+				t.Fatalf("original manifest changed: %q, %v", got, err)
+			}
+
+			if err := os.Remove(manifestPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(aside, manifestPath); err != nil {
+				t.Fatal(err)
+			}
+			gets := upstream.dataGETs.Load()
+			res, err := m2.Resolve(context.Background(), "org/repo", "main", "b.bin")
+			if err != nil || res.Entry == nil || res.Entry.Commit != commit {
+				t.Fatalf("b.bin after recovery = %+v, %v", res, err)
+			}
+			if got := upstream.dataGETs.Load(); got != gets {
+				t.Fatal("b.bin re-downloaded instead of loaded from the recovered manifest")
+			}
+			if _, err := ingestWait(t, m2, "org/repo", "main", "d.bin"); err != nil {
+				t.Fatal(err)
+			}
+			man := readManifest(t, manifestPath)
+			for _, p := range files {
+				if man.Files[p] == nil {
+					t.Errorf("merged manifest lacks %s", p)
+				}
+			}
+			if src := rawSource(t, manifestPath); len(man.Files) != len(files) || src != wantSource {
+				t.Fatalf("merged manifest has %d files, source %q; want %d, %q", len(man.Files), src, len(files), wantSource)
+			}
+			if got := indexFiles(t, indexDir); len(got) != 2 {
+				t.Fatalf("index files = %q, want the pointer and the manifest only", got)
+			}
+		})
+	}
+
+	t.Run("overwrite blocked", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs file permissions the process cannot bypass")
+		}
+		upstream := newPlainUpstream()
+		commit := strings.Repeat("ab", 20)
+		upstream.commit = commit
+		upstream.set("/org/repo/resolve/main/a.bin", []byte("perm a"))
+		upstream.set("/org/repo/resolve/main/b.bin", []byte("perm b"))
+		srv, _, _ := countingServer(t, upstream)
+		storageDir, cacheDir := t.TempDir(), t.TempDir()
+		manifestPath := commitPath(filepath.Join(cacheDir, "index"), "org/repo", commit)
+		m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		if _, err := ingestWait(t, m, "org/repo", "main", "a.bin"); err != nil {
+			t.Fatal(err)
+		}
+		orig, err := os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(manifestPath, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(manifestPath, 0644) })
+
+		m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+		if _, err := ingestWait(t, m2, "org/repo", "main", "b.bin"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(manifestPath, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(manifestPath); err != nil || !bytes.Equal(got, orig) {
+			t.Fatalf("unreadable manifest overwritten: %q, %v", got, err)
+		}
+	})
+}
+
+func TestMirrorIndexRecoveryDuringRevalidation(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = ""
+	upstream.set("/org/repo/resolve/main/a.bin", []byte("old disk a"))
+	upstream.set("/org/repo/resolve/main/b.bin", []byte("disk sibling b"))
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	commit := wantPseudo("org/repo", "main")
+	manifestPath := commitPath(filepath.Join(cacheDir, "index"), "org/repo", commit)
+	aside := manifestPath + ".aside"
+	var recoverOnHead atomic.Bool
+	srv, _, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && recoverOnHead.Swap(false) {
+			if err := os.Remove(manifestPath); err != nil {
+				t.Error(err)
+			}
+			if err := os.Rename(aside, manifestPath); err != nil {
+				t.Error(err)
+			}
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	seed, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+	for _, file := range []string{"a.bin", "b.bin"} {
+		if _, err := ingestWait(t, seed, "org/repo", "main", file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Rename(manifestPath, aside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(manifestPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	upstream.set("/org/repo/resolve/main/a.bin", []byte("new memory a"))
+	m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir, WithRevalidateInterval(0))
+	if _, err := ingestWait(t, m, "org/repo", "main", "a.bin"); err != nil {
+		t.Fatal(err)
+	}
+	latest := []byte("latest upstream a")
+	upstream.set("/org/repo/resolve/main/a.bin", latest)
+	recoverOnHead.Store(true)
+	entry, err := ingestWait(t, m, "org/repo", commit, "a.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(indexEntryPath(indexDir, ungrouped.Commit, ungrouped.Key)+".tmp", rawDecoy, 0644); err != nil {
-		t.Fatal(err)
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, latest) {
+		t.Errorf("revalidation returned %q, want %q", got, latest)
 	}
-	inBranches := indexEntryPath(filepath.Join(indexDir, "branches"), decoy.Commit, decoy.Key)
-	if err := os.MkdirAll(filepath.Dir(inBranches), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(inBranches, rawDecoy, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	m, _ := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
 	m.mu.Lock()
-	loaded := len(m.entries)
+	ready := m.entries[resolveKey{repo: "org/repo", rev: commit, path: "a.bin"}]
+	indexed := m.commits["org/repo\x00"+commit].files["a.bin"]
 	m.mu.Unlock()
-	if loaded != 2 {
-		t.Fatalf("loaded %d entries, want exactly the 2 fanout entries", loaded)
+	if ready == nil || ready != indexed {
+		t.Errorf("ready entry %+v differs from commit entry %+v", ready, indexed)
 	}
-	res, err := m.Resolve(context.Background(), "org/repo", commit, "g.bin")
-	if err != nil || res.Entry == nil {
-		t.Fatalf("Resolve after restart = %+v, %v; want ready entry", res, err)
+	manifest := readManifest(t, manifestPath)
+	if manifest.Files["a.bin"] == nil || manifest.Files["b.bin"] == nil {
+		t.Fatalf("recovered manifest lost a file: %+v", manifest)
 	}
-	if n := upstream.dataGETs.Load(); n != 0 {
-		t.Fatalf("restart refetched %d times", n)
+}
+
+func TestMirrorIndexCommitIsolation(t *testing.T) {
+	upstream := newPlainUpstream()
+	commit, other := strings.Repeat("ab", 20), strings.Repeat("cd", 20)
+	upstream.commit = commit
+	upstream.set("/org/a/resolve/main/x.bin", []byte("a x"))
+	upstream.set("/org/a/resolve/main/y.bin", []byte("a y"))
+	upstream.set("/org/a/resolve/"+other+"/z.bin", []byte("a z"))
+	upstream.set("/org/b/resolve/main/x.bin", []byte("b x"))
+	upstream.set("/org/a/resolve/main/w.bin", []byte("a w"))
+	srv, _, _ := countingServer(t, upstream)
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	indexDir := filepath.Join(cacheDir, "index")
+	want := func(repo, commit string, files ...string) {
+		t.Helper()
+		man := readManifest(t, commitPath(indexDir, repo, commit))
+		got := make([]string, 0, len(man.Files))
+		for p := range man.Files {
+			got = append(got, p)
+		}
+		sort.Strings(got)
+		if man.Repo != repo || man.Commit != commit || strings.Join(got, ",") != strings.Join(files, ",") {
+			t.Fatalf("%s@%s manifest = %+v, want files %v", repo, commit, man, files)
+		}
 	}
 
-	for _, e := range []*fileEntry{grouped, ungrouped} {
-		k, _ := parseResolveKey(e.Key)
-		m.mu.Lock()
-		le := m.entries[k]
-		m.mu.Unlock()
-		if le == nil || le.ETag != e.ETag {
-			t.Fatalf("entry %q not loaded: %+v", e.Key, le)
+	m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+	for _, k := range []resolveKey{{"org/a", "main", "x.bin"}, {"org/a", "main", "y.bin"}, {"org/a", other, "z.bin"}, {"org/b", "main", "x.bin"}} {
+		if _, err := ingestWait(t, m, k.repo, k.rev, k.path); err != nil {
+			t.Fatal(err)
 		}
-		m.dropEntry(k, le)
-		if _, err := os.Stat(indexEntryPath(indexDir, e.Commit, e.Key)); !os.IsNotExist(err) {
-			t.Fatalf("fanout leaf for %q not removed: %v", e.Key, err)
+	}
+	want("org/a", commit, "x.bin", "y.bin")
+	want("org/a", other, "z.bin")
+	want("org/b", commit, "x.bin")
+	sum := sha256.Sum256([]byte("a x"))
+	if got := readManifest(t, commitPath(indexDir, "org/a", commit)).Files["x.bin"].SHA256; got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("org/a x.bin sha256 = %s, want its own content", got)
+	}
+
+	key := resolveKey{repo: "org/a", rev: commit, path: "x.bin"}
+	m.mu.Lock()
+	e := m.entries[key]
+	m.mu.Unlock()
+	m.dropEntry(key, e)
+	want("org/a", commit, "y.bin")
+	want("org/a", other, "z.bin")
+	want("org/b", commit, "x.bin")
+
+	m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+	if _, err := ingestWait(t, m2, "org/a", "main", "w.bin"); err != nil {
+		t.Fatal(err)
+	}
+	want("org/a", commit, "w.bin", "y.bin")
+	want("org/a", other, "z.bin")
+	want("org/b", commit, "x.bin")
+}
+
+func TestMirrorPersistWaitsForLock(t *testing.T) {
+	cacheDir := t.TempDir()
+	m, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), cacheDir)
+	key := resolveKey{repo: "org/repo", rev: strings.Repeat("ab", 20), path: "f.bin"}
+	manifestPath := commitPath(filepath.Join(cacheDir, "index"), key.repo, key.rev)
+	e := &fileEntry{State: stateReady, Size: 1, ETag: "e", CheckedAt: time.Unix(1, 0).UTC()}
+	m.mu.Lock()
+	m.entries[key] = e
+	m.loadCommit(key.repo, key.rev).publish(key.path, e)
+
+	m.persistMu.Lock()
+	var release sync.Once
+	unlock := func() { release.Do(m.persistMu.Unlock) }
+	defer unlock()
+	done := make(chan error, 1)
+	go func() { done <- m.persistCommit(key.repo, key.rev) }()
+	m.mu.Unlock() // a writer that skipped persistMu is now free to snapshot and write
+	select {
+	case err := <-done:
+		t.Fatalf("persist finished (%v) while persistMu was held", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := os.Stat(manifestPath); !os.IsNotExist(err) {
+		t.Fatalf("manifest written while persistMu was held: %v", err)
+	}
+
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("persist did not finish after persistMu was released")
+	}
+	if man := readManifest(t, manifestPath); len(man.Files) != 1 || man.Files["f.bin"] == nil || man.Files["f.bin"].ETag != "e" {
+		t.Fatalf("manifest after release = %+v, want f.bin only", man)
+	}
+}
+
+func TestWriteJSONCleansTemp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.json")
+	tmp := filepath.Join(dir, ".x.json.tmp")
+	value := func(want string) {
+		t.Helper()
+		if got := jsonKeys(t, path)["v"]; string(got) != want {
+			t.Fatalf("destination v = %s, want %s", got, want)
+		}
+		if _, err := os.Lstat(tmp); !os.IsNotExist(err) {
+			t.Fatalf("temp file left behind: %v", err)
+		}
+	}
+	if err := writeJSON(path, map[string]int{"v": 1}); err != nil {
+		t.Fatal(err)
+	}
+	value("1")
+	if err := os.Mkdir(tmp, 0755); err != nil { // a directory in the temp's place fails the write
+		t.Fatal(err)
+	}
+	if err := writeJSON(path, map[string]int{"v": 2}); err == nil {
+		t.Fatal("write with an unwritable temp succeeded")
+	}
+	value("1")
+	if err := writeJSON(path, map[string]int{"v": 3}); err != nil {
+		t.Fatal(err)
+	}
+	value("3")
+}
+
+func TestMirrorIndexHostileNames(t *testing.T) {
+	type pin struct{ repo, rev, commit, path, etag string }
+	cA, cB := strings.Repeat("ab", 20), strings.Repeat("cd", 20)
+	cases := []struct{ name, repoA, revA, repoB, revB string }{
+		{"json rev", "org/repo", "main", "org/repo", "main.json"},
+		{"json.tmp rev", "org/repo", "main", "org/repo", "main.json.tmp"},
+		{"JSON repo", "org/repo", "main", "org/repo.JSON", "main"},
+		{"dot control percent backslash", "..", ".\x01", "a%2E\\b", "%00"},
+		{"case variants", "Org/Repo", "Main", "org/repo", "main"},
+		{"long names", strings.Repeat("x", 300), "main", strings.Repeat("x", 300), strings.Repeat("r", 300)},
+	}
+	for _, c := range cases {
+		a := pin{c.repoA, c.revA, cA, "a.bin", "ea"}
+		b := pin{c.repoB, c.revB, cB, "b.bin", "eb"}
+		for _, order := range []string{"A-then-B", "B-then-A"} {
+			t.Run(c.name+"/"+order, func(t *testing.T) {
+				cacheDir := t.TempDir()
+				m, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), cacheDir)
+				publish := func(p pin) {
+					e := &fileEntry{State: stateReady, Size: 1, ETag: p.etag, CheckedAt: time.Unix(1, 0).UTC()}
+					m.mu.Lock()
+					m.branches[p.repo+"\x00"+p.rev] = &branchEntry{Commit: p.commit, CheckedAt: time.Unix(1, 0).UTC()}
+					m.entries[resolveKey{repo: p.repo, rev: p.commit, path: p.path}] = e
+					m.loadCommit(p.repo, p.commit).publish(p.path, e)
+					m.mu.Unlock()
+					if err := m.persistBranch(p.repo, p.rev); err != nil {
+						t.Fatal(err)
+					}
+					if err := m.persistCommit(p.repo, p.commit); err != nil {
+						t.Fatal(err)
+					}
+				}
+				first, second := a, b
+				if order == "B-then-A" {
+					first, second = b, a
+				}
+				for _, p := range []pin{first, second, first} {
+					publish(p)
+				}
+				if files := indexFiles(t, filepath.Join(cacheDir, "index")); len(files) != 4 {
+					t.Fatalf("index holds %d files, want 2 pointers + 2 manifests: %q", len(files), files)
+				}
+
+				m2, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), cacheDir)
+				for _, p := range []pin{a, b} {
+					m2.mu.Lock()
+					bp := m2.loadBranch(p.repo, p.rev)
+					m2.loadCommit(p.repo, p.commit)
+					e := m2.entries[resolveKey{repo: p.repo, rev: p.commit, path: p.path}]
+					m2.mu.Unlock()
+					if bp == nil || bp.Commit != p.commit {
+						t.Fatalf("branch %q@%q loaded as %+v, want commit %s", p.repo, p.rev, bp, p.commit)
+					}
+					if e == nil || e.ETag != p.etag {
+						t.Fatalf("entry %q@%s/%s loaded as %+v, want etag %s", p.repo, p.commit, p.path, e, p.etag)
+					}
+				}
+			})
 		}
 	}
 }
@@ -549,95 +1622,598 @@ func TestMirrorIndexRestart(t *testing.T) {
 func TestMirrorIndexSymlinkRoot(t *testing.T) {
 	cacheDir := t.TempDir()
 	indexDir := filepath.Join(cacheDir, "index")
-	if err := os.Symlink(t.TempDir(), indexDir); err != nil {
+	target := t.TempDir()
+	if err := os.Symlink(target, indexDir); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
+	upstream := newPlainUpstream()
 	commit := strings.Repeat("ab", 20)
-	entries := []*fileEntry{
-		{Key: "/org/repo/resolve/" + commit + "/grouped.bin", State: stateReady, Commit: commit},
-		{Key: "/org/repo/resolve/main/ungrouped.bin", State: stateReady},
+	upstream.commit = commit
+	upstream.set("/org/repo/resolve/main/f.bin", []byte("through symlink"))
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	storageDir := t.TempDir()
+	m, _ := newTestMirror(t, upstreamSrv.URL, storageDir, cacheDir)
+	if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); err != nil {
+		t.Fatal(err)
 	}
-	for _, entry := range entries {
-		if err := persistEntry(indexDir, entry); err != nil {
-			t.Fatal(err)
+	for _, p := range []string{branchEntryPath(target, "org/repo", "main"), commitPath(target, "org/repo", commit)} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("record not written behind the symlink: %v", err)
 		}
 	}
-	engine, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), cacheDir)
-	if len(engine.entries) != len(entries) {
-		t.Fatalf("loaded %d entries through symlink, want %d", len(engine.entries), len(entries))
+
+	dead, requests := deadServer(t)
+	m2, _ := newTestMirror(t, dead.URL, storageDir, cacheDir, WithRevalidateInterval(-1))
+	res, err := m2.Resolve(context.Background(), "org/repo", "main", "f.bin")
+	if err != nil || res.Entry == nil || res.Entry.Commit != commit {
+		t.Fatalf("Resolve through symlink root = %+v, %v", res, err)
 	}
-	for _, entry := range entries {
-		key, _ := parseResolveKey(entry.Key)
-		loaded := engine.entries[key]
-		if loaded == nil || loaded.Commit != entry.Commit {
-			t.Fatalf("entry %q not loaded through symlink: %+v", entry.Key, loaded)
+	if count := requests.Load(); count != 0 {
+		t.Fatalf("symlink restart made %d upstream requests", count)
+	}
+}
+
+// Earlier layouts are neither loaded nor touched.
+func TestMirrorIndexIgnoresLegacy(t *testing.T) {
+	cacheDir := t.TempDir()
+	indexDir := filepath.Join(cacheDir, "index")
+	repoDir := filepath.Join(indexDir, hashHex("org/repo"))
+	commit := strings.Repeat("cd", 20)
+	key := "/org/repo/resolve/" + commit + "/f.bin"
+	rawB := []byte(`{"repo":"org/repo","rev":"main","commit":"` + commit + `","checked_at":"2026-01-01T00:00:00Z"}`)
+	rawE := []byte(`{"key":"` + key + `","state":"ready","size":1,"etag":"etag-1","commit":"` + commit + `","checked_at":"2026-01-01T00:00:00Z"}`)
+	h := hashHex(key)
+	leaf := filepath.Join(h[:2], h[2:4], h[4:]+".json")
+	legacy := map[string][]byte{
+		filepath.Join(indexDir, "branches", hashHex("org/repo@main")+".json"): rawB,
+		filepath.Join(indexDir, "branches", "org", "repo", "main.json"):       rawB,
+		filepath.Join(indexDir, h+".json"):                                    rawE,
+		filepath.Join(indexDir, commit, leaf):                                 rawE,
+		filepath.Join(indexDir, "files", "org", "repo", commit, leaf):         rawE,
+		filepath.Join(repoDir, "commits", commit, leaf):                       rawE,
+		filepath.Join(repoDir, "files", leaf):                                 rawE,
+	}
+	for p, raw := range legacy {
+		writeRaw(t, p, raw)
+	}
+	before := indexFiles(t, indexDir)
+
+	dead, _ := deadServer(t)
+	m, _ := newTestMirror(t, dead.URL, t.TempDir(), cacheDir, WithRevalidateInterval(-1))
+	for _, rev := range []string{"main", commit} {
+		if entry, err := ingestWait(t, m, "org/repo", rev, "f.bin"); err == nil {
+			t.Fatalf("%s/f.bin served from a legacy record: %+v", rev, entry)
+		}
+	}
+	for p, raw := range legacy {
+		if got, err := os.ReadFile(p); err != nil || !bytes.Equal(got, raw) {
+			t.Fatalf("legacy record %s changed: %q, %v", p, got, err)
+		}
+	}
+	if after := indexFiles(t, indexDir); strings.Join(after, "\n") != strings.Join(before, "\n") {
+		t.Fatalf("index files changed: %q -> %q", before, after)
+	}
+
+	// A same-path pointer from the previous layout still carries repo and rev keys.
+	t.Run("prior pointer reused", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		indexDir := filepath.Join(cacheDir, "index")
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		writeRaw(t, branchEntryPath(indexDir, "org/repo", "main"), []byte(`{"repo":"org/repo","rev":"main","commit":"`+commit+`","checked_at":"`+now+`"}`))
+		writeRaw(t, commitPath(indexDir, "org/repo", commit), []byte(`{"repo":"org/repo","commit":"`+commit+`","files":{"f.bin":{"size":1,"etag":"e","checked_at":"`+now+`"}}}`))
+
+		dead, requests := deadServer(t)
+		m, _ := newTestMirror(t, dead.URL, t.TempDir(), cacheDir)
+		res, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+		if err != nil || res.Entry == nil || res.Entry.Commit != commit {
+			t.Fatalf("Resolve through the prior pointer = %+v, %v", res, err)
+		}
+		if count := requests.Load(); count != 0 {
+			t.Fatalf("fresh prior pointer made %d upstream requests", count)
+		}
+	})
+}
+
+func TestMirrorBranchProbeFailureAfterPin(t *testing.T) {
+	commitB := strings.Repeat("bb", 20)
+	for _, synthetic := range []bool{false, true} {
+		for _, tc := range []struct {
+			status   int
+			notFound bool // the failure matches ErrUpstreamNotFound
+			keepPin  bool // the old pin keeps serving
+		}{
+			{http.StatusNotFound, true, false},
+			{http.StatusUnauthorized, false, false},
+			{http.StatusForbidden, false, false},
+			{http.StatusGone, false, false},
+			{http.StatusServiceUnavailable, false, true},
+			{http.StatusTooManyRequests, false, true},
+		} {
+			name, commitA, header := fmt.Sprintf("real/%d", tc.status), strings.Repeat("aa", 20), strings.Repeat("aa", 20)
+			if synthetic {
+				name, commitA, header = fmt.Sprintf("synthetic/%d", tc.status), wantPseudo("org/repo", "main"), ""
+			}
+			t.Run(name, func(t *testing.T) {
+				upstream := newPlainUpstream()
+				upstream.commit = header
+				upstream.set("/org/repo/resolve/main/f.bin", []byte("pinned content"))
+				upstream.set("/org/repo/resolve/main/g.bin", []byte("sibling"))
+				var status atomic.Int64
+				srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if s := status.Load(); s != 0 && r.URL.Path == "/org/repo/resolve/main/f.bin" {
+						w.Header().Set("X-Repo-Commit", commitB)
+						w.WriteHeader(int(s))
+						return
+					}
+					upstream.ServeHTTP(w, r)
+				}))
+				m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+				ctx := context.Background()
+				branchKey := resolveKey{repo: "org/repo", rev: "main", path: "f.bin"}
+				pinned := func() string {
+					m.mu.Lock()
+					defer m.mu.Unlock()
+					if b := m.branches["org/repo\x00main"]; b != nil {
+						return b.Commit
+					}
+					return ""
+				}
+				// expire ends the branch key's current backoff and reports its recorded failures.
+				expire := func() int {
+					m.mu.Lock()
+					defer m.mu.Unlock()
+					n := 0
+					if fe := m.entries[branchKey]; fe != nil && fe.State == stateFailed {
+						fe.nextRetry = time.Time{}
+						n += fe.failures
+					}
+					if b := m.branches["org/repo\x00main"]; b != nil {
+						b.nextRetry = time.Time{}
+						n += b.failures
+					}
+					return n
+				}
+				resolveMain := func(step string) {
+					t.Helper()
+					res, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+					if tc.keepPin {
+						if err != nil || res.Entry == nil || res.Entry.Commit != commitA {
+							t.Fatalf("%s: main = %+v, %v; want the retained pin %s", step, res, err, commitA)
+						}
+						return
+					}
+					if err == nil || errors.Is(err, ErrUpstreamNotFound) != tc.notFound {
+						t.Fatalf("%s: main = %+v, %v; want a failure with not-found %v", step, res, err, tc.notFound)
+					}
+				}
+
+				entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+				if err != nil || entry.Commit != commitA {
+					t.Fatalf("initial ingest = %+v, %v", entry, err)
+				}
+
+				status.Store(int64(tc.status))
+				before, gets := requests.Load(), upstream.dataGETs.Load()
+				for i := range 3 {
+					resolveMain(fmt.Sprintf("resolve %d", i))
+				}
+				if got := requests.Load() - before; got != 1 {
+					t.Fatalf("three resolves made %d upstream requests, want the one probe", got)
+				}
+				if got := pinned(); got != commitA {
+					t.Fatalf("branch pinned to %q after a %d probe, want %s kept", got, tc.status, commitA)
+				}
+				res, err := m.Resolve(ctx, "org/repo", commitA, "f.bin")
+				if err != nil || res.Entry == nil || res.Entry.Commit != commitA {
+					t.Fatalf("direct commit = %+v, %v; want the cached entry", res, err)
+				}
+				if got := requests.Load() - before; got != 1 {
+					t.Fatalf("direct commit resolve made %d upstream requests, want 0", got-1)
+				}
+
+				// The next backoff window probes once more and grows the failure count.
+				if n := expire(); n != 1 {
+					t.Fatalf("failures after one probe = %d, want 1", n)
+				}
+				before = requests.Load()
+				resolveMain("after expiry")
+				resolveMain("inside the second backoff")
+				if got := requests.Load() - before; got != 1 {
+					t.Fatalf("second window made %d upstream requests, want 1", got)
+				}
+				if upstream.dataGETs.Load() != gets {
+					t.Fatal("f.bin was re-downloaded during the failure")
+				}
+				if entry, err := ingestWait(t, m, "org/repo", "main", "g.bin"); err != nil || entry.Commit != commitA {
+					t.Fatalf("sibling g.bin = %+v, %v; want commit %s", entry, err, commitA)
+				}
+
+				// Recovery: the successful probe serves the pin again and clears the failure state.
+				status.Store(0)
+				if n := expire(); n != 2 {
+					t.Fatalf("failures after two probes = %d, want 2", n)
+				}
+				if res, err = m.Resolve(ctx, "org/repo", "main", "f.bin"); err != nil || res.Entry == nil || res.Entry.Commit != commitA {
+					t.Fatalf("recovered main = %+v, %v", res, err)
+				}
+				m.mu.Lock()
+				fe, b := m.entries[branchKey], m.branches["org/repo\x00main"]
+				m.mu.Unlock()
+				if fe != nil || b == nil || b.failures != 0 {
+					t.Fatalf("failure state after recovery: entry %+v, pin %+v; want none", fe, b)
+				}
+			})
 		}
 	}
 }
 
-// TestMirrorIndexMigration: branch mappings persisted under legacy hashed
-// names move to their canonical location on startup and stay loaded; legacy
-// flat file entries are neither moved nor loaded.
-func TestMirrorIndexMigration(t *testing.T) {
+func TestMirrorSourcelessFailureRetiredOnPin(t *testing.T) {
 	upstream := newPlainUpstream()
-	upstreamSrv := httptest.NewServer(upstream)
-	defer upstreamSrv.Close()
+	upstream.commit = ""
+	data := []byte("sourceless then sourced")
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	upstream.set("/org/repo/resolve/main/bad.bin", data)
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/cdn/org/repo/resolve/main/bad.bin" {
+			corrupt := bytes.Repeat([]byte("x"), len(data))
+			w.Header().Set("Content-Length", fmt.Sprint(len(corrupt)))
+			_, _ = w.Write(corrupt)
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	ctx := context.Background()
+	pseudo := wantPseudo("org/repo", "main")
 
-	cacheDir := t.TempDir()
-	commit := strings.Repeat("cd", 20)
-
-	// Legacy hashed branch mapping.
-	branchDir := filepath.Join(cacheDir, "index", "branches")
-	if err := os.MkdirAll(branchDir, 0755); err != nil {
-		t.Fatal(err)
+	if _, err := ingestWait(t, m, "org/repo", pseudo, "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("direct pseudo commit in a fresh process: err = %v, want ErrUpstreamNotFound", err)
 	}
-	b := &branchEntry{Repo: "org/repo", Rev: "main", Commit: commit, CheckedAt: time.Now()}
-	rawB, err := json.Marshal(b)
-	if err != nil {
-		t.Fatal(err)
+	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	if err != nil || entry.Commit != pseudo {
+		t.Fatalf("main after the sourceless miss = %+v, %v; want commit %s", entry, err, pseudo)
 	}
-	bSum := sha256.Sum256([]byte("org/repo@main"))
-	legacyBranch := filepath.Join(branchDir, hex.EncodeToString(bSum[:])+".json")
-	if err := os.WriteFile(legacyBranch, rawB, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Legacy flat file entry.
-	key := "/org/repo/resolve/" + commit + "/f.bin"
-	e := &fileEntry{Key: key, State: stateReady, Size: 1, ETag: "etag-1", Commit: commit, CheckedAt: time.Now()}
-	rawE, err := json.Marshal(e)
-	if err != nil {
-		t.Fatal(err)
-	}
-	eSum := sha256.Sum256([]byte(key))
-	flatEntry := filepath.Join(cacheDir, "index", hex.EncodeToString(eSum[:])+".json")
-	if err := os.WriteFile(flatEntry, rawE, 0644); err != nil {
-		t.Fatal(err)
+	res, err := m.Resolve(ctx, "org/repo", pseudo, "f.bin")
+	if err != nil || res.Entry == nil || res.Entry.SHA256 != entry.SHA256 {
+		t.Fatalf("direct pseudo commit after the branch pin = %+v, %v; want the ingested entry", res, err)
 	}
 
-	m, _ := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
-
-	if _, err := os.Stat(legacyBranch); !os.IsNotExist(err) {
-		t.Fatalf("legacy hashed branch mapping still present: %v", err)
+	if _, err := ingestWait(t, m, "org/repo", "main", "bad.bin"); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("corrupt download err = %v, want a sha256 mismatch", err)
 	}
-	readable := filepath.Join(branchDir, "org", "repo", "main.json")
-	if _, err := os.Stat(readable); err != nil {
-		t.Fatalf("migrated branch mapping missing: %v", err)
+	before := requests.Load()
+	if _, err := ingestWait(t, m, "org/repo", "main", "bad.bin"); err == nil {
+		t.Fatal("bad.bin ingested again inside its backoff")
 	}
-
-	if _, err := os.Stat(flatEntry); err != nil {
-		t.Fatalf("legacy flat entry was moved: %v", err)
+	if _, err := m.Resolve(ctx, "org/repo", pseudo, "bad.bin"); err == nil {
+		t.Fatal("direct pseudo commit bypassed the source failure backoff")
 	}
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("backoff made %d upstream requests, want 0", got)
+	}
+}
 
+func TestMirrorObsoleteSourceFailureIgnored(t *testing.T) {
+	data := []byte("moving target")
+	commitB := strings.Repeat("bb", 20)
+	synthetic, real := newPlainUpstream(), newPlainUpstream()
+	synthetic.commit, real.commit = "", commitB
+	synthetic.set("/org/repo/resolve/main/f.bin", data)
+	real.set("/org/repo/resolve/main/f.bin", data)
+	var moved atomic.Bool
+	hold, started := make(chan struct{}), make(chan struct{})
+	var startOnce, release sync.Once
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/cdn/org/repo/resolve/main/f.bin" {
+			startOnce.Do(func() { close(started) })
+			if !gateWait(hold) {
+				return
+			}
+			corrupt := bytes.Repeat([]byte("x"), len(data))
+			w.Header().Set("Content-Length", fmt.Sprint(len(corrupt)))
+			_, _ = w.Write(corrupt)
+			return
+		}
+		if moved.Load() {
+			real.ServeHTTP(w, r)
+			return
+		}
+		synthetic.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+	t.Cleanup(func() { release.Do(func() { close(hold) }) })
+	ctx := context.Background()
+
+	// Ingest would join the held flight by its original request key.
+	first, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+	if err != nil || first.Stream == nil {
+		t.Fatalf("first resolve = %+v, %v; want an in-flight stream", first, err)
+	}
+	awaitClosed(t, started, "synthetic download")
+	moved.Store(true)
+	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	if err != nil || entry.Commit != commitB {
+		t.Fatalf("main after the upstream move = %+v, %v; want commit %s", entry, err, commitB)
+	}
+	release.Do(func() { close(hold) })
+	awaitClosed(t, first.Stream.t.done, "obsolete ingest")
 	m.mu.Lock()
-	k, _ := parseResolveKey(key)
-	loadedEntry := m.entries[k]
-	loadedBranch := m.branches["org/repo\x00main"]
+	obsolete := m.entries[resolveKey{repo: "org/repo", rev: wantPseudo("org/repo", "main"), path: "f.bin"}]
 	m.mu.Unlock()
-	if loadedEntry != nil {
-		t.Fatalf("legacy flat file entry loaded: %+v", loadedEntry)
+	if obsolete == nil || obsolete.State != stateFailed {
+		t.Fatalf("obsolete synthetic ingest ended as %+v, want a failure on the corrupt bytes", obsolete)
 	}
-	if loadedBranch == nil || loadedBranch.Commit != commit {
-		t.Fatalf("migrated branch mapping not loaded: %+v", loadedBranch)
+	res, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+	if err != nil || res.Entry == nil || res.Entry.Commit != commitB {
+		t.Fatalf("main after the obsolete failure = %+v, %v; want commit %s", res, err, commitB)
+	}
+	before := requests.Load()
+	for range 3 {
+		if _, err := ingestWait(t, m, "org/repo", wantPseudo("org/repo", "main"), "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+			t.Fatalf("obsolete commit retry = %v, want the retained ingest failure", err)
+		}
+	}
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("obsolete commit retries made %d upstream requests, want 0", got)
+	}
+}
+
+func TestMirrorRejectedFileSurvivesSiblingBackoff(t *testing.T) {
+	for _, tc := range []struct{ name, header string }{{"real", strings.Repeat("aa", 20)}, {"synthetic", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newPlainUpstream()
+			upstream.commit = tc.header
+			upstream.set("/org/repo/resolve/main/f.bin", []byte("cached f"))
+			upstream.set("/org/repo/resolve/main/g.bin", []byte("cached g"))
+			var fStatus, gStatus atomic.Int64 // non-zero replaces the upstream answer for that file
+			srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if s := fStatus.Load(); s != 0 && r.URL.Path == "/org/repo/resolve/main/f.bin" {
+					w.WriteHeader(int(s))
+					return
+				}
+				if s := gStatus.Load(); s != 0 && r.URL.Path == "/org/repo/resolve/main/g.bin" {
+					w.WriteHeader(int(s))
+					return
+				}
+				upstream.ServeHTTP(w, r)
+			}))
+			m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+			ctx := context.Background()
+			fKey := resolveKey{repo: "org/repo", rev: "main", path: "f.bin"}
+			expire := func() {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				m.entries[fKey].nextRetry = time.Time{}
+			}
+			for _, file := range []string{"f.bin", "g.bin"} {
+				if _, err := ingestWait(t, m, "org/repo", "main", file); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			fStatus.Store(http.StatusNotFound)
+			gStatus.Store(http.StatusServiceUnavailable)
+			if _, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+				t.Fatalf("f.bin after the 404 probe: err = %v, want ErrUpstreamNotFound", err)
+			}
+			expire()
+			if res, err := m.Resolve(ctx, "org/repo", "main", "g.bin"); err != nil || res.Entry == nil {
+				t.Fatalf("g.bin during the 503 outage = %+v, %v; want the cached entry", res, err)
+			}
+			before := requests.Load()
+			res, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+			if !errors.Is(err, ErrUpstreamNotFound) {
+				t.Fatalf("f.bin during the sibling backoff = %+v, %v after %d requests; want ErrUpstreamNotFound", res, err, requests.Load()-before)
+			}
+
+			expire()
+			fStatus.Store(http.StatusServiceUnavailable)
+			if res, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); err == nil {
+				t.Fatalf("f.bin after its own 503 probe = %+v; want the rejection kept", res)
+			}
+			expire()
+			fStatus.Store(0)
+			if res, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); err != nil || res.Entry == nil {
+				t.Fatalf("f.bin after its successful probe = %+v, %v; want the cached entry", res, err)
+			}
+			m.mu.Lock()
+			fe := m.entries[fKey]
+			m.mu.Unlock()
+			if fe != nil {
+				t.Fatalf("rejection record kept after the successful probe: %+v", fe)
+			}
+		})
+	}
+}
+
+func TestMirrorDirectPseudoRecoveryRetiresSourceFailure(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = ""
+	data := []byte("checksum content")
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	var corrupt atomic.Bool
+	corrupt.Store(true)
+	srv, _, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if corrupt.Load() && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/cdn/") {
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(bytes.Repeat([]byte("x"), len(data)))
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	src := resolveKey{repo: "org/repo", rev: "main", path: "f.bin"}
+	key := resolveKey{repo: "org/repo", rev: wantPseudo("org/repo", "main"), path: "f.bin"}
+	if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); err == nil {
+		t.Fatal("corrupt first ingest succeeded")
+	}
+	m.mu.Lock()
+	m.entries[src].nextRetry = time.Time{}
+	m.mu.Unlock()
+
+	corrupt.Store(false)
+	if _, err := ingestWait(t, m, "org/repo", key.rev, "f.bin"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	retained, ready := m.entries[src], m.entries[key]
+	m.mu.Unlock()
+	if retained != nil {
+		t.Errorf("source failure retained after the recovery: %+v", retained)
+	}
+	m.dropEntry(key, ready)
+	corrupt.Store(true)
+	if _, err := ingestWait(t, m, "org/repo", key.rev, "f.bin"); err == nil {
+		t.Fatal("corrupt ingest after the recovery succeeded")
+	}
+	m.mu.Lock()
+	fe := m.entries[src]
+	m.mu.Unlock()
+	if fe == nil || fe.failures != 1 {
+		t.Errorf("source failure after the recovery = %+v, want one failure", fe)
+	}
+}
+
+func TestMirrorOverlappingProbeKeepsIngestFailure(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = ""
+	data := []byte("checksum content")
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	getStarted, headStarted := make(chan struct{}), make(chan struct{})
+	releaseGet, releaseHead := make(chan struct{}), make(chan struct{})
+	var heads atomic.Int64
+	var getOnce, freeGet, freeHead sync.Once
+	srv, _, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/org/repo/resolve/main/f.bin" && heads.Add(1) == 2:
+			close(headStarted)
+			if !gateWait(releaseHead) {
+				return
+			}
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/cdn/"):
+			getOnce.Do(func() { close(getStarted) })
+			if !gateWait(releaseGet) {
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(bytes.Repeat([]byte("x"), len(data)))
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+	t.Cleanup(func() {
+		freeGet.Do(func() { close(releaseGet) })
+		freeHead.Do(func() { close(releaseHead) })
+	})
+	ctx := context.Background()
+
+	first, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+	if err != nil || first.Stream == nil {
+		t.Fatalf("first resolve = %+v, %v; want an in-flight stream", first, err)
+	}
+	awaitClosed(t, getStarted, "first download")
+	done := make(chan struct{})
+	var second *Resolution
+	var secondErr error
+	go func() {
+		defer close(done)
+		second, secondErr = m.Resolve(ctx, "org/repo", "main", "f.bin")
+	}()
+	awaitClosed(t, headStarted, "second probe")
+	freeGet.Do(func() { close(releaseGet) })
+	awaitClosed(t, first.Stream.t.done, "first ingest")
+	m.mu.Lock()
+	failure := m.entries[resolveKey{repo: "org/repo", rev: "main", path: "f.bin"}]
+	m.mu.Unlock()
+	if failure == nil || failure.State != stateFailed {
+		t.Fatalf("first ingest ended as %+v, want the checksum failure", failure)
+	}
+	freeHead.Do(func() { close(releaseHead) })
+	awaitClosed(t, done, "second resolve")
+	if secondErr == nil {
+		t.Fatalf("second resolve after the overlapping probe = %+v, want the ingest failure", second)
+	}
+}
+
+// loadBranch remembers absent and rejected pointers, not filesystem faults.
+func TestMirrorLoadBranchRemembersMisses(t *testing.T) {
+	m, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), t.TempDir())
+	commit := strings.Repeat("ab", 20)
+	valid := []byte(`{"commit":"` + commit + `","checked_at":"2026-01-01T00:00:00Z"}`)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, tc := range []struct {
+		rev, name string
+		raw       []byte
+	}{
+		{"main", "absent", nil},
+		{"dev", "corrupt", []byte("{")},
+		{"tag", "invalid commit", []byte(`{"commit":"nope"}`)},
+	} {
+		p := branchEntryPath(m.indexDir, "org/repo", tc.rev)
+		if tc.raw != nil {
+			writeRaw(t, p, tc.raw)
+		}
+		if b := m.loadBranch("org/repo", tc.rev); b != nil {
+			t.Fatalf("%s pointer loaded as %+v", tc.name, b)
+		}
+		writeRaw(t, p, valid)
+		if b := m.loadBranch("org/repo", tc.rev); b != nil {
+			t.Fatalf("%s pointer reread after the miss: %+v", tc.name, b)
+		}
+	}
+
+	p := branchEntryPath(m.indexDir, "org/repo", "faulty")
+	if err := os.MkdirAll(p, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if b := m.loadBranch("org/repo", "faulty"); b != nil {
+		t.Fatalf("directory in place of the pointer loaded as %+v", b)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	writeRaw(t, p, valid)
+	if b := m.loadBranch("org/repo", "faulty"); b == nil || b.Commit != commit {
+		t.Fatalf("pointer not loaded after the fault cleared: %+v", b)
+	}
+}
+
+func TestMirrorRepoContainingResolve(t *testing.T) {
+	const repo = "org/resolve/x"
+	upstream := newPlainUpstream()
+	upstream.commit = ""
+	data := []byte("resolve inside the repo name")
+	upstream.set("/"+repo+"/resolve/main/f.bin", data)
+	upstream.set("/"+repo+"/resolve/main/g.bin", []byte("second"))
+	srv, _, paths := countingServer(t, upstream)
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	pseudo := wantPseudo(repo, "main")
+
+	m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir)
+	entry, err := ingestWait(t, m, repo, "main", "f.bin")
+	if err != nil || entry.Commit != pseudo {
+		t.Fatalf("main = %+v, %v; want pseudo commit %s", entry, err, pseudo)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes differ from upstream data")
+	}
+	if src := rawSource(t, commitPath(filepath.Join(cacheDir, "index"), repo, pseudo)); src != "main" {
+		t.Fatalf("manifest source = %q, want main", src)
+	}
+
+	m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
+	res, err := m2.Resolve(context.Background(), repo, pseudo, "f.bin")
+	if err != nil || res.Entry == nil || res.Entry.SHA256 != entry.SHA256 {
+		t.Fatalf("direct pseudo f.bin after restart = %+v, %v; want the cached entry", res, err)
+	}
+	if entry, err = ingestWait(t, m2, repo, pseudo, "g.bin"); err != nil || entry.Commit != pseudo {
+		t.Fatalf("direct pseudo g.bin after restart = %+v, %v", entry, err)
+	}
+	if _, ok := paths.Load("/" + repo + "/resolve/main/g.bin"); !ok {
+		t.Fatal("g.bin was not fetched through the source branch")
 	}
 }

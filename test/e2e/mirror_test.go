@@ -5,11 +5,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -258,12 +261,11 @@ func pollResolveStatus(t *testing.T, resolveURL string, want int) string {
 	return ""
 }
 
-// waitIndexPersisted waits for the on-disk index entry, the mirror's
-// persistence contract for ready files. Entries live under per-commit
-// directories; branch mappings under index/branches do not count.
-func waitIndexPersisted(t *testing.T, cacheDir string) {
+// A branch pointer or empty manifest does not imply a completed ingest.
+func waitIndexPersisted(t *testing.T, cacheDir string, files ...string) {
 	t.Helper()
 	dir := filepath.Join(cacheDir, "index")
+	manifestRe := regexp.MustCompile(`^[0-9a-f]{40}\.json$`)
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		found := false
@@ -271,24 +273,37 @@ func waitIndexPersisted(t *testing.T, cacheDir string) {
 			if err != nil {
 				return nil
 			}
-			if de.IsDir() {
-				if de.Name() == "branches" {
-					return filepath.SkipDir
-				}
+			if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
 				return nil
 			}
-			if strings.HasSuffix(de.Name(), ".json") {
-				found = true
-				return filepath.SkipAll
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				return nil
 			}
-			return nil
+			parts := strings.Split(filepath.ToSlash(rel), "/")
+			if len(parts) != 3 || parts[1] != "commits" || !manifestRe.MatchString(parts[2]) {
+				return nil
+			}
+			var man struct {
+				Files map[string]json.RawMessage `json:"files"`
+			}
+			if raw, err := os.ReadFile(path); err != nil || json.Unmarshal(raw, &man) != nil || len(man.Files) == 0 {
+				return nil
+			}
+			for _, f := range files {
+				if man.Files[f] == nil {
+					return nil
+				}
+			}
+			found = true
+			return filepath.SkipAll
 		})
 		if found {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("index entry never persisted")
+	t.Fatalf("index entry for %q never persisted", files)
 }
 
 func getBody(t *testing.T, url string) []byte {
@@ -725,6 +740,140 @@ func TestMirrorPseudoCommit(t *testing.T) {
 			t.Fatalf("X-Repo-Commit = %q, want the pinned revision %q", got, rev)
 		}
 	})
+}
+
+type upstreamLog struct {
+	hub       http.Handler
+	rejectAll atomic.Bool
+	mu        sync.Mutex
+	hits      map[string]int
+}
+
+func (l *upstreamLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	l.hits[r.Method+" "+r.URL.Path]++
+	l.mu.Unlock()
+	if l.rejectAll.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	l.hub.ServeHTTP(w, r)
+}
+
+func (l *upstreamLog) snapshot() map[string]int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return maps.Clone(l.hits)
+}
+
+func TestMirrorPseudoManifestRestartAndLazyFetch(t *testing.T) {
+	hub := newFakeHub()
+	hub.commit = "" // upstream omits X-Repo-Commit
+	dataA, dataB := deterministicData(12*1024), deterministicData(20*1024)
+	hub.set("/org/repo/resolve/main/a.bin", dataA)
+	hub.set("/org/repo/resolve/main/b.bin", dataB)
+	front := &upstreamLog{hub: hub, hits: map[string]int{}}
+	hubSrv := httptest.NewServer(front)
+	defer hubSrv.Close()
+	etagOf := func(data []byte) string {
+		sum := sha256.Sum256(data)
+		return `"` + hex.EncodeToString(sum[:]) + `"`
+	}
+	resolveURL := func(srv *httptest.Server, rev, name string) string {
+		return srv.URL + "/org/repo/resolve/" + rev + "/" + name
+	}
+
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	srv := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir)
+	if body := getBody(t, resolveURL(srv, "main", "a.bin")); !bytes.Equal(body, dataA) {
+		t.Fatal("a.bin body mismatch")
+	}
+	readyA := waitMirrorReady(t, resolveURL(srv, "main", "a.bin"))
+	pseudo := readyA.Header.Get("X-Repo-Commit")
+	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(pseudo) || readyA.Header.Get("ETag") != etagOf(dataA) {
+		t.Fatalf("a.bin ready headers: commit %q etag %q", pseudo, readyA.Header.Get("ETag"))
+	}
+	waitIndexPersisted(t, cacheDir, "a.bin")
+
+	srv2 := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir)
+	before := front.snapshot()
+	if body := getBody(t, resolveURL(srv2, pseudo, "b.bin")); !bytes.Equal(body, dataB) {
+		t.Fatal("b.bin through the restarted mirror mismatch")
+	}
+	readyB := waitMirrorReady(t, resolveURL(srv2, pseudo, "b.bin"))
+	if c, etag, size := readyB.Header.Get("X-Repo-Commit"), readyB.Header.Get("ETag"), readyB.Header.Get("X-Linked-Size"); c != pseudo || etag != etagOf(dataB) || size != fmt.Sprint(len(dataB)) {
+		t.Fatalf("b.bin ready headers: commit %q etag %q size %q; want %s %s %d", c, etag, size, pseudo, etagOf(dataB), len(dataB))
+	}
+	after := front.snapshot()
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		key := method + " /org/repo/resolve/main/b.bin"
+		if got := after[key] - before[key]; got != 1 {
+			t.Fatalf("%s = %d, want 1 (fetched through the source branch once)", key, got)
+		}
+	}
+	if got := hub.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs = %d, want 2 (a.bin and b.bin once each)", got)
+	}
+
+	cached := []struct {
+		rev, name string
+		want      []byte
+	}{{pseudo, "b.bin", dataB}, {pseudo, "a.bin", dataA}, {"main", "a.bin", dataA}}
+	quiet := front.snapshot()
+	for _, tc := range cached {
+		if body := getBody(t, resolveURL(srv2, tc.rev, tc.name)); !bytes.Equal(body, tc.want) {
+			t.Fatalf("%s/%s: body mismatch", tc.rev, tc.name)
+		}
+		if ready := waitMirrorReady(t, resolveURL(srv2, tc.rev, tc.name)); ready.Header.Get("X-Repo-Commit") != pseudo || ready.Header.Get("ETag") != etagOf(tc.want) {
+			t.Fatalf("%s/%s: ready headers commit %q etag %q", tc.rev, tc.name, ready.Header.Get("X-Repo-Commit"), ready.Header.Get("ETag"))
+		}
+	}
+	if got := front.snapshot(); !maps.Equal(got, quiet) {
+		t.Fatalf("serving ready files made upstream requests: %v -> %v", quiet, got)
+	}
+	waitIndexPersisted(t, cacheDir, "a.bin", "b.bin")
+
+	front.rejectAll.Store(true)
+	srv3 := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir, mirror.WithRevalidateInterval(0))
+	offline := front.snapshot()
+	for _, tc := range cached {
+		if body := getBody(t, resolveURL(srv3, tc.rev, tc.name)); !bytes.Equal(body, tc.want) {
+			t.Fatalf("%s/%s offline: body mismatch", tc.rev, tc.name)
+		}
+		if got := waitMirrorReady(t, resolveURL(srv3, tc.rev, tc.name)).Header.Get("X-Repo-Commit"); got != pseudo {
+			t.Fatalf("%s/%s offline: X-Repo-Commit = %q, want %s", tc.rev, tc.name, got, pseudo)
+		}
+	}
+	if snap := front.snapshot(); snap["HEAD /org/repo/resolve/main/a.bin"] <= offline["HEAD /org/repo/resolve/main/a.bin"] {
+		t.Fatal("offline revalidation never probed the source branch")
+	}
+	c := noRedirectClient()
+	for i := range 2 {
+		resp, err := c.Get(resolveURL(srv3, pseudo, "c.bin"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "upstream status 503") {
+			t.Fatalf("c.bin request %d: status %d body %q, want 502 from the failed source probe", i, resp.StatusCode, body)
+		}
+	}
+	if body := getBody(t, resolveURL(srv3, pseudo, "b.bin")); !bytes.Equal(body, dataB) {
+		t.Fatal("sibling b.bin unusable after the c.bin failure")
+	}
+	snap := front.snapshot()
+	if snap["HEAD /org/repo/resolve/main/c.bin"] != 1 || snap["GET /org/repo/resolve/main/c.bin"] != 0 {
+		t.Fatalf("c.bin upstream traffic: %d probes, %d fetches; want one probe and no fetch", snap["HEAD /org/repo/resolve/main/c.bin"], snap["GET /org/repo/resolve/main/c.bin"])
+	}
+	for key := range snap {
+		if strings.Contains(key, pseudo) {
+			t.Errorf("upstream requested by pseudo commit: %s", key)
+		}
+	}
+	if got := hub.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs after the outage = %d, want 2", got)
+	}
 }
 
 // TestMirrorDistinctRevisions: the same path under different revisions must be
