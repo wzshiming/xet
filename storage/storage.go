@@ -12,8 +12,11 @@ import (
 
 var ErrInvalidShard = errors.New("invalid shard")
 
-// Storage defines the interface for storing and retrieving XET data
+// Storage is the backend contract implemented by the local, s3 and memory
+// packages; the package overview describes the shared layout and semantics.
 type Storage interface {
+	// Xorb objects: content-addressed chunk data under xorbs/.
+
 	// PutXorb stores an xorb by its hash
 	PutXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash, r io.Reader) (bool, error)
 
@@ -41,6 +44,8 @@ type Storage interface {
 	// DeleteXorb removes a stored xorb object.
 	DeleteXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) error
 
+	// Shard objects: serialized shards under shards/, resolved through the indexes.
+
 	// PutShard stores a shard, named by the SHA-256 of its stored bytes
 	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
@@ -62,11 +67,15 @@ type Storage interface {
 	// DeleteShard removes a stored shard object.
 	DeleteShard(ctx context.Context, shardHash string) error
 
+	// File lookups by content SHA-256 through index/sha256.
+
 	// GetReconstructedFile returns a ReadSeekCloser for a file reconstructed from a shard by its SHA-256 digest.
 	GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error)
 
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest.
 	GetFileHashBySHA256(ctx context.Context, namespace string, sha256 [32]byte) (xet.FileHash, error)
+
+	// GC index access: walks, cache-bypassing reads and deletes of index entries.
 
 	// WalkFileIndex calls fn with each file hash and its owning shard hash from index/files.
 	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error

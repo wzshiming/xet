@@ -142,8 +142,8 @@ type SweepOptions struct {
 // xorbs. An unreadable shard is treated as live, reported, and no xorb is deleted that pass.
 //
 // A dead shard's entries are deleted, never repointed, even when a live shard shares the chunk or
-// (under AnchorFiles) the SHA-256 of identical content — FileStorage keeps an entry's first writer,
-// S3 its last — so that lookup misses until an upload of the content under a chunking with no
+// (under AnchorFiles) the SHA-256 of identical content — the local backend keeps an entry's first
+// writer, S3 its last — so that lookup misses until an upload of the content under a chunking with no
 // files entry rewrites it; the live file stays whole and file-hash resolvable.
 //
 // The grace window shields uploads mid-commit (PutShard: xorbs, shard, chunks, sha256, files entry

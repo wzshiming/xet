@@ -1,3 +1,6 @@
+// Package local implements storage.Storage on a filesystem below the base
+// directory given to NewStorage. Objects and index entries land through a
+// temp file plus rename, and an index entry already present is kept.
 package local
 
 import (
@@ -20,7 +23,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-// Storage implements Storage using the filesystem
+// Storage implements storage.Storage on the local filesystem.
 type Storage struct {
 	basePath  string
 	baseURL   string
@@ -342,7 +345,7 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on
-// first use. Handles are retained in the FileStorage-wide LRU cache so the
+// first use. Handles are retained in the store-wide LRU cache so the
 // number of open files stays bounded and handles are reused across shards;
 // evicted handles are closed via the cache's OnEvicted callback. The handle's
 // own lock must be held while seeking and reading through it.

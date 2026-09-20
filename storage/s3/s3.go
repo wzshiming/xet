@@ -1,3 +1,6 @@
+// Package s3 implements storage.Storage over an S3-compatible object store
+// with the local backend's layout under an optional key prefix. Index entries
+// are overwritten on every write and xorb download URLs are presigned by default.
 package s3
 
 import (
@@ -30,10 +33,11 @@ import (
 // clients to work through a large reconstruction term by term.
 const defaultPresignExpiry = time.Hour
 
-// Storage implements Storage backed by an S3-compatible object store. It
-// uses the same object layout as FileStorage (xorbs/, shards/, index/files/,
-// index/chunks/, index/sha256/ with a two-level 2/2/60 hash fanout), so a
-// bucket populated by syncing a FileStorage directory is directly usable.
+// Storage implements storage.Storage backed by an S3-compatible object store.
+// It uses the same object layout as the local backend (xorbs/, shards/,
+// index/files/, index/chunks/, index/sha256/ with a two-level 2/2/60 hash
+// fanout), so a bucket populated by syncing a local storage directory is
+// directly usable.
 type Storage struct {
 	client          *awss3.Client
 	presignClient   *awss3.PresignClient
@@ -78,7 +82,7 @@ func WithPrefix(prefix string) Option {
 }
 
 // WithBaseURL sets the base URL used when generating xorb download URLs,
-// mirroring WithBaseURL on FileStorage.
+// mirroring the local backend's WithBaseURL.
 func WithBaseURL(baseURL string) Option {
 	return func(ss *Storage) {
 		ss.baseURL = baseURL
@@ -185,8 +189,8 @@ func NewStorage(ctx context.Context, opts ...Option) (*Storage, error) {
 	return ss, nil
 }
 
-// objectKey returns the same two-level fanout layout FileStorage uses on
-// disk, under the configured prefix.
+// objectKey returns the same two-level fanout layout the local backend uses
+// on disk, under the configured prefix.
 func (ss *Storage) objectKey(kind, name string) string {
 	key := storage.ObjectKey(kind, name)
 	if ss.prefix != "" {
@@ -888,7 +892,7 @@ func (ss *Storage) GetReconstructedFile(ctx context.Context, namespace string, s
 // GetXorbURL generates a URL for accessing xorb data. By default it is a
 // presigned S3 GET URL so clients fetch xorb ranges straight from the object
 // store; with presigning disabled the URL routes through the CAS server's
-// xorb endpoint like FileStorage.
+// xorb endpoint like the local backend.
 func (ss *Storage) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
 	if ss.presign {
 		req, err := ss.presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
