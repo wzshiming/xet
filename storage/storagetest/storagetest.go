@@ -71,5 +71,7 @@ var cases = []struct {
 	{"TestListFilesGroupsBySHA256", testListFilesGroupsBySHA256},
 	{"TestListFilesMarksDanglingEntries", testListFilesMarksDanglingEntries},
 	{"TestListFilesToleratesVanishedXorb", testListFilesToleratesVanishedXorb},
+	{"TestListFilesComputesUniqueAndShared", testListFilesComputesUniqueAndShared},
+	{"TestListFilesMarksInvalidChunkMetadata", testListFilesMarksInvalidChunkMetadata},
 	{"TestPutShardVerifiesFileHash", testPutShardVerifiesFileHash},
 }
