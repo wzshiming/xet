@@ -13,7 +13,7 @@ import (
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	xetdownload "github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/server"
-	"github.com/wzshiming/xet/storage"
+	s3storage "github.com/wzshiming/xet/storage/s3"
 	"github.com/wzshiming/xet/test/conformance/rustref"
 )
 
@@ -49,9 +49,9 @@ func newS3BackedServer(t *testing.T) (runningServer, string) {
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	stor, err := storage.NewS3Storage(context.Background(),
-		storage.WithS3Client(s3Client),
-		storage.WithS3Bucket(bucket),
+	stor, err := s3storage.NewStorage(context.Background(),
+		s3storage.WithS3Client(s3Client),
+		s3storage.WithBucket(bucket),
 	)
 	if err != nil {
 		t.Fatalf("create S3 storage: %v", err)

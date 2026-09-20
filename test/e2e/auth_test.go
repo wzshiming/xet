@@ -23,13 +23,14 @@ import (
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // newAuthServer wires the cmd/xetd composition: /internal/ behind its own
 // token, CAS routes behind the issuer.
 func newAuthServer(t *testing.T, issuer *auth.Issuer, internalToken string) *httptest.Server {
 	t.Helper()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

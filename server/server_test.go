@@ -22,13 +22,14 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/xorb"
 )
 
 func authorizerFixture(t *testing.T) (storage.Storage, xet.FileHash, xet.XorbHash, xet.ChunkHash, [32]byte, []byte, []byte) {
 	t.Helper()
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +200,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Run("sha256 xorb", func(t *testing.T) {
-		target, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+		target, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -239,7 +240,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 		{"sha256 v2 shard extra empty file", "/v2/shards", writeToken, &shard.FileMetadataExt{SHA256Hash: shard.SHA256Hash(digest)}, false, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			target, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+			target, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -314,7 +315,7 @@ func TestShardUploadHashMismatchIsNotRetryable(t *testing.T) {
 		for _, mismatch := range []string{"file hash mismatch", "SHA-256 mismatch"} {
 			t.Run(endpoint+"/"+mismatch, func(t *testing.T) {
 				ctx := context.Background()
-				stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+				stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -373,7 +374,7 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 	_, fileHash, _, _, _, _, shardBytes := authorizerFixture(t)
 	for _, endpoint := range []string{"/v1/shards", "/shards", "/v2/shards"} {
 		t.Run(endpoint, func(t *testing.T) {
-			target, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+			target, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -619,7 +620,7 @@ func TestRoutesAuthorizationParsingOrder(t *testing.T) {
 
 func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 	ctx := context.Background()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +727,7 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 }
 
 func TestXetBridgeRejectsInvalidAndUnknownSHA256(t *testing.T) {
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +750,7 @@ func TestXetBridgeRejectsInvalidAndUnknownSHA256(t *testing.T) {
 // TestXetBridgeServesEmptyDigest: the sha256 of zero bytes names content that
 // is never ingested, so the bridge answers it without touching storage.
 func TestXetBridgeServesEmptyDigest(t *testing.T) {
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

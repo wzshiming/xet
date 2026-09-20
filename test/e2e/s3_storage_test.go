@@ -20,6 +20,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/s3"
 )
 
 // TestS3StorageUploadRestartAndDownload runs the full upload/download cycle
@@ -49,11 +50,11 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 
 	// Constructed through the production option path, not an injected client.
 	newStorage := func() storage.Storage {
-		stor, err := storage.NewS3Storage(ctx,
-			storage.WithS3Bucket(bucket),
-			storage.WithS3Prefix("xet-data"),
-			storage.WithS3Endpoint(endpoint),
-			storage.WithS3PathStyle(true),
+		stor, err := s3.NewStorage(ctx,
+			s3.WithBucket(bucket),
+			s3.WithPrefix("xet-data"),
+			s3.WithEndpoint(endpoint),
+			s3.WithPathStyle(true),
 		)
 		if err != nil {
 			t.Fatal(err)

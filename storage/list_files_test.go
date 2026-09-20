@@ -1,21 +1,16 @@
 package storage
 
 import (
-	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	iofs "io/fs"
 	"math"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // sortEntries orders expectations the way ListFiles sorts its result:
@@ -30,177 +25,6 @@ func sortEntries(entries []FileListEntry) {
 		}
 		return cmp.Compare(a.FileHashes[0], b.FileHashes[0])
 	})
-}
-
-type listBackend struct {
-	name          string
-	newStore      func(t *testing.T) Storage
-	writeDangling func(t *testing.T, st Storage, fileHash, shardHash string)
-}
-
-func listBackends() []listBackend {
-	return []listBackend{
-		{
-			name: "file",
-			newStore: func(t *testing.T) Storage {
-				st, err := NewFileStorage(WithBasePath(t.TempDir()))
-				if err != nil {
-					t.Fatal(err)
-				}
-				return st
-			},
-			writeDangling: func(t *testing.T, st Storage, fileHash, shardHash string) {
-				fs := st.(*FileStorage)
-				if err := writeIndexFile(fs.objectPath("index/files", fileHash), []byte(shardHash)); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			name: "s3",
-			newStore: func(t *testing.T) Storage {
-				return newTestS3Storage(t)
-			},
-			writeDangling: func(t *testing.T, st Storage, fileHash, shardHash string) {
-				ss := st.(*S3Storage)
-				if err := ss.putIndexObject(context.Background(), ss.objectKey("index/files", fileHash), []byte(shardHash)); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-	}
-}
-
-// putListedFile stores one file chunked as parts (one single-chunk xorb per
-// part) and returns its hex file hash together with the exact stored size of
-// its chunks (a footer-less encode of each part is exactly the packed chunk
-// bytes the listing attributes).
-func putListedFile(t *testing.T, ctx context.Context, st Storage, parts [][]byte) (string, uint64) {
-	t.Helper()
-	shardObj := shard.NewShard()
-	fileBlock := shard.FileBlock{}
-	var chunkHashes []xet.ChunkHash
-	var chunkSizes []uint64
-	var storedSize uint64
-	for _, part := range parts {
-		var encoded bytes.Buffer
-		encoder := xorb.NewEncoder(&encoded, true)
-		if _, err := encoder.Write(part); err != nil {
-			t.Fatal(err)
-		}
-		if err := encoder.Close(); err != nil {
-			t.Fatal(err)
-		}
-		xorbHash := encoder.SummoryHash()
-		if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
-			t.Fatal(err)
-		}
-		var chunkOnly bytes.Buffer
-		bare := xorb.NewEncoder(&chunkOnly, false)
-		if _, err := bare.Write(part); err != nil {
-			t.Fatal(err)
-		}
-		if err := bare.Close(); err != nil {
-			t.Fatal(err)
-		}
-		storedSize += uint64(chunkOnly.Len())
-		chunkHash := xet.ComputeChunkHash(part)
-		chunkHashes = append(chunkHashes, chunkHash)
-		chunkSizes = append(chunkSizes, uint64(len(part)))
-		fileBlock.Entries = append(fileBlock.Entries, shard.FileDataSequenceEntry{
-			CASHash: xorbHash, UnpackedSegBytes: uint32(len(part)), ChunkIndexEnd: 1,
-		})
-		shardObj.AddCASBlock(shard.CASBlock{
-			CASHash: xorbHash,
-			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: chunkHash, UnpackedSegBytes: uint32(len(part))}},
-		})
-	}
-	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
-	fileBlock.FileHash = fileHash
-	shardObj.AddFile(fileBlock)
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
-		t.Fatal(err)
-	}
-	return fileHash.String(), storedSize
-}
-
-// TestListFilesGroupsBySHA256 proves that identical content chunked two
-// different ways (two xet file hashes) collapses into one entry whose size is
-// counted once, while empty files stay ungrouped with no SHA-256.
-func TestListFilesGroupsBySHA256(t *testing.T) {
-	for _, backend := range listBackends() {
-		t.Run(backend.name, func(t *testing.T) {
-			ctx := context.Background()
-			st := backend.newStore(t)
-
-			content := []byte("same content, two different chunkings")
-			other := []byte("a different file")
-
-			oneChunk, oneStored := putListedFile(t, ctx, st, [][]byte{content})
-			twoChunks, twoStored := putListedFile(t, ctx, st, [][]byte{content[:11], content[11:]})
-			otherHash, otherStored := putListedFile(t, ctx, st, [][]byte{other})
-
-			emptyHash := xet.FileHash{}
-			emptyShard := shard.NewShard()
-			emptyShard.AddFile(shard.FileBlock{FileHash: emptyHash})
-			if _, err := st.PutShard(ctx, emptyShard); err != nil {
-				t.Fatalf("PutShard(empty file): %v", err)
-			}
-
-			got, err := ListFiles(ctx, st.(ListStore))
-			if err != nil {
-				t.Fatalf("ListFiles: %v", err)
-			}
-
-			contentSHA := sha256.Sum256(content)
-			otherSHA := sha256.Sum256(other)
-			grouped := []string{oneChunk, twoChunks}
-			slices.Sort(grouped)
-			// Both chunkings are stored, so the group's unique bytes count the
-			// stored chunks of both.
-			want := []FileListEntry{
-				{FileHashes: []string{emptyHash.String()}},
-				{SHA256: hex.EncodeToString(contentSHA[:]), FileHashes: grouped, OriginalSize: uint64(len(content)), UniqueSize: oneStored + twoStored},
-				{SHA256: hex.EncodeToString(otherSHA[:]), FileHashes: []string{otherHash}, OriginalSize: uint64(len(other)), UniqueSize: otherStored},
-			}
-			sortEntries(want)
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("ListFiles() = %+v, want %+v", got, want)
-			}
-		})
-	}
-}
-
-// TestListFilesMarksDanglingEntries covers file-index entries whose shard is
-// gone: they stay listed, flagged missing, with no SHA-256 or size.
-func TestListFilesMarksDanglingEntries(t *testing.T) {
-	for _, backend := range listBackends() {
-		t.Run(backend.name, func(t *testing.T) {
-			ctx := context.Background()
-			st := backend.newStore(t)
-
-			content := []byte("still resolvable")
-			realHash, realStored := putListedFile(t, ctx, st, [][]byte{content})
-
-			danglingHash := strings.Repeat("ab", 32)
-			backend.writeDangling(t, st, danglingHash, strings.Repeat("cd", 32))
-
-			got, err := ListFiles(ctx, st.(ListStore))
-			if err != nil {
-				t.Fatalf("ListFiles: %v", err)
-			}
-
-			digest := sha256.Sum256(content)
-			want := []FileListEntry{
-				{FileHashes: []string{danglingHash}, Missing: true},
-				{SHA256: hex.EncodeToString(digest[:]), FileHashes: []string{realHash}, OriginalSize: uint64(len(content)), UniqueSize: realStored},
-			}
-			sortEntries(want)
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("ListFiles() = %+v, want %+v", got, want)
-			}
-		})
-	}
 }
 
 // fakeListStore serves hand-built shards and per-xorb chunk packed sizes,

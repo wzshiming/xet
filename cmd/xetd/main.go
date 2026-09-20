@@ -18,6 +18,8 @@ import (
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/storage/s3"
 )
 
 func main() {
@@ -48,24 +50,24 @@ func main() {
 	var stor storage.Storage
 	var err error
 	if *s3Bucket != "" {
-		stor, err = storage.NewS3Storage(context.Background(),
-			storage.WithS3Bucket(*s3Bucket),
-			storage.WithS3Prefix(*s3Prefix),
-			storage.WithS3Endpoint(*s3Endpoint),
-			storage.WithS3Region(*s3Region),
-			storage.WithS3PathStyle(*s3PathStyle),
-			storage.WithS3Presign(*s3Presign),
-			storage.WithS3PresignExpiry(*s3PresignExpiry),
-			storage.WithS3PresignEndpoint(*s3PresignEndpoint),
-			storage.WithS3BaseURL(*baseURL),
+		stor, err = s3.NewStorage(context.Background(),
+			s3.WithBucket(*s3Bucket),
+			s3.WithPrefix(*s3Prefix),
+			s3.WithEndpoint(*s3Endpoint),
+			s3.WithRegion(*s3Region),
+			s3.WithPathStyle(*s3PathStyle),
+			s3.WithPresign(*s3Presign),
+			s3.WithPresignExpiry(*s3PresignExpiry),
+			s3.WithPresignEndpoint(*s3PresignEndpoint),
+			s3.WithBaseURL(*baseURL),
 		)
 		if err == nil {
 			fmt.Printf("S3 storage enabled, bucket: %s\n", *s3Bucket)
 		}
 	} else {
-		stor, err = storage.NewFileStorage(
-			storage.WithBasePath(*storageDir),
-			storage.WithBaseURL(*baseURL),
+		stor, err = local.NewStorage(
+			local.WithBasePath(*storageDir),
+			local.WithBaseURL(*baseURL),
 		)
 	}
 	if err != nil {

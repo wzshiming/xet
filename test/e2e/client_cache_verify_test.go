@@ -15,14 +15,14 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // TestClientCacheEndToEnd verifies the client disk cache end to end:
 // correctness, warm-download cache hits, and background compaction of
 // overlapping same-xorb entries created by dedup'd downloads.
 func TestClientCacheEndToEnd(t *testing.T) {
-	uploadStorage, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	uploadStorage, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

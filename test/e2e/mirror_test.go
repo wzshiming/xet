@@ -25,7 +25,7 @@ import (
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // fakeHub is a configurable plain hub: resolve requests answer metadata
@@ -163,9 +163,9 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	}))
 	t.Cleanup(srv.Close)
 
-	stor, err := storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(srv.URL),
+	stor, err := local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(srv.URL),
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -17,14 +17,14 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
-	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 // newTestServer serves a real CAS handler over local storage and records
 // every request as "path|range-header".
 func newTestServer(t *testing.T) (client.AuthProvider, func() string) {
 	t.Helper()
-	stor, err := storage.NewFileStorage(storage.WithBasePath(t.TempDir()))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}

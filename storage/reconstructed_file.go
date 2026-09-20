@@ -11,9 +11,9 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-// xorbRangeReader is the subset of Storage that reconstructedFile needs to
+// XorbRangeReader is the subset of Storage that reconstructedFile needs to
 // stream chunk ranges out of stored xorbs.
-type xorbRangeReader interface {
+type XorbRangeReader interface {
 	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
 	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 }
@@ -23,7 +23,7 @@ type xorbRangeReader interface {
 // provide HEAD and byte-range responses without materializing the whole file.
 type reconstructedFile struct {
 	ctx       context.Context
-	storage   xorbRangeReader
+	storage   XorbRangeReader
 	namespace string
 	entries   []shard.FileDataSequenceEntry
 	offsets   []int64
@@ -39,9 +39,9 @@ type reconstructedFile struct {
 	closed     bool
 }
 
-// findFileBySHA256 returns the shard file whose recorded SHA-256 matches
+// FindFileBySHA256 returns the shard file whose recorded SHA-256 matches
 // digest, or nil when the shard does not carry it.
-func findFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
+func FindFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
 	want := shard.NewSHA256Hash(digest)
 	for i := range sh.Files {
 		if sh.Files[i].MetadataExt != nil && sh.Files[i].MetadataExt.SHA256Hash == want {
@@ -51,8 +51,9 @@ func findFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
 	return nil
 }
 
-func newReconstructedFile(ctx context.Context, stor xorbRangeReader, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
-	file := findFileBySHA256(sh, digest)
+// NewReconstructedFile exposes the file in sh whose recorded SHA-256 is digest.
+func NewReconstructedFile(ctx context.Context, stor XorbRangeReader, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
+	file := FindFileBySHA256(sh, digest)
 	if file == nil {
 		return nil, fmt.Errorf("SHA-256 is not present in shard")
 	}

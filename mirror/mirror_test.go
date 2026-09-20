@@ -25,6 +25,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 func TestSpoolTailRead(t *testing.T) {
@@ -98,7 +99,7 @@ func TestSpoolTailRead(t *testing.T) {
 func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, opts ...Option) (*Mirror, storage.Storage) {
 	t.Helper()
 
-	stor, err := storage.NewFileStorage(storage.WithBasePath(storageDir))
+	stor, err := local.NewStorage(local.WithBasePath(storageDir))
 	if err != nil {
 		t.Fatal(err)
 	}

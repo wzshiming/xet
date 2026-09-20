@@ -16,6 +16,7 @@ import (
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/testutil"
 	"github.com/wzshiming/xet/test/conformance/utils"
@@ -82,9 +83,9 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 					// Now create storage with the correct base URL
 					var err error
-					stor, err = storage.NewFileStorage(
-						storage.WithBasePath(storageDir),
-						storage.WithBaseURL(httpSrv.URL),
+					stor, err = local.NewStorage(
+						local.WithBasePath(storageDir),
+						local.WithBaseURL(httpSrv.URL),
 					)
 					if err != nil {
 						t.Fatalf("Failed to create storage: %v", err)
@@ -239,9 +240,9 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Now create storage with the correct base URL
 			var err error
-			stor, err = storage.NewFileStorage(
-				storage.WithBasePath(storageDir),
-				storage.WithBaseURL(httpSrv.URL),
+			stor, err = local.NewStorage(
+				local.WithBasePath(storageDir),
+				local.WithBaseURL(httpSrv.URL),
 			)
 			if err != nil {
 				t.Fatalf("Failed to create storage: %v", err)
@@ -382,9 +383,9 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 	defer httpSrv.Close()
 
 	var err error
-	stor, err = storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(httpSrv.URL),
+	stor, err = local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(httpSrv.URL),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
@@ -509,9 +510,9 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 	defer httpSrv.Close()
 
 	var err error
-	stor, err = storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(httpSrv.URL),
+	stor, err = local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(httpSrv.URL),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)

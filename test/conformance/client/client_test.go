@@ -20,6 +20,7 @@ import (
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/test/conformance/rustref"
 	"github.com/wzshiming/xet/test/conformance/testutil"
 	"github.com/wzshiming/xet/test/conformance/utils"
@@ -182,9 +183,9 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 						defer rustrefHttpSrv.Close()
 
 						var err error
-						rustrefStor, err = storage.NewFileStorage(
-							storage.WithBasePath(rustrefStorageDir),
-							storage.WithBaseURL(rustrefHttpSrv.URL),
+						rustrefStor, err = local.NewStorage(
+							local.WithBasePath(rustrefStorageDir),
+							local.WithBaseURL(rustrefHttpSrv.URL),
 						)
 						if err != nil {
 							t.Fatalf("Failed to create xet-core storage: %v", err)
@@ -233,9 +234,9 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 						}))
 						defer nativeHttpSrv.Close()
 
-						nativeStor, err = storage.NewFileStorage(
-							storage.WithBasePath(nativeStorageDir),
-							storage.WithBaseURL(nativeHttpSrv.URL),
+						nativeStor, err = local.NewStorage(
+							local.WithBasePath(nativeStorageDir),
+							local.WithBaseURL(nativeHttpSrv.URL),
 						)
 						if err != nil {
 							t.Fatalf("Failed to create native storage: %v", err)
@@ -302,9 +303,9 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 						defer httpSrv.Close()
 
 						var err error
-						stor, err = storage.NewFileStorage(
-							storage.WithBasePath(storageDir),
-							storage.WithBaseURL(httpSrv.URL),
+						stor, err = local.NewStorage(
+							local.WithBasePath(storageDir),
+							local.WithBaseURL(httpSrv.URL),
 						)
 						if err != nil {
 							t.Fatalf("Failed to create storage: %v", err)
@@ -450,9 +451,9 @@ func testClientUploadConformanceWithExistingData(t *testing.T, protocol rustref.
 	defer rustrefHTTP.Close()
 
 	var err error
-	rustrefStor, err = storage.NewFileStorage(
-		storage.WithBasePath(rustrefStorageDir),
-		storage.WithBaseURL(rustrefHTTP.URL),
+	rustrefStor, err = local.NewStorage(
+		local.WithBasePath(rustrefStorageDir),
+		local.WithBaseURL(rustrefHTTP.URL),
 	)
 	if err != nil {
 		t.Fatalf("create xet-core storage: %v", err)
@@ -490,9 +491,9 @@ func testClientUploadConformanceWithExistingData(t *testing.T, protocol rustref.
 	}))
 	defer nativeHTTP.Close()
 
-	nativeStor, err = storage.NewFileStorage(
-		storage.WithBasePath(nativeStorageDir),
-		storage.WithBaseURL(nativeHTTP.URL),
+	nativeStor, err = local.NewStorage(
+		local.WithBasePath(nativeStorageDir),
+		local.WithBaseURL(nativeHTTP.URL),
 	)
 	if err != nil {
 		t.Fatalf("create native storage: %v", err)
@@ -1293,9 +1294,9 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	defer httpSrv.Close()
 
 	var err error
-	stor, err = storage.NewFileStorage(
-		storage.WithBasePath(storageDir),
-		storage.WithBaseURL(httpSrv.URL),
+	stor, err = local.NewStorage(
+		local.WithBasePath(storageDir),
+		local.WithBaseURL(httpSrv.URL),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
@@ -1482,9 +1483,9 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		defer proxiedSrv.Close()
 
 		var innerErr error
-		innerStor, innerErr = storage.NewFileStorage(
-			storage.WithBasePath(innerStorDir),
-			storage.WithBaseURL(proxiedSrv.URL),
+		innerStor, innerErr = local.NewStorage(
+			local.WithBasePath(innerStorDir),
+			local.WithBaseURL(proxiedSrv.URL),
 		)
 		if innerErr != nil {
 			t.Fatalf("create inner storage: %v", innerErr)
@@ -1573,9 +1574,9 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		defer cmpHTTP.Close()
 
 		var cmpErr error
-		cmpStor, cmpErr = storage.NewFileStorage(
-			storage.WithBasePath(cmpStorDir),
-			storage.WithBaseURL(cmpHTTP.URL),
+		cmpStor, cmpErr = local.NewStorage(
+			local.WithBasePath(cmpStorDir),
+			local.WithBaseURL(cmpHTTP.URL),
 		)
 		if cmpErr != nil {
 			t.Fatalf("create comparison storage: %v", cmpErr)
