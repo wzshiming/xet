@@ -12,8 +12,8 @@ import (
 
 // Validate reads the xorb stream and verifies its structural and hash integrity.
 // Chunks are processed without buffering all raw data; only chunk hashes and sizes
-// are accumulated for hash verification against the footer.
-// For chunk-only format (no footer), only structural validity is checked.
+// are accumulated to check that xorbHash is the Merkle root of the decoded chunks
+// and, when a footer is present, that the footer agrees with it.
 // Returns nil if the stream is valid, or a descriptive error otherwise.
 func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	tmp := pool.GetChunkBuf()
@@ -29,8 +29,8 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	for {
 		n, err := io.ReadFull(r, headerBuf[:])
 		if err == io.EOF {
-			// Chunk-only format: structural validation passed.
-			return nil
+			// Chunk-only format: the claimed hash is all that binds the content.
+			return checkXorbHash(xorbHash, chunkHashes, chunkSizes)
 		}
 		if err == io.ErrUnexpectedEOF {
 			return fmt.Errorf("failed to read chunk header: %w", err)
@@ -40,6 +40,9 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		}
 
 		if n >= 7 && bytes.Equal(headerBuf[:7], xorbIdentifier[:]) {
+			if err := checkXorbHash(xorbHash, chunkHashes, chunkSizes); err != nil {
+				return err
+			}
 			return validateWithFooter(r, tmp[:], headerBuf, xorbHash, chunkHashes)
 		}
 
@@ -70,12 +73,23 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		if err != nil {
 			return fmt.Errorf("decompress chunk: %w", err)
 		}
+		if len(uncompressedBuf) != int(uncompressedSize) {
+			return fmt.Errorf("chunk size mismatch: header declares %d, payload has %d", uncompressedSize, len(uncompressedBuf))
+		}
 		h := xet.ComputeChunkHash(uncompressedBuf)
 		chunkHashes = append(chunkHashes, h)
 		chunkSizes = append(chunkSizes, uint64(uncompressedSize))
 		packedEndOffset += 8 + uint64(compressedSize)
 		unpackedEndOffset += uint64(uncompressedSize)
 	}
+}
+
+// checkXorbHash rejects a claimed hash that is not the Merkle root of the decoded chunks.
+func checkXorbHash(claimed xet.XorbHash, chunkHashes []xet.ChunkHash, chunkSizes []uint64) error {
+	if computed := xet.ComputeXorbHash(chunkHashes, chunkSizes); computed != claimed {
+		return fmt.Errorf("xorb hash mismatch: claimed %x, computed %x", claimed, computed)
+	}
+	return nil
 }
 
 // validateWithFooter reads the footer from the stream and validates it against
