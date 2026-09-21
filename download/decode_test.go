@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
@@ -228,6 +230,198 @@ func TestReaderAcceptsMaxChunkRange(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// randomChunks returns n incompressible chunks so the encoded xorb length does
+// not depend on the content.
+func randomChunks(seed int64, n, size int) [][]byte {
+	rng := rand.New(rand.NewSource(seed))
+	chunks := make([][]byte, n)
+	for i := range chunks {
+		chunks[i] = make([]byte, size)
+		rng.Read(chunks[i])
+	}
+	return chunks
+}
+
+func chunkHashes(chunks [][]byte) []xet.ChunkHash {
+	hashes := make([]xet.ChunkHash, len(chunks))
+	for i, c := range chunks {
+		hashes[i] = xet.ComputeChunkHash(c)
+	}
+	return hashes
+}
+
+// TestReaderVerifiesFileHash pins WithExpectedFileHash: the output is hashed
+// once per term chunk occurrence along the original chunk boundaries and
+// compared with the expected file hash at EOF, on cold and cached reads.
+func TestReaderVerifiesFileHash(t *testing.T) {
+	const chunkSize = 1000
+	chunks := randomChunks(1, 3, chunkSize)
+	wrongChunks := randomChunks(2, 3, chunkSize)
+	encoded := buildTestXorb(t, chunks)
+	wrongEncoded := buildTestXorb(t, wrongChunks)
+	if len(wrongEncoded) != len(encoded) {
+		t.Fatalf("substituted xorb is %d bytes, want %d", len(wrongEncoded), len(encoded))
+	}
+	hashes := chunkHashes(chunks)
+
+	// Terms reuse chunks and select subsets of the single wide fetch entry.
+	terms := []Term{
+		{Hash: testCacheHash, UnpackedLength: 2 * chunkSize, Range: ChunkRange{Start: 0, End: 2}},
+		{Hash: testCacheHash, UnpackedLength: 2 * chunkSize, Range: ChunkRange{Start: 1, End: 3}},
+		{Hash: testCacheHash, UnpackedLength: chunkSize, Range: ChunkRange{Start: 0, End: 1}},
+	}
+	var full []byte
+	var fileHashes []xet.ChunkHash
+	var fileSizes []uint64
+	for _, term := range terms {
+		for i := term.Range.Start; i < term.Range.End; i++ {
+			full = append(full, chunks[i]...)
+			fileHashes = append(fileHashes, hashes[i])
+			fileSizes = append(fileSizes, chunkSize)
+		}
+	}
+	fileHash := xet.ComputeFileHash(fileHashes, fileSizes)
+
+	readers := map[string]func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error){
+		"v1": func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV1(ctx, &fakeClientAdapter{data: data}, &ReconstructionResponseV1{
+				OffsetIntoFirstRange: offset,
+				Terms:                terms,
+				FetchInfo: map[string][]FetchInfoEntry{
+					testCacheHash: {{
+						Range:    ChunkRange{Start: 0, End: 3},
+						URL:      "test://xorb",
+						URLRange: ByteRange{Start: 0, End: int64(len(encoded) - 1)},
+					}},
+				},
+			}, opts...)
+		},
+		"v2": func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV2(ctx, &fakeClientAdapter{data: data}, &ReconstructionResponseV2{
+				OffsetIntoFirstRange: offset,
+				Terms:                terms,
+				Xorbs: map[string][]XorbMultiRangeFetch{
+					testCacheHash: {{
+						URL: "test://xorb",
+						Ranges: []XorbRangeDescriptor{{
+							Chunks: ChunkRange{Start: 0, End: 3},
+							Bytes:  ByteRange{Start: 0, End: int64(len(encoded) - 1)},
+						}},
+					}},
+				},
+			}, opts...)
+		},
+	}
+
+	readAll := func(t *testing.T, r io.ReadCloser, oneByte bool) ([]byte, error) {
+		t.Helper()
+		defer r.Close()
+		var src io.Reader = r
+		if oneByte {
+			src = iotest.OneByteReader(r)
+		}
+		return io.ReadAll(src)
+	}
+	wantMismatch := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+			t.Fatalf("err = %v, want file hash mismatch", err)
+		}
+	}
+
+	ctx := context.Background()
+	for name, newReader := range readers {
+		t.Run(name, func(t *testing.T) {
+			for _, oneByte := range []bool{false, true} {
+				cache := NewCacheManager(t.TempDir(), 0)
+				r, err := newReader(ctx, encoded, terms, 0, WithCacheManager(cache), WithExpectedFileHash(fileHash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := readAll(t, r, oneByte)
+				if err != nil || !bytes.Equal(got, full) {
+					t.Fatalf("oneByte=%v: got %d bytes, err %v; want %d bytes", oneByte, len(got), err, len(full))
+				}
+			}
+
+			t.Run("substituted content", func(t *testing.T) {
+				cache := NewCacheManager(t.TempDir(), 0)
+				r, err := newReader(ctx, wrongEncoded, terms, 0, WithCacheManager(cache), WithExpectedFileHash(fileHash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				got, err := io.ReadAll(r)
+				wantMismatch(t, err)
+				if len(got) != len(full) {
+					t.Fatalf("got %d bytes before the mismatch, want %d", len(got), len(full))
+				}
+				if _, err := r.Read(make([]byte, 1)); err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+					t.Fatalf("Read after mismatch = %v, want the mismatch to persist", err)
+				}
+			})
+
+			// Cached ranges bypass the network entirely; the reader gets no
+			// fetchable source.
+			for _, test := range []struct {
+				name   string
+				chunks [][]byte
+				ok     bool
+			}{
+				{"cached content", chunks, true},
+				{"substituted cached content", wrongChunks, false},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					cache := NewCacheManager(t.TempDir(), 0)
+					cached := make([]string, len(test.chunks))
+					for i, c := range test.chunks {
+						cached[i] = string(c)
+					}
+					writeRangeEntry(t, cache, testCacheHash, 0, 3, 0, int64(len(encoded)-1), cached)
+					r, err := newReader(ctx, nil, terms, 0, WithCacheManager(cache), WithExpectedFileHash(fileHash))
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := readAll(t, r, false)
+					if test.ok {
+						if err != nil || !bytes.Equal(got, full) {
+							t.Fatalf("got %d bytes, err %v; want %d bytes", len(got), err, len(full))
+						}
+						return
+					}
+					wantMismatch(t, err)
+				})
+			}
+
+			t.Run("empty file", func(t *testing.T) {
+				cache := NewCacheManager(t.TempDir(), 0)
+				r, err := newReader(ctx, nil, nil, 0, WithCacheManager(cache), WithExpectedFileHash(xet.FileHash{}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := readAll(t, r, false); err != nil || len(got) != 0 {
+					t.Fatalf("got %d bytes, err %v; want empty", len(got), err)
+				}
+				r, err = newReader(ctx, nil, nil, 0, WithCacheManager(cache), WithExpectedFileHash(fileHash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = readAll(t, r, false)
+				wantMismatch(t, err)
+			})
+
+			t.Run("offset into first range", func(t *testing.T) {
+				cache := NewCacheManager(t.TempDir(), 0)
+				r, err := newReader(ctx, encoded, terms, 1, WithCacheManager(cache), WithExpectedFileHash(fileHash))
+				if err == nil {
+					r.Close()
+					t.Fatal("expected an error: a partial reconstruction cannot be verified")
+				}
+			})
+		})
 	}
 }
 

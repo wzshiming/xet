@@ -1,6 +1,9 @@
 package download
 
 import (
+	"fmt"
+
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/progress"
 )
 
@@ -11,6 +14,7 @@ type options struct {
 	concurrency  int
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
+	expectedHash *xet.FileHash
 }
 
 // WithCacheManager shares one CacheManager across readers so the capacity
@@ -29,6 +33,13 @@ func WithConcurrency(concurrency int) Option {
 	}
 }
 
+// WithExpectedFileHash verifies full reconstructions before EOF and rejects nonzero offsets.
+func WithExpectedFileHash(fileHash xet.FileHash) Option {
+	return func(o *options) {
+		o.expectedHash = &fileHash
+	}
+}
+
 // WithProgressFunc sets a callback to receive download progress updates.
 // name identifies this download in the callback (e.g. file hash string).
 // total is computed upfront from the reconstruction plan so the caller always
@@ -39,4 +50,33 @@ func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
 	}
+}
+
+func newFileVerifier(o *options, offsetIntoFirstRange int64) (*fileVerifier, error) {
+	if o.expectedHash == nil {
+		return nil, nil
+	}
+	if offsetIntoFirstRange != 0 {
+		return nil, fmt.Errorf("cannot verify file hash: reconstruction starts at offset %d", offsetIntoFirstRange)
+	}
+	return &fileVerifier{expected: *o.expectedHash}, nil
+}
+
+// Each original chunk occurrence contributes once, in file order.
+type fileVerifier struct {
+	expected xet.FileHash
+	hashes   []xet.ChunkHash
+	sizes    []uint64
+}
+
+func (v *fileVerifier) add(chunk []byte) {
+	v.hashes = append(v.hashes, xet.ComputeChunkHash(chunk))
+	v.sizes = append(v.sizes, uint64(len(chunk)))
+}
+
+func (v *fileVerifier) verify() error {
+	if got := xet.ComputeFileHash(v.hashes, v.sizes); got != v.expected {
+		return fmt.Errorf("file hash mismatch: expected %s, got %s", v.expected, got)
+	}
+	return nil
 }
