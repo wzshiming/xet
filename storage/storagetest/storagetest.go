@@ -76,5 +76,7 @@ var cases = []struct {
 	{"TestPutShardVerifiesFileHash", testPutShardVerifiesFileHash},
 	{"TestPutShardCommitsNewFilesBesideKnownFile", testPutShardCommitsNewFilesBesideKnownFile},
 	{"TestPutShardRetryRepairsMissingFileEntry", testPutShardRetryRepairsMissingFileEntry},
+	{"TestPutXorbRejectsWrongIdentity", testPutXorbRejectsWrongIdentity},
+	{"TestPutXorbRejectsForgedChunkSizes", testPutXorbRejectsForgedChunkSizes},
 	{"TestUsageCountsObjectsByKind", testUsageCountsObjectsByKind},
 }
