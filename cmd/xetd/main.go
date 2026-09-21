@@ -12,7 +12,6 @@ import (
 
 	"github.com/gorilla/handlers"
 	"github.com/wzshiming/xet/auth"
-	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
@@ -95,14 +94,6 @@ func main() {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
 		// The hub front end handles resolve/token/tree requests through the
 		// mirror engine and proxies the rest to the upstream.
-		xetClient, err := client.NewClient(
-			client.WithCacheDir(filepath.Join(*storageDir, "mirror", "chunks")),
-		)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create xet client: %v\n", err)
-			os.Exit(1)
-		}
-
 		next, err = hf.NewUpstreamProxy(*upstream, *upstreamToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create upstream proxy: %v\n", err)
@@ -114,7 +105,6 @@ func main() {
 			mirror.WithUpstream(*upstream),
 			mirror.WithUpstreamToken(*upstreamToken),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
-			mirror.WithClient(xetClient),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)

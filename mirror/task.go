@@ -187,18 +187,21 @@ func (m *Mirror) runTask(t *task, pre *probeResult) {
 	t.probe = pr
 	if pr.size >= 0 {
 		t.setSize(pr.size)
+	} else if pr.xet {
+		// Xet provides no earlier size source when the probe omits it.
+		t.setSize(-1)
 	}
 	close(t.probed)
 	defer t.setSize(-1) // unblock size waiters at the latest when the task ends
+
+	m.ingestSlots <- struct{}{}
+	defer func() { <-m.ingestSlots }()
 
 	switch {
 	case pr.size >= 0 && sp.size() == pr.size:
 		// A previous task already spooled the whole file (e.g. it failed
 		// between fetch and ingest); skip the refetch.
 	case pr.xet:
-		// The xet ingest reports no size before completion; when the probe
-		// found none there is no early source, so stop replies waiting for one.
-		t.setSize(-1)
 		err = m.fetchXet(ctx, t, upath)
 	default:
 		err = m.fetchPlain(ctx, t, upath)

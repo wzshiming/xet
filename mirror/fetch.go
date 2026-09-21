@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 )
 
+var errStalled = errors.New("upstream transfer stalled")
+
 // fetchXet downloads the file through the upstream xet CAS into the spool,
 // resuming from the current spool offset on retries. Resolve and token
 // handling reuse the hf package: the returned provider refreshes short-lived
@@ -20,7 +23,7 @@ import (
 // itself runs inside the retry loop so a transient failure there does not
 // fail the whole task.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
-	return fetchWithRetries(ctx, "xet download", func() error {
+	return m.fetchWithRetries(ctx, "xet download", func(ctx context.Context) error {
 		fileHash, provider, err := hf.ResolveDownload(ctx, m.probeClient, m.upstreamURL(key))
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
@@ -32,23 +35,51 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, key string) error {
 // fetchPlain downloads the file bytes over plain HTTP into the spool, resuming
 // from the current spool offset with Range requests on retries.
 func (m *Mirror) fetchPlain(ctx context.Context, t *task, key string) error {
-	return fetchWithRetries(ctx, "plain download", func() error {
+	return m.fetchWithRetries(ctx, "plain download", func(ctx context.Context) error {
 		return m.fetchPlainOnce(ctx, t, key)
 	})
 }
 
-func fetchWithRetries(ctx context.Context, operation string, fetch func() error) error {
+func (m *Mirror) fetchWithRetries(ctx context.Context, operation string, fetch func(context.Context) error) error {
 	var lastErr error
 	for attempt := range maxFetchAttempts {
 		if err := sleepBackoff(ctx, attempt); err != nil {
 			return err
 		}
-		lastErr = fetch()
+		actx, stop := watchStall(ctx, m.stallTimeout)
+		lastErr = fetch(actx)
+		stop()
 		if lastErr == nil {
 			return nil
 		}
+		if cause := context.Cause(actx); errors.Is(cause, errStalled) {
+			lastErr = fmt.Errorf("%w: %w", cause, lastErr)
+		}
 	}
 	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxFetchAttempts, lastErr)
+}
+
+// Each attempt has its own clock, shared by its concurrent upstream requests.
+func watchStall(ctx context.Context, stall time.Duration) (context.Context, func()) {
+	clk := &stallClock{}
+	clk.touch()
+	ctx, cancel := context.WithCancelCause(context.WithValue(ctx, stallClockKey{}, clk))
+	go func() {
+		ticker := time.NewTicker(stall / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if clk.idle() >= stall {
+					cancel(errStalled)
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() { cancel(nil) }
 }
 
 func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, key string) error {

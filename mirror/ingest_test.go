@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -218,5 +220,266 @@ func TestIngestInFlight(t *testing.T) {
 				t.Fatalf("upstream GETs = %d, want 1 (joins must share one download)", got)
 			}
 		})
+	}
+}
+
+type gatedUpstream struct {
+	mu      sync.Mutex
+	files   map[string][]byte
+	gates   map[string]chan struct{}
+	held    int
+	peak    int
+	started chan string
+	commit  string
+	corrupt string // path whose advertised etag does not match its bytes
+}
+
+func newGatedUpstream(files map[string][]byte) *gatedUpstream {
+	u := &gatedUpstream{files: files, gates: map[string]chan struct{}{}, started: make(chan string, len(files)), commit: strings.Repeat("ab", 20)}
+	for p := range files {
+		u.gates[p] = make(chan struct{})
+	}
+	return u
+}
+
+func (u *gatedUpstream) release(path string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if gate, ok := u.gates[path]; ok {
+		close(gate)
+		delete(u.gates, path)
+	}
+}
+
+func (u *gatedUpstream) releaseAll() {
+	u.mu.Lock()
+	paths := make([]string, 0, len(u.gates))
+	for p := range u.gates {
+		paths = append(paths, p)
+	}
+	u.mu.Unlock()
+	for _, p := range paths {
+		u.release(p)
+	}
+}
+
+func (u *gatedUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path, cdn := strings.CutPrefix(r.URL.Path, "/cdn")
+	// Like a hub, the branch head is also served at its commit.
+	path = strings.Replace(path, "/resolve/"+u.commit+"/", "/resolve/main/", 1)
+	data, ok := u.files[path]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if !cdn {
+		sum := sha256.Sum256(data)
+		if path == u.corrupt {
+			sum[0] ^= 0xff
+		}
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+		w.Header().Set("X-Repo-Commit", u.commit)
+		http.Redirect(w, r, "/cdn"+path, http.StatusFound)
+		return
+	}
+	if r.Method == http.MethodGet {
+		u.mu.Lock()
+		gate := u.gates[path]
+		u.held++
+		u.peak = max(u.peak, u.held)
+		u.mu.Unlock()
+		u.started <- path
+		if gate != nil {
+			<-gate
+		}
+		u.mu.Lock()
+		u.held--
+		u.mu.Unlock()
+	}
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
+}
+
+func awaitStarted(t *testing.T, ch <-chan string) string {
+	t.Helper()
+	select {
+	case p := <-ch:
+		return p
+	case <-time.After(10 * time.Second):
+		t.Fatal("upstream data GET: timed out")
+	}
+	return ""
+}
+
+func TestMirrorIngestConcurrencyBound(t *testing.T) {
+	files := map[string][]byte{}
+	for _, name := range []string{"a.bin", "b.bin", "c.bin"} {
+		data := make([]byte, 64*1024)
+		if _, err := rand.Read(data); err != nil {
+			t.Fatal(err)
+		}
+		files["/org/repo/resolve/main/"+name] = data
+	}
+	up := newGatedUpstream(files)
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithMaxConcurrentIngests(2))
+	t.Cleanup(up.releaseAll)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ingestions := map[string]*Ingestion{}
+	for path := range files {
+		in, err := m.Ingest("org/repo", "main", strings.TrimPrefix(path, "/org/repo/resolve/main/"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ingestions[path] = in
+	}
+
+	running := map[string]bool{awaitStarted(t, up.started): true}
+	running[awaitStarted(t, up.started)] = true
+	var queued string
+	for path := range files {
+		if !running[path] {
+			queued = path
+		}
+	}
+	if len(running) != 2 || queued == "" {
+		t.Fatalf("running = %v, want two distinct transfers", running)
+	}
+	if held := len(m.ingestSlots); held != 2 {
+		t.Fatalf("ingest slots held = %d, want 2", held)
+	}
+	select {
+	case p := <-up.started:
+		t.Fatalf("%s started beyond the cap", p)
+	default:
+	}
+
+	res, err := m.Resolve(ctx, "org/repo", "main", strings.TrimPrefix(queued, "/org/repo/resolve/main/"))
+	if err != nil || res.Stream == nil {
+		t.Fatalf("Resolve queued = %+v, %v; want the in-flight stream", res, err)
+	}
+	if _, commit, err := res.Stream.WaitMeta(ctx); err != nil || commit != up.commit {
+		t.Fatalf("queued WaitMeta = %q, %v; want commit %s", commit, err, up.commit)
+	}
+	if size, ok := res.Stream.WaitSize(ctx); !ok || size != int64(len(files[queued])) {
+		t.Fatalf("queued WaitSize = %d, %v; want %d, true", size, ok, len(files[queued]))
+	}
+	var first string
+	for path := range running {
+		first = path
+	}
+	joined, err := m.Ingest("org/repo", "main", strings.TrimPrefix(first, "/org/repo/resolve/main/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	tasks := len(m.tasks)
+	m.mu.Unlock()
+	if tasks != 3 {
+		t.Fatalf("tasks = %d, want 3 (one per file, joins attach)", tasks)
+	}
+
+	up.release(first)
+	if got := awaitStarted(t, up.started); got != queued {
+		t.Fatalf("next transfer = %s, want the queued %s", got, queued)
+	}
+	up.releaseAll()
+
+	for path, in := range ingestions {
+		awaitClosed(t, in.Done(), path)
+		entry, err := in.Entry()
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, files[path]) {
+			t.Fatalf("%s: stored bytes mismatch", path)
+		}
+	}
+	awaitClosed(t, joined.Done(), "joined")
+	if _, err := joined.Entry(); err != nil {
+		t.Fatal(err)
+	}
+	up.mu.Lock()
+	peak := up.peak
+	up.mu.Unlock()
+	if peak != 2 {
+		t.Fatalf("peak concurrent upstream transfers = %d, want 2", peak)
+	}
+}
+
+func TestMirrorIngestFailureReleasesSlot(t *testing.T) {
+	good := make([]byte, 32*1024)
+	if _, err := rand.Read(good); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{"/org/repo/resolve/main/bad.bin": make([]byte, 32*1024), "/org/repo/resolve/main/good.bin": good}
+	up := newGatedUpstream(files)
+	up.corrupt = "/org/repo/resolve/main/bad.bin"
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithMaxConcurrentIngests(1))
+	t.Cleanup(up.releaseAll)
+
+	bad, err := m.Ingest("org/repo", "main", "bad.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := awaitStarted(t, up.started); got != up.corrupt {
+		t.Fatalf("first transfer = %s, want %s", got, up.corrupt)
+	}
+	in, err := m.Ingest("org/repo", "main", "good.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// good.bin waits for the single slot; its size resolves meanwhile.
+	res, err := m.Resolve(context.Background(), "org/repo", "main", "good.bin")
+	if err != nil || res.Stream == nil {
+		t.Fatalf("Resolve queued = %+v, %v; want the in-flight stream", res, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if size, ok := res.Stream.WaitSize(ctx); !ok || size != int64(len(good)) {
+		t.Fatalf("queued WaitSize = %d, %v; want %d, true", size, ok, len(good))
+	}
+	select {
+	case p := <-up.started:
+		t.Fatalf("%s started while the slot is held", p)
+	default:
+	}
+	up.release(up.corrupt)
+	awaitClosed(t, bad.Done(), "bad ingest")
+	if _, err := bad.Entry(); !errors.Is(err, errSpoolCorrupt) {
+		t.Fatalf("bad ingest err = %v, want spool corrupt", err)
+	}
+
+	if got := awaitStarted(t, up.started); got != "/org/repo/resolve/main/good.bin" {
+		t.Fatalf("next transfer = %s, want good.bin", got)
+	}
+	up.releaseAll()
+	awaitClosed(t, in.Done(), "good ingest")
+	entry, err := in.Entry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, good) {
+		t.Fatal("stored bytes mismatch")
+	}
+}
+
+func TestWithMaxConcurrentIngestsDefault(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		m, _ := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir(), WithMaxConcurrentIngests(n))
+		if got := cap(m.ingestSlots); got != 16 {
+			t.Fatalf("WithMaxConcurrentIngests(%d): slots = %d, want 16", n, got)
+		}
+	}
+	m, _ := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir())
+	if got := cap(m.ingestSlots); got != 16 {
+		t.Fatalf("default slots = %d, want 16", got)
 	}
 }

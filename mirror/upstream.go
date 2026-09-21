@@ -5,10 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/wzshiming/xet/client/hf"
 )
@@ -28,6 +31,51 @@ func (t *authInjector) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("Authorization", "Bearer "+t.token)
 	}
 	return t.inner.RoundTrip(req)
+}
+
+// stallEpoch anchors stallClock readings so they use the monotonic clock.
+var stallEpoch = time.Now()
+
+// stallClock records the latest upstream progress of one fetch attempt.
+type stallClock struct{ last atomic.Int64 } // nanoseconds since stallEpoch
+
+func (c *stallClock) touch() { c.last.Store(int64(time.Since(stallEpoch))) }
+
+func (c *stallClock) idle() time.Duration {
+	return time.Since(stallEpoch) - time.Duration(c.last.Load())
+}
+
+// stallClockKey carries the attempt's stallClock in the request context.
+type stallClockKey struct{}
+
+// stallTransport touches the request context's attempt clock on response headers and on every body read that delivers bytes.
+type stallTransport struct{ inner http.RoundTripper }
+
+func (t *stallTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clk, _ := req.Context().Value(stallClockKey{}).(*stallClock)
+	if clk == nil {
+		return t.inner.RoundTrip(req)
+	}
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	clk.touch()
+	resp.Body = &stallBody{ReadCloser: resp.Body, clock: clk}
+	return resp, nil
+}
+
+type stallBody struct {
+	io.ReadCloser
+	clock *stallClock
+}
+
+func (b *stallBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.clock.touch()
+	}
+	return n, err
 }
 
 // upstreamURL maps a local resolve path to the upstream equivalent.
