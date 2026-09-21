@@ -237,23 +237,32 @@ func (fs *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash,
 	if err := os.MkdirAll(filepath.Dir(xorbPath), 0755); err != nil {
 		return false, fmt.Errorf("create xorb directory: %w", err)
 	}
-	// Write xorb to disk using streaming
-	f, err := os.OpenFile(xorbPath+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Concurrent writers must not share a temporary file.
+	f, err := os.CreateTemp(filepath.Dir(xorbPath), ".xorb-*")
 	if err != nil {
 		return false, fmt.Errorf("create xorb file: %w", err)
 	}
+	tmpPath := f.Name()
 
 	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
 	if err != nil {
 		f.Close()
-		os.Remove(xorbPath + ".tmp")
+		os.Remove(tmpPath)
 		return false, fmt.Errorf("validate xorb: %w", err)
 	}
-	f.Close()
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return false, fmt.Errorf("finalize xorb file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return false, fmt.Errorf("finalize xorb file: %w", err)
+	}
 
 	// Atomically rename temp file to final path
-	if err := os.Rename(xorbPath+".tmp", xorbPath); err != nil {
-		os.Remove(xorbPath + ".tmp")
+	if err := os.Rename(tmpPath, xorbPath); err != nil {
+		os.Remove(tmpPath)
 		return false, fmt.Errorf("finalize xorb file: %w", err)
 	}
 

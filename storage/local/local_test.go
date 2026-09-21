@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -353,4 +355,165 @@ func TestOverwriteIndexFileConcurrentSameKey(t *testing.T) {
 			t.Fatalf("key %s holds %q, not one of the written values", key, data)
 		}
 	}
+}
+
+// stepReader feeds PutXorb its input one step at a time. A Read that finds
+// nothing buffered first signals entered, proving the previous step was
+// fully consumed and teed to disk, then blocks until the test sends the next
+// step; a closed steps channel reads as EOF.
+type stepReader struct {
+	steps   chan readStep
+	entered chan struct{}
+	buf     []byte
+	err     error
+}
+
+type readStep struct {
+	data []byte
+	err  error
+}
+
+func newStepReader() *stepReader {
+	return &stepReader{steps: make(chan readStep), entered: make(chan struct{}, 4)}
+}
+
+func (r *stepReader) Read(p []byte) (int, error) {
+	for len(r.buf) == 0 && r.err == nil {
+		r.entered <- struct{}{}
+		step, ok := <-r.steps
+		if !ok {
+			return 0, io.EOF
+		}
+		r.buf, r.err = step.data, step.err
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	if len(r.buf) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+// putXorbAsync runs PutXorb in the background and reports its error.
+func putXorbAsync(fs *Storage, xorbHash xet.XorbHash, r io.Reader) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := fs.PutXorb(context.Background(), "default", xorbHash, r)
+		done <- err
+	}()
+	return done
+}
+
+// await receives from ch, failing instead of hanging if a writer stalls.
+func await[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting on PutXorb")
+	}
+	var zero T
+	return zero
+}
+
+// assertStoredXorb checks the committed object holds exactly encoded and
+// still validates against its hash.
+func assertStoredXorb(t *testing.T, fs *Storage, xorbHash xet.XorbHash, encoded []byte) {
+	t.Helper()
+	stored, err := os.ReadFile(fs.objectPath("xorbs", xorbHash.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, encoded) {
+		t.Fatalf("stored xorb differs from the uploaded bytes (%d vs %d bytes)", len(stored), len(encoded))
+	}
+	if err := xorb.Validate(bytes.NewReader(stored), xorbHash); err != nil {
+		t.Fatalf("stored xorb does not validate: %v", err)
+	}
+}
+
+// assertNoXorbTemp checks the committed object is the only entry left in
+// its directory.
+func assertNoXorbTemp(t *testing.T, fs *Storage, xorbHash xet.XorbHash) {
+	t.Helper()
+	xorbPath := fs.objectPath("xorbs", xorbHash.String())
+	entries, err := os.ReadDir(filepath.Dir(xorbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if len(names) != 1 || names[0] != filepath.Base(xorbPath) {
+		t.Fatalf("xorb directory holds %q, want only %q", names, filepath.Base(xorbPath))
+	}
+}
+
+// TestPutXorbInterruptedConcurrentWriterKeepsCommittedBytes lets a second
+// upload of the same xorb open its output after the first has written a
+// prefix, finishes the first while the second stalls, then disconnects the
+// second. The committed object must be the first writer's complete stream:
+// sharing "<path>.tmp" let the second open truncate the prefix, so the first
+// published a hole-filled file its stream validation never saw.
+func TestPutXorbInterruptedConcurrentWriterKeepsCommittedBytes(t *testing.T) {
+	fs, err := NewStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, bytes.Repeat([]byte{1}, 1000), []byte("second chunk"))
+	split := len(encoded) / 2
+
+	first := newStepReader()
+	firstDone := putXorbAsync(fs, xorbHash, first)
+	await(t, first.entered)
+	first.steps <- readStep{data: encoded[:split]}
+	await(t, first.entered) // prefix consumed and teed to disk
+
+	second := newStepReader()
+	secondDone := putXorbAsync(fs, xorbHash, second)
+	await(t, second.entered) // second writer has opened its output
+
+	first.steps <- readStep{data: encoded[split:]}
+	if err := await(t, firstDone); err != nil {
+		t.Fatalf("first PutXorb: %v", err)
+	}
+	assertStoredXorb(t, fs, xorbHash, encoded)
+
+	second.steps <- readStep{err: errors.New("client disconnected")}
+	if err := await(t, secondDone); err == nil {
+		t.Fatal("second PutXorb succeeded despite a disconnected client")
+	}
+	assertStoredXorb(t, fs, xorbHash, encoded)
+	assertNoXorbTemp(t, fs, xorbHash)
+}
+
+// TestPutXorbConcurrentWritersBothPublish lets two uploads of the same xorb
+// open their outputs before either finishes, then completes them one after
+// the other. Each must publish its own validated file instead of failing on
+// a temp the other writer already renamed away, leaving one committed object.
+func TestPutXorbConcurrentWritersBothPublish(t *testing.T) {
+	fs, err := NewStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("shared xorb"))
+
+	first, second := newStepReader(), newStepReader()
+	firstDone := putXorbAsync(fs, xorbHash, first)
+	await(t, first.entered)
+	secondDone := putXorbAsync(fs, xorbHash, second)
+	await(t, second.entered)
+
+	first.steps <- readStep{data: encoded}
+	if err := await(t, firstDone); err != nil {
+		t.Fatalf("first PutXorb: %v", err)
+	}
+	second.steps <- readStep{data: encoded}
+	if err := await(t, secondDone); err != nil {
+		t.Fatalf("second PutXorb: %v", err)
+	}
+	assertStoredXorb(t, fs, xorbHash, encoded)
+	assertNoXorbTemp(t, fs, xorbHash)
 }
