@@ -115,6 +115,8 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
+		// Entries already served from the cache hold references; drop them.
+		p.Close()
 		return nil, err
 	}
 

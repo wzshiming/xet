@@ -165,7 +165,7 @@ func (m *CacheManager) release(path string) {
 func (m *CacheManager) noteMergeCandidate(hash string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(hash) < minCacheHashLen {
+	if checkCacheHash(hash) != nil {
 		return
 	}
 	if m.pendingMerge == nil {

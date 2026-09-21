@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +18,61 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-const testCacheHash = "0123456789abcdef"
+const testCacheHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestCacheHashValidation(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "cache")
+	m := NewCacheManager(dir, 0)
+	m.mergeQuiet = time.Hour
+	before := listTree(t, root)
+	invalid := []string{
+		"",
+		"abcd",
+		"0123456789abcdef",
+		testCacheHash + "0",
+		strings.Repeat("g", 64),
+		".." + strings.Repeat("0", 62),
+		"00/" + strings.Repeat("0", 61),
+		"../../victim/pwned",
+	}
+	for _, hash := range invalid {
+		if _, err := newCacheRange(dir, hash, 0, 1, 0, 10); err == nil {
+			t.Errorf("newCacheRange accepted %q", hash)
+		}
+		if cached, err := openCachedRange(m, hash, 0, 1); err == nil {
+			if cached != nil {
+				cached.Done()
+			}
+			t.Errorf("openCachedRange accepted %q", hash)
+		}
+		if err := mergeHashDir(m, hash); err == nil {
+			t.Errorf("mergeHashDir accepted %q", hash)
+		}
+		m.noteMergeCandidate(hash)
+	}
+	m.mu.Lock()
+	pending := len(m.pendingMerge)
+	m.mu.Unlock()
+	if pending != 0 {
+		t.Errorf("noteMergeCandidate queued %d invalid hashes", pending)
+	}
+	if after := listTree(t, root); !slices.Equal(after, before) {
+		t.Errorf("invalid hashes changed the tree to %v", after)
+	}
+
+	for _, hash := range []string{testCacheHash, strings.ToUpper(testCacheHash)} {
+		if _, err := newCacheRange(dir, hash, 0, 1, 0, 10); err != nil {
+			t.Errorf("newCacheRange(%q) = %v", hash, err)
+		}
+		if cached, err := openCachedRange(m, hash, 0, 1); err != nil || cached != nil {
+			t.Errorf("openCachedRange(%q) = %v, %v; want a miss", hash, cached, err)
+		}
+		if err := mergeHashDir(m, hash); err != nil {
+			t.Errorf("mergeHashDir(%q) = %v", hash, err)
+		}
+	}
+}
 
 func TestChunkCacheRejectsEmptyHashSuffix(t *testing.T) {
 	dir := t.TempDir()

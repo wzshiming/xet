@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/internal/pool"
 )
@@ -32,7 +33,10 @@ type cacheRange struct {
 }
 
 func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (cacheRange, error) {
-	if len(hash) < minCacheHashLen || chunkEnd < chunkStart || bytesEnd < bytesStart {
+	if err := checkCacheHash(hash); err != nil {
+		return cacheRange{}, err
+	}
+	if chunkEnd < chunkStart || bytesEnd < bytesStart {
 		return cacheRange{}, fmt.Errorf("invalid cache range for hash %q", hash)
 	}
 	return cacheRange{
@@ -49,8 +53,13 @@ func (r cacheRange) dir() string {
 	return cacheHashDir(r.cacheDir, r.hash)
 }
 
-// Keep the hash suffix nonempty so cleanup cannot reach the cache root.
-const minCacheHashLen = 5
+// checkCacheHash admits only full xorb hashes, which cacheHashDir splices into paths.
+func checkCacheHash(hash string) error {
+	if _, err := xet.ParseXorbHash(hash); err != nil {
+		return fmt.Errorf("invalid xorb hash %q: %w", hash, err)
+	}
+	return nil
+}
 
 // cacheHashDir returns the two-level fanout directory holding hash's entries:
 // cacheDir/<hash[:2]>/<hash[2:4]>/<hash[4:]>.
@@ -272,8 +281,8 @@ func defaultCacheDir(cacheDir string) string {
 // [chunkStart, chunkEnd). It scans the hash directory and assembles metas
 // from cached files. Returns nil if the range cannot be fully covered.
 func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) (*chunkCache, error) {
-	if len(hash) < minCacheHashLen {
-		return nil, nil
+	if err := checkCacheHash(hash); err != nil {
+		return nil, err
 	}
 	hashDir := cacheHashDir(m.dir, hash)
 	files, err := os.ReadDir(hashDir)

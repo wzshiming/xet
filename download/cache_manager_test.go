@@ -76,10 +76,10 @@ func entryExists(t *testing.T, dir, hash string) bool {
 }
 
 const (
-	testHashA = "aa11111111111111"
-	testHashB = "bb22222222222222"
-	testHashC = "cc33333333333333"
-	testHashD = "dd44444444444444"
+	testHashA = "aa11111111111111111111111111111111111111111111111111111111111111"
+	testHashB = "bb22222222222222222222222222222222222222222222222222222222222222"
+	testHashC = "cc33333333333333333333333333333333333333333333333333333333333333"
+	testHashD = "dd44444444444444444444444444444444444444444444444444444444444444"
 )
 
 // trackedTotal reads the manager's in-memory byte total.
@@ -450,7 +450,7 @@ func TestCacheEvictionRemovesEmptyDirs(t *testing.T) {
 	m := NewCacheManager(dir, 0)
 	// Both share the first fanout level "aa"; only the second level differs.
 	pathA := writeCacheEntry(t, m, testHashA, payload)
-	sibling := "aa22222222222222"
+	sibling := "aa" + strings.Repeat("2", 62)
 	writeCacheEntry(t, m, sibling, payload)
 
 	// Room for one entry: only the older A goes.
@@ -487,7 +487,7 @@ func TestCacheEvictionOrderStress(t *testing.T) {
 
 	hashes := make([]string, 6)
 	for i := range hashes {
-		hashes[i] = fmt.Sprintf("%02d11111111111111", i)
+		hashes[i] = fmt.Sprintf("%02d", i) + strings.Repeat("1", 62)
 		writeCacheEntry(t, m, hashes[i], payload)
 	}
 	// Only the three most recent entries survive.

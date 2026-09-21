@@ -5,8 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 
@@ -17,10 +23,12 @@ import (
 
 // fakeClientAdapter serves a pre-encoded xorb honoring the Range header.
 type fakeClientAdapter struct {
-	data []byte
+	data  []byte
+	calls atomic.Int32
 }
 
 func (f *fakeClientAdapter) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	f.calls.Add(1)
 	start, end := int64(0), int64(len(f.data)-1)
 	if rangeHeader := header.Get("Range"); rangeHeader != "" {
 		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
@@ -135,6 +143,136 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func listTree(t *testing.T, root string) []string {
+	t.Helper()
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+		paths = append(paths, path)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+// TestReaderRejectsInvalidXorbHash pins that a server-supplied xorb hash is
+// validated before it becomes a cache path: reader construction fails without
+// a download, without touching anything outside the cache, and without pinning
+// terms already served from it.
+func TestReaderRejectsInvalidXorbHash(t *testing.T) {
+	chunks := []string{"chunk-a", "chunk-b"}
+	var raw [][]byte
+	for _, c := range chunks {
+		raw = append(raw, []byte(c))
+	}
+	encoded := buildTestXorb(t, raw)
+	n := uint32(len(chunks))
+	byteEnd := int64(len(encoded) - 1)
+	want := []byte(strings.Join(chunks, ""))
+
+	// Each hash becomes one term covering the whole xorb.
+	newReaders := map[string]func(adapter ClientAdapter, cache *CacheManager, hashes ...string) (io.ReadCloser, error){
+		"v1": func(adapter ClientAdapter, cache *CacheManager, hashes ...string) (io.ReadCloser, error) {
+			recon := &ReconstructionResponseV1{FetchInfo: map[string][]FetchInfoEntry{}}
+			for _, hash := range hashes {
+				recon.Terms = append(recon.Terms, Term{Hash: hash, UnpackedLength: uint64(len(want)), Range: ChunkRange{End: n}})
+				recon.FetchInfo[hash] = []FetchInfoEntry{{Range: ChunkRange{End: n}, URL: "test://xorb", URLRange: ByteRange{End: byteEnd}}}
+			}
+			return NewReaderV1(context.Background(), adapter, recon, WithCacheManager(cache))
+		},
+		"v2": func(adapter ClientAdapter, cache *CacheManager, hashes ...string) (io.ReadCloser, error) {
+			recon := &ReconstructionResponseV2{Xorbs: map[string][]XorbMultiRangeFetch{}}
+			for _, hash := range hashes {
+				recon.Terms = append(recon.Terms, Term{Hash: hash, UnpackedLength: uint64(len(want)), Range: ChunkRange{End: n}})
+				recon.Xorbs[hash] = []XorbMultiRangeFetch{{URL: "test://xorb", Ranges: []XorbRangeDescriptor{{Chunks: ChunkRange{End: n}, Bytes: ByteRange{End: byteEnd}}}}}
+			}
+			return NewReaderV2(context.Background(), adapter, recon, WithCacheManager(cache))
+		},
+	}
+
+	fresh := strings.Repeat("fedcba9876543210", 4)
+	invalid := []string{
+		"../../victim/pwned",
+		"",
+		"abcd",
+		"0123456789abcdef",
+		fresh + "0",
+		strings.Repeat("g", 64),
+		".." + strings.Repeat("0", 62),
+		"00/" + strings.Repeat("0", 61),
+	}
+
+	for name, newReader := range newReaders {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			cacheDir := filepath.Join(root, "cache")
+			m := NewCacheManager(cacheDir, 0)
+			cachedPath := writeRangeEntry(t, m, testCacheHash, 0, n, 0, byteEnd, chunks)
+			// The traversal hash resolves to this cache-shaped file outside the cache root.
+			sentinel := filepath.Join(root, "victim", "pwned", cacheFileName(0, n, 0, byteEnd))
+			if err := os.MkdirAll(filepath.Dir(sentinel), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sentinel, []byte("sentinel"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			before := listTree(t, root)
+
+			for _, hash := range invalid {
+				adapter := &fakeClientAdapter{data: encoded}
+				r, err := newReader(adapter, m, testCacheHash, hash)
+				if err == nil {
+					io.ReadAll(r) //nolint:errcheck
+					r.Close()
+					t.Errorf("hash %q: reader accepted", hash)
+				}
+				if calls := adapter.calls.Load(); calls != 0 {
+					t.Errorf("hash %q: %d downloads, want none", hash, calls)
+				}
+				if got, err := os.ReadFile(sentinel); err != nil || string(got) != "sentinel" {
+					t.Errorf("hash %q: sentinel = %q, %v", hash, got, err)
+				}
+				if after := listTree(t, root); !slices.Equal(after, before) {
+					t.Errorf("hash %q: tree changed to %v", hash, after)
+				}
+				m.mu.Lock()
+				v, ok := m.lru.Get(cachedPath)
+				m.mu.Unlock()
+				if ok && v.(*cacheEntry).refs != 0 {
+					t.Errorf("hash %q: cached term kept %d refs after failed init", hash, v.(*cacheEntry).refs)
+				}
+			}
+
+			adapter := &fakeClientAdapter{data: encoded}
+			r, err := newReader(adapter, m, testCacheHash, fresh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r)
+			r.Close()
+			if err != nil || !bytes.Equal(got, bytes.Repeat(want, 2)) {
+				t.Fatalf("valid hashes: %v, got %q", err, got)
+			}
+			if calls := adapter.calls.Load(); calls != 1 {
+				t.Errorf("valid hashes: %d downloads, want one for the uncached term", calls)
+			}
+			if _, err := os.Stat(cacheFilePath(cacheDir, fresh, 0, n, 0, byteEnd)); err != nil {
+				t.Errorf("downloaded term not cached under its fanout path: %v", err)
+			}
+			r, err = newReader(adapter, m, fresh)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err = io.ReadAll(r)
+			r.Close()
+			if err != nil || !bytes.Equal(got, want) || adapter.calls.Load() != 1 {
+				t.Fatalf("reopen: %v, got %q, %d downloads; want the cached bytes without a download", err, got, adapter.calls.Load())
+			}
+		})
 	}
 }
 
