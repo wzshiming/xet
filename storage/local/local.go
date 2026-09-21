@@ -299,16 +299,16 @@ func (fs *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash)
 
 // PutShard stores a shard
 func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Check if any file in the shard already exists
-	alreadyExists := false
+	// Only a shard whose every file is already indexed is a no-op
+	alreadyExists := len(s.Files) > 0
 	for _, fileBlock := range s.Files {
-		if exists, err := fs.hasFile(fileBlock.FileHash); err == nil {
-			if exists {
-				alreadyExists = true
-				break
-			}
-		} else if !os.IsNotExist(err) {
+		exists, err := fs.hasFile(fileBlock.FileHash)
+		if err != nil {
 			return false, fmt.Errorf("check shard: %w", err)
+		}
+		if !exists {
+			alreadyExists = false
+			break
 		}
 	}
 

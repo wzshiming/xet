@@ -229,10 +229,16 @@ func (s *Storage) GetXorbRangeReadCloser(_ context.Context, _ string, xorbHash x
 
 // PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
 func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	// Only a shard whose every file is already indexed is a no-op
+	alreadyExists := len(sh.Files) > 0
 	for _, file := range sh.Files {
-		if s.indexEntry("index/files", file.FileHash.String()) != "" {
-			return false, nil
+		if s.indexEntry("index/files", file.FileHash.String()) == "" {
+			alreadyExists = false
+			break
 		}
+	}
+	if alreadyExists {
+		return false, nil
 	}
 	if err := storage.PrepareShard(ctx, sh, s); err != nil {
 		return false, err
