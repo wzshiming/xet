@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -530,6 +531,104 @@ func TestMirrorIndexLayout(t *testing.T) {
 	if got := string(record["size"]); got != fmt.Sprint(len(data)) {
 		t.Fatalf("file record size = %s, want %d", got, len(data))
 	}
+}
+
+func TestMirrorUsage(t *testing.T) {
+	ctx := context.Background()
+	cacheDir := t.TempDir()
+	m, _ := newTestMirror(t, "http://upstream.invalid", t.TempDir(), cacheDir)
+	if got, err := m.Usage(ctx); err != nil || got != (Usage{}) {
+		t.Fatalf("usage of fresh mirror = %+v, %v; want zero", got, err)
+	}
+
+	commit := strings.Repeat("ab", 20)
+	manifest := commitPath(m.indexDir, "org/repo", commit)
+	pointer := branchEntryPath(m.indexDir, "org/repo", "main")
+	manifestJSON := []byte(`{"repo":"org/repo","commit":"` + commit + `","files":{}}`)
+	pointerJSON := []byte(`{"commit":"` + commit + `"}`)
+	writeRaw(t, manifest, manifestJSON)
+	writeRaw(t, pointer, pointerJSON)
+	writeRaw(t, manifest+".tmp", []byte("partial"))
+	wantIndex := storage.ObjectUsage{Count: 3, Bytes: int64(len(manifestJSON) + len(pointerJSON) + len("partial"))}
+	writeRaw(t, filepath.Join(cacheDir, "chunks", "aa", "bb", "cc", "x.json"), []byte(`{}`))
+	writeRaw(t, filepath.Join(cacheDir, "chunks", "y.spool"), []byte("not ours"))
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink(manifest, filepath.Join(filepath.Dir(pointer), "link.json")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := m.Usage(ctx); err != nil || got != (Usage{Index: wantIndex}) {
+		t.Fatalf("usage with index files = %+v, %v; want %+v", got, err, Usage{Index: wantIndex})
+	}
+
+	sp, err := openSpool(m.spoolDir, "/org/repo/resolve/main/f.bin", "etag1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.Write(make([]byte, 40)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.Usage(ctx); err != nil || got.Spool != (storage.ObjectUsage{Count: 1, Bytes: 40}) {
+		t.Fatalf("usage with in-flight spool = %+v, %v; want spool count 1 bytes 40", got, err)
+	}
+	sp.finish(errors.New("interrupted"))
+	consumed, err := openSpool(m.spoolDir, "/org/repo/resolve/main/g.bin", "etag2", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := consumed.Write(make([]byte, 60)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.Usage(ctx); err != nil || got.Spool != (storage.ObjectUsage{Count: 2, Bytes: 100}) {
+		t.Fatalf("usage with retained and in-flight spools = %+v, %v; want spool count 2 bytes 100", got, err)
+	}
+	consumed.markRemove()
+	consumed.finish(nil)
+	want := Usage{Index: wantIndex, Spool: storage.ObjectUsage{Count: 1, Bytes: 40}}
+	if got, err := m.Usage(ctx); err != nil || got != want {
+		t.Fatalf("usage after ingest consumed a spool = %+v, %v; want %+v", got, err, want)
+	}
+
+	bare := &Mirror{indexDir: m.indexDir, spoolDir: m.spoolDir}
+	if got, err := bare.Usage(ctx); err != nil || got != want {
+		t.Fatalf("usage from directories only = %+v, %v; want %+v", got, err, want)
+	}
+	m.mu.Lock()
+	loaded := len(m.entries) + len(m.commits) + len(m.branches)
+	m.mu.Unlock()
+	if loaded != 0 {
+		t.Fatalf("usage loaded %d in-memory entries", loaded)
+	}
+
+	t.Run("missing dirs", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "never-created")
+		absent := &Mirror{indexDir: filepath.Join(root, "index"), spoolDir: filepath.Join(root, "spool")}
+		if got, err := absent.Usage(ctx); err != nil || got != (Usage{}) {
+			t.Fatalf("usage of missing dirs = %+v, %v; want zero", got, err)
+		}
+		if _, err := os.Stat(root); !os.IsNotExist(err) {
+			t.Fatalf("usage must not create directories: %v", err)
+		}
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		for _, mir := range []*Mirror{absent, m} {
+			if got, err := mir.Usage(canceled); !errors.Is(err, context.Canceled) || got != (Usage{}) {
+				t.Fatalf("usage with canceled ctx = %+v, %v; want zero, context.Canceled", got, err)
+			}
+		}
+	})
+
+	t.Run("scan failure", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("ENOTDIR is not reported on windows")
+		}
+		file := filepath.Join(t.TempDir(), "file")
+		writeRaw(t, file, []byte("not a directory"))
+		broken := &Mirror{indexDir: filepath.Join(file, "index"), spoolDir: m.spoolDir}
+		if got, err := broken.Usage(ctx); !errors.Is(err, syscall.ENOTDIR) || got != (Usage{}) {
+			t.Fatalf("usage through a file = %+v, %v; want zero, ENOTDIR", got, err)
+		}
+	})
 }
 
 // indexFiles lists every regular file under dir, sorted.

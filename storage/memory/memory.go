@@ -301,6 +301,10 @@ func (s *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash stri
 	return s.walkObjects(ctx, "xorbs", fn)
 }
 
+func (s *Storage) Usage(ctx context.Context) (storage.Usage, error) {
+	return storage.ComputeUsage(ctx, s.walkObjects)
+}
+
 // WalkFileIndex calls fn for every index/files entry.
 func (s *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
 	return s.walkIndex(ctx, "index/files", fn)

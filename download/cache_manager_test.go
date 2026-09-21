@@ -2,11 +2,14 @@ package download
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -497,6 +500,116 @@ func TestCacheEvictionOrderStress(t *testing.T) {
 		if !entryExists(t, dir, h) {
 			t.Fatalf("entry %s should have survived", h)
 		}
+	}
+}
+
+func TestCacheUsageCountsFilesWithoutTracking(t *testing.T) {
+	dir := t.TempDir()
+	payload := "0123456789"
+	entrySize := cacheEntryFileSize(payload)
+	writer := NewCacheManager(dir, 0)
+	pathA := writeCacheEntry(t, writer, testHashA, payload)
+	writeCacheEntry(t, writer, testHashB, payload)
+	orphan := writeOrphanEntry(t, dir, testHashC)
+
+	sealed, err := os.ReadFile(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	junkDir := cacheHashDir(dir, "ee55555555555555")
+	for _, p := range []string{
+		filepath.Join(junkDir, "notes.txt"),
+		filepath.Join(junkDir, cacheFileName(0, 1, 0, 10)+".tmp"),
+		filepath.Join(junkDir, cacheFileName(1, 2, 10, 20), filepath.Base(pathA)),
+		filepath.Join(dir, "tmp", "aa", "bb", filepath.Base(pathA)),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, sealed, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink(pathA, filepath.Join(junkDir, cacheFileName(3, 4, 30, 40))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Capacity 1 would evict everything if Usage ever fell through to prepare.
+	fresh := NewCacheManager(dir, 1)
+	got, err := fresh.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (CacheUsage{Count: 7, Bytes: 6*entrySize + 4}); got != want {
+		t.Fatalf("usage = %+v, want %+v", got, want)
+	}
+	fresh.mu.Lock()
+	untouched := fresh.total == 0 && fresh.lastReconcile.IsZero() && fresh.lru.Len() == 0
+	fresh.mu.Unlock()
+	if !untouched {
+		t.Fatal("usage must not touch the tracked state")
+	}
+	for _, p := range []string{pathA, orphan} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("usage must leave the directory untouched: %v", err)
+		}
+	}
+	if !entryExists(t, dir, testHashB) {
+		t.Fatal("usage evicted a sealed entry")
+	}
+
+	// Removals and entries published by other managers show up on the next call.
+	if err := os.Remove(pathA); err != nil {
+		t.Fatal(err)
+	}
+	writeCacheEntry(t, NewCacheManager(dir, 0), testHashD, payload)
+	got, err = fresh.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (CacheUsage{Count: 7, Bytes: 6*entrySize + 4}); got != want {
+		t.Fatalf("usage after remove/publish = %+v, want %+v", got, want)
+	}
+}
+
+func TestCacheUsageEmptyMissingAndCanceled(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	absent := NewCacheManager(missing, 0)
+	got, err := absent.Usage(context.Background())
+	if err != nil || got != (CacheUsage{}) {
+		t.Fatalf("usage of missing dir = %+v, %v; want zero", got, err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("usage must not create the cache dir: %v", err)
+	}
+	if got, err := NewCacheManager(t.TempDir(), 0).Usage(context.Background()); err != nil || got != (CacheUsage{}) {
+		t.Fatalf("usage of empty dir = %+v, %v; want zero", got, err)
+	}
+
+	populated := NewCacheManager(t.TempDir(), 0)
+	writeCacheEntry(t, populated, testHashA, "0123456789")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, m := range []*CacheManager{absent, populated} {
+		if got, err := m.Usage(ctx); !errors.Is(err, context.Canceled) || got != (CacheUsage{}) {
+			t.Fatalf("usage with canceled ctx = %+v, %v; want zero, context.Canceled", got, err)
+		}
+	}
+}
+
+func TestCacheUsageReportsScanFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("ENOTDIR is not reported on windows")
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewCacheManager(filepath.Join(file, "cache"), 0).Usage(context.Background())
+	if !errors.Is(err, syscall.ENOTDIR) || got != (CacheUsage{}) {
+		t.Fatalf("usage through a file = %+v, %v; want zero, ENOTDIR", got, err)
 	}
 }
 
