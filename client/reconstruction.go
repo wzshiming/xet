@@ -45,7 +45,7 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 	}
 	defer resp.Body.Close()
 
-	if err := reqError(req, resp); err != nil {
+	if err := reconstructionError(req, resp); err != nil {
 		return nil, err
 	}
 
@@ -55,6 +55,14 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 	}
 
 	return &reconstructionResp, nil
+}
+
+// Reconstruction ranges are encoded in JSON even when the status is 200.
+func reconstructionError(req *http.Request, resp *http.Response) error {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	return reqError(req, resp)
 }
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file
@@ -90,7 +98,7 @@ func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provid
 	}
 	defer resp.Body.Close()
 
-	if err := reqError(req, resp); err != nil {
+	if err := reconstructionError(req, resp); err != nil {
 		return nil, err
 	}
 

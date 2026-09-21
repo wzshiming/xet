@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -296,5 +297,101 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 
 	if reconstruction.OffsetIntoFirstRange != 1000 {
 		t.Errorf("Expected OffsetIntoFirstRange 1000, got %d", reconstruction.OffsetIntoFirstRange)
+	}
+}
+
+// Servers answer a ranged reconstruction query with 200: the JSON body carries
+// offset_into_first_range instead of a 206 status.
+func TestGetReconstructionRangeStatusOK(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=1000-" {
+			t.Errorf("Expected Range header 'bytes=1000-', got '%s'", got)
+		}
+		resp := download.ReconstructionResponseV1{
+			OffsetIntoFirstRange: 1000,
+			Terms:                []download.Term{},
+			FetchInfo:            map[string][]download.FetchInfoEntry{},
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	reconstruction, err := client.GetReconstructionV1(context.Background(), xet.FileHash{}, http.Header{"Range": []string{"bytes=1000-"}})
+	if err != nil {
+		t.Fatalf("GetReconstructionV1 rejected a 200 ranged response: %v", err)
+	}
+	if reconstruction.OffsetIntoFirstRange != 1000 {
+		t.Errorf("Expected OffsetIntoFirstRange 1000, got %d", reconstruction.OffsetIntoFirstRange)
+	}
+}
+
+func TestGetReconstructionRangeV2StatusOK(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=1000-" {
+			t.Errorf("Expected Range header 'bytes=1000-', got '%s'", got)
+		}
+		resp := download.ReconstructionResponseV2{
+			OffsetIntoFirstRange: 1000,
+			Terms:                []download.Term{},
+			Xorbs:                map[string][]download.XorbMultiRangeFetch{},
+		}
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	c, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	reconstruction, err := c.GetReconstructionV2(context.Background(), xet.FileHash{}, http.Header{"Range": []string{"bytes=1000-"}})
+	if err != nil {
+		t.Fatalf("GetReconstructionV2 rejected a 200 ranged response: %v", err)
+	}
+	if reconstruction.OffsetIntoFirstRange != 1000 {
+		t.Errorf("Expected OffsetIntoFirstRange 1000, got %d", reconstruction.OffsetIntoFirstRange)
+	}
+}
+
+func TestGetReconstructionRangeErrorStatus(t *testing.T) {
+	var status atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "denied", int(status.Load()))
+	}))
+	defer server.Close()
+
+	c, err := NewClient(WithBaseURL(server.URL))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	header := http.Header{"Range": []string{"bytes=1000-"}}
+	for _, tc := range []struct {
+		status       int
+		wantNotFound bool
+	}{
+		{status: http.StatusNotFound, wantNotFound: true},
+		{status: http.StatusForbidden, wantNotFound: false},
+	} {
+		status.Store(int32(tc.status))
+		_, errV1 := c.GetReconstructionV1(context.Background(), xet.FileHash{}, header)
+		_, errV2 := c.GetReconstructionV2(context.Background(), xet.FileHash{}, header)
+		for _, err := range []error{errV1, errV2} {
+			if err == nil {
+				t.Fatalf("status %d: expected error", tc.status)
+			}
+			if errors.Is(err, errNotFound) != tc.wantNotFound {
+				t.Fatalf("status %d: errNotFound match = %v, want %v: %v", tc.status, !tc.wantNotFound, tc.wantNotFound, err)
+			}
+		}
 	}
 }
