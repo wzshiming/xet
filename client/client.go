@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet/download"
@@ -28,6 +29,7 @@ type Client struct {
 	namespace     string
 	concurrency   int
 	retries       int
+	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cacheDir      string
 	cacheSize     int64
@@ -90,6 +92,13 @@ func WithRetries(retries int) Options {
 	}
 }
 
+// WithIdleTimeout sets the GET/HEAD read-idle timeout (default DefaultIdleTimeout; <= 0 disables it).
+func WithIdleTimeout(timeout time.Duration) Options {
+	return func(c *Client) {
+		c.idleTimeout = timeout
+	}
+}
+
 // WithCacheDir enables the persistent disk chunk cache at the given directory.
 func WithCacheDir(cacheDir string) Options {
 	return func(c *Client) {
@@ -114,6 +123,7 @@ func NewClient(opts ...Options) (*Client, error) {
 		namespace:   "default",
 		concurrency: 4,
 		retries:     5,
+		idleTimeout: DefaultIdleTimeout,
 		cacheSize:   download.DefaultCacheSize,
 	}
 	for _, opt := range opts {
@@ -134,9 +144,13 @@ func NewClient(opts ...Options) (*Client, error) {
 		CheckRedirect: c.httpClient.CheckRedirect,
 		Jar:           c.httpClient.Jar,
 		Timeout:       c.httpClient.Timeout,
-		Transport: httpseek.NewMustReaderTransport(c.httpClient.Transport,
+		Transport: httpseek.NewMustReaderTransport(NewIdleTimeoutTransport(c.httpClient.Transport, c.idleTimeout),
 			func(r *http.Request, retry int, err error) error {
 				if retry >= c.retryAttempts() {
+					var timeout interface{ Timeout() bool }
+					if errors.As(err, &timeout) && timeout.Timeout() {
+						return err // unwrapped so url.Error.Timeout stays true
+					}
 					return fmt.Errorf("max retries reached: %w", err)
 				}
 				return nil
@@ -252,6 +266,17 @@ func resetRequestBody(req *http.Request) error {
 	return fmt.Errorf("request body is not retryable")
 }
 
+// do issues one request on the plain httpClient, guarding GET/HEAD with the read-idle timeout.
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	httpClient := c.httpClient
+	if c.idleTimeout > 0 && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+		guarded := *c.httpClient
+		guarded.Transport = NewIdleTimeoutTransport(guarded.Transport, c.idleTimeout)
+		httpClient = &guarded
+	}
+	return httpClient.Do(req)
+}
+
 func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 	attempts := c.retryAttempts()
 
@@ -263,7 +288,7 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 			}
 		}
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := c.do(req)
 		if err == nil {
 			if isServerError(resp.StatusCode) {
 				lastErr = fmt.Errorf("server error status %s", resp.Status)

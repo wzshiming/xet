@@ -288,7 +288,7 @@ func (c *Client) FetchXorbRangeWithURL(ctx context.Context, rawURL string, heade
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	maps.Copy(req.Header, header)
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch xorb range: %w", err)
 	}

@@ -9,20 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"maps"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/upload"
@@ -402,7 +401,8 @@ func TestMirrorStalledPlainFetchResumes(t *testing.T) {
 
 	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
 	t.Cleanup(func() { close(up.abort) })
-	m.stallTimeout = 200 * time.Millisecond
+	// Shorten the upstream read-idle guard below the shared auth injector.
+	m.probeClient.Transport.(*authInjector).inner = client.NewIdleTimeoutTransport(http.DefaultTransport.(*http.Transport).Clone(), 200*time.Millisecond)
 
 	in, err := m.Ingest("org/repo", "main", "stall.bin")
 	if err != nil {
@@ -427,138 +427,6 @@ func TestMirrorStalledPlainFetchResumes(t *testing.T) {
 	}
 }
 
-func TestStalledFetchPreservesErrors(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	m := &Mirror{stallTimeout: 20 * time.Millisecond}
-	attempts := 0
-	err := m.fetchWithRetries(ctx, "test fetch", func(attempt context.Context) error {
-		attempts++
-		<-attempt.Done()
-		return errors.Join(io.ErrUnexpectedEOF, attempt.Err())
-	})
-	if attempts != maxFetchAttempts {
-		t.Fatalf("attempts = %d, want %d", attempts, maxFetchAttempts)
-	}
-	for _, want := range []error{errStalled, io.ErrUnexpectedEOF, context.Canceled} {
-		if !errors.Is(err, want) {
-			t.Errorf("error %v does not preserve %v", err, want)
-		}
-	}
-}
-
-func TestWatchStall(t *testing.T) {
-	const stall = 200 * time.Millisecond
-	parent, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		every, _ := time.ParseDuration(r.URL.Query().Get("every"))
-		count, _ := strconv.Atoi(r.URL.Query().Get("count"))
-		w.WriteHeader(http.StatusOK)
-		w.(http.Flusher).Flush()
-		for range count {
-			select {
-			case <-time.After(every):
-				_, _ = w.Write([]byte{1})
-				w.(http.Flusher).Flush()
-			case <-r.Context().Done():
-				return
-			}
-		}
-		if count == 0 {
-			<-r.Context().Done()
-		}
-	}))
-	t.Cleanup(srv.Close)
-	rt := &stallTransport{inner: srv.Client().Transport}
-	hc := &http.Client{Transport: rt}
-	get := func(ctx context.Context, query string) error {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"?"+query, nil)
-		resp, err := hc.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		_, err = io.Copy(io.Discard, resp.Body)
-		return err
-	}
-
-	t.Run("delivered bytes reset", func(t *testing.T) {
-		ctx, stop := watchStall(parent, stall)
-		defer stop()
-		if err := get(ctx, "every=40ms&count=15"); err != nil || ctx.Err() != nil {
-			t.Fatalf("progressing transfer canceled: %v (%v)", err, context.Cause(ctx))
-		}
-	})
-
-	t.Run("silence cancels", func(t *testing.T) {
-		ctx, stop := watchStall(parent, stall)
-		defer stop()
-		if err := get(ctx, "count=0"); err == nil {
-			t.Fatal("silent body read returned without error")
-		}
-		if cause := context.Cause(ctx); !errors.Is(cause, errStalled) {
-			t.Fatalf("cause = %v, want errStalled", cause)
-		}
-	})
-
-	t.Run("clocks are per attempt", func(t *testing.T) {
-		live, stopLive := watchStall(parent, stall)
-		defer stopLive()
-		silent, stopSilent := watchStall(parent, stall)
-		defer stopSilent()
-		var liveErr error
-		var liveDone, silentDone time.Time
-		var wg sync.WaitGroup
-		wg.Go(func() { liveErr = get(live, "every=40ms&count=15"); liveDone = time.Now() })
-		wg.Go(func() { _ = get(silent, "count=0"); silentDone = time.Now() })
-		wg.Wait()
-		if liveErr != nil || live.Err() != nil {
-			t.Fatalf("live attempt failed: %v (%v)", liveErr, context.Cause(live))
-		}
-		if cause := context.Cause(silent); !errors.Is(cause, errStalled) {
-			t.Fatalf("silent attempt cause = %v, want errStalled", cause)
-		}
-		if !silentDone.Before(liveDone) {
-			t.Fatal("silent attempt outlived the live one: bytes of another attempt reset its clock")
-		}
-	})
-
-	t.Run("parent cancel propagates", func(t *testing.T) {
-		parent, cancel := context.WithCancel(parent)
-		ctx, stop := watchStall(parent, time.Hour)
-		defer stop()
-		cancel()
-		select {
-		case <-ctx.Done():
-		case <-time.After(5 * time.Second):
-			t.Fatal("attempt outlived its parent context")
-		}
-		if cause := context.Cause(ctx); !errors.Is(cause, context.Canceled) || errors.Is(cause, errStalled) {
-			t.Fatalf("cause = %v, want context.Canceled", cause)
-		}
-	})
-
-	t.Run("no clock passes through", func(t *testing.T) {
-		for _, withClock := range []bool{false, true} {
-			ctx := parent
-			if withClock {
-				ctx = context.WithValue(ctx, stallClockKey{}, &stallClock{})
-			}
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"?every=1ms&count=1", nil)
-			resp, err := rt.RoundTrip(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, wrapped := resp.Body.(*stallBody)
-			_ = resp.Body.Close()
-			if wrapped != withClock {
-				t.Fatalf("clock in context %t: body wrapped %t", withClock, wrapped)
-			}
-		}
-	})
-}
-
 // The second xorb is paced or stalled before its first chunk completes.
 type xetStallUpstream struct {
 	hubURL, casURL string
@@ -566,13 +434,13 @@ type xetStallUpstream struct {
 	sha256         string
 	size           int
 	xorbB          string // hash of the stalled xorb
-	resumeAt       int64  // bytes of the file served from the first xorb
 	slowFeed       bool
 	stalls         atomic.Int32
 	canceled       atomic.Int32
 	xorbGETs       atomic.Int32
 	mu             sync.Mutex
 	reconRanges    []string // Range header of each reconstruction request
+	xorbBRanges    []string // Range header of each GET for the stalled xorb
 	abort          chan struct{}
 }
 
@@ -641,26 +509,15 @@ func newXetStallUpstream(t *testing.T, resolvePath string, head, tail []byte) *x
 	casSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/reconstructions/"):
-			rg := r.Header.Get("Range")
 			u.mu.Lock()
-			u.reconRanges = append(u.reconRanges, rg)
+			u.reconRanges = append(u.reconRanges, r.Header.Get("Range"))
 			u.mu.Unlock()
-			if rg == "" {
-				break
-			}
-			// The client still requires 206 for ranged reconstruction metadata.
-			rec := httptest.NewRecorder()
-			cas.ServeHTTP(rec, r)
-			maps.Copy(w.Header(), rec.Header())
-			if rec.Code == http.StatusOK {
-				rec.Code = http.StatusPartialContent
-			}
-			w.WriteHeader(rec.Code)
-			_, _ = w.Write(rec.Body.Bytes())
-			return
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/xorbs/"):
 			u.xorbGETs.Add(1)
 			if strings.Contains(r.URL.Path, u.xorbB) {
+				u.mu.Lock()
+				u.xorbBRanges = append(u.xorbBRanges, r.Header.Get("Range"))
+				u.mu.Unlock()
 				if u.slowFeed {
 					w = &slowWriter{ResponseWriter: w, r: r, u: u}
 				} else if u.stalls.Add(1) == 1 {
@@ -694,7 +551,7 @@ func newXetStallUpstream(t *testing.T, resolvePath string, head, tail []byte) *x
 	if len(entries) != 2 || entries[0].CASHash == entries[1].CASHash {
 		t.Fatalf("fixture file spans %d terms, want two xorbs", len(entries))
 	}
-	u.resumeAt, u.xorbB = int64(entries[0].UnpackedSegBytes), entries[1].CASHash.String()
+	u.xorbB = entries[1].CASHash.String()
 	sum := sha256.Sum256(data)
 	u.fileHash, u.sha256, u.size = fileHash.String(), hex.EncodeToString(sum[:]), len(data)
 
@@ -721,6 +578,17 @@ func newXetStallUpstream(t *testing.T, resolvePath string, head, tail []byte) *x
 	return u
 }
 
+// shortIdleClient is a xet client whose GET/HEAD read-idle guard fires after 200ms.
+func shortIdleClient(t *testing.T) *client.Client {
+	t.Helper()
+	c, err := client.NewClient(client.WithIdleTimeout(200*time.Millisecond), client.WithCacheDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// A stalled term body is resumed by the client at the compressed offset: no new attempt, no second reconstruction query.
 func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	head, tail := make([]byte, 256*1024), make([]byte, 256*1024)
 	if _, err := rand.Read(head); err != nil {
@@ -731,9 +599,8 @@ func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	}
 	const resolvePath = "/org/repo/resolve/main/stall.bin"
 	up := newXetStallUpstream(t, resolvePath, head, tail)
-	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir())
+	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithClient(shortIdleClient(t)))
 	t.Cleanup(func() { close(up.abort) }) // runs first: unblocks a still-stalled handler before servers close
-	m.stallTimeout = 200 * time.Millisecond
 
 	in, err := m.Ingest("org/repo", "main", "stall.bin")
 	if err != nil {
@@ -751,10 +618,21 @@ func TestMirrorStalledXetFetchResumes(t *testing.T) {
 		t.Fatalf("upstream xorb GETs = %d, want 3 (first xorb, stalled second, resumed second)", got)
 	}
 	up.mu.Lock()
-	ranges := append([]string(nil), up.reconRanges...)
+	reconRanges := append([]string(nil), up.reconRanges...)
+	xorbBRanges := append([]string(nil), up.xorbBRanges...)
 	up.mu.Unlock()
-	if want := []string{"", fmt.Sprintf("bytes=%d-", up.resumeAt)}; !slices.Equal(ranges, want) {
-		t.Fatalf("reconstruction Range headers = %q, want %q (resume from the spooled first term)", ranges, want)
+	if !slices.Equal(reconRanges, []string{""}) {
+		t.Fatalf("reconstruction Range headers = %q, want one unranged query", reconRanges)
+	}
+	var start, end int64
+	if len(xorbBRanges) != 2 {
+		t.Fatalf("stalled xorb Range headers = %q, want the stalled and the resumed request", xorbBRanges)
+	}
+	if _, err := fmt.Sscanf(xorbBRanges[0], "bytes=%d-%d", &start, &end); err != nil {
+		t.Fatalf("stalled xorb Range %q: %v", xorbBRanges[0], err)
+	}
+	if want := fmt.Sprintf("bytes=%d-%d", start+4096, end); xorbBRanges[1] != want {
+		t.Fatalf("resumed xorb Range = %q, want %q (the bytes the stalled response delivered)", xorbBRanges[1], want)
 	}
 	if entry.SHA256 != up.sha256 {
 		t.Fatalf("entry sha256 = %s, want %s", entry.SHA256, up.sha256)
@@ -764,7 +642,7 @@ func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	}
 }
 
-// A term body that keeps moving without completing a chunk for longer than the stall timeout is live: one attempt, no cancel, exact bytes.
+// A term body that keeps moving without completing a chunk for longer than the idle timeout is live: one attempt, no cancel, exact bytes.
 func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	head, tail := make([]byte, 256*1024), make([]byte, 256*1024)
 	if _, err := rand.Read(head); err != nil {
@@ -776,10 +654,13 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/slow.bin"
 	up := newXetStallUpstream(t, resolvePath, head, tail)
 	up.slowFeed = true
+	xc := shortIdleClient(t)
 	cacheDir := t.TempDir()
-	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir)
+	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir, WithClient(xc))
 	t.Cleanup(func() { close(up.abort) })
-	m.stallTimeout = 200 * time.Millisecond
+	if m.xetClient != xc {
+		t.Fatal("WithClient not used")
+	}
 
 	in, err := m.Ingest("org/repo", "main", "slow.bin")
 	if err != nil {
@@ -799,7 +680,11 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, append(head, tail...)) {
 		t.Fatal("stored bytes mismatch")
 	}
-	if entries, err := os.ReadDir(filepath.Join(cacheDir, "chunks")); err != nil || len(entries) == 0 {
-		t.Fatalf("xet chunk cache under the mirror cache dir: %d entries, %v", len(entries), err)
+	usage, err := xc.Usage(context.Background())
+	if err != nil || usage.Download.Count == 0 {
+		t.Fatalf("supplied client chunk cache: %+v, %v; want entries", usage.Download, err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "chunks")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("mirror created its own chunk cache despite WithClient: %v", err)
 	}
 }

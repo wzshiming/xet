@@ -48,12 +48,11 @@ var resolveRe = regexp.MustCompile(`^/(.+?)/resolve/([^/]+)/(.+)$`)
 var commitRevRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 const (
-	maxFetchAttempts    = 5
-	failureBackoffBase  = 10 * time.Second
-	failureBackoffCap   = 10 * time.Minute
-	maxFailureShift     = 6
-	defaultMaxIngests   = 16
-	defaultStallTimeout = 60 * time.Second
+	maxFetchAttempts   = 5
+	failureBackoffBase = 10 * time.Second
+	failureBackoffCap  = 10 * time.Minute
+	maxFailureShift    = 6
+	defaultMaxIngests  = 16
 )
 
 var (
@@ -106,7 +105,6 @@ type Mirror struct {
 	revalidateInterval time.Duration
 	maxIngests         int
 	ingestSlots        chan struct{}
-	stallTimeout       time.Duration
 
 	probeClient  *http.Client // does not follow redirects; used for metadata probes
 	fetchClient  *http.Client // follows redirects; body drops resume via httpseek
@@ -146,6 +144,11 @@ func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
 }
 
+// WithClient sets the xet client used for upstream xet downloads; unset creates one caching chunks under the cache dir.
+func WithClient(c *client.Client) Option {
+	return func(m *Mirror) { m.xetClient = c }
+}
+
 // WithRevalidateInterval sets how often ready entries for branch (non-commit)
 // revisions are re-checked against the upstream. Zero revalidates on every
 // request; negative disables revalidation. Defaults to 5 minutes.
@@ -164,7 +167,6 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
 		maxIngests:         defaultMaxIngests,
-		stallTimeout:       defaultStallTimeout,
 		entries:            map[resolveKey]*fileEntry{},
 		branches:           map[string]*branchEntry{},
 		commits:            map[string]*commitState{},
@@ -199,8 +201,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
-	stalling := &stallTransport{inner: baseTransport}
-	injecting := &authInjector{inner: stalling, host: u.Host, token: m.upstreamToken}
+	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout), host: u.Host, token: m.upstreamToken}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: injecting,
@@ -217,13 +218,11 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		}),
 	}
 
-	// The CAS client shares the transport but never the hub credential.
-	m.xetClient, err = client.NewClient(
-		client.WithHTTPClient(&http.Client{Transport: stalling}),
-		client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("mirror: create xet client: %w", err)
+	if m.xetClient == nil {
+		m.xetClient, err = client.NewClient(client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")))
+		if err != nil {
+			return nil, fmt.Errorf("mirror: create xet client: %w", err)
+		}
 	}
 
 	m.localAdapter = &localCAS{storage: m.storage, namespace: "default"}

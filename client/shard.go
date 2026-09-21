@@ -232,7 +232,7 @@ func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider A
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
