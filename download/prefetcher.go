@@ -41,6 +41,14 @@ type selectedFetch struct {
 	chunkEnd   uint32
 }
 
+// checkFetchRange rejects server-supplied ranges before any cache file is sized from them.
+func checkFetchRange(term *Term, chunks ChunkRange, span ByteRange) error {
+	if term.Range.Start >= term.Range.End || !validChunkRange(chunks.Start, chunks.End) || span.Start < 0 || span.End < span.Start {
+		return fmt.Errorf("invalid range for term chunks [%d, %d) of xorb %s", term.Range.Start, term.Range.End, term.Hash)
+	}
+	return nil
+}
+
 type prefetchEntry struct {
 	task  fetchTask
 	cache *chunkCache

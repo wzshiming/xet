@@ -205,6 +205,9 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 		if err != nil {
 			return nil, nil, err
 		}
+		if err := checkFetchRange(term, fetchInfo.Range, fetchInfo.URLRange); err != nil {
+			return nil, nil, err
+		}
 
 		key := fetchKey{
 			Hash:  term.Hash,

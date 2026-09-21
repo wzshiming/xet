@@ -3,11 +3,15 @@ package download
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
 
@@ -135,6 +139,94 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// refusingClient counts download attempts and fails them so nothing is ever cached.
+type refusingClient struct {
+	calls atomic.Int32
+}
+
+func (c *refusingClient) DownloadXorbWithURL(context.Context, string, http.Header) (io.ReadCloser, error) {
+	c.calls.Add(1)
+	return nil, errors.New("unexpected download")
+}
+
+func (*refusingClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
+	panic("not used")
+}
+
+// rangeReaders build V1 and V2 readers for one term served from a fetch range spanning bytes [0, bytesEnd].
+var rangeReaders = map[string]func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error){
+	"v1": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
+		return NewReaderV1(context.Background(), client, &ReconstructionResponseV1{
+			Terms: []Term{{Hash: testCacheHash, Range: term}},
+			FetchInfo: map[string][]FetchInfoEntry{
+				testCacheHash: {{Range: fetch, URL: "test://xorb", URLRange: ByteRange{Start: 0, End: bytesEnd}}},
+			},
+		}, WithCacheManager(cache))
+	},
+	"v2": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
+		return NewReaderV2(context.Background(), client, &ReconstructionResponseV2{
+			Terms: []Term{{Hash: testCacheHash, Range: term}},
+			Xorbs: map[string][]XorbMultiRangeFetch{
+				testCacheHash: {{URL: "test://xorb", Ranges: []XorbRangeDescriptor{{Chunks: fetch, Bytes: ByteRange{Start: 0, End: bytesEnd}}}}},
+			},
+		}, WithCacheManager(cache))
+	},
+}
+
+func TestReaderRejectsInvalidChunkRanges(t *testing.T) {
+	cases := map[string]struct{ term, fetch ChunkRange }{
+		"fetchPastMax":   {ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 0, End: xet.MaxChunksPerXorb + 1}},
+		"fetchMaxUint32": {ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 0, End: math.MaxUint32}},
+		"emptyTerm":      {ChunkRange{Start: 1, End: 1}, ChunkRange{Start: 0, End: 8}},
+		"reversedTerm":   {ChunkRange{Start: 2, End: 1}, ChunkRange{Start: 0, End: 8}},
+	}
+	for name, newReader := range rangeReaders {
+		for caseName, tc := range cases {
+			t.Run(name+"/"+caseName, func(t *testing.T) {
+				dir := t.TempDir()
+				client := &refusingClient{}
+				r, err := newReader(client, tc.term, tc.fetch, 1023, NewCacheManager(dir, 0))
+				if err == nil {
+					r.Close()
+					t.Fatalf("accepted term %v served from fetch range %v", tc.term, tc.fetch)
+				}
+				if calls := client.calls.Load(); calls != 0 {
+					t.Fatalf("rejected plan made %d downloads", calls)
+				}
+				if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+					t.Fatalf("rejected plan created cache entries: %v", entries)
+				}
+			})
+		}
+	}
+}
+
+func TestReaderAcceptsMaxChunkRange(t *testing.T) {
+	chunks := make([][]byte, xet.MaxChunksPerXorb)
+	for i := range chunks {
+		chunks[i] = []byte{byte(i)}
+	}
+	encoded := buildTestXorb(t, chunks)
+	full := bytes.Join(chunks, nil)
+	fetch := ChunkRange{Start: 0, End: xet.MaxChunksPerXorb}
+	terms := []ChunkRange{fetch, {Start: xet.MaxChunksPerXorb - 1, End: xet.MaxChunksPerXorb}}
+	for name, newReader := range rangeReaders {
+		for _, term := range terms {
+			t.Run(fmt.Sprintf("%s/term=%d-%d", name, term.Start, term.End), func(t *testing.T) {
+				r, err := newReader(&fakeClientAdapter{data: encoded}, term, fetch, int64(len(encoded)-1), NewCacheManager(t.TempDir(), 0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				got, err := io.ReadAll(r)
+				if want := full[term.Start:term.End]; err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+				}
+			})
 		}
 	}
 }

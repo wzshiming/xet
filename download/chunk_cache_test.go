@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"hash/crc32"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -35,6 +38,55 @@ func TestChunkCacheRejectsEmptyHashSuffix(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("invalid hash created cache directories: %v", entries)
+	}
+}
+
+func TestNewCacheRangeBounds(t *testing.T) {
+	cases := []struct {
+		chunkStart, chunkEnd uint32
+		bytesStart, bytesEnd int64
+		ok                   bool
+	}{
+		{0, 1, 0, 0, true},
+		{0, xet.MaxChunksPerXorb, 0, 10, true},
+		{xet.MaxChunksPerXorb - 1, xet.MaxChunksPerXorb, 5, 5, true},
+		{1, 1, 0, 0, false},
+		{2, 1, 0, 0, false},
+		{0, xet.MaxChunksPerXorb + 1, 0, 0, false},
+		{0, math.MaxUint32, 0, 0, false},
+		{math.MaxUint32 - 1, math.MaxUint32, 0, 0, false},
+		{0, 1, -1, 0, false},
+		{0, 1, 1, 0, false},
+	}
+	for _, tc := range cases {
+		_, err := newCacheRange("cache", testCacheHash, tc.chunkStart, tc.chunkEnd, tc.bytesStart, tc.bytesEnd)
+		if (err == nil) != tc.ok {
+			t.Errorf("chunks [%d, %d) bytes [%d, %d]: err = %v, want ok=%v", tc.chunkStart, tc.chunkEnd, tc.bytesStart, tc.bytesEnd, err, tc.ok)
+		}
+	}
+}
+
+func TestCacheFileLayoutRejectsOversizedChunkCount(t *testing.T) {
+	for name, end := range map[string]uint32{"pastMax": xet.MaxChunksPerXorb + 1, "wrapsCount": math.MaxUint32} {
+		t.Run(name, func(t *testing.T) {
+			// A sealed layout for [0, end) with all-zero offsets and no data.
+			numOffsets := end + 1
+			header := make([]byte, 4+4*int(numOffsets))
+			binary.LittleEndian.PutUint32(header, numOffsets)
+			content := binary.LittleEndian.AppendUint32(header, crc32.ChecksumIEEE(header))
+			path := filepath.Join(t.TempDir(), cacheFileName(0, end, 0, 0))
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			f, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if _, err := readCacheFileLayout(f, 0, end, int64(len(content))); err == nil {
+				t.Fatalf("accepted a cache file claiming %d chunks", end)
+			}
+		})
 	}
 }
 
