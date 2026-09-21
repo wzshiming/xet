@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/pool"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -56,9 +57,49 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 	return digest, fileHash, nil
 }
 
+// verifyCASBlock checks the declared chunk sequence against every chunk of the stored xorb.
+func verifyCASBlock(ctx context.Context, cb *shard.CASBlock, xorbs Storage) error {
+	rc, err := xorbs.GetXorbReadSeekCloser(ctx, "", cb.CASHash)
+	if err != nil {
+		return fmt.Errorf("open xorb: %w", err)
+	}
+	defer rc.Close()
+	buf := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(buf)
+	name := cb.CASHash.String()
+	decoder := xorb.NewDecoder(rc, false)
+	for i := 0; ; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := decoder.Read(buf[:])
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("decode xorb %s chunk %d: %w", name, i, err)
+		}
+		if (err == io.EOF) != (i == len(cb.Chunks)) {
+			return fmt.Errorf("%w: xorb %s does not have the %d declared chunks", ErrInvalidShard, name, len(cb.Chunks))
+		}
+		if err == io.EOF {
+			return nil
+		}
+		hashes, _ := decoder.Chunks()
+		if hashes[i] != cb.Chunks[i].ChunkHash {
+			return fmt.Errorf("%w: xorb %s chunk %d hash mismatch", ErrInvalidShard, name, i)
+		}
+		if n != int(cb.Chunks[i].UnpackedSegBytes) {
+			return fmt.Errorf("%w: xorb %s chunk %d has %d bytes, %d declared", ErrInvalidShard, name, i, n, cb.Chunks[i].UnpackedSegBytes)
+		}
+	}
+}
+
 func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	if len(s.Files) == 0 {
 		return fmt.Errorf("shard has no file blocks")
+	}
+	for i := range s.CASInfos {
+		if err := verifyCASBlock(ctx, &s.CASInfos[i], xorbs); err != nil {
+			return err
+		}
 	}
 	for i := range s.Files {
 		computed, fileHash, err := ComputeFileHashes(ctx, &s.Files[i], xorbs)
