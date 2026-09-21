@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"slices"
 	"testing"
 	"testing/iotest"
 
@@ -175,6 +176,104 @@ func TestBuildReconstructionForwardsContextAndNamespace(t *testing.T) {
 		}
 		if st.ctx != ctx || st.namespace != "tenant" {
 			t.Fatalf("%s: GetXorbURL got ctx %v, namespace %q; want the caller's ctx and %q", name, st.ctx, st.namespace, "tenant")
+		}
+	}
+}
+
+// TestBuildReconstructionRangeHeader pins which whole terms a Range header
+// selects; tails are never trimmed, so ExpectedLength rounds up to a term end.
+func TestBuildReconstructionRangeHeader(t *testing.T) {
+	var fileHash xet.FileHash
+	var entries []shard.FileDataSequenceEntry
+	var allTerms []Term
+	for index, length := range []uint32{1000, 1000, 500} {
+		entry := shard.FileDataSequenceEntry{
+			CASHash:          xet.XorbHash{byte(index + 1)},
+			UnpackedSegBytes: length,
+			ChunkIndexStart:  uint32(index),
+			ChunkIndexEnd:    uint32(index + 1),
+		}
+		entries = append(entries, entry)
+		allTerms = append(allTerms, Term{
+			Hash:           entry.CASHash.String(),
+			UnpackedLength: uint64(length),
+			Range:          ChunkRange{Start: entry.ChunkIndexStart, End: entry.ChunkIndexEnd},
+		})
+	}
+	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash, Entries: entries}}}
+	emptyShard := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash}}}
+
+	type result struct {
+		terms  []Term
+		offset int64
+		length int64
+	}
+	build := map[string]func(sh *shard.Shard, header string) (result, error){
+		"v1": func(sh *shard.Shard, header string) (result, error) {
+			resp, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, "tenant", sh, fileHash, header)
+			if err != nil {
+				return result{}, err
+			}
+			return result{resp.Terms, resp.OffsetIntoFirstRange, ExpectedLengthV1(resp)}, nil
+		},
+		"v2": func(sh *shard.Shard, header string) (result, error) {
+			resp, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, "tenant", sh, fileHash, header)
+			if err != nil {
+				return result{}, err
+			}
+			return result{resp.Terms, resp.OffsetIntoFirstRange, ExpectedLengthV2(resp)}, nil
+		},
+	}
+
+	tests := []struct {
+		name, header string
+		first, last  int // selected entries [first, last)
+		offset       int64
+		length       int64
+	}{
+		{"no range", "", 0, 3, 0, 2500},
+		{"open from start", "bytes=0-", 0, 3, 0, 2500},
+		{"open interior", "bytes=1500-", 1, 3, 500, 1000},
+		{"open at term boundary", "bytes=1000-", 1, 3, 0, 1500},
+		{"open last byte", "bytes=2499-", 2, 3, 499, 1},
+		{"open at end of file", "bytes=2500-", 0, 0, 0, 0},
+		{"explicit", "bytes=500-1499", 0, 2, 500, 1500},
+		{"explicit clamped", "bytes=2400-9999", 2, 3, 400, 100},
+		{"suffix", "bytes=-300", 2, 3, 200, 300},
+		{"suffix at term boundary", "bytes=-500", 2, 3, 0, 500},
+		{"suffix longer than file", "bytes=-99999", 0, 3, 0, 2500},
+		{"suffix zero", "bytes=-0", 0, 0, 0, 0},
+		{"start beyond end", "bytes=5000-6000", 0, 0, 0, 0},
+		{"start after end", "bytes=1500-1000", 0, 3, 0, 2500},
+		{"garbage", "bytes=abc", 0, 3, 0, 2500},
+		{"multirange", "bytes=0-499,1000-1499", 0, 3, 0, 2500},
+		{"overflow", "bytes=99999999999999999999-", 0, 3, 0, 2500},
+		{"dash only", "bytes=-", 0, 3, 0, 2500},
+		{"signed", "bytes=+5-", 0, 3, 0, 2500},
+		{"other unit", "items=0-10", 0, 3, 0, 2500},
+	}
+	for name, fn := range build {
+		for _, test := range tests {
+			t.Run(name+"/"+test.name, func(t *testing.T) {
+				got, err := fn(sh, test.header)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := result{allTerms[test.first:test.last], test.offset, test.length}
+				if !slices.Equal(got.terms, want.terms) || got.offset != want.offset || got.length != want.length {
+					t.Fatalf("Range %q: got %d terms %v offset %d length %d; want %d terms offset %d length %d",
+						test.header, len(got.terms), got.terms, got.offset, got.length, len(want.terms), want.offset, want.length)
+				}
+			})
+		}
+		for _, header := range []string{"", "bytes=0-", "bytes=-1", "bytes=0-0"} {
+			got, err := fn(emptyShard, header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.terms) != 0 || got.offset != 0 || got.length != 0 {
+				t.Fatalf("%s: empty file with Range %q: got %+v, want no terms", name, header, got)
+			}
 		}
 	}
 }

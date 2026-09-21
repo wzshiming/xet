@@ -3,7 +3,6 @@ package download
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -26,18 +25,11 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		return nil, fmt.Errorf("file not found in shard")
 	}
 
-	// Parse range header if present
-	var requestedStart, requestedEnd int64
-	hasRange := false
-	if rangeHeader != "" {
-		hasRange = true
-		rangeHeader = strings.TrimPrefix(rangeHeader, "bytes=")
-		parts := strings.Split(rangeHeader, "-")
-		if len(parts) == 2 {
-			fmt.Sscanf(parts[0], "%d", &requestedStart)
-			fmt.Sscanf(parts[1], "%d", &requestedEnd)
-		}
+	var fileSize int64
+	for _, entry := range fileBlock.Entries {
+		fileSize += int64(entry.UnpackedSegBytes)
 	}
+	requestedStart, requestedEnd, hasRange := parseByteRange(rangeHeader, fileSize)
 
 	response := &ReconstructionResponseV2{
 		OffsetIntoFirstRange: 0,
