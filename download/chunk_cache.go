@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/internal/pool"
 )
@@ -32,7 +33,7 @@ type cacheRange struct {
 }
 
 func newCacheRange(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (cacheRange, error) {
-	if len(hash) < minCacheHashLen || chunkEnd < chunkStart || bytesEnd < bytesStart {
+	if len(hash) < minCacheHashLen || !validChunkRange(chunkStart, chunkEnd) || bytesStart < 0 || bytesEnd < bytesStart {
 		return cacheRange{}, fmt.Errorf("invalid cache range for hash %q", hash)
 	}
 	return cacheRange{
@@ -51,6 +52,11 @@ func (r cacheRange) dir() string {
 
 // Keep the hash suffix nonempty so cleanup cannot reach the cache root.
 const minCacheHashLen = 5
+
+// validChunkRange gates every count-derived allocation: a nonempty range within one xorb.
+func validChunkRange(start, end uint32) bool {
+	return start < end && end <= xet.MaxChunksPerXorb
+}
 
 // cacheHashDir returns the two-level fanout directory holding hash's entries:
 // cacheDir/<hash[:2]>/<hash[2:4]>/<hash[4:]>.
@@ -444,7 +450,7 @@ type cacheFileLayout struct {
 // sealed entry: header, data, then a trailing crc32. Any other size means
 // the file is still being written or is a crashed leftover.
 func readCacheFileLayout(f *os.File, fileStart, fileEnd uint32, fileSize int64) (cacheFileLayout, error) {
-	if fileEnd < fileStart {
+	if !validChunkRange(fileStart, fileEnd) {
 		return cacheFileLayout{}, fmt.Errorf("invalid chunk range")
 	}
 	expected := fileEnd - fileStart + 1
