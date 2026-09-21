@@ -8,8 +8,6 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
-
-	"github.com/wzshiming/xet/download"
 )
 
 func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
@@ -18,11 +16,11 @@ func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := cacheClient.CacheUsage(t.Context()); err != nil || got != (download.CacheUsage{}) {
+	if got, err := cacheClient.Usage(t.Context()); err != nil || got != (Usage{}) {
 		t.Fatalf("usage of empty cache = %+v, %v; want zero", got, err)
 	}
 
-	var want download.CacheUsage
+	var want Usage
 	for name, data := range map[string]string{"chunks/entry": "cached bytes", "staging.tmp": "partial"} {
 		filePath := filepath.Join(cacheDir, name)
 		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
@@ -31,10 +29,10 @@ func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 		if err := os.WriteFile(filePath, []byte(data), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		want.Count++
-		want.Bytes += int64(len(data))
+		want.Download.Count++
+		want.Download.Bytes += int64(len(data))
 	}
-	if got, err := cacheClient.CacheUsage(t.Context()); err != nil || got != want {
+	if got, err := cacheClient.Usage(t.Context()); err != nil || got != want {
 		t.Fatalf("usage = %+v, %v; want %+v", got, err, want)
 	}
 }
@@ -46,7 +44,7 @@ func TestCacheUsageForwardsContextAndDirectoryErrors(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if got, err := c.CacheUsage(ctx); !errors.Is(err, context.Canceled) || got != (download.CacheUsage{}) {
+	if got, err := c.Usage(ctx); !errors.Is(err, context.Canceled) || got != (Usage{}) {
 		t.Fatalf("usage with canceled ctx = %+v, %v; want zero, context.Canceled", got, err)
 	}
 
@@ -61,7 +59,7 @@ func TestCacheUsageForwardsContextAndDirectoryErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := c.CacheUsage(t.Context()); !errors.Is(err, syscall.ENOTDIR) || got != (download.CacheUsage{}) {
+	if got, err := c.Usage(t.Context()); !errors.Is(err, syscall.ENOTDIR) || got != (Usage{}) {
 		t.Fatalf("usage through a file = %+v, %v; want zero, ENOTDIR", got, err)
 	}
 }
