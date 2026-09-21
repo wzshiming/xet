@@ -115,6 +115,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
+		p.Close()
 		return nil, err
 	}
 
