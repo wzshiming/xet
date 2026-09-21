@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -150,7 +151,7 @@ func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, ch
 // as one sealed entry and returns its path, or "" when the range can no
 // longer be assembled because a source was evicted mid-pass.
 func writeMergedEntry(m *CacheManager, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (string, error) {
-	lockFile, err := lockChunkCache(m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	lockFile, err := lockChunkCache(context.Background(), m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return "", err
 	}

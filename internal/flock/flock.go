@@ -1,9 +1,9 @@
 package flock
 
 import (
+	"context"
 	"errors"
 	"os"
-	"runtime"
 	"time"
 )
 
@@ -14,24 +14,22 @@ const (
 	lockSpinMaxSleep = 100 * time.Millisecond // maximum sleep between retries
 )
 
-// Lock repeatedly calls TryLock until the lock is acquired.
-//
-// Each iteration yields the processor via runtime.Gosched before retrying.
-// When the lock remains contended beyond lockSpinBase attempts, it
-// switches to exponential backoff sleep (capped at lockSpinMaxSleep) to
-// avoid consuming CPU.
+// Lock waits until the lock is acquired.
 func Lock(f *os.File) error {
+	return LockContext(context.Background(), f)
+}
+
+// LockContext is Lock that gives up with ctx.Err() once ctx is done.
+func LockContext(ctx context.Context, f *os.File) error {
 	for {
 		err := TryLock(f)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, ErrLocked) {
+		if err == nil || !errors.Is(err, ErrLocked) {
 			return err
 		}
-
-		runtime.Gosched()
-
-		time.Sleep(lockSpinMaxSleep)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(lockSpinMaxSleep):
+		}
 	}
 }

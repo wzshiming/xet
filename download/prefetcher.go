@@ -59,10 +59,12 @@ type prefetchEntry struct {
 
 type prefetcher struct {
 	ctx          context.Context
+	cancel       context.CancelFunc // nil when no fetch was started
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
+	workers      sync.WaitGroup // feeder and worker goroutines started by start
 }
 
 type progressReader struct {
@@ -114,8 +116,11 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 
 	orderEntry(items, termOrder)
 
+	// Fetches run on a context Close cancels, so callers sharing ctx are unaffected.
+	ctx, cancel := context.WithCancel(ctx)
 	p := &prefetcher{
 		ctx:          ctx,
+		cancel:       cancel,
 		client:       client,
 		entries:      entries,
 		progressFunc: opts.progressFunc,
@@ -156,19 +161,19 @@ func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	desiredWorkers = min(desiredWorkers, len(newItems))
 
 	jobs := make(chan *prefetchEntry)
-	go func() {
+	p.workers.Go(func() {
 		defer close(jobs)
 		for _, item := range newItems {
 			jobs <- item
 		}
-	}()
+	})
 
 	for i := 0; i < desiredWorkers; i++ {
-		go func() {
+		p.workers.Go(func() {
 			for entry := range jobs {
 				p.runJob(entry)
 			}
-		}()
+		})
 	}
 
 	return nil
@@ -204,7 +209,11 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	var err error
 	key := entry.task.key
 
-	lockFile, err := lockChunkCache(p.cache.dir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
+	if err = p.ctx.Err(); err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	lockFile, err := lockChunkCache(p.ctx, p.cache.dir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
@@ -237,7 +246,11 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		p.failEntry(entry, err)
 		return
 	}
-	defer rc.Close()
+	closeBody := sync.OnceValue(rc.Close)
+	defer closeBody()
+	// Bodies not bound to ctx only stop a stalled Read when closed.
+	stop := context.AfterFunc(p.ctx, func() { closeBody() })
+	defer stop()
 
 	var reader io.Reader = rc
 	if p.progressFunc != nil {
@@ -298,8 +311,11 @@ func (p *prefetcher) reportProgress(key fetchKey, current, total int64) {
 	}
 }
 
-// Close also rejects unpublished entries so late results cannot retain caches.
+// Cancel network reads before waiting for cache cleanup.
 func (p *prefetcher) Close() {
+	if p.cancel != nil {
+		p.cancel()
+	}
 	for _, entry := range p.entries {
 		// once.Do orders any concurrent publication before the read below.
 		p.failEntry(entry, fs.ErrClosed)

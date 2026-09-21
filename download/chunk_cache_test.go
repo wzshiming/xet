@@ -269,6 +269,63 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	}
 }
 
+// TestChunkCacheDoneKeepsCompletedRange releases a writer that decoded every
+// expected chunk but never read the decoder's trailing EOF: the entry must be
+// sealed and reusable, while a writer one chunk short is still discarded.
+func TestChunkCacheDoneKeepsCompletedRange(t *testing.T) {
+	chunks := [][]byte{[]byte("first"), []byte("second")}
+	encoded := buildTestXorb(t, chunks)
+	for _, tc := range []struct {
+		name   string
+		loaded uint32
+		sealed bool
+	}{
+		{"complete", 1, true},
+		{"incomplete", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dec := xorb.NewDecoder(bytes.NewReader(encoded), false)
+			cache, err := newChunkCache(dec, NewCacheManager(dir, 0), testCacheHash, 0, 2, 0, int64(len(encoded)-1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.LoadTo(tc.loaded); err != nil {
+				t.Fatal(err)
+			}
+			cache.Done()
+			assertEntryUnlocked(t, cache.path)
+
+			// A fresh manager verifies the checksum on its first open.
+			cached, err := openCachedRange(NewCacheManager(dir, 0), testCacheHash, 0, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.sealed {
+				if cached != nil {
+					cached.Done()
+					t.Fatal("incomplete entry was sealed")
+				}
+				if info, err := os.Stat(cache.path); err != nil || info.Size() != 0 {
+					t.Fatalf("incomplete entry was not discarded: %v, %v", info, err)
+				}
+				return
+			}
+			if cached == nil {
+				t.Fatal("completed entry was discarded")
+			}
+			defer cached.Done()
+			buf := make([]byte, 16)
+			for i, want := range chunks {
+				n, err := cached.Chunk(uint32(i), buf)
+				if err != nil || !bytes.Equal(buf[:n], want) {
+					t.Fatalf("chunk %d = %q, %v; want %q", i, buf[:n], err, want)
+				}
+			}
+		})
+	}
+}
+
 // corruptDataByte flips the last byte of the data region, which sits just
 // before the four-byte crc32 trailer.
 func corruptDataByte(t *testing.T, path string) {
