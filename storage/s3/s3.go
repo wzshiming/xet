@@ -393,15 +393,20 @@ func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, _ string, xorbHas
 
 // PutShard stores a shard and its file/chunk/sha256 index objects.
 func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Check if any file in the shard already exists
+	// Only a shard whose every file is already indexed is a no-op
+	alreadyExists := len(s.Files) > 0
 	for _, fileBlock := range s.Files {
 		exists, err := ss.hasFile(ctx, fileBlock.FileHash)
 		if err != nil {
 			return false, fmt.Errorf("check shard: %w", err)
 		}
-		if exists {
-			return false, nil // Already exists
+		if !exists {
+			alreadyExists = false
+			break
 		}
+	}
+	if alreadyExists {
+		return false, nil // Already exists
 	}
 
 	if err := storage.PrepareShard(ctx, s, ss); err != nil {
