@@ -9,9 +9,40 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 )
+
+// addXorbFile stores parts as one multi-chunk xorb and appends the file and
+// CAS blocks describing it to sh.
+func addXorbFile(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard, parts [][]byte) File {
+	t.Helper()
+	encoded, xorbHash := EncodeXorb(t, true, parts...)
+	if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	f := File{Content: bytes.Join(parts, nil), XorbHashes: []xet.XorbHash{xorbHash}}
+	cb := shard.CASBlock{CASHash: xorbHash}
+	var sizes []uint64
+	for _, part := range parts {
+		chunkHash := xet.ComputeChunkHash(part)
+		f.ChunkHashes = append(f.ChunkHashes, chunkHash)
+		sizes = append(sizes, uint64(len(part)))
+		cb.Chunks = append(cb.Chunks, shard.CASChunkSequenceEntry{
+			ChunkHash: chunkHash, ByteRangeStart: cb.NumBytesInCAS, UnpackedSegBytes: uint32(len(part)),
+		})
+		cb.NumBytesInCAS += uint32(len(part))
+	}
+	f.FileHash = xet.ComputeFileHash(f.ChunkHashes, sizes)
+	sh.AddCASBlock(cb)
+	sh.AddFile(shard.FileBlock{FileHash: f.FileHash, Entries: []shard.FileDataSequenceEntry{
+		{CASHash: xorbHash, UnpackedSegBytes: uint32(len(f.Content)), ChunkIndexEnd: uint32(len(parts))},
+	}})
+	digest := sha256.Sum256(f.Content)
+	f.SHA256Hex = hex.EncodeToString(digest[:])
+	return f
+}
 
 // addFile appends parts to sh as one file and returns its File.
 func addFile(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard, parts [][]byte) File {
@@ -118,6 +149,78 @@ func testPutShardVerifiesFileHash(t *testing.T, b Backend) {
 			}
 			if _, err := st.GetShard(ctx, sh.Files[0].FileHash); err != nil {
 				t.Fatalf("GetShard(): %v", err)
+			}
+		})
+	}
+}
+
+// Chunk hashes are indexed straight from the CAS blocks, so every declared
+// chunk sequence must match the stored xorb even when no file references it.
+func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
+	parts := [][]byte{[]byte("first chunk"), []byte("second chunk, different size")}
+	for _, test := range []struct {
+		name    string
+		mutate  func(sh *shard.Shard)
+		wantErr string
+	}{
+		{name: "full CAS blocks"},
+		{name: "dedup without CAS blocks", mutate: func(sh *shard.Shard) { sh.CASInfos = nil }},
+		{name: "forged chunk hash", mutate: func(sh *shard.Shard) { sh.CASInfos[0].Chunks[1].ChunkHash[0] ^= 1 }, wantErr: "chunk 1 hash"},
+		{name: "forged chunk hash in unreferenced block", mutate: func(sh *shard.Shard) { sh.CASInfos[1].Chunks[0].ChunkHash[0] ^= 1 }, wantErr: "chunk 0 hash"},
+		{name: "forged chunk size", mutate: func(sh *shard.Shard) { sh.CASInfos[0].Chunks[1].UnpackedSegBytes++ }, wantErr: "chunk 1 has"},
+		{name: "undeclared trailing chunk", mutate: func(sh *shard.Shard) { sh.CASInfos[1].Chunks = sh.CASInfos[1].Chunks[:1] }, wantErr: "1 declared chunks"},
+		{name: "declared chunk beyond xorb", mutate: func(sh *shard.Shard) {
+			cb := &sh.CASInfos[1]
+			cb.Chunks = append(cb.Chunks, cb.Chunks[1])
+		}, wantErr: "3 declared chunks"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := b.New(t)
+			sh := shard.NewShard()
+			f := addXorbFile(t, ctx, st, sh, parts)
+			unreferenced := shard.NewShard()
+			addXorbFile(t, ctx, st, unreferenced, [][]byte{[]byte("chunk of an unreferenced xorb"), []byte("its second chunk")})
+			sh.AddCASBlock(unreferenced.CASInfos[0])
+			if test.mutate != nil {
+				test.mutate(sh)
+			}
+
+			inserted, err := st.PutShard(ctx, sh)
+			if test.wantErr == "" {
+				if err != nil || !inserted {
+					t.Fatalf("PutShard() = %v, %v", inserted, err)
+				}
+				assertFilesCommitted(t, ctx, st, f)
+				return
+			}
+			if inserted || !errors.Is(err, storage.ErrInvalidShard) || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("PutShard() = %v, %v, want %q", inserted, err, test.wantErr)
+			}
+			if got, err := st.GetFileIndexEntry(ctx, f.FileHash); err != nil || got != "" {
+				t.Fatalf("GetFileIndexEntry() after rejection = %q, %v", got, err)
+			}
+			if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
+				t.Fatalf("GetSHA256IndexEntry() after rejection = %q, %v", got, err)
+			}
+			for _, cb := range sh.CASInfos {
+				for _, chunk := range cb.Chunks {
+					if got, err := st.GetChunkIndexEntry(ctx, chunk.ChunkHash); err != nil || got != "" {
+						t.Fatalf("GetChunkIndexEntry(%s) after rejection = %q, %v", chunk.ChunkHash.String(), got, err)
+					}
+				}
+			}
+
+			honest := shard.NewShard()
+			addXorbFile(t, ctx, st, honest, parts)
+			if inserted, err := st.PutShard(ctx, honest); err != nil || !inserted {
+				t.Fatalf("honest PutShard() after rejection = %v, %v", inserted, err)
+			}
+			assertFilesCommitted(t, ctx, st, f)
+			for _, chunkHash := range f.ChunkHashes {
+				if _, err := st.GetShardByChunkHash(ctx, "default", chunkHash); err != nil {
+					t.Fatalf("GetShardByChunkHash(%s) after honest retry: %v", chunkHash.String(), err)
+				}
 			}
 		})
 	}

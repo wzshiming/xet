@@ -25,13 +25,9 @@ import (
 // SHA-256 of the exact stored bytes and does not vary with the creation time
 // embedded in the (unstored) footer.
 func TestShardNameIsDeterministicContentHash(t *testing.T) {
-	newIdenticalShard := func(creationTime uint64) *shard.Shard {
+	newIdenticalShard := func(st *Storage, creationTime uint64) *shard.Shard {
 		s := shard.NewShard()
-		s.AddFile(shard.FileBlock{FileHash: xet.FileHash{}})
-		s.AddCASBlock(shard.CASBlock{
-			CASHash: xet.XorbHash{2},
-			Chunks:  []shard.CASChunkSequenceEntry{{ChunkHash: xet.ChunkHash{3}}},
-		})
+		storagetest.AddFileBlock(t, context.Background(), st, s, [][]byte{[]byte("identical content")})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
 		return s
 	}
@@ -43,7 +39,7 @@ func TestShardNameIsDeterministicContentHash(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inserted, err := st.PutShard(context.Background(), newIdenticalShard(creationTime)); err != nil || !inserted {
+		if inserted, err := st.PutShard(context.Background(), newIdenticalShard(st, creationTime)); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 		entries, err := fanoutEntries(filepath.Join(basePath, "shards"))

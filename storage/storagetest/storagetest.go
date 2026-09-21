@@ -74,6 +74,7 @@ var cases = []struct {
 	{"TestListFilesComputesUniqueAndShared", testListFilesComputesUniqueAndShared},
 	{"TestListFilesMarksInvalidChunkMetadata", testListFilesMarksInvalidChunkMetadata},
 	{"TestPutShardVerifiesFileHash", testPutShardVerifiesFileHash},
+	{"TestPutShardVerifiesCASChunks", testPutShardVerifiesCASChunks},
 	{"TestPutShardCommitsNewFilesBesideKnownFile", testPutShardCommitsNewFilesBesideKnownFile},
 	{"TestPutShardRetryRepairsMissingFileEntry", testPutShardRetryRepairsMissingFileEntry},
 	{"TestPutXorbRejectsWrongIdentity", testPutXorbRejectsWrongIdentity},
