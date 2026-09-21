@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -753,6 +754,68 @@ func gateWait(ch <-chan struct{}) bool {
 		return true
 	case <-time.After(10 * time.Second):
 		return false
+	}
+}
+
+func TestMirrorKeepsParallelUpstreamConnectionsIdle(t *testing.T) {
+	const parallel = 3 // net/http keeps only 2 idle connections per host by default
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var conns atomic.Int32
+	arrived := make(chan struct{}, parallel)
+	release := make(chan struct{}, parallel)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		select {
+		case arrived <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	for range 2 {
+		var wg sync.WaitGroup
+		for range parallel {
+			wg.Go(func() {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				resp, err := m.probeClient.Do(req)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				resp.Body.Close()
+			})
+		}
+		for range parallel {
+			select {
+			case <-arrived:
+			case <-ctx.Done():
+				wg.Wait()
+				t.Fatal(ctx.Err())
+			}
+		}
+		for range parallel {
+			release <- struct{}{}
+		}
+		wg.Wait()
+	}
+	if got := conns.Load(); got != parallel {
+		t.Fatalf("%d upstream connections for two rounds of %d parallel probes, want %d", got, parallel, parallel)
 	}
 }
 

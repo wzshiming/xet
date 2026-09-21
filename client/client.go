@@ -123,11 +123,10 @@ func NewClient(opts ...Options) (*Client, error) {
 	c.cacheManager = download.NewCacheManager(c.cacheDir, c.cacheSize)
 
 	if c.httpClient.Transport == nil {
-		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
-	}
-
-	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
-		transport.DisableKeepAlives = true
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConnsPerHost = 32
+		transport.MaxIdleConns = 128
+		c.httpClient.Transport = transport
 	}
 
 	c.getHttpClient = &http.Client{
