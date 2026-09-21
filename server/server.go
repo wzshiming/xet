@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -312,8 +313,10 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 		}
 		batch.Files[fileHash.String()] = single.Terms
 		for xorbHash, entries := range single.FetchInfo {
-			if _, exists := batch.FetchInfo[xorbHash]; !exists {
-				batch.FetchInfo[xorbHash] = entries
+			for _, entry := range entries {
+				if !slices.Contains(batch.FetchInfo[xorbHash], entry) {
+					batch.FetchInfo[xorbHash] = append(batch.FetchInfo[xorbHash], entry)
+				}
 			}
 		}
 	}

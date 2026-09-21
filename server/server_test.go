@@ -20,6 +20,8 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
@@ -539,6 +541,102 @@ func TestUnknownReconstructionRequiresAuthorization(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestBatchReconstructionKeepsSharedXorbRanges(t *testing.T) {
+	ctx := context.Background()
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewHandler(WithStorage(stor)))
+	defer srv.Close()
+	getJSON := func(t *testing.T, path string, out any) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d", path, resp.StatusCode)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	files := [][]byte{[]byte("first file packed into the shared xorb"), []byte("second file packed into the shared xorb")}
+	uploader, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashes, err := uploader.UploadFiles(ctx, []io.ReadSeeker{bytes.NewReader(files[0]), bytes.NewReader(files[1])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	singles := make([]download.ReconstructionResponseV1, len(hashes))
+	for fileIndex, fileHash := range hashes {
+		getJSON(t, "/v1/reconstructions/"+fileHash.String(), &singles[fileIndex])
+		if len(singles[fileIndex].Terms) != 1 {
+			t.Fatalf("file %d terms = %+v, want one", fileIndex, singles[fileIndex].Terms)
+		}
+	}
+	xorbHash := singles[0].Terms[0].Hash
+	if singles[1].Terms[0].Hash != xorbHash || singles[1].Terms[0].Range == singles[0].Terms[0].Range {
+		t.Fatalf("files must share one xorb at distinct chunk ranges, got %+v and %+v", singles[0].Terms[0], singles[1].Terms[0])
+	}
+
+	for _, test := range []struct {
+		name  string
+		order []int
+	}{
+		{"upload order", []int{0, 1}},
+		{"reversed", []int{1, 0}},
+		{"repeated", []int{0, 1, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requested := make([]xet.FileHash, len(test.order))
+			query := make([]string, len(test.order))
+			for slot, index := range test.order {
+				requested[slot] = hashes[index]
+				query[slot] = "file_id=" + hashes[index].String()
+			}
+			var batch download.BatchReconstructionResponse
+			getJSON(t, "/reconstructions?"+strings.Join(query, "&"), &batch)
+			if len(batch.FetchInfo[xorbHash]) != 2 {
+				t.Errorf("fetch_info[%s] = %+v, want two entries", xorbHash, batch.FetchInfo[xorbHash])
+			}
+			for _, single := range singles {
+				for _, entry := range single.FetchInfo[xorbHash] {
+					if !slices.Contains(batch.FetchInfo[xorbHash], entry) {
+						t.Errorf("fetch_info[%s] = %+v, missing %+v", xorbHash, batch.FetchInfo[xorbHash], entry)
+					}
+				}
+			}
+
+			downloader, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			readers, sizes, err := downloader.DownloadFiles(ctx, requested)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for slot, index := range test.order {
+				if readers[slot] == nil {
+					t.Fatalf("file %d not returned", slot)
+				}
+				got, err := io.ReadAll(readers[slot])
+				if err != nil {
+					t.Fatalf("file %d: %v", slot, err)
+				}
+				if !bytes.Equal(got, files[index]) || sizes[slot] != int64(len(files[index])) {
+					t.Fatalf("file %d = %q (size %d), want %q", slot, got, sizes[slot], files[index])
+				}
+			}
+		})
 	}
 }
 
