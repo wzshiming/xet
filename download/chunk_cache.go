@@ -1,6 +1,7 @@
 package download
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -170,7 +171,7 @@ func parseCacheFileName(name string) (chunkStart, chunkEnd uint32, bytesStart, b
 //
 // The caller must call Done() to release the file lock.
 func newChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*chunkCache, error) {
-	lockFile, err := lockChunkCache(m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	lockFile, err := lockChunkCache(context.Background(), m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +189,8 @@ func newChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart, chun
 	return cache, err
 }
 
-func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*os.File, error) {
+// Waiting for another writer's lock is cancelable.
+func lockChunkCache(ctx context.Context, cacheDir, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (*os.File, error) {
 	r, err := newCacheRange(cacheDir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return nil, err
@@ -213,7 +215,7 @@ func lockChunkCache(cacheDir, hash string, chunkStart, chunkEnd uint32, bytesSta
 			}
 			return nil, fmt.Errorf("create cache file: %w", err)
 		}
-		if err := flock.Lock(lockFile); err != nil {
+		if err := flock.LockContext(ctx, lockFile); err != nil {
 			lockFile.Close()
 			return nil, fmt.Errorf("lock cache file: %w", err)
 		}
@@ -597,6 +599,9 @@ func (c *chunkCache) load() (int, error) {
 		}
 		return 0, err
 	}
+	if c.published {
+		return 0, fmt.Errorf("decoded %d chunks, expected %d", len(c.metas)+1, c.expectedChunks)
+	}
 
 	if _, werr := c.file.WriteAt(tmp[:n], c.writePos); werr != nil {
 		return 0, fmt.Errorf("write chunk to file: %w", werr)
@@ -604,6 +609,12 @@ func (c *chunkCache) load() (int, error) {
 	c.crc = crc32.Update(c.crc, crc32.IEEETable, tmp[:n])
 	c.metas = append(c.metas, chunkRef{offset: c.writePos, size: int32(n)})
 	c.writePos += int64(n)
+	// Seal now: Done may interrupt the trailing EOF read before finalize runs.
+	if uint32(len(c.metas)) == c.expectedChunks {
+		if err := c.seal(); err != nil {
+			return 0, err
+		}
+	}
 	return len(c.metas), nil
 }
 
@@ -635,8 +646,7 @@ func (c *chunkCache) LoadTo(idx uint32) error {
 	return c.loadTo(idx)
 }
 
-// LoadAll decodes and caches all remaining chunks, then patches the offset
-// header and syncs the file to disk.
+// LoadAll decodes remaining chunks and ensures the entry is sealed.
 func (c *chunkCache) LoadAll() error {
 	for {
 		_, err := c.load()
@@ -649,26 +659,27 @@ func (c *chunkCache) LoadAll() error {
 	}
 }
 
-// finalize patches the offset table in the header, seals the file with the
-// crc32 trailer, syncs it, and releases the write lock. The entry becomes
-// visible to readers once its size matches the sealed layout. No-op for
-// read-only caches.
+// finalize leaves read-only and already sealed entries unchanged.
 func (c *chunkCache) finalize() error {
 	c.mut.Lock()
 	defer c.mut.Unlock()
-	metas := c.metas
-	file := c.file
-	readonly := c.readonly
 
-	if readonly {
+	if c.readonly || c.published {
 		return nil
 	}
-	if file == nil {
+	if c.file == nil {
 		return fmt.Errorf("cache file is closed")
 	}
-	if uint32(len(metas)) != c.expectedChunks {
-		return fmt.Errorf("decoded %d chunks, expected %d", len(metas), c.expectedChunks)
+	if uint32(len(c.metas)) != c.expectedChunks {
+		return fmt.Errorf("decoded %d chunks, expected %d", len(c.metas), c.expectedChunks)
 	}
+	return c.seal()
+}
+
+// seal publishes the complete entry while the caller holds c.mut.
+func (c *chunkCache) seal() error {
+	metas := c.metas
+	file := c.file
 
 	// Compute sequential offsets and write them into the pre-allocated header.
 	numOffsets := uint32(len(metas) + 1)

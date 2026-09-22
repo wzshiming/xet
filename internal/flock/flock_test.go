@@ -2,12 +2,13 @@ package flock
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -303,61 +304,36 @@ func TestLockConcurrent(t *testing.T) {
 }
 
 func TestLockContextCancel(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "cancel.lock")
-
-	f1, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f1.Close()
-
-	f2, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f2.Close()
-
-	// Hold the lock on f1
-	if err := TryLock(f1); err != nil {
-		t.Fatalf("TryLock on f1 failed: %v", err)
-	}
-
-	// Lock on f2 in a goroutine with a context that will be cancelled
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// Lock in a tight loop — we cancel the context to stop
-		for {
-			if err := TryLock(f2); err == nil {
-				// Acquired unexpectedly — unlock and return
-				Unlock(f2)
-				return
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			runtime.Gosched()
+	synctest.Test(t, func(t *testing.T) {
+		lockPath := filepath.Join(t.TempDir(), "cancel.lock")
+		heldFile, err := os.Create(lockPath)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
+		defer heldFile.Close()
+		waitingFile, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer waitingFile.Close()
+		if err := TryLock(heldFile); err != nil {
+			t.Fatal(err)
+		}
 
-	// Let the goroutine spin for a bit
-	time.Sleep(50 * time.Millisecond)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- LockContext(ctx, waitingFile)
+		}()
+		synctest.Wait()
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("LockContext = %v, want context.Canceled", err)
+		}
 
-	// Cancel the context — goroutine should exit
-	cancel()
-
-	select {
-	case <-done:
-		// Goroutine exited as expected
-	case <-time.After(time.Second):
-		t.Fatal("goroutine did not exit after context cancellation (timeout)")
-	}
-
-	// Cleanup
-	if err := Unlock(f1); err != nil {
-		t.Fatalf("Unlock on f1 failed: %v", err)
-	}
+		if err := Unlock(heldFile); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
