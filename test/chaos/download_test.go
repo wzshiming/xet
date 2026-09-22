@@ -309,22 +309,9 @@ func (fx *fixture) requireHealed(t *testing.T, ctx context.Context, cacheDir str
 	}
 }
 
-// skipStalledBodyRace skips under -race: abandoning a stalled body makes the
-// prefetcher close the httpseek reader while a worker is blocked in Read on it,
-// which the race detector reports (deferred to a later stage).
-func skipStalledBodyRace(t *testing.T) {
-	t.Helper()
-	if raceEnabled {
-		t.Skip("prefetcher Close races with a stalled httpseek body Read; pending fix")
-	}
-}
-
 // TestParentCancelDuringBodyStall checks that canceling mid-stall returns
-// promptly and leaves a cache that heals. The error is context.Canceled in
-// most runs but "chunk 0: file closed" when the worker's failure closes the
-// cache first (1 of 40 runs); pinning the category is deferred.
+// promptly with context.Canceled and leaves a cache that heals.
 func TestParentCancelDuringBodyStall(t *testing.T) {
-	skipStalledBodyRace(t)
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
@@ -349,10 +336,9 @@ func TestParentCancelDuringBodyStall(t *testing.T) {
 	case <-time.After(waitTimeout):
 		t.Fatal("download did not return after its context was canceled")
 	}
-	if err == nil {
-		t.Fatal("download succeeded after its context was canceled")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("download error = %v, want context.Canceled", err)
 	}
-	t.Logf("canceled download error: %v (context.Canceled=%v)", err, errors.Is(err, context.Canceled))
 	if took := time.Since(canceledAt); took > 2*time.Second {
 		t.Fatalf("download returned %v after cancel", took)
 	}
@@ -360,7 +346,6 @@ func TestParentCancelDuringBodyStall(t *testing.T) {
 }
 
 func TestBatchReaderCloseDuringStall(t *testing.T) {
-	skipStalledBodyRace(t)
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()

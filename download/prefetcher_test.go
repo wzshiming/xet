@@ -347,6 +347,41 @@ func TestReaderV2CancelAfterFirstChunkReleasesEntry(t *testing.T) {
 	}
 }
 
+// TestReaderReportsCanceledFetchAfterWorkerExit cancels a stalled fetch and
+// lets the worker discard its entry before the reader touches it: the read
+// must still report the cancellation, not the closed cache file.
+func TestReaderReportsCanceledFetchAfterWorkerExit(t *testing.T) {
+	chunks, encoded, _, readers := splitRangeReaders(t)
+	for name, newReader := range readers {
+		t.Run(name, func(t *testing.T) {
+			m := NewCacheManager(t.TempDir(), 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			client := &gatedClient{
+				data:    encoded,
+				stallAt: len(buildTestXorb(t, chunks[:1])),
+				stalled: make(chan struct{}),
+				closed:  make(chan struct{}),
+			}
+			r, err := newReader(ctx, client, m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			p := readerPrefetcher(t, r)
+			// The first chunk is published; the worker stalls on the second.
+			<-client.stalled
+			cancel()
+			if !awaitWorkers(t, p) {
+				t.FailNow()
+			}
+			if _, err := io.ReadAll(r); !errors.Is(err, context.Canceled) {
+				t.Fatalf("read after cancel: %v, want context.Canceled", err)
+			}
+		})
+	}
+}
+
 // TestReaderCloseAbortsStalledDownload closes a reader while its worker holds
 // cache.mut inside a network read that never completes and the parent context
 // stays live: Close must cancel the fetch instead of waiting for it, leave no

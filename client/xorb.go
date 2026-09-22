@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/upload"
@@ -161,8 +162,10 @@ func (c *Client) DownloadXorbWithAuthProvider(ctx context.Context, provider Auth
 // DownloadXorb downloads a xorb from a URL and returns a streaming Decoder.
 // The caller must call Decoder.Close() when done to release the underlying HTTP connection.
 func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	maps.Copy(req.Header, header)
@@ -177,20 +180,47 @@ func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header htt
 		resp, err = c.doWithNetworkRetry(req)
 	}
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("fetch xorb: %w", err)
 	}
 
 	if req.Header.Get("Range") != "" &&
 		(resp.StatusCode == http.StatusPartialContent || isExactWholeRangeResponse(req, resp)) {
-		return resp.Body, nil
+		return &xorbBody{rc: resp.Body, cancel: cancel}, nil
 	}
 
 	if err := reqError(req, resp); err != nil {
 		resp.Body.Close()
+		cancel()
 		return nil, err
 	}
 
-	return resp.Body, nil
+	return &xorbBody{rc: resp.Body, cancel: cancel}, nil
+}
+
+// xorbBody serializes Read and Close of the httpseek body, which is not safe
+// for concurrent use; Close cancels the request first so a blocked Read returns.
+type xorbBody struct {
+	rc     io.ReadCloser
+	cancel context.CancelFunc
+	mut    sync.Mutex
+}
+
+func (b *xorbBody) Read(p []byte) (int, error) {
+	b.mut.Lock()
+	defer b.mut.Unlock()
+	n, err := b.rc.Read(p)
+	if err != nil {
+		b.cancel()
+	}
+	return n, err
+}
+
+func (b *xorbBody) Close() error {
+	b.cancel()
+	b.mut.Lock()
+	defer b.mut.Unlock()
+	return b.rc.Close()
 }
 
 // isExactWholeRangeResponse accepts the behavior used by xet-core's signed

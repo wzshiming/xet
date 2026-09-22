@@ -296,6 +296,72 @@ func TestDownloadXorbWithURLIdleTimeoutDisabledHonorsParentDeadline(t *testing.T
 	}
 }
 
+// stalledBody reports that a Read started, then blocks until ctx ends like a
+// connection that stopped delivering bytes.
+type stalledBody struct {
+	ctx     context.Context
+	reading chan struct{}
+}
+
+func (b stalledBody) Read([]byte) (int, error) {
+	select {
+	case b.reading <- struct{}{}:
+	default:
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (stalledBody) Close() error { return nil }
+
+// TestDownloadXorbWithURLCloseUnblocksStalledRead closes the body while a Read
+// is blocked on it: Close must return promptly and end that Read instead of
+// letting it reopen the range, without touching the reader concurrently.
+func TestDownloadXorbWithURLCloseUnblocksStalledRead(t *testing.T) {
+	reading := make(chan struct{}, 1)
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: http.StatusOK, ContentLength: 64, Body: stalledBody{ctx: r.Context(), reading: reading}}, nil
+	})
+	c, err := NewClient(WithHTTPClient(&http.Client{Transport: transport}), WithIdleTimeout(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := c.DownloadXorbWithURL(t.Context(), "http://example/xorb", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := r.Read(make([]byte, 16))
+		readErr <- err
+	}()
+	<-reading
+	closed := make(chan error, 1)
+	go func() { closed <- r.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return while a Read was blocked")
+	}
+	select {
+	case err := <-readErr:
+		if err == nil {
+			t.Fatal("blocked Read returned no error after Close")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked Read did not return after Close")
+	}
+	if t.Context().Err() != nil {
+		t.Fatal("parent context ended")
+	}
+}
+
 // Raw GET routes keep status and headers verbatim and never retry, but still time out when idle.
 func TestRawGETIdleTimeout(t *testing.T) {
 	var requests atomic.Int32
