@@ -372,6 +372,52 @@ func TestWrongContentRangeOnResumeFails(t *testing.T) {
 	}
 }
 
+// TestRangeAnswersFailSafely serves the multi-chunk range with mismatched
+// range metadata: the whole xorb as 200, or a 206 describing a shifted range.
+// Both must fail at once instead of being taken for the requested bytes, while
+// a 206 lacking Content-Range is still accepted as is.
+func TestRangeAnswersFailSafely(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+
+	for _, tc := range []struct {
+		kind    faultKind
+		wantErr string // substring of the failure; "" means the download must succeed
+		gets    int    // requests for the range, counting the one-shot fallback
+	}{
+		{ignoreRange, "status 200 OK", 1},
+		{shiftRange, "Content-Range", 1},
+		{noContentRange, "", 2},
+	} {
+		t.Run(tc.kind.String(), func(t *testing.T) {
+			fx.proxy.arm(func(r record) fault {
+				if fx.big.match(r) {
+					return fault{kind: tc.kind}
+				}
+				return fault{}
+			})
+			cacheDir := t.TempDir()
+			err := fx.download(ctx, fx.proxyClient(t, cacheDir), apiV2, newOutput(t, nil))
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("download: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("download error = %v, want %q reported", err, tc.wantErr)
+			}
+			gets := filter(fx.proxy.settle(t), fx.big.match)
+			if len(gets) != tc.gets {
+				t.Fatalf("requests for %s = %+v, want %d", fx.big.rangeHeader(), gets, tc.gets)
+			}
+			if tc.wantErr == "" {
+				fx.assertCached(t, ctx, cacheDir)
+			} else if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.match); len(healed) != 1 {
+				t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
+			}
+		})
+	}
+}
+
 func v2Reconstruction(r record) bool {
 	return r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/v2/reconstructions/")
 }

@@ -19,19 +19,21 @@ const waitTimeout = 10 * time.Second
 type faultKind int
 
 const (
-	passThrough  faultKind = iota
-	stallHeaders           // send nothing until the client gives up
-	stallBody              // relay prefix bytes, then hang
-	abortBody              // relay prefix bytes, then close the connection mid-body
-	resetBody              // relay prefix bytes, then reset the connection
-	shortBody              // relay prefix bytes under the declared Content-Length, then end the response
-	shortChunked           // relay prefix bytes without Content-Length, then end the response cleanly
-	trickle                // relay piece bytes every gap on a live connection
-	injectStatus           // answer status without forwarding
-	shiftRange             // forward with the Range start moved one byte later, so the 206 describes another range
+	passThrough    faultKind = iota
+	stallHeaders             // send nothing until the client gives up
+	stallBody                // relay prefix bytes, then hang
+	abortBody                // relay prefix bytes, then close the connection mid-body
+	resetBody                // relay prefix bytes, then reset the connection
+	shortBody                // relay prefix bytes under the declared Content-Length, then end the response
+	shortChunked             // relay prefix bytes without Content-Length, then end the response cleanly
+	trickle                  // relay piece bytes every gap on a live connection
+	injectStatus             // answer status without forwarding
+	shiftRange               // forward with the Range start moved one byte later, so the 206 describes another range
+	ignoreRange              // forward without the Range header, so the backend answers 200 with the whole resource
+	noContentRange           // relay the response without its Content-Range header
 )
 
-var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus", "shiftRange"}
+var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus", "shiftRange", "ignoreRange", "noContentRange"}
 
 func (k faultKind) String() string { return faultNames[k] }
 
@@ -180,11 +182,14 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header = r.Header.Clone()
 	req.ContentLength = r.ContentLength
-	if f.kind == shiftRange {
+	switch f.kind {
+	case shiftRange:
 		var start, end int64
 		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err == nil {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+1, end))
 		}
+	case ignoreRange:
+		req.Header.Del("Range")
 	}
 	resp, err := p.transport.RoundTrip(req)
 	if err != nil {
@@ -197,15 +202,18 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 	for key, values := range resp.Header {
 		w.Header()[key] = values
 	}
-	if f.kind == shortChunked {
+	switch f.kind {
+	case shortChunked:
 		w.Header().Del("Content-Length")
+	case noContentRange:
+		w.Header().Del("Content-Range")
 	}
 	w.WriteHeader(resp.StatusCode)
 	p.setStatus(rec, resp.StatusCode)
 
 	body := &countingWriter{w: w, p: p, rec: rec}
 	switch f.kind {
-	case passThrough, shiftRange:
+	case passThrough, shiftRange, ignoreRange, noContentRange:
 		_, _ = io.Copy(body, resp.Body)
 	case trickle:
 		for {

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/upload"
 )
@@ -172,11 +174,12 @@ func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header htt
 
 	// Use the getHttpClient for retry with resume with range requests.
 	resp, err := c.getHttpClient.Do(req)
-	if err != nil && req.Header.Get("Range") != "" {
-		// Some CAS signed-range endpoints return 206 without Content-Range.
-		// httpseek correctly rejects that as a resumable HTTP response, but the
-		// original one-shot response is still usable, so retry without the
-		// resumable transport.
+	if err != nil && req.Header.Get("Range") != "" && (errors.Is(err, httpseek.ErrNoContentRange) || errors.Is(err, httpseek.ErrCodeForByteRange)) {
+		// Some CAS signed-range endpoints return 206 without Content-Range or
+		// the exact term bytes as 200. httpseek correctly rejects those as
+		// resumable responses, but the one-shot response is still usable, so
+		// fetch it without the resumable transport; any other range answer
+		// describes different bytes and stays an error.
 		resp, err = c.doWithNetworkRetry(req)
 	}
 	if err != nil {

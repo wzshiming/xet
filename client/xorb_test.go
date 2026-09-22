@@ -551,3 +551,62 @@ func TestDownloadXorbWithURLStatusBudget(t *testing.T) {
 		})
 	}
 }
+
+// TestDownloadXorbWithURLRangeAnswers pins how a ranged GET treats answers
+// httpseek rejects: the exact term bytes as 200 are still accepted through one
+// plain request, anything describing other bytes fails without a second try.
+func TestDownloadXorbWithURLRangeAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		status       int
+		contentRange string
+		body         string
+		wantBody     string // "" means the call must fail with wantErr
+		wantErr      string
+		wantRequests int32
+	}{
+		{"exact bytes as 200 from an offset", http.StatusOK, "", "term", "term", "", 2},
+		{"whole resource as 200 from an offset", http.StatusOK, "", "whole xorb", "", "status 200 OK", 2},
+		{"206 for another range", http.StatusPartialContent, "bytes 5-8/10", "erm?", "", "Content-Range", 1},
+		{"206 without Content-Range", http.StatusPartialContent, "", "term", "term", "", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if got := r.Header.Get("Range"); got != "bytes=4-7" {
+					t.Errorf("Range = %q, want bytes=4-7", got)
+				}
+				if tc.contentRange != "" {
+					w.Header().Set("Content-Range", tc.contentRange)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(WithRetryBackoff(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.DownloadXorbWithURL(t.Context(), srv.URL, http.Header{"Range": {"bytes=4-7"}})
+			if tc.wantBody == "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := io.ReadAll(r)
+				r.Close()
+				if err != nil || string(got) != tc.wantBody {
+					t.Fatalf("body = %q, %v; want %q", got, err, tc.wantBody)
+				}
+			}
+			if n := requests.Load(); n != tc.wantRequests {
+				t.Fatalf("requests = %d, want %d", n, tc.wantRequests)
+			}
+		})
+	}
+}
