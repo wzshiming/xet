@@ -136,9 +136,7 @@ func NewClient(opts ...Options) (*Client, error) {
 		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
 
-	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
-		transport.DisableKeepAlives = true
-	}
+	
 
 	c.getHttpClient = &http.Client{
 		CheckRedirect: c.httpClient.CheckRedirect,
