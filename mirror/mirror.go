@@ -52,6 +52,7 @@ const (
 	failureBackoffBase = 10 * time.Second
 	failureBackoffCap  = 10 * time.Minute
 	maxFailureShift    = 6
+	defaultMaxIngests  = 16
 )
 
 var (
@@ -102,6 +103,8 @@ type Mirror struct {
 	indexDir           string
 	spoolDir           string
 	revalidateInterval time.Duration
+	maxIngests         int
+	ingestSlots        chan struct{}
 
 	probeClient  *http.Client // does not follow redirects; used for metadata probes
 	fetchClient  *http.Client // follows redirects; body drops resume via httpseek
@@ -136,15 +139,12 @@ func WithUpstreamToken(token string) Option {
 	return func(m *Mirror) { m.upstreamToken = token }
 }
 
-// WithCacheDir sets the directory holding the persisted index and in-flight
-// spool files. Defaults to ./xet-mirror.
+// WithCacheDir stores indexes, spools and chunks under dir; defaults to ./xet-mirror.
 func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
 }
 
-// WithClient sets the xet client used for upstream xet downloads, letting
-// the caller configure it (chunk cache location, concurrency, ...). When
-// unset a default client is created.
+// WithClient sets the xet client used for upstream xet downloads; unset creates one caching chunks under the cache dir.
 func WithClient(c *client.Client) Option {
 	return func(m *Mirror) { m.xetClient = c }
 }
@@ -156,11 +156,17 @@ func WithRevalidateInterval(d time.Duration) Option {
 	return func(m *Mirror) { m.revalidateInterval = d }
 }
 
+// WithMaxConcurrentIngests limits active ingests; nonpositive values use 16.
+func WithMaxConcurrentIngests(n int) Option {
+	return func(m *Mirror) { m.maxIngests = n }
+}
+
 // NewMirror creates a mirror engine.
 func NewMirror(opts ...Option) (*Mirror, error) {
 	m := &Mirror{
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
+		maxIngests:         defaultMaxIngests,
 		entries:            map[resolveKey]*fileEntry{},
 		branches:           map[string]*branchEntry{},
 		commits:            map[string]*commitState{},
@@ -176,6 +182,10 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	if m.upstreamRaw == "" {
 		return nil, fmt.Errorf("mirror: upstream is required")
 	}
+	if m.maxIngests <= 0 {
+		m.maxIngests = defaultMaxIngests
+	}
+	m.ingestSlots = make(chan struct{}, m.maxIngests)
 	u, err := url.Parse(m.upstreamRaw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("mirror: invalid upstream URL %q", m.upstreamRaw)
@@ -191,7 +201,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
-	injecting := &authInjector{inner: baseTransport, host: u.Host, token: m.upstreamToken}
+	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout), host: u.Host, token: m.upstreamToken}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: injecting,
@@ -209,7 +219,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	if m.xetClient == nil {
-		m.xetClient, err = client.NewClient()
+		m.xetClient, err = client.NewClient(client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")))
 		if err != nil {
 			return nil, fmt.Errorf("mirror: create xet client: %w", err)
 		}
