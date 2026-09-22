@@ -493,3 +493,60 @@ func TestDownloadXorbWithURLRejectsWrongLengthOKResponse(t *testing.T) {
 		t.Fatalf("expected range response error, got %v", err)
 	}
 }
+
+// TestDownloadXorbWithURLStatusBudget pins the requests a ranged GET spends on
+// statuses: retryable ones up to retries+1 times, terminal ones once.
+func TestDownloadXorbWithURLStatusBudget(t *testing.T) {
+	const body = "term"
+	serve := func(statuses ...int) (*httptest.Server, *atomic.Int32) {
+		var requests atomic.Int32
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if n := int(requests.Add(1)); n <= len(statuses) {
+				http.Error(w, http.StatusText(statuses[n-1]), statuses[n-1])
+				return
+			}
+			w.Header().Set("Content-Range", "bytes 0-3/4")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, body)
+		})), &requests
+	}
+	for _, tc := range []struct {
+		name     string
+		statuses []int
+		want     int32
+		fails    bool
+	}{
+		{"503 twice then served", []int{503, 503}, 3, false},
+		{"429 then served", []int{429}, 2, false},
+		{"503 always", []int{503, 503, 503, 503}, 3, true},
+		{"404", []int{404}, 1, true},
+		{"401", []int{401}, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, requests := serve(tc.statuses...)
+			defer srv.Close()
+			c, err := NewClient(WithRetries(2))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.DownloadXorbWithURL(t.Context(), srv.URL, http.Header{"Range": {"bytes=0-3"}})
+			if tc.fails {
+				if err == nil || !strings.Contains(err.Error(), strconv.Itoa(tc.statuses[0])) {
+					t.Fatalf("err = %v, want status %d reported", err, tc.statuses[0])
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := io.ReadAll(r)
+				r.Close()
+				if err != nil || string(got) != body {
+					t.Fatalf("body = %q, %v", got, err)
+				}
+			}
+			if n := requests.Load(); n != tc.want {
+				t.Fatalf("requests = %d, want %d", n, tc.want)
+			}
+		})
+	}
+}

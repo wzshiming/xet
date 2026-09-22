@@ -136,13 +136,11 @@ func NewClient(opts ...Options) (*Client, error) {
 		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
 
-	
-
 	c.getHttpClient = &http.Client{
 		CheckRedirect: c.httpClient.CheckRedirect,
 		Jar:           c.httpClient.Jar,
 		Timeout:       c.httpClient.Timeout,
-		Transport: httpseek.NewMustReaderTransport(NewIdleTimeoutTransport(c.httpClient.Transport, c.idleTimeout),
+		Transport: httpseek.NewMustReaderTransport(&retryStatusTransport{base: NewIdleTimeoutTransport(c.httpClient.Transport, c.idleTimeout), c: c},
 			func(r *http.Request, retry int, err error) error {
 				if retry >= c.retryAttempts() {
 					var timeout interface{ Timeout() bool }
@@ -236,15 +234,43 @@ func isNetworkError(err error) bool {
 	return false
 }
 
-func isServerError(statusCode int) bool {
-	return statusCode == http.StatusInternalServerError ||
-		statusCode == http.StatusBadGateway ||
-		statusCode == http.StatusServiceUnavailable ||
-		statusCode == http.StatusGatewayTimeout
+// isRetryableStatus matches xet-core's transient set: 408, 429 and the 5xx gateway family.
+func isRetryableStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
 }
 
 func (c *Client) retryAttempts() int {
 	return max(c.retries+1, 1)
+}
+
+// retryStatusTransport re-sends GET/HEAD requests answered with a retryable
+// status. It sits below httpseek so a status on a resumed range open is retried
+// too, while network failures stay with httpseek's own resume handling.
+type retryStatusTransport struct {
+	base http.RoundTripper
+	c    *Client
+}
+
+func (t *retryStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		return t.base.RoundTrip(req)
+	}
+	attempts := t.c.retryAttempts()
+	for i := 1; ; i++ {
+		resp, err := t.base.RoundTrip(req)
+		if err != nil || !isRetryableStatus(resp.StatusCode) || i >= attempts {
+			return resp, err
+		}
+		resp.Body.Close()
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			return nil, fmt.Errorf("server error status %s: %w", resp.Status, ctxErr)
+		}
+	}
 }
 
 func resetRequestBody(req *http.Request) error {
@@ -288,7 +314,7 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 
 		resp, err := c.do(req)
 		if err == nil {
-			if isServerError(resp.StatusCode) {
+			if isRetryableStatus(resp.StatusCode) {
 				lastErr = fmt.Errorf("server error status %s", resp.Status)
 				resp.Body.Close()
 				if req.Context().Err() != nil {

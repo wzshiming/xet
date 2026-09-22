@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +174,131 @@ func TestTrickleBodyOutlivesIdleTimeoutWithoutRetry(t *testing.T) {
 		}
 	}
 	fx.assertCached(t, ctx, cacheDir)
+}
+
+// retryableStatuses are answered by retrying, matching xet-core's transient set.
+var retryableStatuses = []int{
+	http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+	http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+}
+
+// statusLog lists the status of each record in order.
+func statusLog(recs []record) []int {
+	out := make([]int, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.Status)
+	}
+	return out
+}
+
+// TestTransientStatusThenHeal answers the reconstruction query and the
+// multi-chunk range with a retryable status twice before serving them.
+func TestTransientStatusThenHeal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+
+	for _, status := range retryableStatuses {
+		for _, api := range []apiVersion{apiAuto, apiBatch} {
+			t.Run(fmt.Sprintf("%d/%s", status, api), func(t *testing.T) {
+				fx.proxy.arm(func(r record) fault {
+					if (r.reconstruction() || fx.big.match(r)) && r.Seq < 2 {
+						return fault{kind: injectStatus, status: status}
+					}
+					return fault{}
+				})
+				cacheDir := t.TempDir()
+				fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir), api)
+
+				recs := fx.proxy.settle(t)
+				if got, want := statusLog(filter(recs, record.reconstruction)), []int{status, status, http.StatusOK}; !slices.Equal(got, want) {
+					t.Fatalf("reconstruction statuses = %v, want %v", got, want)
+				}
+				gets := filter(recs, fx.big.match)
+				if got, want := statusLog(gets), []int{status, status, http.StatusPartialContent}; !slices.Equal(got, want) {
+					t.Fatalf("statuses for %s = %v, want %v: %+v", fx.big.rangeHeader(), got, want, gets)
+				}
+				if last := gets[2]; last.Fault != passThrough || last.Bytes != fx.big.end-fx.big.start+1 {
+					t.Fatalf("third request = %+v, want the full range served", last)
+				}
+				fx.assertCached(t, ctx, cacheDir)
+			})
+		}
+	}
+}
+
+// TestTransientStatusOnResumeThenHeal aborts the multi-chunk range mid-chunk
+// and answers the first two resume requests with 503 before serving them.
+func TestTransientStatusOnResumeThenHeal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	prefix := fx.midChunkPrefix(t, fx.big)
+	resume := fmt.Sprintf("bytes=%d-%d", fx.big.start+prefix, fx.big.end)
+	fx.proxy.arm(func(r record) fault {
+		switch {
+		case fx.big.match(r):
+			return fault{kind: abortBody, prefix: prefix}
+		case fx.big.within(prefix)(r) && r.Range == resume && r.Seq < 2:
+			return fault{kind: injectStatus, status: http.StatusServiceUnavailable}
+		}
+		return fault{}
+	})
+	cacheDir := t.TempDir()
+	fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir), apiV2)
+
+	gets := filter(fx.proxy.settle(t), fx.big.within(prefix))
+	want := []int{http.StatusPartialContent, http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusPartialContent}
+	if got := statusLog(gets); !slices.Equal(got, want) {
+		t.Fatalf("statuses = %v, want %v: %+v", got, want, gets)
+	}
+	if gets[0].Bytes != prefix || gets[3].Range != resume || gets[3].Bytes != fx.big.end-fx.big.start-prefix+1 {
+		t.Fatalf("requests = %+v, want %d bytes aborted and the rest served by the third resume", gets, prefix)
+	}
+	fx.assertCached(t, ctx, cacheDir)
+}
+
+// TestStatusBudgets pins how many requests a permanent status costs: retryable
+// ones retries+1, terminal ones a single request; the cache heals either way.
+func TestStatusBudgets(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	const retries = 2
+
+	for _, tc := range []struct {
+		name         string
+		match        func(record) bool
+		status, want int
+	}{
+		{"xorb 503", fx.big.match, http.StatusServiceUnavailable, retries + 1},
+		{"xorb 401", fx.big.match, http.StatusUnauthorized, 1},
+		{"xorb 404", fx.big.match, http.StatusNotFound, 1},
+		{"reconstruction 503", record.reconstruction, http.StatusServiceUnavailable, retries + 1},
+		{"reconstruction 401", record.reconstruction, http.StatusUnauthorized, 1},
+		{"reconstruction 404", record.reconstruction, http.StatusNotFound, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx.proxy.arm(func(r record) fault {
+				if tc.match(r) {
+					return fault{kind: injectStatus, status: tc.status}
+				}
+				return fault{}
+			})
+			cacheDir := t.TempDir()
+			err := fx.download(ctx, fx.proxyClient(t, cacheDir, client.WithRetries(retries)), apiV1, newOutput(t, nil))
+			if err == nil || !strings.Contains(err.Error(), strconv.Itoa(tc.status)) {
+				t.Fatalf("download error = %v, want status %d reported", err, tc.status)
+			}
+			got := statusLog(filter(fx.proxy.settle(t), tc.match))
+			if len(got) != tc.want || slices.Contains(got, http.StatusOK) || slices.Contains(got, http.StatusPartialContent) {
+				t.Fatalf("%s answered %v, want %d attempts", tc.name, got, tc.want)
+			}
+			if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.match); len(healed) != 1 {
+				t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
+			}
+		})
+	}
 }
 
 func v2Reconstruction(r record) bool {
