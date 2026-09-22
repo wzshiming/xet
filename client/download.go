@@ -23,6 +23,7 @@ const (
 // DownloadFile downloads and reconstructs a file from its hash into w,
 // automatically falling back to V1 if V2 is not supported. It seeks w to
 // determine the current size for resume support.
+// Full downloads are hash-verified; resumed suffixes are not.
 func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
 	return c.DownloadFileWithAuthProvider(ctx, nil, fileHash, w)
 }
@@ -125,7 +126,7 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.downloadOptions()...)
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.downloadOptions(fileHash, resumeOffset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
@@ -148,19 +149,21 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.downloadOptions()...)
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.downloadOptions(fileHash, resumeOffset)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
 	return reader, download.ExpectedLengthV2(reconstructionResp), nil
 }
 
-// downloadOptions returns the shared download options derived from the client
-// configuration.
-func (c *Client) downloadOptions() []download.Option {
+// Only full downloads have all chunks needed to verify fileHash.
+func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithCacheManager(c.cacheManager),
+	}
+	if resumeOffset == 0 {
+		opts = append(opts, download.WithExpectedFileHash(fileHash))
 	}
 	if c.progressFunc != nil {
 		opts = append(opts, download.WithProgressFunc(c.progressFunc))
@@ -172,6 +175,7 @@ func (c *Client) downloadOptions() []download.Option {
 // All files share one fetch_info map, so each xorb is fetched only once across the batch.
 // It returns a reader and size per file in the same order as fileHashes.
 // Individual errors are embedded per-entry; a nil reader means that file was not found.
+// Each reader verifies its content against the requested hash before EOF.
 // Readers release their cache references when read to EOF; close any reader
 // that is not fully consumed.
 func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.FileHash) ([]io.ReadCloser, []int64, error) {
@@ -207,7 +211,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		reader, err := download.NewReaderV1(ctx, c, singleResp, c.downloadOptions()...)
+		reader, err := download.NewReaderV1(ctx, c, singleResp, c.downloadOptions(fileHash, 0)...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

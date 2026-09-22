@@ -1,16 +1,25 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/xorb"
 )
 
 func TestGetReconstruction(t *testing.T) {
@@ -394,4 +403,271 @@ func TestGetReconstructionRangeErrorStatus(t *testing.T) {
 			}
 		}
 	}
+}
+
+// downloadFixture is a CAS stub holding one single-term xorb per file, served
+// through the V1, V2, and batch reconstruction APIs.
+type downloadFixture struct {
+	srv          *httptest.Server
+	hashes       []xet.FileHash
+	xorbHashes   []string
+	data         [][]byte // original file contents
+	served       [][]byte // encoded xorb bytes returned for each file
+	rejectRange  bool     // refuse Range reconstruction requests
+	offsetOnFull int64    // OffsetIntoFirstRange reported without a Range header
+}
+
+const fixtureChunkSize = 1000
+
+// encodeFixtureXorb encodes two incompressible chunks so a substituted xorb
+// has the same length as the original.
+func encodeFixtureXorb(t *testing.T, seed int64) (encoded, data []byte, xorbHash xet.XorbHash, fileHash xet.FileHash) {
+	t.Helper()
+	rng := rand.New(rand.NewSource(seed))
+	var buf bytes.Buffer
+	enc := xorb.NewEncoder(&buf, false)
+	var hashes []xet.ChunkHash
+	var sizes []uint64
+	for range 2 {
+		chunk := make([]byte, fixtureChunkSize)
+		rng.Read(chunk)
+		if _, err := enc.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, chunk...)
+		hashes = append(hashes, xet.ComputeChunkHash(chunk))
+		sizes = append(sizes, fixtureChunkSize)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), data, enc.SummoryHash(), xet.ComputeFileHash(hashes, sizes)
+}
+
+func newDownloadFixture(t *testing.T, seeds ...int64) *downloadFixture {
+	t.Helper()
+	f := &downloadFixture{}
+	for _, seed := range seeds {
+		encoded, data, xorbHash, fileHash := encodeFixtureXorb(t, seed)
+		f.hashes = append(f.hashes, fileHash)
+		f.xorbHashes = append(f.xorbHashes, xorbHash.String())
+		f.data = append(f.data, data)
+		f.served = append(f.served, encoded)
+	}
+	f.srv = httptest.NewServer(http.HandlerFunc(f.serveHTTP))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// substitute serves different bytes of the same length for file i.
+func (f *downloadFixture) substitute(t *testing.T, i int) {
+	t.Helper()
+	encoded, _, _, _ := encodeFixtureXorb(t, int64(100+i))
+	if len(encoded) != len(f.served[i]) {
+		t.Fatalf("substituted xorb is %d bytes, want %d", len(encoded), len(f.served[i]))
+	}
+	f.served[i] = encoded
+}
+
+func (f *downloadFixture) index(fileHash string) int {
+	for i, h := range f.hashes {
+		if h.String() == fileHash {
+			return i
+		}
+	}
+	return -1
+}
+
+func (f *downloadFixture) term(i int) download.Term {
+	return download.Term{Hash: f.xorbHashes[i], UnpackedLength: uint64(len(f.data[i])), Range: download.ChunkRange{Start: 0, End: 2}}
+}
+
+func (f *downloadFixture) fetchInfo(i int) download.FetchInfoEntry {
+	return download.FetchInfoEntry{
+		Range:    download.ChunkRange{Start: 0, End: 2},
+		URL:      f.srv.URL + "/xorbs/" + strconv.Itoa(i),
+		URLRange: download.ByteRange{Start: 0, End: int64(len(f.served[i]) - 1)},
+	}
+}
+
+func (f *downloadFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if name, ok := strings.CutPrefix(r.URL.Path, "/xorbs/"); ok {
+		i, err := strconv.Atoi(name)
+		if err != nil || i < 0 || i >= len(f.served) {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(f.served[i]))
+		return
+	}
+	if r.URL.Path == "/reconstructions" {
+		resp := download.BatchReconstructionResponse{Files: map[string][]download.Term{}, FetchInfo: map[string][]download.FetchInfoEntry{}}
+		for _, id := range r.URL.Query()["file_id"] {
+			if i := f.index(id); i >= 0 {
+				resp.Files[id] = []download.Term{f.term(i)}
+				resp.FetchInfo[f.xorbHashes[i]] = []download.FetchInfoEntry{f.fetchInfo(i)}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+	version, id, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/reconstructions/")
+	i := f.index(id)
+	if i < 0 {
+		http.NotFound(w, r)
+		return
+	}
+	offset := f.offsetOnFull
+	if rg := r.Header.Get("Range"); rg != "" {
+		if f.rejectRange {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if _, err := fmt.Sscanf(rg, "bytes=%d-", &offset); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+	}
+	var resp any
+	switch version {
+	case "v1":
+		resp = download.ReconstructionResponseV1{
+			OffsetIntoFirstRange: offset,
+			Terms:                []download.Term{f.term(i)},
+			FetchInfo:            map[string][]download.FetchInfoEntry{f.xorbHashes[i]: {f.fetchInfo(i)}},
+		}
+	case "v2":
+		info := f.fetchInfo(i)
+		resp = download.ReconstructionResponseV2{
+			OffsetIntoFirstRange: offset,
+			Terms:                []download.Term{f.term(i)},
+			Xorbs: map[string][]download.XorbMultiRangeFetch{f.xorbHashes[i]: {{
+				URL:    info.URL,
+				Ranges: []download.XorbRangeDescriptor{{Chunks: info.Range, Bytes: info.URLRange}},
+			}}},
+		}
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// downloadInto runs one client download entry point into a temp file that
+// already holds prefix, and returns the file contents.
+func downloadInto(t *testing.T, prefix []byte, do func(w io.WriteSeeker) error) ([]byte, error) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write(prefix); err != nil {
+		t.Fatal(err)
+	}
+	doErr := do(f)
+	got, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got, doErr
+}
+
+func wantHashMismatch(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+		t.Fatalf("err = %v, want file hash mismatch", err)
+	}
+}
+
+// TestDownloadFileVerifiesFileHash pins that whole downloads (including a
+// restart after a rejected resume) are verified against the requested hash,
+// while a true resume keeps appending the suffix unverified.
+func TestDownloadFileVerifiesFileHash(t *testing.T) {
+	entryPoints := map[string]func(c *Client, ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error{
+		"v1": (*Client).DownloadFileV1,
+		"v2": (*Client).DownloadFileV2,
+	}
+	ctx := context.Background()
+	for name, downloadFile := range entryPoints {
+		t.Run(name, func(t *testing.T) {
+			run := func(t *testing.T, fx *downloadFixture, prefix []byte) ([]byte, error) {
+				t.Helper()
+				c, err := NewClient(WithBaseURL(fx.srv.URL), WithCacheDir(t.TempDir()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return downloadInto(t, prefix, func(w io.WriteSeeker) error {
+					return downloadFile(c, ctx, fx.hashes[0], w)
+				})
+			}
+
+			t.Run("full", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				if got, err := run(t, fx, nil); err != nil || !bytes.Equal(got, fx.data[0]) {
+					t.Fatalf("got %d bytes, err %v; want %d bytes", len(got), err, len(fx.data[0]))
+				}
+			})
+
+			t.Run("full substituted", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.substitute(t, 0)
+				_, err := run(t, fx, nil)
+				wantHashMismatch(t, err)
+			})
+
+			t.Run("resume", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				prefix := fx.data[0][:fixtureChunkSize+1]
+				if got, err := run(t, fx, prefix); err != nil || !bytes.Equal(got, fx.data[0]) {
+					t.Fatalf("got %d bytes, err %v; want %d bytes", len(got), err, len(fx.data[0]))
+				}
+			})
+
+			t.Run("restart after rejected resume", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.rejectRange = true
+				prefix := fx.data[0][:fixtureChunkSize+1]
+				if got, err := run(t, fx, prefix); err != nil || !bytes.Equal(got, fx.data[0]) {
+					t.Fatalf("got %d bytes, err %v; want %d bytes", len(got), err, len(fx.data[0]))
+				}
+				fx.substitute(t, 0)
+				_, err := run(t, fx, prefix)
+				wantHashMismatch(t, err)
+			})
+
+			t.Run("offset in full response", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.offsetOnFull = 1
+				if _, err := run(t, fx, nil); err == nil {
+					t.Fatal("expected an error: a full download cannot verify a partial reconstruction")
+				}
+			})
+		})
+	}
+}
+
+// TestDownloadFilesVerifiesFileHash pins per-file verification of batch
+// downloads: a substituted xorb fails only the reader of that file.
+func TestDownloadFilesVerifiesFileHash(t *testing.T) {
+	fx := newDownloadFixture(t, 1, 2)
+	fx.substitute(t, 1)
+	c, err := NewClient(WithBaseURL(fx.srv.URL), WithCacheDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readers, sizes, err := c.DownloadFiles(context.Background(), fx.hashes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range readers {
+		defer r.Close()
+	}
+	got, err := io.ReadAll(readers[0])
+	if err != nil || !bytes.Equal(got, fx.data[0]) || sizes[0] != int64(len(fx.data[0])) {
+		t.Fatalf("file 0: got %d bytes (size %d), err %v", len(got), sizes[0], err)
+	}
+	_, err = io.ReadAll(readers[1])
+	wantHashMismatch(t, err)
 }

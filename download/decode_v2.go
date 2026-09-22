@@ -18,6 +18,7 @@ type ReaderV2 struct {
 	skipBytes      int64
 	termFetches    []selectedFetch
 	prefetcher     *prefetcher
+	verifier       *fileVerifier
 
 	// State for reading
 	termIdx      int
@@ -41,6 +42,10 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	if cache == nil {
 		return nil, fmt.Errorf("no cache manager provided")
 	}
+	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
+	if err != nil {
+		return nil, err
+	}
 	// Adopt pre-existing entries and clean up orphaned partial files before
 	// the download starts; only the manager's first prepare walks the cache
 	// directory.
@@ -63,6 +68,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		skipBytes:      reconstruction.OffsetIntoFirstRange,
 		termFetches:    termFetches,
 		prefetcher:     prefetcher,
+		verifier:       verifier,
 	}, nil
 }
 
@@ -77,6 +83,16 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 	for n < len(p) {
 		// Check if we're done with all terms
 		if r.termIdx >= len(r.reconstruction.Terms) {
+			if r.verifier != nil {
+				if err := r.verifier.verify(); err != nil {
+					r.err = err
+					r.cleanup()
+					if n > 0 {
+						return n, nil
+					}
+					return 0, err
+				}
+			}
 			r.cleanup()
 			return n, io.EOF
 		}
@@ -111,6 +127,11 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		}
 
 		data := buf[:size]
+
+		// A chunk is re-read when Read returns mid-chunk; hash it only on its first visit.
+		if r.verifier != nil && r.chunkOffset == 0 {
+			r.verifier.add(data)
+		}
 
 		// Apply OffsetIntoFirstRange skip; it may span multiple leading chunks
 		if r.termIdx == 0 && r.skipBytes > 0 {
