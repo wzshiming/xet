@@ -2,6 +2,7 @@ package chaos_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,9 +28,10 @@ const (
 	shortChunked           // relay prefix bytes without Content-Length, then end the response cleanly
 	trickle                // relay piece bytes every gap on a live connection
 	injectStatus           // answer status without forwarding
+	shiftRange             // forward with the Range start moved one byte later, so the 206 describes another range
 )
 
-var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus"}
+var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus", "shiftRange"}
 
 func (k faultKind) String() string { return faultNames[k] }
 
@@ -178,6 +180,12 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header = r.Header.Clone()
 	req.ContentLength = r.ContentLength
+	if f.kind == shiftRange {
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err == nil {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start+1, end))
+		}
+	}
 	resp, err := p.transport.RoundTrip(req)
 	if err != nil {
 		p.setStatus(rec, http.StatusBadGateway)
@@ -197,7 +205,7 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 
 	body := &countingWriter{w: w, p: p, rec: rec}
 	switch f.kind {
-	case passThrough:
+	case passThrough, shiftRange:
 		_, _ = io.Copy(body, resp.Body)
 	case trickle:
 		for {

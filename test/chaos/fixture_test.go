@@ -23,6 +23,7 @@ import (
 
 const (
 	idleTimeout = 200 * time.Millisecond
+	backoffBase = 2 * time.Millisecond // keeps retries quick; TestRetryBackoffSpacesAttempts raises it
 	testTimeout = 15 * time.Second
 )
 
@@ -146,6 +147,7 @@ func newClient(t *testing.T, baseURL, cacheDir string, opts ...client.Options) *
 		client.WithCacheDir(cacheDir),
 		client.WithHTTPClient(&http.Client{Transport: transport}),
 		client.WithIdleTimeout(idleTimeout),
+		client.WithRetryBackoff(backoffBase),
 	}, opts...)
 	c, err := client.NewClient(opts...)
 	if err != nil {

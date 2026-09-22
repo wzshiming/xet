@@ -301,6 +301,77 @@ func TestStatusBudgets(t *testing.T) {
 	}
 }
 
+// TestRetryBackoffSpacesAttempts answers the reconstruction query and the
+// multi-chunk range with 503 three times: every retry must start no sooner
+// than half the doubled base after the previous answer, the jitter floor.
+func TestRetryBackoffSpacesAttempts(t *testing.T) {
+	const base = 40 * time.Millisecond
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	fx.proxy.arm(func(r record) fault {
+		if (r.reconstruction() || fx.big.match(r)) && r.Seq < 3 {
+			return fault{kind: injectStatus, status: http.StatusServiceUnavailable}
+		}
+		return fault{}
+	})
+	cacheDir := t.TempDir()
+	fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, client.WithRetryBackoff(base)), apiV1)
+
+	recs := fx.proxy.settle(t)
+	for _, path := range []struct {
+		name string
+		recs []record
+		ok   int
+	}{
+		{"reconstruction", filter(recs, record.reconstruction), http.StatusOK},
+		{"xorb", filter(recs, fx.big.match), http.StatusPartialContent},
+	} {
+		if got, want := statusLog(path.recs), []int{503, 503, 503, path.ok}; !slices.Equal(got, want) {
+			t.Fatalf("%s statuses = %v, want %v", path.name, got, want)
+		}
+		for i := 1; i < len(path.recs); i++ {
+			gap, floor := path.recs[i].Start.Sub(path.recs[i-1].End), base<<(i-1)/2
+			t.Logf("%s retry %d started %v after the previous answer (floor %v)", path.name, i, gap, floor)
+			if gap < floor {
+				t.Fatalf("%s retry %d started %v after the previous answer, want at least %v", path.name, i, gap, floor)
+			}
+		}
+	}
+	fx.assertCached(t, ctx, cacheDir)
+}
+
+// TestWrongContentRangeOnResumeFails aborts the multi-chunk range mid-chunk and
+// answers its resume with a 206 for a shifted range: the download must fail
+// without accepting the bytes or re-asking for the same deterministic answer.
+func TestWrongContentRangeOnResumeFails(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	prefix := fx.midChunkPrefix(t, fx.big)
+	fx.proxy.arm(func(r record) fault {
+		switch {
+		case fx.big.match(r):
+			return fault{kind: abortBody, prefix: prefix}
+		case fx.big.within(prefix)(r):
+			return fault{kind: shiftRange}
+		}
+		return fault{}
+	})
+	cacheDir := t.TempDir()
+	err := fx.download(ctx, fx.proxyClient(t, cacheDir), apiV2, newOutput(t, nil))
+	if err == nil || !strings.Contains(err.Error(), "Content-Range") {
+		t.Fatalf("download error = %v, want the Content-Range mismatch reported", err)
+	}
+	gets := filter(fx.proxy.settle(t), fx.big.within(prefix))
+	if len(gets) != 2 || gets[0].Fault != abortBody || gets[1].Fault != shiftRange || gets[1].Status != http.StatusPartialContent {
+		t.Fatalf("requests = %+v, want the aborted response and a single shifted resume", gets)
+	}
+	if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.within(prefix)); len(healed) != 1 {
+		t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
+	}
+}
+
 func v2Reconstruction(r record) bool {
 	return r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/v2/reconstructions/")
 }

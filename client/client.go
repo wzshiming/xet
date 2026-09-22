@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"time"
@@ -13,6 +14,11 @@ import (
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
+
+// DefaultRetryBackoff is the default wait before the first retry; each further retry doubles it up to maxRetryBackoff.
+const DefaultRetryBackoff = 500 * time.Millisecond
+
+const maxRetryBackoff = 5 * time.Second
 
 // AuthProvider provides dynamic base URL and access token values.
 type AuthProvider interface {
@@ -29,6 +35,7 @@ type Client struct {
 	namespace     string
 	concurrency   int
 	retries       int
+	retryBackoff  time.Duration
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cacheDir      string
@@ -92,6 +99,15 @@ func WithRetries(retries int) Options {
 	}
 }
 
+// WithRetryBackoff sets the wait before the first retry (default
+// DefaultRetryBackoff); each further retry doubles it, capped at 5s, with the
+// actual wait drawn from the upper half of that value. Values <= 0 disable waiting.
+func WithRetryBackoff(base time.Duration) Options {
+	return func(c *Client) {
+		c.retryBackoff = base
+	}
+}
+
 // WithIdleTimeout sets the GET/HEAD read-idle timeout (default DefaultIdleTimeout; <= 0 disables it).
 func WithIdleTimeout(timeout time.Duration) Options {
 	return func(c *Client) {
@@ -119,12 +135,13 @@ func WithCacheSize(sizeBytes int64) Options {
 // NewClient creates a new API client
 func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
-		httpClient:  &http.Client{},
-		namespace:   "default",
-		concurrency: 4,
-		retries:     5,
-		idleTimeout: DefaultIdleTimeout,
-		cacheSize:   download.DefaultCacheSize,
+		httpClient:   &http.Client{},
+		namespace:    "default",
+		concurrency:  4,
+		retries:      5,
+		retryBackoff: DefaultRetryBackoff,
+		idleTimeout:  DefaultIdleTimeout,
+		cacheSize:    download.DefaultCacheSize,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -142,6 +159,9 @@ func NewClient(opts ...Options) (*Client, error) {
 		Timeout:       c.httpClient.Timeout,
 		Transport: httpseek.NewMustReaderTransport(&retryStatusTransport{base: NewIdleTimeoutTransport(c.httpClient.Transport, c.idleTimeout), c: c},
 			func(r *http.Request, retry int, err error) error {
+				if !isRetryableRead(err) {
+					return err
+				}
 				if retry >= c.retryAttempts() {
 					var timeout interface{ Timeout() bool }
 					if errors.As(err, &timeout) && timeout.Timeout() {
@@ -149,7 +169,7 @@ func NewClient(opts ...Options) (*Client, error) {
 					}
 					return fmt.Errorf("max retries reached: %w", err)
 				}
-				return nil
+				return c.waitRetry(r.Context(), retry, err)
 			}),
 	}
 
@@ -244,8 +264,57 @@ func isRetryableStatus(statusCode int) bool {
 	return false
 }
 
+// isRetryableRead reports whether httpseek should reopen after err: its
+// protocol errors describe the server's answer and would repeat, so only
+// transport failures are retried.
+func isRetryableRead(err error) bool {
+	for _, protocol := range []error{
+		httpseek.ErrUnsupported, httpseek.ErrCodeForByteRange, httpseek.ErrNoContentRange,
+		httpseek.ErrInvalidContentRange, httpseek.ErrContentChanged, httpseek.ErrRangeNotSatisfiable, httpseek.ErrSizeUnknown,
+	} {
+		if errors.Is(err, protocol) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Client) retryAttempts() int {
 	return max(c.retries+1, 1)
+}
+
+// retryDelay returns the wait before retry number retry (0-based): equal jitter over the doubled base, capped.
+func (c *Client) retryDelay(retry int) time.Duration {
+	d := c.retryBackoff
+	if d <= 0 {
+		return 0
+	}
+	for i := 0; i < retry && d < maxRetryBackoff; i++ {
+		d *= 2
+	}
+	d = min(d, maxRetryBackoff)
+	return d/2 + rand.N(d/2+1)
+}
+
+// waitRetry sleeps retryDelay(retry) unless ctx ends first; a finished context
+// returns err joined with the context error so both stay visible to errors.Is.
+func (c *Client) waitRetry(ctx context.Context, retry int, err error) error {
+	if d := c.retryDelay(retry); d > 0 && ctx.Err() == nil {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+	}
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return nil
+	}
+	if errors.Is(err, ctxErr) {
+		return err
+	}
+	return errors.Join(err, ctxErr)
 }
 
 // retryStatusTransport re-sends GET/HEAD requests answered with a retryable
@@ -267,8 +336,8 @@ func (t *retryStatusTransport) RoundTrip(req *http.Request) (*http.Response, err
 			return resp, err
 		}
 		resp.Body.Close()
-		if ctxErr := req.Context().Err(); ctxErr != nil {
-			return nil, fmt.Errorf("server error status %s: %w", resp.Status, ctxErr)
+		if err := t.c.waitRetry(req.Context(), i-1, fmt.Errorf("server error status %s", resp.Status)); err != nil {
+			return nil, err
 		}
 	}
 }
@@ -307,6 +376,10 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 	var lastErr error
 	for i := range attempts {
 		if i > 0 {
+			if err := c.waitRetry(req.Context(), i-1, lastErr); err != nil {
+				lastErr = err
+				break
+			}
 			if err := resetRequestBody(req); err != nil {
 				return nil, fmt.Errorf("reset request body: %w", err)
 			}
@@ -317,9 +390,6 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 			if isRetryableStatus(resp.StatusCode) {
 				lastErr = fmt.Errorf("server error status %s", resp.Status)
 				resp.Body.Close()
-				if req.Context().Err() != nil {
-					break
-				}
 				continue
 			}
 			return resp, nil
@@ -328,9 +398,6 @@ func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("do request: %w", err)
 		}
 		lastErr = err
-		if req.Context().Err() != nil {
-			break
-		}
 	}
 
 	return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
