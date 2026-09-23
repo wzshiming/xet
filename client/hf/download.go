@@ -103,6 +103,8 @@ func normalizeRepoType(repoType string) string {
 		return "dataset"
 	case "space", "spaces":
 		return "space"
+	case "kernel", "kernels":
+		return "kernel"
 	default:
 		return ""
 	}

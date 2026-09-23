@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestResolveHuggingFace(t *testing.T) {
@@ -171,6 +172,31 @@ func TestResolveReadWithExplicitTarget(t *testing.T) {
 		t.Fatalf("Token returned error: %v", err)
 	}
 	if token != "cas-read-token" {
+		t.Fatalf("unexpected token: %s", token)
+	}
+}
+
+func TestResolveReadKernelTarget(t *testing.T) {
+	const wantPath = "/api/kernels/org/repo/xet-read-token/main"
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wantPath {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, `{"casUrl":"https://cas-download.example.com","accessToken":"cas-kernel-token","exp":9876}`)
+	}))
+	defer tokenSrv.Close()
+
+	target := Target{Endpoint: tokenSrv.URL, RepoType: "kernels", RepoID: "org/repo", Revision: "main"}
+
+	provider := NewReadTokenProvider(&http.Client{Timeout: 5 * time.Second}, target, "hf-token")
+	token, err := provider.Token(context.Background())
+	if err != nil {
+		t.Fatalf("Token returned error: %v", err)
+	}
+	if token != "cas-kernel-token" {
 		t.Fatalf("unexpected token: %s", token)
 	}
 }
