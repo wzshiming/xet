@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -199,9 +200,7 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for key, values := range resp.Header {
-		w.Header()[key] = values
-	}
+	maps.Copy(w.Header(), resp.Header)
 	switch f.kind {
 	case shortChunked:
 		w.Header().Del("Content-Length")

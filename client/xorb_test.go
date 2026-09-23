@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -69,9 +70,9 @@ func TestDownloadXorbWithURLStalledHeadersFailAfterRetries(t *testing.T) {
 		t.Fatalf("parent context ended: %v", ctx.Err())
 	}
 	srv.Close() // returns once every stalled handler has seen its connection dropped
-	// retries=1 lets the httpseek handler pass retry indices 0..1 before failing.
-	if n := attempts.Load(); n != 3 {
-		t.Fatalf("attempts = %d, want 3", n)
+	// retries=1 allows one reopen after the first stalled attempt.
+	if n := attempts.Load(); n != 2 {
+		t.Fatalf("attempts = %d, want 2", n)
 	}
 	if seen, got := requests.Load(), observedCancel.Load(); seen == 0 || got != seen {
 		t.Fatalf("handlers observing cancel = %d of %d requests", got, seen)
@@ -608,5 +609,206 @@ func TestDownloadXorbWithURLRangeAnswers(t *testing.T) {
 				t.Fatalf("requests = %d, want %d", n, tc.wantRequests)
 			}
 		})
+	}
+}
+
+// scriptResource is the ranged resource behind the scripted servers below; bytes=4-7 reads "term".
+const scriptResource = "0123term89"
+
+// TestDownloadXorbWithURLFallbackChecksContentRange answers the resumable open
+// with a 206 lacking Content-Range and the one-shot fallback with a 206 that
+// carries one: its bytes are taken only when it describes the requested range.
+func TestDownloadXorbWithURLFallbackChecksContentRange(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		contentRange string
+		start, end   int // bytes the fallback serves
+		ok           bool
+	}{
+		{"requested range", "bytes 4-7/10", 4, 7, true},
+		{"unknown total", "bytes 4-7/*", 4, 7, true},
+		{"shifted range", "bytes 5-8/10", 5, 8, false},
+		{"shorter range", "bytes 4-6/10", 4, 6, false},
+		{"missing total", "bytes 4-7/", 4, 7, false},
+		{"invalid total", "bytes 4-7/garbage", 4, 7, false},
+		{"trailing total data", "bytes 4-7/10junk", 4, 7, false},
+		{"impossible total", "bytes 4-7/7", 4, 7, false},
+		{"signed total", "bytes 4-7/+10", 4, 7, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Range"); got != "bytes=4-7" {
+					t.Errorf("Range = %q, want bytes=4-7", got)
+				}
+				if requests.Add(1) == 1 {
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = io.WriteString(w, scriptResource[4:8])
+					return
+				}
+				w.Header().Set("Content-Range", tc.contentRange)
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = io.WriteString(w, scriptResource[tc.start:tc.end+1])
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(WithRetryBackoff(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.DownloadXorbWithURL(t.Context(), srv.URL, http.Header{"Range": {"bytes=4-7"}})
+			if !tc.ok {
+				if err == nil || !strings.Contains(err.Error(), "Content-Range") {
+					t.Fatalf("err = %v, want the Content-Range mismatch reported", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(r)
+				r.Close()
+				if err != nil || string(body) != "term" {
+					t.Fatalf("body = %q, %v; want term", body, err)
+				}
+			}
+			if n := requests.Load(); n != 2 {
+				t.Fatalf("requests = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// answer is one scripted reply to a ranged GET for scriptResource.
+type answer int
+
+const (
+	answer503   answer = iota // retryable status
+	answerDrop                // transport error before headers
+	answerServe               // 206 for the requested range
+	answerCut                 // 206 whose body delivers two bytes, then fails
+)
+
+var errDropped = errors.New("connection dropped")
+
+// scriptTransport replies to each request with the next answer in script,
+// cycling through it, and counts attempts.
+func scriptTransport(attempts *atomic.Int32, script ...answer) http.RoundTripper {
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		n := int(attempts.Add(1))
+		var start, end int64
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			return nil, fmt.Errorf("unexpected Range %q", r.Header.Get("Range"))
+		}
+		a := script[(n-1)%len(script)]
+		switch a {
+		case answer503:
+			return &http.Response{StatusCode: 503, Status: "503 Service Unavailable", Header: http.Header{}, Body: http.NoBody, Request: r}, nil
+		case answerDrop:
+			return nil, errDropped
+		}
+		body := io.Reader(strings.NewReader(scriptResource[start : end+1]))
+		if a == answerCut {
+			body = io.MultiReader(strings.NewReader(scriptResource[start:start+2]), iotest.ErrReader(errDropped))
+		}
+		header := http.Header{"Content-Range": {fmt.Sprintf("bytes %d-%d/%d", start, end, len(scriptResource))}}
+		return &http.Response{StatusCode: 206, Status: "206 Partial Content", Header: header, ContentLength: end - start + 1, Body: io.NopCloser(body), Request: r}, nil
+	})
+}
+
+// readXorb downloads url and drains it, reporting the first failure of either step.
+func readXorb(ctx context.Context, c *Client, url string) ([]byte, error) {
+	r, err := c.DownloadXorbWithURL(ctx, url, http.Header{"Range": {"bytes=4-7"}})
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+// TestDownloadXorbWithURLMixedFaultBudget interleaves retryable statuses,
+// transport drops and a mid-body cut on one ranged GET with WithRetries(2):
+// all failures share one budget, so three attempts without received bytes end
+// the download, and bytes received in between start the count over.
+func TestDownloadXorbWithURLMixedFaultBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		script  []answer
+		wantErr string // "" means the download must yield term
+		want    int32  // attempts
+	}{
+		{"status then drop then served", []answer{answer503, answerDrop, answerServe}, "", 3},
+		{"drop then status then served", []answer{answerDrop, answer503, answerServe}, "", 3},
+		{"status and drop alternate", []answer{answer503, answerDrop}, "503", 3},
+		{"drop and status alternate", []answer{answerDrop, answer503}, "connection dropped", 3},
+		{"served one attempt too late", []answer{answer503, answerDrop, answer503, answerServe}, "503", 3},
+		{"cut body then status then served", []answer{answerCut, answer503, answerServe}, "", 3},
+		{"cut body then status then drop", []answer{answerCut, answer503, answerDrop, answerServe}, "connection dropped", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			c, err := NewClient(WithHTTPClient(&http.Client{Transport: scriptTransport(&attempts, tc.script...)}), WithRetries(2), WithRetryBackoff(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := readXorb(t.Context(), c, "http://cas/xorb")
+			if tc.wantErr == "" && (err != nil || string(got) != "term") {
+				t.Errorf("body = %q, %v; want term", got, err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("err = %v, want %q reported", err, tc.wantErr)
+			}
+			if n := attempts.Load(); n != tc.want {
+				t.Errorf("attempts = %d, want %d", n, tc.want)
+			}
+		})
+	}
+}
+
+// TestDownloadXorbWithURLBudgetIsPerDownload runs two downloads on one client
+// that each need two retries, holding the first download's serving attempt
+// until the second has failed once: a budget shared across downloads would
+// run out, separate budgets let both finish.
+func TestDownloadXorbWithURLBudgetIsPerDownload(t *testing.T) {
+	var attemptsA, attemptsB atomic.Int32
+	scriptA := scriptTransport(&attemptsA, answer503, answer503, answerServe)
+	scriptB := scriptTransport(&attemptsB, answer503, answer503, answerServe)
+	bFailed := make(chan struct{})
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/b" {
+			resp, err := scriptB.RoundTrip(r)
+			if attemptsB.Load() == 1 {
+				close(bFailed)
+			}
+			return resp, err
+		}
+		if attemptsA.Load() == 2 {
+			<-bFailed
+		}
+		return scriptA.RoundTrip(r)
+	})
+	c, err := NewClient(WithHTTPClient(&http.Client{Transport: transport}), WithRetries(2), WithRetryBackoff(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		got []byte
+		err error
+	}
+	results := make(chan result, 2)
+	for _, path := range []string{"/a", "/b"} {
+		go func() {
+			got, err := readXorb(ctx, c, "http://cas"+path)
+			results <- result{got, err}
+		}()
+	}
+	for range 2 {
+		if r := <-results; r.err != nil || string(r.got) != "term" {
+			t.Fatalf("body = %q, %v; want term", r.got, r.err)
+		}
+	}
+	if a, b := attemptsA.Load(), attemptsB.Load(); a != 3 || b != 3 {
+		t.Fatalf("attempts: a %d, b %d; want 3 each", a, b)
 	}
 }

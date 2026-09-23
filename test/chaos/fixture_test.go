@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	idleTimeout = 200 * time.Millisecond
-	backoffBase = 2 * time.Millisecond // keeps retries quick; TestRetryBackoffSpacesAttempts raises it
+	idleTimeout = 200 * time.Millisecond // stall and trickle tests opt in with client.WithIdleTimeout(idleTimeout)
+	backoffBase = 2 * time.Millisecond   // keeps retries quick; TestRetryBackoffSpacesAttempts raises it
 	testTimeout = 15 * time.Second
 )
 
@@ -138,6 +138,7 @@ func deterministicData(size int) []byte {
 }
 
 // newClient returns a client on an owned transport that is drained at cleanup.
+// The idle timeout is generous so only tests that stall opt in to a short one.
 func newClient(t *testing.T, baseURL, cacheDir string, opts ...client.Options) *client.Client {
 	t.Helper()
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -146,7 +147,7 @@ func newClient(t *testing.T, baseURL, cacheDir string, opts ...client.Options) *
 		client.WithBaseURL(baseURL),
 		client.WithCacheDir(cacheDir),
 		client.WithHTTPClient(&http.Client{Transport: transport}),
-		client.WithIdleTimeout(idleTimeout),
+		client.WithIdleTimeout(testTimeout),
 		client.WithRetryBackoff(backoffBase),
 	}, opts...)
 	c, err := client.NewClient(opts...)

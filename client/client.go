@@ -158,22 +158,53 @@ func NewClient(opts ...Options) (*Client, error) {
 		Jar:           c.httpClient.Jar,
 		Timeout:       c.httpClient.Timeout,
 		Transport: httpseek.NewMustReaderTransport(&retryStatusTransport{base: NewIdleTimeoutTransport(c.httpClient.Transport, c.idleTimeout), c: c},
-			func(r *http.Request, retry int, err error) error {
+			func(r *http.Request, _ int, err error) error {
 				if !isRetryableRead(err) {
 					return err
 				}
-				if retry >= c.retryAttempts() {
+				budget := budgetFrom(r.Context())
+				if !budget.spend() {
 					var timeout interface{ Timeout() bool }
 					if errors.As(err, &timeout) && timeout.Timeout() {
 						return err // unwrapped so url.Error.Timeout stays true
 					}
 					return fmt.Errorf("max retries reached: %w", err)
 				}
-				return c.waitRetry(r.Context(), retry, err)
+				return c.waitRetry(r.Context(), budget.failures-1, err)
 			}),
 	}
 
 	return c, nil
+}
+
+// retryBudget counts one download's failed attempts since bytes last arrived;
+// the status transport and httpseek's reopen handler share it through the
+// request context.
+type retryBudget struct {
+	retries  int
+	failures int
+}
+
+type retryBudgetKey struct{}
+
+// withRetryBudget gives ctx a fresh budget of c.retries.
+func (c *Client) withRetryBudget(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryBudgetKey{}, &retryBudget{retries: c.retries})
+}
+
+// budgetFrom returns the request's budget; nil, for a request without one, allows no retry.
+func budgetFrom(ctx context.Context) *retryBudget {
+	b, _ := ctx.Value(retryBudgetKey{}).(*retryBudget)
+	return b
+}
+
+// spend records a failed attempt and reports whether a retry is still allowed.
+func (b *retryBudget) spend() bool {
+	if b == nil {
+		return false
+	}
+	b.failures++
+	return b.failures <= b.retries
 }
 
 type Usage struct {
@@ -318,8 +349,9 @@ func (c *Client) waitRetry(ctx context.Context, retry int, err error) error {
 }
 
 // retryStatusTransport re-sends GET/HEAD requests answered with a retryable
-// status. It sits below httpseek so a status on a resumed range open is retried
-// too, while network failures stay with httpseek's own resume handling.
+// status while the download's budget lasts and resets that budget as body
+// bytes arrive. It sits below httpseek so a status on a resumed range open is
+// retried too, while transport failures stay with httpseek's reopen handling.
 type retryStatusTransport struct {
 	base http.RoundTripper
 	c    *Client
@@ -329,17 +361,40 @@ func (t *retryStatusTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		return t.base.RoundTrip(req)
 	}
-	attempts := t.c.retryAttempts()
-	for i := 1; ; i++ {
+	budget := budgetFrom(req.Context())
+	for {
 		resp, err := t.base.RoundTrip(req)
-		if err != nil || !isRetryableStatus(resp.StatusCode) || i >= attempts {
-			return resp, err
+		if err != nil {
+			return nil, err
 		}
-		resp.Body.Close()
-		if err := t.c.waitRetry(req.Context(), i-1, fmt.Errorf("server error status %s", resp.Status)); err != nil {
+		if !isRetryableStatus(resp.StatusCode) {
+			if budget != nil {
+				resp.Body = &progressBody{ReadCloser: resp.Body, budget: budget}
+			}
+			return resp, nil
+		}
+		if !budget.spend() {
+			return resp, nil
+		}
+		_ = resp.Body.Close()
+		if err := t.c.waitRetry(req.Context(), budget.failures-1, fmt.Errorf("server error status %s", resp.Status)); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// progressBody resets the download's retry budget whenever bytes arrive.
+type progressBody struct {
+	io.ReadCloser
+	budget *retryBudget
+}
+
+func (b *progressBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.budget.failures = 0
+	}
+	return n, err
 }
 
 func resetRequestBody(req *http.Request) error {

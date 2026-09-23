@@ -62,7 +62,7 @@ func TestXorbHeaderStallOnceThenHeal(t *testing.T) {
 			})
 			cacheDir := t.TempDir()
 			began := time.Now()
-			fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir), api)
+			fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, client.WithIdleTimeout(idleTimeout)), api)
 			if elapsed := time.Since(began); elapsed < idleTimeout {
 				t.Fatalf("download took %v, expected it to outlive the idle timeout %v", elapsed, idleTimeout)
 			}
@@ -109,7 +109,11 @@ func TestXorbBodyFaultResumesAtWireOffset(t *testing.T) {
 					return fault{}
 				})
 				cacheDir := t.TempDir()
-				fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir), api)
+				var opts []client.Options
+				if tc.kind == stallBody || tc.kind == resetBody { // the client may only notice a reset through the idle guard
+					opts = append(opts, client.WithIdleTimeout(idleTimeout))
+				}
+				fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, opts...), api)
 
 				gets := filter(fx.proxy.settle(t), fx.big.within(prefix))
 				if len(gets) != 2 || gets[0].Fault != tc.kind || gets[0].Range != fx.big.rangeHeader() || gets[0].Status != http.StatusPartialContent || gets[0].Bytes != prefix {
@@ -160,7 +164,7 @@ func TestTrickleBodyOutlivesIdleTimeoutWithoutRetry(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	began := time.Now()
-	fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir), apiV2)
+	fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, client.WithIdleTimeout(idleTimeout)), apiV2)
 	if elapsed := time.Since(began); elapsed <= idleTimeout {
 		t.Fatalf("download took %v, expected the trickle to outlive the idle timeout %v", elapsed, idleTimeout)
 	}
@@ -490,7 +494,7 @@ func TestSeededOutputResumesThroughFault(t *testing.T) {
 			})
 			cacheDir := t.TempDir()
 			out := newOutput(t, fx.file2[:seeded])
-			if err := fx.download(ctx, fx.proxyClient(t, cacheDir), apiAuto, out); err != nil {
+			if err := fx.download(ctx, fx.proxyClient(t, cacheDir, client.WithIdleTimeout(idleTimeout)), apiAuto, out); err != nil {
 				t.Fatal(err)
 			}
 			fx.requireFile2(t, out)
