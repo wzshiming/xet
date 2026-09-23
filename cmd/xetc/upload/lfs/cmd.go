@@ -99,7 +99,7 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfRepo, "repo", "", "Hugging Face repo ID or repo URL")
 	cmd.Flags().StringVar(&hfToken, "token", "", "Hugging Face access token")
 	cmd.Flags().StringVar(&hfEndpoint, "endpoint", common.DefaultHFEndpoint, "Hugging Face Hub endpoint override")
-	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, or space")
+	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, space, or kernel")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of upload tasks to run concurrently")

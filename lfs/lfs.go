@@ -135,6 +135,8 @@ func repoTypeURLPrefix(repoType string) string {
 		return "datasets/"
 	case "space":
 		return "spaces/"
+	case "kernel":
+		return "kernels/"
 	default:
 		return ""
 	}
@@ -151,6 +153,8 @@ func normalizeRepoType(repoType string) string {
 		return "dataset"
 	case "space", "spaces":
 		return "space"
+	case "kernel", "kernels":
+		return "kernel"
 	default:
 		return ""
 	}

@@ -143,14 +143,14 @@ func (h *Handler) registerRoutes() {
 	// resolve response carries no xet-auth Link header: clients that skipped
 	// the resolve HEAD (hub tree caches) refresh their CAS credential here;
 	// answer locally so they stay on the mirror instead of the upstream CAS.
-	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/xet-read-token/{rev}", h.handleToken(auth.Read)).Methods(http.MethodGet)
+	h.root.HandleFunc("/api/{type:models|datasets|spaces|kernels}/{repo:.+?}/xet-read-token/{rev}", h.handleToken(auth.Read)).Methods(http.MethodGet)
 	// Clients ask for upload credentials here; the reference minter leaves them to the upstream.
-	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/xet-write-token/{rev}", h.handleToken(auth.Write)).Methods(http.MethodGet)
+	h.root.HandleFunc("/api/{type:models|datasets|spaces|kernels}/{repo:.+?}/xet-write-token/{rev}", h.handleToken(auth.Write)).Methods(http.MethodGet)
 	// Hub tree listing API paths, with or without a subpath. Their entries
 	// carry per-file xet hashes that would steer downstream clients straight
 	// to the upstream CAS.
-	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/tree/{rev}", h.handleTree).Methods(http.MethodGet)
-	h.root.HandleFunc("/api/{type:models|datasets|spaces}/{repo:.+?}/tree/{rev}/{path:.*}", h.handleTree).Methods(http.MethodGet)
+	h.root.HandleFunc("/api/{type:models|datasets|spaces|kernels}/{repo:.+?}/tree/{rev}", h.handleTree).Methods(http.MethodGet)
+	h.root.HandleFunc("/api/{type:models|datasets|spaces|kernels}/{repo:.+?}/tree/{rev}/{path:.*}", h.handleTree).Methods(http.MethodGet)
 	// Hub-style download paths. The prefix before /resolve/ is treated as an
 	// opaque repo identity, so no platform-specific routing exists.
 	h.root.HandleFunc("/{repo:.+?}/resolve/{rev}/{path:.+}", h.handleResolve).Methods(http.MethodGet, http.MethodHead)

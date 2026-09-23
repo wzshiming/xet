@@ -1154,6 +1154,7 @@ func TestHubRouting(t *testing.T) {
 			"/xet-token/" + fileHash.String(),
 			"/api/models/org/repo/xet-read-token/main",
 			"/api/models/org/repo/xet-write-token/main",
+			"/api/kernels/org/repo/xet-read-token/main",
 		} {
 			resp, err := http.Get(fx.srv.URL + path)
 			if err != nil {
@@ -1168,6 +1169,7 @@ func TestHubRouting(t *testing.T) {
 			{Permission: auth.Read, File: &fileHash},
 			{Permission: auth.Read, RepoType: "models", Repo: "org/repo", Revision: "main"},
 			{Permission: auth.Write, RepoType: "models", Repo: "org/repo", Revision: "main"},
+			{Permission: auth.Read, RepoType: "kernels", Repo: "org/repo", Revision: "main"},
 		}
 		if !reflect.DeepEqual(fx.tokenRequests, want) {
 			t.Fatalf("token requests = %+v, want %+v", fx.tokenRequests, want)
@@ -1214,6 +1216,7 @@ func TestHubRouting(t *testing.T) {
 			"/xet-token/" + fileHash.String(),
 			"/api/models/org/repo/xet-read-token/main",
 			"/api/models/org/repo/tree/main",
+			"/api/kernels/org/repo/tree/main",
 			"/api/models/org/repo/xet-write-token/main",
 			"/org/repo/resolve/main/file.bin",
 		} {
