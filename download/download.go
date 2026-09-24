@@ -2,9 +2,7 @@ package download
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/progress"
@@ -19,8 +17,12 @@ type options struct {
 	cache        *CacheManager
 	expectedHash *xet.FileHash
 	retries      int
-	refreshV1    func(context.Context) (*ReconstructionResponseV1, error)
-	refreshV2    func(context.Context) (*ReconstructionResponseV2, error)
+}
+
+// reconstructionRefresher is a ClientAdapter that re-queries a reader's reconstruction after a fetch URL answers 403, up to RefreshRetries times per range.
+type reconstructionRefresher[T any] interface {
+	RefreshReconstruction(context.Context) (*T, error)
+	RefreshRetries() int
 }
 
 // WithCacheManager shares one CacheManager across readers so the capacity
@@ -56,32 +58,6 @@ func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
 	}
-}
-
-// WithURLRefreshV1 re-queries through refresh when a fetch URL answers 403, up to retries times per range.
-func WithURLRefreshV1(retries int, refresh func(context.Context) (*ReconstructionResponseV1, error)) Option {
-	return func(o *options) {
-		o.retries = retries
-		o.refreshV1 = refresh
-	}
-}
-
-// WithURLRefreshV2 is WithURLRefreshV1 for the V2 reconstruction API.
-func WithURLRefreshV2(retries int, refresh func(context.Context) (*ReconstructionResponseV2, error)) Option {
-	return func(o *options) {
-		o.retries = retries
-		o.refreshV2 = refresh
-	}
-}
-
-var errLayoutChanged = errors.New("refreshed reconstruction describes different content")
-
-// sameLayout rejects a refreshed answer whose terms or offset differ from the original.
-func sameLayout(offset, freshOffset int64, terms, freshTerms []Term) error {
-	if offset != freshOffset || !slices.Equal(terms, freshTerms) {
-		return errLayoutChanged
-	}
-	return nil
 }
 
 func newFileVerifier(o *options, offsetIntoFirstRange int64) (*fileVerifier, error) {

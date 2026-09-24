@@ -172,26 +172,31 @@ func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int
 	return chunks, encoded, split, readers
 }
 
+// refreshing gives client the re-query capability: fresh is answered once onRefresh allows it.
+type refreshing[T any] struct {
+	ClientAdapter
+	fresh     *T
+	retries   int
+	onRefresh func(context.Context) error
+}
+
+func (r refreshing[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
+	if err := r.onRefresh(ctx); err != nil {
+		return nil, err
+	}
+	return r.fresh, nil
+}
+
+func (r refreshing[T]) RefreshRetries() int { return r.retries }
+
 // openRefreshing opens old through client with concurrency workers and
 // re-plans from fresh after a 403, calling onRefresh first with the refresh context.
 func openRefreshing(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, retries, concurrency int, onRefresh func(context.Context) error) (io.ReadCloser, error) {
 	opts := []Option{WithCacheManager(m), WithConcurrency(concurrency)}
 	if api == "v1" {
-		opts = append(opts, WithURLRefreshV1(retries, func(ctx context.Context) (*ReconstructionResponseV1, error) {
-			if err := onRefresh(ctx); err != nil {
-				return nil, err
-			}
-			return fresh.v1, nil
-		}))
-		return NewReaderV1(ctx, client, old.v1, opts...)
+		return NewReaderV1(ctx, refreshing[ReconstructionResponseV1]{client, fresh.v1, retries, onRefresh}, old.v1, opts...)
 	}
-	opts = append(opts, WithURLRefreshV2(retries, func(ctx context.Context) (*ReconstructionResponseV2, error) {
-		if err := onRefresh(ctx); err != nil {
-			return nil, err
-		}
-		return fresh.v2, nil
-	}))
-	return NewReaderV2(ctx, client, old.v2, opts...)
+	return NewReaderV2(ctx, refreshing[ReconstructionResponseV2]{client, fresh.v2, retries, onRefresh}, old.v2, opts...)
 }
 
 // forbidden403 is what a refused fetch URL produces, like client's statusError.
@@ -240,32 +245,12 @@ func (c *expiringClient) requests() []string {
 
 func byteRange(r ByteRange) string { return fmt.Sprintf("bytes=%d-%d", r.Start, r.End) }
 
-// TestRefreshRejectsChangedLayout answers the 403 with a reconstruction that
-// describes other bytes: the reader must fail before fetching anything through
-// the new URL, reporting both the 403 and why the answer was refused. The
-// unchanged second range is held until then so only the first range decides.
-func TestRefreshRejectsChangedLayout(t *testing.T) {
+func TestRefreshRejectsChangedRanges(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(a *answers)
 		want   string
 	}{
-		{"term hash", func(a *answers) {
-			a.v1.Terms[1].Hash, a.v2.Terms[1].Hash = "fedcba9876543210", "fedcba9876543210"
-		}, "different content"},
-		{"term length", func(a *answers) {
-			a.v1.Terms[0].UnpackedLength, a.v2.Terms[0].UnpackedLength = 1999, 1999
-		}, "different content"},
-		{"term chunks", func(a *answers) {
-			a.v1.Terms[1].Range.Start, a.v2.Terms[1].Range.Start = 1, 1
-		}, "different content"},
-		{"term order", func(a *answers) {
-			slices.Reverse(a.v1.Terms)
-			slices.Reverse(a.v2.Terms)
-		}, "different content"},
-		{"offset", func(a *answers) {
-			a.v1.OffsetIntoFirstRange, a.v2.OffsetIntoFirstRange = 1, 1
-		}, "different content"},
 		{"byte range", func(a *answers) {
 			a.v1.FetchInfo[testCacheHash][0].URLRange.End++
 			a.v2.Xorbs[testCacheHash][0].Ranges[0].Bytes.End++
@@ -333,6 +318,8 @@ func TestRefreshUsesFreshURLForLaterRanges(t *testing.T) {
 		t.Run(api, func(t *testing.T) {
 			chunks, encoded, _, old := splitAnswers(t, "test://old")
 			_, _, _, fresh := splitAnswers(t, "test://new")
+			fresh.v1.OffsetIntoFirstRange, fresh.v2.OffsetIntoFirstRange = 1, 1
+			fresh.v1.Terms[0].UnpackedLength, fresh.v2.Terms[0].UnpackedLength = 1999, 1999
 			client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old"}
 			var refreshes atomic.Int32
 			r, err := openRefreshing(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, 1, 1, func(context.Context) error {

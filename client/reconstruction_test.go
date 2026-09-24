@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -415,6 +417,10 @@ type downloadFixture struct {
 	served       [][]byte // encoded xorb bytes returned for each file
 	rejectRange  bool     // refuse Range reconstruction requests
 	offsetOnFull int64    // OffsetIntoFirstRange reported without a Range header
+	expired      int32    // fetch URLs handed out by the first expired queries answer 403
+	queries      atomic.Int32
+	mu           sync.Mutex
+	requests     []string // one "<uri> range=<Range> auth=<Authorization>" per request
 }
 
 const fixtureChunkSize = 1000
@@ -485,21 +491,35 @@ func (f *downloadFixture) term(i int) download.Term {
 func (f *downloadFixture) fetchInfo(i int) download.FetchInfoEntry {
 	return download.FetchInfoEntry{
 		Range:    download.ChunkRange{Start: 0, End: 2},
-		URL:      f.srv.URL + "/xorbs/" + strconv.Itoa(i),
+		URL:      fmt.Sprintf("%s/xorbs/%d?gen=%d", f.srv.URL, i, f.queries.Load()),
 		URLRange: download.ByteRange{Start: 0, End: int64(len(f.served[i]) - 1)},
 	}
 }
 
+func (f *downloadFixture) requestLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.requests)
+}
+
 func (f *downloadFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests = append(f.requests, fmt.Sprintf("%s range=%q auth=%q", r.URL.RequestURI(), r.Header.Get("Range"), r.Header.Get("Authorization")))
+	f.mu.Unlock()
 	if name, ok := strings.CutPrefix(r.URL.Path, "/xorbs/"); ok {
 		i, err := strconv.Atoi(name)
 		if err != nil || i < 0 || i >= len(f.served) {
 			http.NotFound(w, r)
 			return
 		}
+		if gen, _ := strconv.Atoi(r.URL.Query().Get("gen")); gen <= int(f.expired) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(f.served[i]))
 		return
 	}
+	f.queries.Add(1)
 	if r.URL.Path == "/reconstructions" {
 		resp := download.BatchReconstructionResponse{Files: map[string][]download.Term{}, FetchInfo: map[string][]download.FetchInfoEntry{}}
 		for _, id := range r.URL.Query()["file_id"] {
@@ -642,6 +662,102 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 				fx.offsetOnFull = 1
 				if _, err := run(t, fx, nil); err == nil {
 					t.Fatal("expected an error: a full download cannot verify a partial reconstruction")
+				}
+			})
+		})
+	}
+}
+
+// staticAuth is an AuthProvider pointing at another CAS with its own token.
+type staticAuth struct{ baseURL, token string }
+
+func (a staticAuth) BaseURL(context.Context) (string, error) { return a.baseURL, nil }
+func (a staticAuth) Token(context.Context) (string, error)   { return a.token, nil }
+
+// TestNewReader pins the public reader factories: a full read is verified and
+// sized, a Range header yields the suffix, and the provider signs both the
+// query and the re-query that replaces a fetch URL refused with 403.
+func TestNewReader(t *testing.T) {
+	type withProvider func(c *Client, ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error)
+	type plain func(c *Client, ctx context.Context, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error)
+	apis := map[string]struct {
+		plain
+		withProvider
+	}{
+		"v1": {(*Client).NewReaderV1, (*Client).NewReaderV1WithAuthProvider},
+		"v2": {(*Client).NewReaderV2, (*Client).NewReaderV2WithAuthProvider},
+	}
+	ctx := context.Background()
+	const offset = fixtureChunkSize + 1
+	rangeHeader := http.Header{"Range": {fmt.Sprintf("bytes=%d-", offset)}}
+	for name, api := range apis {
+		t.Run(name, func(t *testing.T) {
+			newClient := func(t *testing.T, fx *downloadFixture, opts ...Options) *Client {
+				t.Helper()
+				c, err := NewClient(append([]Options{WithBaseURL(fx.srv.URL), WithToken("default-token"), WithCacheDir(t.TempDir()), WithRetryBackoff(0)}, opts...)...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			query := func(fx *downloadFixture, rng, token string) string {
+				return fmt.Sprintf("/%s/reconstructions/%s range=%q auth=%q", name, fx.hashes[0], rng, token)
+			}
+			xorbGet := func(fx *downloadFixture, gen int) string {
+				return fmt.Sprintf("/xorbs/0?gen=%d range=\"bytes=0-%d\" auth=\"\"", gen, len(fx.served[0])-1)
+			}
+			readAll := func(t *testing.T, r io.ReadCloser, size int64, err error, want []byte) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				got, err := io.ReadAll(r)
+				if err != nil || !bytes.Equal(got, want) || size != int64(len(want)) {
+					t.Fatalf("got %d bytes (size %d), err %v; want %d bytes", len(got), size, err, len(want))
+				}
+			}
+
+			t.Run("full", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				r, size, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], nil)
+				readAll(t, r, size, err, fx.data[0])
+				if got, want := fx.requestLog(), []string{query(fx, "", "Bearer default-token"), xorbGet(fx, 1)}; !slices.Equal(got, want) {
+					t.Fatalf("requests = %q, want %q", got, want)
+				}
+			})
+
+			t.Run("full substituted", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.substitute(t, 0)
+				r, _, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				_, err = io.ReadAll(r)
+				wantHashMismatch(t, err)
+			})
+
+			t.Run("range", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				r, size, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], rangeHeader)
+				readAll(t, r, size, err, fx.data[0][offset:])
+				if got := fx.requestLog(); len(got) == 0 || got[0] != query(fx, rangeHeader.Get("Range"), "Bearer default-token") {
+					t.Fatalf("requests = %q, want the Range forwarded to the query", got)
+				}
+			})
+
+			t.Run("provider refresh", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.expired = 1
+				c := newClient(t, fx, WithBaseURL("http://127.0.0.1:1"), WithRetries(1))
+				provider := staticAuth{baseURL: fx.srv.URL, token: "provider-token"}
+				r, size, err := api.withProvider(c, ctx, provider, fx.hashes[0], rangeHeader)
+				readAll(t, r, size, err, fx.data[0][offset:])
+				q := query(fx, rangeHeader.Get("Range"), "Bearer provider-token")
+				if got, want := fx.requestLog(), []string{q, xorbGet(fx, 1), q, xorbGet(fx, 2)}; !slices.Equal(got, want) {
+					t.Fatalf("requests = %q, want %q", got, want)
 				}
 			})
 		})

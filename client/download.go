@@ -117,7 +117,7 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 		// offset.
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
-				resumeOffset, header = 0, nil
+				header = nil
 				reconstructionResp, err = c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 			}
 		}
@@ -125,17 +125,7 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 			return nil, 0, fmt.Errorf("query reconstruction: %w", err)
 		}
 	}
-
-	// The same query, Range included, replaces expired fetch URLs.
-	refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
-		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
-	}
-	opts := append(c.downloadOptions(fileHash, resumeOffset), download.WithURLRefreshV1(c.retries, refresh))
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
-	if err != nil {
-		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
-	}
-	return reader, download.ExpectedLengthV1(reconstructionResp), nil
+	return c.openV1(ctx, provider, fileHash, header, reconstructionResp)
 }
 
 func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
@@ -145,7 +135,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 		// V1, which resumes from the same offset.
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
-				resumeOffset, header = 0, nil
+				header = nil
 				reconstructionResp, err = c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 			}
 		}
@@ -153,25 +143,82 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 			return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
 		}
 	}
+	return c.openV2(ctx, provider, fileHash, header, reconstructionResp)
+}
 
+// NewReaderV1 opens a reader over fileHash through the V1 API and returns the
+// expected length. header is forwarded to the reconstruction query; a Range
+// header yields that suffix, and only full reads are hash-verified.
+func (c *Client) NewReaderV1(ctx context.Context, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error) {
+	return c.NewReaderV1WithAuthProvider(ctx, nil, fileHash, header)
+}
+
+// NewReaderV1WithAuthProvider is NewReaderV1 with a per-call auth provider,
+// which also signs the re-query replacing fetch URLs refused with 403.
+func (c *Client) NewReaderV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error) {
+	reconstructionResp, err := c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query reconstruction: %w", err)
+	}
+	return c.openV1(ctx, provider, fileHash, header, reconstructionResp)
+}
+
+// NewReaderV2 is NewReaderV1 through the V2 API.
+func (c *Client) NewReaderV2(ctx context.Context, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error) {
+	return c.NewReaderV2WithAuthProvider(ctx, nil, fileHash, header)
+}
+
+// NewReaderV2WithAuthProvider is NewReaderV1WithAuthProvider through the V2 API.
+func (c *Client) NewReaderV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error) {
+	reconstructionResp, err := c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query reconstruction v2: %w", err)
+	}
+	return c.openV2(ctx, provider, fileHash, header, reconstructionResp)
+}
+
+// openV1 reads reconstructionResp; a 403 re-queries with the same provider and header.
+func (c *Client) openV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, reconstructionResp *download.ReconstructionResponseV1) (io.ReadCloser, int64, error) {
+	refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
+		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
+	}
+	reader, err := download.NewReaderV1(ctx, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
+	}
+	return reader, download.ExpectedLengthV1(reconstructionResp), nil
+}
+
+func (c *Client) openV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, reconstructionResp *download.ReconstructionResponseV2) (io.ReadCloser, int64, error) {
 	refresh := func(ctx context.Context) (*download.ReconstructionResponseV2, error) {
 		return c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	}
-	opts := append(c.downloadOptions(fileHash, resumeOffset), download.WithURLRefreshV2(c.retries, refresh))
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
+	reader, err := download.NewReaderV2(ctx, refreshingClient[download.ReconstructionResponseV2]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
 	return reader, download.ExpectedLengthV2(reconstructionResp), nil
 }
 
+// refreshingClient lets download re-query one reader's reconstruction after a fetch URL answers 403.
+type refreshingClient[T any] struct {
+	*Client
+	refresh func(context.Context) (*T, error)
+}
+
+func (r refreshingClient[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
+	return r.refresh(ctx)
+}
+
+func (r refreshingClient[T]) RefreshRetries() int { return r.retries }
+
 // Only full downloads have all chunks needed to verify fileHash.
-func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []download.Option {
+func (c *Client) downloadOptions(fileHash xet.FileHash, header http.Header) []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithCacheManager(c.cacheManager),
 	}
-	if resumeOffset == 0 {
+	if header.Get("Range") == "" {
 		opts = append(opts, download.WithExpectedFileHash(fileHash))
 	}
 	if c.progressFunc != nil {
@@ -249,8 +296,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		opts := append(c.downloadOptions(fileHash, 0), download.WithURLRefreshV1(c.retries, refresh))
-		reader, err := download.NewReaderV1(ctx, c, singleResp, opts...)
+		reader, err := download.NewReaderV1(ctx, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, singleResp, c.downloadOptions(fileHash, nil)...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

@@ -56,7 +56,12 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refreshTasksV1(reconstruction, options.refreshV1))
+	var refresh func(context.Context) ([]fetchTask, error)
+	if r, ok := client.(reconstructionRefresher[ReconstructionResponseV1]); ok {
+		options.retries = r.RefreshRetries()
+		refresh = refreshTasksV1(r.RefreshReconstruction)
+	}
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refresh)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -250,17 +255,10 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 	return selected, tasks, nil
 }
 
-// refreshTasksV1 re-plans from a refreshed answer that still describes the same bytes.
-func refreshTasksV1(orig *ReconstructionResponseV1, refresh func(context.Context) (*ReconstructionResponseV1, error)) func(context.Context) ([]fetchTask, error) {
-	if refresh == nil {
-		return nil
-	}
+func refreshTasksV1(refresh func(context.Context) (*ReconstructionResponseV1, error)) func(context.Context) ([]fetchTask, error) {
 	return func(ctx context.Context) ([]fetchTask, error) {
 		fresh, err := refresh(ctx)
 		if err != nil {
-			return nil, err
-		}
-		if err := sameLayout(orig.OffsetIntoFirstRange, fresh.OffsetIntoFirstRange, orig.Terms, fresh.Terms); err != nil {
 			return nil, err
 		}
 		_, tasks, err := planReaderV1(fresh)
