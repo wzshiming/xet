@@ -182,7 +182,7 @@ func (c *Client) openV1(ctx context.Context, provider AuthProvider, fileHash xet
 	refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
 		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 	}
-	reader, err := download.NewReaderV1(ctx, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
+	reader, err := download.NewReaderV1WithAuthProvider(ctx, c, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
@@ -193,7 +193,7 @@ func (c *Client) openV2(ctx context.Context, provider AuthProvider, fileHash xet
 	refresh := func(ctx context.Context) (*download.ReconstructionResponseV2, error) {
 		return c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 	}
-	reader, err := download.NewReaderV2(ctx, refreshingClient[download.ReconstructionResponseV2]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
+	reader, err := download.NewReaderV2WithAuthProvider(ctx, c, refreshingClient[download.ReconstructionResponseV2]{c, refresh}, reconstructionResp, c.downloadOptions(fileHash, header)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
@@ -296,7 +296,7 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		reader, err := download.NewReaderV1(ctx, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, singleResp, c.downloadOptions(fileHash, nil)...)
+		reader, err := download.NewReaderV1WithAuthProvider(ctx, c, refreshingClient[download.ReconstructionResponseV1]{c, refresh}, singleResp, c.downloadOptions(fileHash, nil)...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

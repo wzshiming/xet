@@ -172,9 +172,8 @@ func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int
 	return chunks, encoded, split, readers
 }
 
-// refreshing gives client the re-query capability: fresh is answered once onRefresh allows it.
+// refreshing is a ReconstructionProvider: fresh is answered once onRefresh allows it.
 type refreshing[T any] struct {
-	ClientAdapter
 	fresh     *T
 	retries   int
 	onRefresh func(context.Context) error
@@ -194,9 +193,32 @@ func (r refreshing[T]) RefreshRetries() int { return r.retries }
 func openRefreshing(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, retries, concurrency int, onRefresh func(context.Context) error) (io.ReadCloser, error) {
 	opts := []Option{WithCacheManager(m), WithConcurrency(concurrency)}
 	if api == "v1" {
-		return NewReaderV1(ctx, refreshing[ReconstructionResponseV1]{client, fresh.v1, retries, onRefresh}, old.v1, opts...)
+		return NewReaderV1WithAuthProvider(ctx, client, refreshing[ReconstructionResponseV1]{fresh.v1, retries, onRefresh}, old.v1, opts...)
 	}
-	return NewReaderV2(ctx, refreshing[ReconstructionResponseV2]{client, fresh.v2, retries, onRefresh}, old.v2, opts...)
+	return NewReaderV2WithAuthProvider(ctx, client, refreshing[ReconstructionResponseV2]{fresh.v2, retries, onRefresh}, old.v2, opts...)
+}
+
+// capable is a ClientAdapter that also implements ReconstructionProvider.
+type capable[T any] struct {
+	ClientAdapter
+	refreshing[T]
+}
+
+// openWithoutProvider opens old through a capable client via NewReaderV1/V2 or an explicit nil provider.
+func openWithoutProvider(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, viaNil bool, onRefresh func(context.Context) error) (io.ReadCloser, error) {
+	opts := []Option{WithCacheManager(m), WithConcurrency(1)}
+	if api == "v1" {
+		c := capable[ReconstructionResponseV1]{client, refreshing[ReconstructionResponseV1]{fresh.v1, 2, onRefresh}}
+		if viaNil {
+			return NewReaderV1WithAuthProvider(ctx, c, nil, old.v1, opts...)
+		}
+		return NewReaderV1(ctx, c, old.v1, opts...)
+	}
+	c := capable[ReconstructionResponseV2]{client, refreshing[ReconstructionResponseV2]{fresh.v2, 2, onRefresh}}
+	if viaNil {
+		return NewReaderV2WithAuthProvider(ctx, c, nil, old.v2, opts...)
+	}
+	return NewReaderV2(ctx, c, old.v2, opts...)
 }
 
 // forbidden403 is what a refused fetch URL produces, like client's statusError.
@@ -475,6 +497,50 @@ func TestReaderStopsDuringRefresh(t *testing.T) {
 					t.Fatalf("download after the stop: %v, %d bytes, want %d", err, len(got), len(want))
 				}
 			})
+		}
+	}
+}
+
+func TestNewReaderIgnoresClientRefreshCapability(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		for _, viaNil := range []bool{false, true} {
+			for _, refused := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/nil=%v/refused=%v", api, viaNil, refused), func(t *testing.T) {
+					chunks, encoded, _, old := splitAnswers(t, "test://old")
+					_, _, _, fresh := splitAnswers(t, "test://new")
+					client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}}
+					if refused {
+						client.expired = "test://old"
+					}
+					var refreshes atomic.Int32
+					r, err := openWithoutProvider(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, viaNil, func(context.Context) error {
+						refreshes.Add(1)
+						return nil
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer r.Close()
+					p := readerPrefetcher(t, r)
+					got, err := io.ReadAll(r)
+					awaitWorkers(t, p)
+					if refused {
+						if !forbidden(err) || len(got) != 0 {
+							t.Fatalf("read %d bytes, %v; want the 403 unrefreshed", len(got), err)
+						}
+					} else if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
+					}
+					if n := refreshes.Load(); n != 0 {
+						t.Fatalf("refreshed %d times through the client, want none without a provider", n)
+					}
+					for _, req := range client.requests() {
+						if strings.HasPrefix(req, "test://new") {
+							t.Fatalf("fetched %q without a provider", req)
+						}
+					}
+				})
+			}
 		}
 	}
 }

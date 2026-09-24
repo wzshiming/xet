@@ -19,8 +19,8 @@ type options struct {
 	retries      int
 }
 
-// reconstructionRefresher is a ClientAdapter that re-queries a reader's reconstruction after a fetch URL answers 403, up to RefreshRetries times per range.
-type reconstructionRefresher[T any] interface {
+// ReconstructionProvider re-queries a reader's reconstruction after a fetch URL answers 403, up to RefreshRetries times per range.
+type ReconstructionProvider[T any] interface {
 	RefreshReconstruction(context.Context) (*T, error)
 	RefreshRetries() int
 }

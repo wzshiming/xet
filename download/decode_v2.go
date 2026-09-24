@@ -33,6 +33,11 @@ type ReaderV2 struct {
 
 // NewReaderV2 creates a new V2 reconstruction reader.
 func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
+	return NewReaderV2WithAuthProvider(ctx, client, nil, reconstruction, opts...)
+}
+
+// NewReaderV2WithAuthProvider is NewReaderV1WithAuthProvider for V2 reconstructions.
+func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV2], reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -57,9 +62,9 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	}
 
 	var refresh func(context.Context) ([]fetchTask, error)
-	if r, ok := client.(reconstructionRefresher[ReconstructionResponseV2]); ok {
-		options.retries = r.RefreshRetries()
-		refresh = refreshTasksV2(r.RefreshReconstruction)
+	if provider != nil {
+		options.retries = provider.RefreshRetries()
+		refresh = refreshTasksV2(provider.RefreshReconstruction)
 	}
 	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refresh)
 	if err != nil {

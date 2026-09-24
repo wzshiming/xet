@@ -33,6 +33,11 @@ type ReaderV1 struct {
 
 // NewReaderV1 creates a new V1 reconstruction reader.
 func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
+	return NewReaderV1WithAuthProvider(ctx, client, nil, reconstruction, opts...)
+}
+
+// NewReaderV1WithAuthProvider uses provider to refresh expired URLs; nil disables refreshes.
+func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV1], reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -57,9 +62,9 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	}
 
 	var refresh func(context.Context) ([]fetchTask, error)
-	if r, ok := client.(reconstructionRefresher[ReconstructionResponseV1]); ok {
-		options.retries = r.RefreshRetries()
-		refresh = refreshTasksV1(r.RefreshReconstruction)
+	if provider != nil {
+		options.retries = provider.RefreshRetries()
+		refresh = refreshTasksV1(provider.RefreshReconstruction)
 	}
 	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refresh)
 	if err != nil {
