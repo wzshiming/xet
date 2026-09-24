@@ -104,7 +104,8 @@ type chunkCache struct {
 	metas          []chunkRef
 	writePos       int64 // next write offset in file
 	done           bool
-	readonly       bool // true for read-only cache from openCachedRange
+	loadErr        error // first failed load; later loads and chunk reads report it
+	readonly       bool  // true for read-only cache from openCachedRange
 	mut            sync.Mutex
 	file           *os.File   // backing file
 	files          []*os.File // additional files for multi-file read path (fileIdx > 0)
@@ -584,6 +585,17 @@ func (c *chunkCache) load() (int, error) {
 	c.mut.Lock()
 	defer c.mut.Unlock()
 
+	if c.loadErr != nil {
+		return 0, c.loadErr
+	}
+	n, err := c.loadLocked()
+	if err != nil && err != io.EOF {
+		c.loadErr = err
+	}
+	return n, err
+}
+
+func (c *chunkCache) loadLocked() (int, error) {
 	if c.done || c.readonly {
 		return 0, io.EOF
 	}
@@ -625,8 +637,12 @@ func (c *chunkCache) loadTo(idx uint32) error {
 		c.mut.Lock()
 		curr := len(c.metas)
 		done := c.done
+		loadErr := c.loadErr
 		c.mut.Unlock()
 
+		if loadErr != nil {
+			return loadErr
+		}
 		if curr > int(idx) || done {
 			return nil
 		}

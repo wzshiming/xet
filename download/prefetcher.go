@@ -2,12 +2,14 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/progress"
@@ -65,6 +67,14 @@ type prefetcher struct {
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
 	workers      sync.WaitGroup // feeder and worker goroutines started by start
+
+	// URL refresh after a 403; refresh is nil when not configured.
+	refresh func(context.Context, int64) ([]fetchTask, error)
+	retries int
+	emitted atomic.Int64           // logical bytes the reader has copied out; a refresh queries from here
+	mu      sync.Mutex             // held across refresh so refused workers share one query
+	gen     int                    // counts successful refreshes
+	fresh   map[fetchKey]fetchTask // tasks of generation gen; nil before the first refresh
 }
 
 type progressReader struct {
@@ -84,7 +94,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cache *CacheManager, opts *options) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cache *CacheManager, opts *options, refresh func(context.Context, int64) ([]fetchTask, error)) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -125,6 +135,8 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries:      entries,
 		progressFunc: opts.progressFunc,
 		cache:        cache,
+		refresh:      refresh,
+		retries:      opts.retries,
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -241,7 +253,17 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		"Range": {fmt.Sprintf("bytes=%d-%d", key.Start, key.End)},
 	}
 
-	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
+	task, gen := p.currentTask(entry.task)
+	rc, err := p.client.DownloadXorbWithURL(p.ctx, task.url, header)
+	for attempt := 0; p.refresh != nil && attempt < p.retries && forbidden(err); attempt++ {
+		fresh, freshGen, refreshErr := p.refreshTask(task, gen)
+		if refreshErr != nil {
+			err = fmt.Errorf("%w; refresh fetch info: %w", err, refreshErr)
+			break
+		}
+		task, gen = fresh, freshGen
+		rc, err = p.client.DownloadXorbWithURL(p.ctx, task.url, header)
+	}
 	if err != nil {
 		p.failEntry(entry, err)
 		return
@@ -285,6 +307,53 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 
 func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
 	p.completeEntry(entry, cache, nil)
+}
+
+// forbidden reports whether err carries HTTP 403, the answer of an expired signed URL.
+func forbidden(err error) bool {
+	var status interface{ StatusCode() int }
+	return errors.As(err, &status) && status.StatusCode() == http.StatusForbidden
+}
+
+// currentTask returns task in the latest generation, or task itself before any refresh.
+func (p *prefetcher) currentTask(task fetchTask) (fetchTask, int) {
+	if p.refresh == nil {
+		return task, 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if fresh, ok := p.freshTask(task); ok {
+		return fresh, p.gen
+	}
+	return task, 0
+}
+
+// freshTask finds task in the latest generation if it still covers the same chunks; caller holds p.mu.
+func (p *prefetcher) freshTask(task fetchTask) (fetchTask, bool) {
+	fresh, ok := p.fresh[task.key]
+	return fresh, ok && fresh.chunkStart == task.chunkStart && fresh.chunkEnd == task.chunkEnd
+}
+
+// refreshTask returns task in the generation after gen; only the first caller of a generation queries.
+func (p *prefetcher) refreshTask(task fetchTask, gen int) (fetchTask, int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen == p.gen {
+		tasks, err := p.refresh(p.ctx, p.emitted.Load())
+		if err != nil {
+			return task, gen, err
+		}
+		p.fresh = make(map[fetchKey]fetchTask, len(tasks))
+		for _, t := range tasks {
+			p.fresh[t.key] = t
+		}
+		p.gen++
+	}
+	fresh, ok := p.freshTask(task)
+	if !ok {
+		return task, p.gen, fmt.Errorf("refreshed reconstruction no longer covers %s", task.key)
+	}
+	return fresh, p.gen, nil
 }
 
 func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {

@@ -1,13 +1,14 @@
 package download
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/progress"
 )
 
-// Option is a functional option for NewReaderV1 and NewReaderV2.
+// Option is a functional option for NewReaderV1WithAuthProvider and NewReaderV2WithAuthProvider.
 type Option func(*options)
 
 type options struct {
@@ -15,6 +16,14 @@ type options struct {
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
 	expectedHash *xet.FileHash
+	retries      int
+}
+
+// ReconstructionProvider supplies initial and refreshed reconstruction metadata.
+type ReconstructionProvider[T any] interface {
+	// offset counts the logical bytes the reader has emitted since its start; the opening query passes 0.
+	RefreshReconstruction(ctx context.Context, offset int64) (*T, error)
+	RefreshRetries() int
 }
 
 // WithCacheManager shares one CacheManager across readers so the capacity

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -39,22 +40,55 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.doWithNetworkRetry(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	return getJSON[download.ReconstructionResponseV1](c, req, reconstructionError)
+}
 
-	if err := reconstructionError(req, resp); err != nil {
-		return nil, err
+// Request and body failures share one retry budget.
+func getJSON[T any](c *Client, req *http.Request, statusErr func(*http.Request, *http.Response) error) (*T, error) {
+	attempts := c.retryAttempts()
+
+	var lastErr error
+	for i := range attempts {
+		if i > 0 {
+			if err := c.waitRetry(req.Context(), i-1, lastErr); err != nil {
+				lastErr = err
+				break
+			}
+		}
+
+		resp, err := c.do(req)
+		if err != nil {
+			if !isNetworkError(err) {
+				return nil, fmt.Errorf("do request: %w", err)
+			}
+			lastErr = err
+			continue
+		}
+		if isRetryableStatus(resp.StatusCode) {
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("server error status %s", resp.Status)
+			continue
+		}
+		if err := statusErr(req, resp); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+
+		v := new(T)
+		err = json.NewDecoder(resp.Body).Decode(v)
+		_ = resp.Body.Close()
+		if err == nil {
+			return v, nil
+		}
+		lastErr = fmt.Errorf("decode response: %w", err)
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+			return nil, lastErr
+		}
 	}
 
-	var reconstructionResp download.ReconstructionResponseV1
-	if err := json.NewDecoder(resp.Body).Decode(&reconstructionResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &reconstructionResp, nil
+	return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
 }
 
 // Reconstruction ranges are encoded in JSON even when the status is 200.
@@ -92,22 +126,7 @@ func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provid
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.doWithNetworkRetry(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if err := reconstructionError(req, resp); err != nil {
-		return nil, err
-	}
-
-	var reconstructionResp download.ReconstructionResponseV2
-	if err := json.NewDecoder(resp.Body).Decode(&reconstructionResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	return &reconstructionResp, nil
+	return getJSON[download.ReconstructionResponseV2](c, req, reconstructionError)
 }
 
 // GetBatchReconstruction retrieves reconstruction information for multiple files in a single request.
@@ -150,20 +169,5 @@ func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, pro
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.doWithNetworkRetry(req)
-	if err != nil {
-		return nil, fmt.Errorf("do batch reconstruction request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if err := reqError(req, resp); err != nil {
-		return nil, err
-	}
-
-	var batchResp download.BatchReconstructionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
-		return nil, fmt.Errorf("decode batch reconstruction response: %w", err)
-	}
-
-	return &batchResp, nil
+	return getJSON[download.BatchReconstructionResponse](c, req, reqError)
 }

@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -415,6 +418,10 @@ type downloadFixture struct {
 	served       [][]byte // encoded xorb bytes returned for each file
 	rejectRange  bool     // refuse Range reconstruction requests
 	offsetOnFull int64    // OffsetIntoFirstRange reported without a Range header
+	expired      int32    // fetch URLs handed out by the first expired queries answer 403
+	queries      atomic.Int32
+	mu           sync.Mutex
+	requests     []string // one "<uri> range=<Range> auth=<Authorization>" per request
 }
 
 const fixtureChunkSize = 1000
@@ -485,21 +492,35 @@ func (f *downloadFixture) term(i int) download.Term {
 func (f *downloadFixture) fetchInfo(i int) download.FetchInfoEntry {
 	return download.FetchInfoEntry{
 		Range:    download.ChunkRange{Start: 0, End: 2},
-		URL:      f.srv.URL + "/xorbs/" + strconv.Itoa(i),
+		URL:      fmt.Sprintf("%s/xorbs/%d?gen=%d", f.srv.URL, i, f.queries.Load()),
 		URLRange: download.ByteRange{Start: 0, End: int64(len(f.served[i]) - 1)},
 	}
 }
 
+func (f *downloadFixture) requestLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.requests)
+}
+
 func (f *downloadFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests = append(f.requests, fmt.Sprintf("%s range=%q auth=%q", r.URL.RequestURI(), r.Header.Get("Range"), r.Header.Get("Authorization")))
+	f.mu.Unlock()
 	if name, ok := strings.CutPrefix(r.URL.Path, "/xorbs/"); ok {
 		i, err := strconv.Atoi(name)
 		if err != nil || i < 0 || i >= len(f.served) {
 			http.NotFound(w, r)
 			return
 		}
+		if gen, _ := strconv.Atoi(r.URL.Query().Get("gen")); gen <= int(f.expired) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(f.served[i]))
 		return
 	}
+	f.queries.Add(1)
 	if r.URL.Path == "/reconstructions" {
 		resp := download.BatchReconstructionResponse{Files: map[string][]download.Term{}, FetchInfo: map[string][]download.FetchInfoEntry{}}
 		for _, id := range r.URL.Query()["file_id"] {
@@ -648,6 +669,148 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 	}
 }
 
+// staticAuth is an AuthProvider pointing at another CAS with its own token.
+type staticAuth struct{ baseURL, token string }
+
+func (a staticAuth) BaseURL(context.Context) (string, error) { return a.baseURL, nil }
+func (a staticAuth) Token(context.Context) (string, error)   { return a.token, nil }
+
+// TestNewReader pins the public reader factories: a full read is verified and
+// sized, a Range header yields the suffix, and the provider signs both the
+// query and the re-query that replaces a fetch URL refused with 403.
+func TestNewReader(t *testing.T) {
+	type withProvider func(c *Client, ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error)
+	type plain func(c *Client, ctx context.Context, fileHash xet.FileHash, header http.Header) (io.ReadCloser, int64, error)
+	apis := map[string]struct {
+		plain
+		withProvider
+	}{
+		"v1": {(*Client).NewReaderV1, (*Client).NewReaderV1WithAuthProvider},
+		"v2": {(*Client).NewReaderV2, (*Client).NewReaderV2WithAuthProvider},
+	}
+	ctx := context.Background()
+	const offset = fixtureChunkSize + 1
+	rangeHeader := http.Header{"Range": {fmt.Sprintf("bytes=%d-", offset)}}
+	for name, api := range apis {
+		t.Run(name, func(t *testing.T) {
+			newClient := func(t *testing.T, fx *downloadFixture, opts ...Options) *Client {
+				t.Helper()
+				c, err := NewClient(append([]Options{WithBaseURL(fx.srv.URL), WithToken("default-token"), WithCacheDir(t.TempDir()), WithRetryBackoff(0)}, opts...)...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			query := func(fx *downloadFixture, rng, token string) string {
+				return fmt.Sprintf("/%s/reconstructions/%s range=%q auth=%q", name, fx.hashes[0], rng, token)
+			}
+			xorbGet := func(fx *downloadFixture, gen int) string {
+				return fmt.Sprintf("/xorbs/0?gen=%d range=\"bytes=0-%d\" auth=\"\"", gen, len(fx.served[0])-1)
+			}
+			readAll := func(t *testing.T, r io.ReadCloser, size int64, err error, want []byte) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				got, err := io.ReadAll(r)
+				if err != nil || !bytes.Equal(got, want) || size != int64(len(want)) {
+					t.Fatalf("got %d bytes (size %d), err %v; want %d bytes", len(got), size, err, len(want))
+				}
+			}
+
+			t.Run("full", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				r, size, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], nil)
+				readAll(t, r, size, err, fx.data[0])
+				if got, want := fx.requestLog(), []string{query(fx, "", "Bearer default-token"), xorbGet(fx, 1)}; !slices.Equal(got, want) {
+					t.Fatalf("requests = %q, want %q", got, want)
+				}
+			})
+
+			t.Run("full substituted", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.substitute(t, 0)
+				r, _, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				_, err = io.ReadAll(r)
+				wantHashMismatch(t, err)
+			})
+
+			t.Run("range", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				r, size, err := api.plain(newClient(t, fx), ctx, fx.hashes[0], rangeHeader)
+				readAll(t, r, size, err, fx.data[0][offset:])
+				if got := fx.requestLog(); len(got) == 0 || got[0] != query(fx, rangeHeader.Get("Range"), "Bearer default-token") {
+					t.Fatalf("requests = %q, want the Range forwarded to the query", got)
+				}
+			})
+
+			t.Run("provider refresh", func(t *testing.T) {
+				fx := newDownloadFixture(t, 1)
+				fx.expired = 1
+				c := newClient(t, fx, WithBaseURL("http://127.0.0.1:1"), WithRetries(1))
+				provider := staticAuth{baseURL: fx.srv.URL, token: "provider-token"}
+				r, size, err := api.withProvider(c, ctx, provider, fx.hashes[0], rangeHeader)
+				readAll(t, r, size, err, fx.data[0][offset:])
+				q := query(fx, rangeHeader.Get("Range"), "Bearer provider-token")
+				if got, want := fx.requestLog(), []string{q, xorbGet(fx, 1), q, xorbGet(fx, 2)}; !slices.Equal(got, want) {
+					t.Fatalf("requests = %q, want %q", got, want)
+				}
+			})
+		})
+	}
+}
+
+func TestRefreshRangeAfterOffset(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		offset  int64
+		length  int64
+		want    string
+		wantErr bool
+	}{
+		{"", 0, 100, "", false},
+		{"", 10, 100, "bytes=10-", false},
+		{"bytes=100-", 0, 100, "bytes=100-", false},
+		{"bytes=100-", 10, 100, "bytes=110-", false},
+		{"bytes=100-199", 99, 100, "bytes=199-199", false},
+		{"bytes=100-199", 100, 100, "", true},
+		{fmt.Sprintf("bytes=%d-", math.MaxInt64), 1, 1, "", true},
+		{"bytes=-100", 0, 50, "bytes=-100", false},
+		{"bytes=-100", 10, 100, "bytes=-90", false},
+		{"bytes=-100", 10, 50, "bytes=-40", false},
+		{"bytes=-100", 50, 50, "", true},
+		{"bytes=-100", 51, 50, "", true},
+		{"bytes=abc-", 10, 100, "bytes=abc-", false},
+		{"bytes=100-50", 10, 100, "bytes=100-50", false},
+	} {
+		t.Run(fmt.Sprintf("%s+%d", tc.in, tc.offset), func(t *testing.T) {
+			header := http.Header{"X-Test": {"kept"}}
+			if tc.in != "" {
+				header.Set("Range", tc.in)
+			}
+			before := fmt.Sprint(header)
+			got, err := rangeAfter(header, tc.offset, tc.length)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("rangeAfter(%q, %d) error = %v, wantErr %v", tc.in, tc.offset, err, tc.wantErr)
+			}
+			if after := fmt.Sprint(header); after != before {
+				t.Fatalf("caller's header changed from %s to %s", before, after)
+			}
+			if err == nil && (got.Get("Range") != tc.want || got.Get("X-Test") != "kept") {
+				t.Fatalf("header = %v, want Range %q with X-Test kept", got, tc.want)
+			}
+		})
+	}
+	if got, err := rangeAfter(nil, 5, 100); err != nil || got.Get("Range") != "bytes=5-" {
+		t.Fatalf("rangeAfter(nil, 5) = %v, %v; want bytes=5-", got, err)
+	}
+}
+
 // TestDownloadFilesVerifiesFileHash pins per-file verification of batch
 // downloads: a substituted xorb fails only the reader of that file.
 func TestDownloadFilesVerifiesFileHash(t *testing.T) {
@@ -670,4 +833,165 @@ func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	}
 	_, err = io.ReadAll(readers[1])
 	wantHashMismatch(t, err)
+}
+
+// reply writes one reconstruction response given the healthy status and body.
+type reply func(w http.ResponseWriter, code int, full []byte)
+
+var (
+	healthy   reply = func(w http.ResponseWriter, code int, full []byte) { w.WriteHeader(code); _, _ = w.Write(full) }
+	empty     reply = func(w http.ResponseWriter, code int, _ []byte) { w.WriteHeader(code) }
+	truncated reply = func(w http.ResponseWriter, code int, full []byte) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		w.WriteHeader(code)
+		_, _ = w.Write(full[:len(full)/2])
+	}
+	malformed reply = func(w http.ResponseWriter, code int, _ []byte) {
+		w.WriteHeader(code)
+		_, _ = io.WriteString(w, "<html>")
+	}
+	unavailable reply = func(w http.ResponseWriter, _ int, _ []byte) { http.Error(w, "busy", http.StatusServiceUnavailable) }
+)
+
+// The last reply repeats until the request budget is exhausted.
+func replayFixture(t *testing.T, fx *downloadFixture, wantRange string, replies ...reply) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	calls := new(atomic.Int32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(calls.Add(1))
+		if r.Header.Get("Range") != wantRange || r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("request %d: Range %q Authorization %q, want %q and the client token", n, r.Header.Get("Range"), r.Header.Get("Authorization"), wantRange)
+		}
+		rec := httptest.NewRecorder()
+		fx.serveHTTP(rec, r)
+		replies[min(n, len(replies))-1](w, rec.Code, rec.Body.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	return srv, calls
+}
+
+func TestGetReconstructionRetriesCutBody(t *testing.T) {
+	fx := newDownloadFixture(t, 1)
+	const resume = "bytes=1-"
+	apis := []struct {
+		name  string
+		rng   string
+		terms func(c *Client, ctx context.Context) ([]download.Term, error)
+	}{
+		{"v1", resume, func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetReconstructionV1(ctx, fx.hashes[0], http.Header{"Range": {resume}})
+			if err != nil {
+				return nil, err
+			}
+			return resp.Terms, nil
+		}},
+		{"v2", resume, func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetReconstructionV2(ctx, fx.hashes[0], http.Header{"Range": {resume}})
+			if err != nil {
+				return nil, err
+			}
+			return resp.Terms, nil
+		}},
+		{"batch", "", func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetBatchReconstruction(ctx, fx.hashes)
+			if err != nil {
+				return nil, err
+			}
+			return resp.Files[fx.hashes[0].String()], nil
+		}},
+	}
+	cuts := []struct {
+		name string
+		reply
+	}{{"empty", empty}, {"truncated", truncated}}
+	for _, api := range apis {
+		for _, cut := range cuts {
+			t.Run(api.name+"/"+cut.name, func(t *testing.T) {
+				srv, calls := replayFixture(t, fx, api.rng, cut.reply, healthy)
+				c, err := NewClient(WithBaseURL(srv.URL), WithToken("test-token"), WithRetryBackoff(0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				terms, err := api.terms(c, context.Background())
+				if err != nil {
+					t.Fatalf("%s after a %s first answer: %v", api.name, cut.name, err)
+				}
+				if got := calls.Load(); got != 2 {
+					t.Fatalf("%d requests, want the cut answer and one retry", got)
+				}
+				if len(terms) != 1 || terms[0].Hash != fx.xorbHashes[0] {
+					t.Fatalf("terms = %+v, want the fixture's single term", terms)
+				}
+			})
+		}
+	}
+}
+
+func TestGetReconstructionDecodeBudget(t *testing.T) {
+	fx := newDownloadFixture(t, 1)
+	const retries = 2
+	for _, tc := range []struct {
+		name      string
+		replies   []reply
+		wantCalls int32
+		wantErr   func(error) bool // nil: the call must succeed
+	}{
+		{"status then cut then healthy", []reply{unavailable, truncated, healthy}, 3, nil},
+		{"permanent cut", []reply{truncated}, retries + 1, func(err error) bool { return errors.Is(err, io.ErrUnexpectedEOF) }},
+		{"malformed", []reply{malformed}, 1, func(err error) bool {
+			var syntaxErr *json.SyntaxError
+			return errors.As(err, &syntaxErr)
+		}},
+		{"wrong field type", []reply{func(w http.ResponseWriter, code int, _ []byte) {
+			w.WriteHeader(code)
+			_, _ = io.WriteString(w, `{"offset_into_first_range":"bad"}`)
+		}}, 1, func(err error) bool {
+			var typeErr *json.UnmarshalTypeError
+			return errors.As(err, &typeErr)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, calls := replayFixture(t, fx, "", tc.replies...)
+			c, err := NewClient(WithBaseURL(srv.URL), WithToken("test-token"), WithRetries(retries), WithRetryBackoff(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.GetReconstructionV1(context.Background(), fx.hashes[0], nil)
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("GetReconstructionV1: %v", err)
+			}
+			if tc.wantErr != nil && (err == nil || !tc.wantErr(err)) {
+				t.Fatalf("GetReconstructionV1 error = %v, want the original failure", err)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Fatalf("%d requests, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestGetReconstructionCancelDuringBody(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"offset_into_first_range":0,`)
+		_ = http.NewResponseController(w).Flush()
+		cancel()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(WithBaseURL(srv.URL), WithRetryBackoff(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.GetReconstructionV2(ctx, xet.FileHash{}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetReconstructionV2 error = %v, want context.Canceled", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("%d requests, want no retry after cancellation", got)
+	}
 }

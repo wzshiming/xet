@@ -85,7 +85,7 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 
 	readers := map[string]func(ctx context.Context, offset int64, cache *CacheManager) (io.ReadCloser, error){
 		"v1": func(ctx context.Context, offset int64, cache *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV1(ctx, adapter, &ReconstructionResponseV1{
+			return NewReaderV1WithAuthProvider(ctx, adapter, static(&ReconstructionResponseV1{
 				OffsetIntoFirstRange: offset,
 				Terms:                terms,
 				FetchInfo: map[string][]FetchInfoEntry{
@@ -95,10 +95,10 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 						URLRange: ByteRange{Start: 0, End: int64(len(encoded) - 1)},
 					}},
 				},
-			}, WithCacheManager(cache))
+			}), WithCacheManager(cache))
 		},
 		"v2": func(ctx context.Context, offset int64, cache *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV2(ctx, adapter, &ReconstructionResponseV2{
+			return NewReaderV2WithAuthProvider(ctx, adapter, static(&ReconstructionResponseV2{
 				OffsetIntoFirstRange: offset,
 				Terms:                terms,
 				Xorbs: map[string][]XorbMultiRangeFetch{
@@ -110,7 +110,7 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 						}},
 					}},
 				},
-			}, WithCacheManager(cache))
+			}), WithCacheManager(cache))
 		},
 	}
 
@@ -162,21 +162,71 @@ func (*refusingClient) DownloadXorbsMultipartWithURL(context.Context, string, ht
 // rangeReaders build V1 and V2 readers for one term served from a fetch range spanning bytes [0, bytesEnd].
 var rangeReaders = map[string]func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error){
 	"v1": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
-		return NewReaderV1(context.Background(), client, &ReconstructionResponseV1{
+		return NewReaderV1WithAuthProvider(context.Background(), client, static(&ReconstructionResponseV1{
 			Terms: []Term{{Hash: testCacheHash, Range: term}},
 			FetchInfo: map[string][]FetchInfoEntry{
 				testCacheHash: {{Range: fetch, URL: "test://xorb", URLRange: ByteRange{Start: 0, End: bytesEnd}}},
 			},
-		}, WithCacheManager(cache))
+		}), WithCacheManager(cache))
 	},
 	"v2": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
-		return NewReaderV2(context.Background(), client, &ReconstructionResponseV2{
+		return NewReaderV2WithAuthProvider(context.Background(), client, static(&ReconstructionResponseV2{
 			Terms: []Term{{Hash: testCacheHash, Range: term}},
 			Xorbs: map[string][]XorbMultiRangeFetch{
 				testCacheHash: {{URL: "test://xorb", Ranges: []XorbRangeDescriptor{{Chunks: fetch, Bytes: ByteRange{Start: 0, End: bytesEnd}}}}},
 			},
-		}, WithCacheManager(cache))
+		}), WithCacheManager(cache))
 	},
+}
+
+// TestReaderRequiresProviderAnswer pins the opening query: a failed or empty
+// first answer, or no provider at all, is reported before any fetch or cache entry.
+func TestReaderRequiresProviderAnswer(t *testing.T) {
+	firstErr := errors.New("reconstruction unavailable")
+	openers := map[string]func(ctx context.Context, client ClientAdapter, cache *CacheManager, nilProvider bool, err error) (io.ReadCloser, error){
+		"v1": func(ctx context.Context, client ClientAdapter, cache *CacheManager, nilProvider bool, err error) (io.ReadCloser, error) {
+			if nilProvider {
+				return NewReaderV1WithAuthProvider(ctx, client, nil, WithCacheManager(cache))
+			}
+			return NewReaderV1WithAuthProvider(ctx, client, &refreshing[ReconstructionResponseV1]{firstErr: err}, WithCacheManager(cache))
+		},
+		"v2": func(ctx context.Context, client ClientAdapter, cache *CacheManager, nilProvider bool, err error) (io.ReadCloser, error) {
+			if nilProvider {
+				return NewReaderV2WithAuthProvider(ctx, client, nil, WithCacheManager(cache))
+			}
+			return NewReaderV2WithAuthProvider(ctx, client, &refreshing[ReconstructionResponseV2]{firstErr: err}, WithCacheManager(cache))
+		},
+	}
+	cases := map[string]struct {
+		nilProvider bool
+		err         error
+	}{
+		"firstErr":    {err: firstErr},
+		"nilAnswer":   {},
+		"nilProvider": {nilProvider: true},
+	}
+	for name, open := range openers {
+		for caseName, tc := range cases {
+			t.Run(name+"/"+caseName, func(t *testing.T) {
+				dir := t.TempDir()
+				client := &refusingClient{}
+				r, err := open(context.Background(), client, NewCacheManager(dir, 0), tc.nilProvider, tc.err)
+				if err == nil {
+					r.Close()
+					t.Fatal("opened a reader without a reconstruction")
+				}
+				if tc.err != nil && !errors.Is(err, tc.err) {
+					t.Fatalf("err = %v, want the provider's %v", err, tc.err)
+				}
+				if calls := client.calls.Load(); calls != 0 {
+					t.Fatalf("failed open made %d downloads", calls)
+				}
+				if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+					t.Fatalf("failed open created cache entries: %v", entries)
+				}
+			})
+		}
+	}
 }
 
 func TestReaderRejectsInvalidChunkRanges(t *testing.T) {
@@ -287,7 +337,7 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 
 	readers := map[string]func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error){
 		"v1": func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error) {
-			return NewReaderV1(ctx, &fakeClientAdapter{data: data}, &ReconstructionResponseV1{
+			return NewReaderV1WithAuthProvider(ctx, &fakeClientAdapter{data: data}, static(&ReconstructionResponseV1{
 				OffsetIntoFirstRange: offset,
 				Terms:                terms,
 				FetchInfo: map[string][]FetchInfoEntry{
@@ -297,10 +347,10 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 						URLRange: ByteRange{Start: 0, End: int64(len(encoded) - 1)},
 					}},
 				},
-			}, opts...)
+			}), opts...)
 		},
 		"v2": func(ctx context.Context, data []byte, terms []Term, offset int64, opts ...Option) (io.ReadCloser, error) {
-			return NewReaderV2(ctx, &fakeClientAdapter{data: data}, &ReconstructionResponseV2{
+			return NewReaderV2WithAuthProvider(ctx, &fakeClientAdapter{data: data}, static(&ReconstructionResponseV2{
 				OffsetIntoFirstRange: offset,
 				Terms:                terms,
 				Xorbs: map[string][]XorbMultiRangeFetch{
@@ -312,7 +362,7 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 						}},
 					}},
 				},
-			}, opts...)
+			}), opts...)
 		},
 	}
 

@@ -31,8 +31,8 @@ type ReaderV2 struct {
 	err          error
 }
 
-// NewReaderV2 creates a new V2 reconstruction reader.
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
+// NewReaderV2WithAuthProvider is NewReaderV1WithAuthProvider for V2 reconstructions.
+func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV2], opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -41,6 +41,16 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	cache := options.cache
 	if cache == nil {
 		return nil, fmt.Errorf("no cache manager provided")
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("no reconstruction provider")
+	}
+	reconstruction, err := provider.RefreshReconstruction(ctx, 0)
+	if err != nil {
+		return nil, fmt.Errorf("query reconstruction: %w", err)
+	}
+	if reconstruction == nil {
+		return nil, fmt.Errorf("query reconstruction: nil response")
 	}
 	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
 	if err != nil {
@@ -56,7 +66,8 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options)
+	options.retries = provider.RefreshRetries()
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refreshTasksV2(provider.RefreshReconstruction))
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -151,6 +162,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 			copied := copy(p[n:], data[r.chunkOffset:])
 			n += copied
 			r.chunkOffset += copied
+			r.prefetcher.emitted.Add(int64(copied))
 
 			if r.chunkOffset >= len(data) {
 				r.chunkIdx++
@@ -249,6 +261,17 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 		})
 	}
 	return selected, tasks, nil
+}
+
+func refreshTasksV2(refresh func(context.Context, int64) (*ReconstructionResponseV2, error)) func(context.Context, int64) ([]fetchTask, error) {
+	return func(ctx context.Context, offset int64) ([]fetchTask, error) {
+		fresh, err := refresh(ctx, offset)
+		if err != nil {
+			return nil, err
+		}
+		_, tasks, err := planReaderV2(fresh)
+		return tasks, err
+	}
 }
 
 func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*XorbMultiRangeFetch, *XorbRangeDescriptor, error) {

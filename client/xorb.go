@@ -3,14 +3,18 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/upload"
 )
@@ -161,36 +165,70 @@ func (c *Client) DownloadXorbWithAuthProvider(ctx context.Context, provider Auth
 // DownloadXorb downloads a xorb from a URL and returns a streaming Decoder.
 // The caller must call Decoder.Close() when done to release the underlying HTTP connection.
 func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(c.withRetryBudget(ctx))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	maps.Copy(req.Header, header)
 
-	// Use the getHttpClient for retry with resume with range requests.
+	// getHttpClient resumes range requests; its status retries and reopens draw on the context's budget.
 	resp, err := c.getHttpClient.Do(req)
-	if err != nil && req.Header.Get("Range") != "" {
-		// Some CAS signed-range endpoints return 206 without Content-Range.
-		// httpseek correctly rejects that as a resumable HTTP response, but the
-		// original one-shot response is still usable, so retry without the
-		// resumable transport.
+	if err != nil && req.Header.Get("Range") != "" && (errors.Is(err, httpseek.ErrNoContentRange) || errors.Is(err, httpseek.ErrCodeForByteRange)) {
+		// Some CAS signed-range endpoints return 206 without Content-Range or
+		// the exact term bytes as 200. httpseek correctly rejects those as
+		// resumable responses, but the one-shot response is still usable, so
+		// fetch it without the resumable transport; any other range answer
+		// describes different bytes and stays an error.
 		resp, err = c.doWithNetworkRetry(req)
+		if err == nil && !describesRequestedRange(req, resp) {
+			resp.Body.Close()
+			err = fmt.Errorf("Content-Range %q does not describe %s", resp.Header.Get("Content-Range"), req.Header.Get("Range"))
+		}
 	}
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("fetch xorb: %w", err)
 	}
 
 	if req.Header.Get("Range") != "" &&
 		(resp.StatusCode == http.StatusPartialContent || isExactWholeRangeResponse(req, resp)) {
-		return resp.Body, nil
+		return &xorbBody{rc: resp.Body, cancel: cancel}, nil
 	}
 
 	if err := reqError(req, resp); err != nil {
 		resp.Body.Close()
+		cancel()
 		return nil, err
 	}
 
-	return resp.Body, nil
+	return &xorbBody{rc: resp.Body, cancel: cancel}, nil
+}
+
+// xorbBody serializes Read and Close of the httpseek body, which is not safe
+// for concurrent use; Close cancels the request first so a blocked Read returns.
+type xorbBody struct {
+	rc     io.ReadCloser
+	cancel context.CancelFunc
+	mut    sync.Mutex
+}
+
+func (b *xorbBody) Read(p []byte) (int, error) {
+	b.mut.Lock()
+	defer b.mut.Unlock()
+	n, err := b.rc.Read(p)
+	if err != nil {
+		b.cancel()
+	}
+	return n, err
+}
+
+func (b *xorbBody) Close() error {
+	b.cancel()
+	b.mut.Lock()
+	defer b.mut.Unlock()
+	return b.rc.Close()
 }
 
 // isExactWholeRangeResponse accepts the behavior used by xet-core's signed
@@ -202,12 +240,36 @@ func isExactWholeRangeResponse(req *http.Request, resp *http.Response) bool {
 	if resp.StatusCode != http.StatusOK || resp.ContentLength < 0 {
 		return false
 	}
-	var start, end int64
-	n, err := fmt.Sscanf(req.Header.Get("Range"), "bytes=%d-%d", &start, &end)
-	if err != nil || n != 2 || start < 0 || end < start {
+	start, end, ok := requestedRange(req)
+	return ok && resp.ContentLength == end-start+1
+}
+
+// describesRequestedRange accepts a one-shot 206 without Content-Range, or with
+// one naming exactly the requested range; a shorter answer cannot be resumed.
+func describesRequestedRange(req *http.Request, resp *http.Response) bool {
+	contentRange := resp.Header.Get("Content-Range")
+	if resp.StatusCode != http.StatusPartialContent || contentRange == "" {
+		return true
+	}
+	start, end, ok := requestedRange(req)
+	if !ok {
 		return false
 	}
-	return resp.ContentLength == end-start+1
+	total, ok := strings.CutPrefix(contentRange, fmt.Sprintf("bytes %d-%d/", start, end))
+	if !ok {
+		return false
+	}
+	if total == "*" {
+		return true
+	}
+	size, err := strconv.ParseUint(total, 10, 63)
+	return err == nil && size > uint64(end)
+}
+
+// requestedRange parses a bytes=start-end Range header.
+func requestedRange(req *http.Request) (start, end int64, ok bool) {
+	n, err := fmt.Sscanf(req.Header.Get("Range"), "bytes=%d-%d", &start, &end)
+	return start, end, err == nil && n == 2 && start >= 0 && end >= start
 }
 
 // DownloadXorbsMultipart sends one multi-range request and returns the multipart reader.
