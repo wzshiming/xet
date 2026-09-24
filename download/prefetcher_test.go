@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -118,10 +120,15 @@ func awaitWorkers(t *testing.T, p *prefetcher) bool {
 	return within(t, "prefetch workers", idle)
 }
 
-// splitRangeReaders builds V1 and V2 constructors for one 3-chunk xorb fetched
-// as chunks [0,2) and [2,3), so a stall inside the first range leaves the
-// second queued behind it at concurrency 1. split is the first range's length.
-func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int64, readers map[string]func(context.Context, ClientAdapter, *CacheManager) (io.ReadCloser, error)) {
+// answers is one reconstruction in both API shapes.
+type answers struct {
+	v1 *ReconstructionResponseV1
+	v2 *ReconstructionResponseV2
+}
+
+// splitAnswers describes one 3-chunk xorb fetched through url as chunks [0,2)
+// and [2,3); split is the first range's length.
+func splitAnswers(t *testing.T, url string) (chunks [][]byte, encoded []byte, split int64, a *answers) {
 	t.Helper()
 	chunks = make([][]byte, 3)
 	for i := range chunks {
@@ -138,24 +145,351 @@ func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int
 		{Chunks: ChunkRange{Start: 2, End: 3}, Bytes: ByteRange{Start: split, End: int64(len(encoded) - 1)}},
 	}
 	fetchInfo := []FetchInfoEntry{
-		{Range: ranges[0].Chunks, URL: "test://xorb", URLRange: ranges[0].Bytes},
-		{Range: ranges[1].Chunks, URL: "test://xorb", URLRange: ranges[1].Bytes},
+		{Range: ranges[0].Chunks, URL: url, URLRange: ranges[0].Bytes},
+		{Range: ranges[1].Chunks, URL: url, URLRange: ranges[1].Bytes},
 	}
+	a = &answers{
+		v1: &ReconstructionResponseV1{Terms: terms, FetchInfo: map[string][]FetchInfoEntry{testCacheHash: fetchInfo}},
+		v2: &ReconstructionResponseV2{Terms: slices.Clone(terms), Xorbs: map[string][]XorbMultiRangeFetch{testCacheHash: {{URL: url, Ranges: ranges}}}},
+	}
+	return chunks, encoded, split, a
+}
+
+// splitRangeReaders builds V1 and V2 constructors for splitAnswers' layout, so
+// a stall inside the first range leaves the second queued behind it at
+// concurrency 1.
+func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int64, readers map[string]func(context.Context, ClientAdapter, *CacheManager) (io.ReadCloser, error)) {
+	t.Helper()
+	chunks, encoded, split, a := splitAnswers(t, "test://xorb")
 	readers = map[string]func(context.Context, ClientAdapter, *CacheManager) (io.ReadCloser, error){
 		"v1": func(ctx context.Context, client ClientAdapter, m *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV1(ctx, client, &ReconstructionResponseV1{
-				Terms:     terms,
-				FetchInfo: map[string][]FetchInfoEntry{testCacheHash: fetchInfo},
-			}, WithCacheManager(m), WithConcurrency(1))
+			return NewReaderV1(ctx, client, a.v1, WithCacheManager(m), WithConcurrency(1))
 		},
 		"v2": func(ctx context.Context, client ClientAdapter, m *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV2(ctx, client, &ReconstructionResponseV2{
-				Terms: terms,
-				Xorbs: map[string][]XorbMultiRangeFetch{testCacheHash: {{URL: "test://xorb", Ranges: ranges}}},
-			}, WithCacheManager(m), WithConcurrency(1))
+			return NewReaderV2(ctx, client, a.v2, WithCacheManager(m), WithConcurrency(1))
 		},
 	}
 	return chunks, encoded, split, readers
+}
+
+// openRefreshing opens old through client with concurrency workers and
+// re-plans from fresh after a 403, calling onRefresh first with the refresh context.
+func openRefreshing(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, retries, concurrency int, onRefresh func(context.Context) error) (io.ReadCloser, error) {
+	opts := []Option{WithCacheManager(m), WithConcurrency(concurrency)}
+	if api == "v1" {
+		opts = append(opts, WithURLRefreshV1(retries, func(ctx context.Context) (*ReconstructionResponseV1, error) {
+			if err := onRefresh(ctx); err != nil {
+				return nil, err
+			}
+			return fresh.v1, nil
+		}))
+		return NewReaderV1(ctx, client, old.v1, opts...)
+	}
+	opts = append(opts, WithURLRefreshV2(retries, func(ctx context.Context) (*ReconstructionResponseV2, error) {
+		if err := onRefresh(ctx); err != nil {
+			return nil, err
+		}
+		return fresh.v2, nil
+	}))
+	return NewReaderV2(ctx, client, old.v2, opts...)
+}
+
+// forbidden403 is what a refused fetch URL produces, like client's statusError.
+type forbidden403 struct{}
+
+func (forbidden403) Error() string   { return "API error (status 403 Forbidden)" }
+func (forbidden403) StatusCode() int { return http.StatusForbidden }
+
+// expiringClient serves data like fakeClientAdapter but refuses the expired
+// URL with 403 and logs each answered request as "<url> <Range>". hold runs
+// before a request is answered; refused receives one value per 403.
+type expiringClient struct {
+	fakeClientAdapter
+	expired string
+	hold    func(url, rng string)
+	refused chan<- struct{}
+	mu      sync.Mutex
+	gets    []string
+}
+
+func (c *expiringClient) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	rng := header.Get("Range")
+	if c.hold != nil {
+		c.hold(url, rng)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.gets = append(c.gets, url+" "+rng)
+	c.mu.Unlock()
+	if url == c.expired {
+		if c.refused != nil {
+			c.refused <- struct{}{}
+		}
+		return nil, forbidden403{}
+	}
+	return c.fakeClientAdapter.DownloadXorbWithURL(ctx, url, header)
+}
+
+func (c *expiringClient) requests() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.gets)
+}
+
+func byteRange(r ByteRange) string { return fmt.Sprintf("bytes=%d-%d", r.Start, r.End) }
+
+// TestRefreshRejectsChangedLayout answers the 403 with a reconstruction that
+// describes other bytes: the reader must fail before fetching anything through
+// the new URL, reporting both the 403 and why the answer was refused. The
+// unchanged second range is held until then so only the first range decides.
+func TestRefreshRejectsChangedLayout(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(a *answers)
+		want   string
+	}{
+		{"term hash", func(a *answers) {
+			a.v1.Terms[1].Hash, a.v2.Terms[1].Hash = "fedcba9876543210", "fedcba9876543210"
+		}, "different content"},
+		{"term length", func(a *answers) {
+			a.v1.Terms[0].UnpackedLength, a.v2.Terms[0].UnpackedLength = 1999, 1999
+		}, "different content"},
+		{"term chunks", func(a *answers) {
+			a.v1.Terms[1].Range.Start, a.v2.Terms[1].Range.Start = 1, 1
+		}, "different content"},
+		{"term order", func(a *answers) {
+			slices.Reverse(a.v1.Terms)
+			slices.Reverse(a.v2.Terms)
+		}, "different content"},
+		{"offset", func(a *answers) {
+			a.v1.OffsetIntoFirstRange, a.v2.OffsetIntoFirstRange = 1, 1
+		}, "different content"},
+		{"byte range", func(a *answers) {
+			a.v1.FetchInfo[testCacheHash][0].URLRange.End++
+			a.v2.Xorbs[testCacheHash][0].Ranges[0].Bytes.End++
+		}, "no longer covers"},
+		{"chunk range", func(a *answers) {
+			a.v1.FetchInfo[testCacheHash][0].Range.End = 3
+			a.v2.Xorbs[testCacheHash][0].Ranges[0].Chunks.End = 3
+		}, "no longer covers"},
+		{"missing xorb", func(a *answers) {
+			delete(a.v1.FetchInfo, testCacheHash)
+			delete(a.v2.Xorbs, testCacheHash)
+		}, "no fetch info"},
+	}
+	for _, api := range []string{"v1", "v2"} {
+		for _, tc := range cases {
+			t.Run(api+"/"+tc.name, func(t *testing.T) {
+				_, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				tc.mutate(fresh)
+				second := byteRange(old.v1.FetchInfo[testCacheHash][1].URLRange)
+				release := make(chan struct{})
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old"}
+				client.hold = func(_, rng string) {
+					if rng == second {
+						<-release
+					}
+				}
+				var refreshes atomic.Int32
+				r, err := openRefreshing(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, 2, 1, func(context.Context) error {
+					refreshes.Add(1)
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				p := readerPrefetcher(t, r)
+				got, err := io.ReadAll(r)
+				close(release)
+				awaitWorkers(t, p)
+				if err == nil || !strings.Contains(err.Error(), tc.want) || !forbidden(err) {
+					t.Fatalf("read: %v, want the 403 and %q reported", err, tc.want)
+				}
+				if len(got) != 0 {
+					t.Fatalf("read %d bytes from a refused answer", len(got))
+				}
+				if n := refreshes.Load(); n != 1 {
+					t.Fatalf("refreshed %d times, want once", n)
+				}
+				for _, req := range client.requests() {
+					if strings.HasPrefix(req, "test://new") {
+						t.Fatalf("fetched %q from an answer describing other bytes", req)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestRefreshUsesFreshURLForLaterRanges refuses the first range at the old
+// URL: after one refresh the second range must start at the new URL instead
+// of paying its own 403.
+func TestRefreshUsesFreshURLForLaterRanges(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		t.Run(api, func(t *testing.T) {
+			chunks, encoded, _, old := splitAnswers(t, "test://old")
+			_, _, _, fresh := splitAnswers(t, "test://new")
+			client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old"}
+			var refreshes atomic.Int32
+			r, err := openRefreshing(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, 1, 1, func(context.Context) error {
+				refreshes.Add(1)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			p := readerPrefetcher(t, r)
+			got, err := io.ReadAll(r)
+			awaitWorkers(t, p)
+			if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
+			}
+			ranges := old.v1.FetchInfo[testCacheHash]
+			want := []string{
+				"test://old " + byteRange(ranges[0].URLRange),
+				"test://new " + byteRange(ranges[0].URLRange),
+				"test://new " + byteRange(ranges[1].URLRange),
+			}
+			if got := client.requests(); !slices.Equal(got, want) || refreshes.Load() != 1 {
+				t.Fatalf("requests = %q after %d refreshes, want %q after one", got, refreshes.Load(), want)
+			}
+		})
+	}
+}
+
+// TestRefreshCoalescesConcurrentForbidden refuses both ranges at the old URL
+// while they are in flight together, or refuses the second only after the
+// first was refreshed: either way one refresh serves both.
+func TestRefreshCoalescesConcurrentForbidden(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		for _, late := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/late=%v", api, late), func(t *testing.T) {
+				chunks, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				ranges := old.v1.FetchInfo[testCacheHash]
+				var arrived sync.WaitGroup
+				arrived.Add(2)
+				refreshed := make(chan struct{})
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old"}
+				client.hold = func(url, rng string) {
+					if url != "test://old" {
+						return
+					}
+					arrived.Done()
+					arrived.Wait()
+					if late && rng == byteRange(ranges[1].URLRange) {
+						within(t, "refresh before the late 403", refreshed)
+					}
+				}
+				var refreshes atomic.Int32
+				r, err := openRefreshing(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, 1, 2, func(context.Context) error {
+					if refreshes.Add(1) == 1 {
+						close(refreshed)
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				p := readerPrefetcher(t, r)
+				got, err := io.ReadAll(r)
+				awaitWorkers(t, p)
+				if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
+				}
+				want := []string{
+					"test://new " + byteRange(ranges[0].URLRange),
+					"test://new " + byteRange(ranges[1].URLRange),
+					"test://old " + byteRange(ranges[0].URLRange),
+					"test://old " + byteRange(ranges[1].URLRange),
+				}
+				reqs := client.requests()
+				slices.Sort(reqs)
+				if !slices.Equal(reqs, want) || refreshes.Load() != 1 {
+					t.Fatalf("requests = %q after %d refreshes, want each range refused once and served once after one refresh", reqs, refreshes.Load())
+				}
+			})
+		}
+	}
+}
+
+// TestReaderStopsDuringRefresh closes the reader, or cancels its context,
+// while the refresh that followed two concurrent 403s is still pending: the
+// leading and the waiting worker must exit without it, and the cache must stay usable.
+func TestReaderStopsDuringRefresh(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		for _, stop := range []string{"close", "cancel"} {
+			t.Run(api+"/"+stop, func(t *testing.T) {
+				chunks, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				dir := t.TempDir()
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				refused := make(chan struct{}, 2)
+				var arrived sync.WaitGroup
+				arrived.Add(2)
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old", refused: refused}
+				client.hold = func(url, _ string) {
+					if url == "test://old" {
+						arrived.Done()
+						arrived.Wait()
+					}
+				}
+				entered := make(chan struct{})
+				enter := sync.OnceFunc(func() { close(entered) })
+				r, err := openRefreshing(ctx, api, client, NewCacheManager(dir, 0), old, fresh, 2, 2, func(ctx context.Context) error {
+					enter()
+					<-ctx.Done()
+					return ctx.Err()
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				p := readerPrefetcher(t, r)
+				// Both ranges were refused; one worker is inside the refresh, the other waits for it.
+				<-refused
+				<-refused
+				within(t, "first refresh", entered)
+				if stop == "close" {
+					r.Close()
+				} else {
+					cancel()
+				}
+				if !awaitWorkers(t, p) {
+					t.FailNow()
+				}
+				_, err = io.ReadAll(r)
+				switch {
+				case stop == "close" && !errors.Is(err, fs.ErrClosed):
+					t.Fatalf("read after Close: %v, want fs.ErrClosed", err)
+				case stop == "cancel" && (!errors.Is(err, context.Canceled) || !forbidden(err)):
+					t.Fatalf("read after cancel: %v, want the 403 and context.Canceled", err)
+				}
+				r.Close()
+				for _, req := range client.requests() {
+					if strings.HasPrefix(req, "test://new") {
+						t.Fatalf("fetched %q after the reader stopped", req)
+					}
+				}
+
+				r, err = NewReaderV1(t.Context(), &fakeClientAdapter{data: encoded}, fresh.v1, WithCacheManager(NewCacheManager(dir, 0)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				got, err := io.ReadAll(r)
+				if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("download after the stop: %v, %d bytes, want %d", err, len(got), len(want))
+				}
+			})
+		}
+	}
 }
 
 func newTestPrefetcher(entry *prefetchEntry) *prefetcher {

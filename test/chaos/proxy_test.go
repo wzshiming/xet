@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -32,9 +33,12 @@ const (
 	shiftRange               // forward with the Range start moved one byte later, so the 206 describes another range
 	ignoreRange              // forward without the Range header, so the backend answers 200 with the whole resource
 	noContentRange           // relay the response without its Content-Range header
+	tagURLs                  // relay a reconstruction answer with ?gen=<tag> appended to every xorb URL
 )
 
-var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus", "shiftRange", "ignoreRange", "noContentRange"}
+var faultNames = [...]string{"pass", "stallHeaders", "stallBody", "abortBody", "resetBody", "shortBody", "shortChunked", "trickle", "injectStatus", "shiftRange", "ignoreRange", "noContentRange", "tagURLs"}
+
+var xorbURLs = regexp.MustCompile(`(/v1/xorbs/[^"?]*)"`)
 
 func (k faultKind) String() string { return faultNames[k] }
 
@@ -45,6 +49,7 @@ type fault struct {
 	piece  int64         // trickle write size
 	gap    time.Duration // trickle pause between writes
 	status int           // injectStatus code
+	tag    int           // tagURLs generation
 }
 
 // record is one client request as seen by the proxy: Seq counts earlier
@@ -202,7 +207,7 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 
 	maps.Copy(w.Header(), resp.Header)
 	switch f.kind {
-	case shortChunked:
+	case shortChunked, tagURLs:
 		w.Header().Del("Content-Length")
 	case noContentRange:
 		w.Header().Del("Content-Range")
@@ -214,6 +219,9 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 	switch f.kind {
 	case passThrough, shiftRange, ignoreRange, noContentRange:
 		_, _ = io.Copy(body, resp.Body)
+	case tagURLs:
+		answer, _ := io.ReadAll(resp.Body)
+		_, _ = body.Write(xorbURLs.ReplaceAll(answer, fmt.Appendf(nil, "${1}?gen=%d\"", f.tag)))
 	case trickle:
 		for {
 			if _, err := io.CopyN(body, resp.Body, f.piece); err != nil {

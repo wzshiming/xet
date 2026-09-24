@@ -812,3 +812,30 @@ func TestDownloadXorbWithURLBudgetIsPerDownload(t *testing.T) {
 		t.Fatalf("attempts: a %d, b %d; want 3 each", a, b)
 	}
 }
+
+// TestDownloadXorbWithURLExposesStatus pins the contract download relies on: a
+// refused fetch reports its status through StatusCode(), with or without a
+// Range, while a 404 stays errNotFound.
+func TestDownloadXorbWithURLExposesStatus(t *testing.T) {
+	var status atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "expired", int(status.Load()))
+	}))
+	defer srv.Close()
+	c, err := NewClient(WithRetryBackoff(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, header := range []http.Header{nil, {"Range": {"bytes=0-9"}}} {
+		status.Store(http.StatusForbidden)
+		_, err := c.DownloadXorbWithURL(t.Context(), srv.URL, header)
+		var coded interface{ StatusCode() int }
+		if !errors.As(err, &coded) || coded.StatusCode() != http.StatusForbidden || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("Range %q: err = %v, want StatusCode 403", header.Get("Range"), err)
+		}
+		status.Store(http.StatusNotFound)
+		if _, err := c.DownloadXorbWithURL(t.Context(), srv.URL, header); !errors.Is(err, errNotFound) || errors.As(err, &coded) {
+			t.Fatalf("Range %q: err = %v, want errNotFound without a status", header.Get("Range"), err)
+		}
+	}
+}

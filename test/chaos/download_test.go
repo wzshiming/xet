@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -263,7 +264,9 @@ func TestTransientStatusOnResumeThenHeal(t *testing.T) {
 }
 
 // TestStatusBudgets pins how many requests a permanent status costs: retryable
-// ones retries+1, terminal ones a single request; the cache heals either way.
+// ones retries+1, terminal ones a single request; only a 403 re-queries the
+// reconstruction, so every other xorb status leaves it at one query. The cache
+// heals either way.
 func TestStatusBudgets(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
@@ -271,16 +274,16 @@ func TestStatusBudgets(t *testing.T) {
 	const retries = 2
 
 	for _, tc := range []struct {
-		name         string
-		match        func(record) bool
-		status, want int
+		name                  string
+		match                 func(record) bool
+		status, want, queries int
 	}{
-		{"xorb 503", fx.big.match, http.StatusServiceUnavailable, retries + 1},
-		{"xorb 401", fx.big.match, http.StatusUnauthorized, 1},
-		{"xorb 404", fx.big.match, http.StatusNotFound, 1},
-		{"reconstruction 503", record.reconstruction, http.StatusServiceUnavailable, retries + 1},
-		{"reconstruction 401", record.reconstruction, http.StatusUnauthorized, 1},
-		{"reconstruction 404", record.reconstruction, http.StatusNotFound, 1},
+		{"xorb 503", fx.big.match, http.StatusServiceUnavailable, retries + 1, 1},
+		{"xorb 401", fx.big.match, http.StatusUnauthorized, 1, 1},
+		{"xorb 404", fx.big.match, http.StatusNotFound, 1, 1},
+		{"reconstruction 503", record.reconstruction, http.StatusServiceUnavailable, retries + 1, retries + 1},
+		{"reconstruction 401", record.reconstruction, http.StatusUnauthorized, 1, 1},
+		{"reconstruction 404", record.reconstruction, http.StatusNotFound, 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx.proxy.arm(func(r record) fault {
@@ -294,9 +297,13 @@ func TestStatusBudgets(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), strconv.Itoa(tc.status)) {
 				t.Fatalf("download error = %v, want status %d reported", err, tc.status)
 			}
-			got := statusLog(filter(fx.proxy.settle(t), tc.match))
+			recs := fx.proxy.settle(t)
+			got := statusLog(filter(recs, tc.match))
 			if len(got) != tc.want || slices.Contains(got, http.StatusOK) || slices.Contains(got, http.StatusPartialContent) {
 				t.Fatalf("%s answered %v, want %d attempts", tc.name, got, tc.want)
+			}
+			if got := len(filter(recs, record.reconstruction)); got != tc.queries {
+				t.Fatalf("%s led to %d reconstruction queries, want %d", tc.name, got, tc.queries)
 			}
 			if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.match); len(healed) != 1 {
 				t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
@@ -750,4 +757,304 @@ func TestSharedCacheSecondClientWaitsForRangeLock(t *testing.T) {
 
 	fx.requireAccounting(t, filter(fx.proxy.settle(t), record.xorbGet), 0)
 	fx.assertCached(t, ctx, cacheDir)
+}
+
+// urlGen matches xorb GETs through URLs tagged with generation n.
+func urlGen(n int) func(record) bool {
+	return func(r record) bool { return r.xorbGet() && r.Query == fmt.Sprintf("gen=%d", n) }
+}
+
+// file2Xorb reports whether r fetches one of file2's xorbs rather than small's.
+func (fx *fixture) file2Xorb(r record) bool {
+	for _, term := range fx.terms {
+		if xorbOf(term.Hash)(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// prefetchWorkers counts the running prefetch worker goroutines.
+func prefetchWorkers() int {
+	var buf bytes.Buffer
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+	return strings.Count(buf.String(), "download.(*prefetcher).runJob(")
+}
+
+// waitFor polls cond until it holds or waitTimeout passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(waitTimeout); !cond(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen within %v", what, waitTimeout)
+		}
+	}
+}
+
+// rangeKeys lists "<path> <Range>" of recs in order, so two phases can be compared range by range.
+func rangeKeys(recs []record) []string {
+	out := make([]string, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.Path+" "+r.Range)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// expireGen tags the xorb URLs of every reconstruction answer with its sequence
+// number and refuses the generations below n as an expired signed URL would.
+func expireGen(n int) rule {
+	return func(r record) fault {
+		switch {
+		case r.reconstruction():
+			return fault{kind: tagURLs, tag: r.Seq}
+		case r.xorbGet():
+			var gen int
+			if _, err := fmt.Sscanf(r.Query, "gen=%d", &gen); err != nil || gen < n {
+				return fault{kind: injectStatus, status: http.StatusForbidden}
+			}
+		}
+		return fault{}
+	}
+}
+
+// TestForbiddenURLRefreshedThenHeal refuses the first URL generation: the
+// client must repeat the reconstruction query once, unchanged, and fetch every
+// range through the new URLs without rewinding a seeded output. Ranges that
+// start after the refresh take the new URL directly, so with one worker only
+// the first range is ever refused.
+func TestForbiddenURLRefreshedThenHeal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	seeded := int64(fx.terms[0].UnpackedLength + fx.terms[1].UnpackedLength/2)
+
+	for _, tc := range []struct {
+		api     apiVersion
+		seeded  int64
+		workers int
+	}{{apiV1, 0, 4}, {apiV2, 0, 4}, {apiBatch, 0, 4}, {apiV2, seeded, 4}, {apiV1, 0, 1}, {apiBatch, 0, 1}} {
+		t.Run(fmt.Sprintf("%s/seeded=%d/workers=%d", tc.api, tc.seeded, tc.workers), func(t *testing.T) {
+			fx.proxy.arm(expireGen(1))
+			cacheDir := t.TempDir()
+			out := newOutput(t, fx.file2[:tc.seeded])
+			if err := fx.download(ctx, fx.proxyClient(t, cacheDir, client.WithConcurrency(tc.workers)), tc.api, out); err != nil {
+				t.Fatal(err)
+			}
+			fx.requireFile2(t, out)
+			if out.rewound || out.written != int64(len(fx.file2))-tc.seeded {
+				t.Fatalf("wrote %d bytes (rewound=%v), want %d after the seeded prefix", out.written, out.rewound, int64(len(fx.file2))-tc.seeded)
+			}
+
+			recs := fx.proxy.settle(t)
+			recon := filter(recs, record.reconstruction)
+			if len(recon) != 2 || recon[1].Path != recon[0].Path || recon[1].Query != recon[0].Query || recon[1].Range != recon[0].Range {
+				t.Fatalf("reconstruction requests = %+v, want the same query repeated once", recon)
+			}
+			gets := filter(recs, record.xorbGet)
+			refused, served := filter(gets, urlGen(0)), filter(gets, urlGen(1))
+			if len(refused)+len(served) != len(gets) || len(refused) == 0 {
+				t.Fatalf("xorb GETs = %+v, want the first generation refused and the second served", gets)
+			}
+			for _, g := range gets {
+				if g.Fault == injectStatus && g.Status != http.StatusForbidden || g.Fault == passThrough && g.Status != http.StatusPartialContent {
+					t.Fatalf("xorb GET %+v, want generation 0 refused and generation 1 served", g)
+				}
+			}
+			for _, key := range rangeKeys(refused) {
+				if !slices.Contains(rangeKeys(served), key) {
+					t.Fatalf("refused range %q was never fetched through the new URL: %+v", key, gets)
+				}
+			}
+			if tc.workers == 1 {
+				if late := filter(refused, func(r record) bool { return fx.file2Xorb(r) && !fx.first.match(r) }); len(late) != 0 {
+					t.Fatalf("ranges refused after the first: %+v, want them started at the new URL", late)
+				}
+			}
+			if tc.seeded == 0 {
+				extra := 0
+				if tc.api == apiBatch {
+					extra = 1 // small's own xorb
+				}
+				fx.requireAccounting(t, served, extra)
+				fx.assertCached(t, ctx, cacheDir)
+				return
+			}
+			if gets := filter(recs, xorbOf(fx.first.hash)); len(gets) != 0 {
+				t.Fatalf("fetched %+v, which only backs the seeded prefix", gets)
+			}
+			if healed := fx.heal(t, ctx, cacheDir); len(healed) != 1 || !xorbOf(fx.first.hash)(healed[0]) {
+				t.Fatalf("completing the cache fetched %+v, want only %s", healed, fx.first.hash)
+			}
+		})
+	}
+}
+
+// TestForbiddenURLBudget refuses the multi-chunk range in every URL generation:
+// it costs retries+1 GETs with one reconstruction query per retry before the
+// 403 is reported, the served range is not fetched again, and WithRetries(0)
+// never re-queries.
+func TestForbiddenURLBudget(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+
+	for _, retries := range []int{0, 2} {
+		t.Run(fmt.Sprintf("retries=%d", retries), func(t *testing.T) {
+			fx.proxy.arm(func(r record) fault {
+				switch {
+				case r.reconstruction():
+					return fault{kind: tagURLs, tag: r.Seq}
+				case fx.big.match(r):
+					return fault{kind: injectStatus, status: http.StatusForbidden}
+				}
+				return fault{}
+			})
+			cacheDir := t.TempDir()
+			err := fx.download(ctx, fx.proxyClient(t, cacheDir, client.WithRetries(retries)), apiV1, newOutput(t, nil))
+			if err == nil || !strings.Contains(err.Error(), "403") {
+				t.Fatalf("download error = %v, want the 403 reported", err)
+			}
+			recs := fx.proxy.settle(t)
+			if got := statusLog(filter(recs, record.reconstruction)); len(got) != retries+1 || slices.Contains(got, http.StatusForbidden) {
+				t.Fatalf("reconstruction statuses = %v, want %d queries", got, retries+1)
+			}
+			if got := statusLog(filter(recs, fx.big.match)); len(got) != retries+1 || slices.Contains(got, http.StatusPartialContent) {
+				t.Fatalf("statuses for %s = %v, want %d refused attempts", fx.big.rangeHeader(), got, retries+1)
+			}
+			if got := statusLog(filter(recs, fx.first.match)); !slices.Equal(got, []int{http.StatusPartialContent}) {
+				t.Fatalf("statuses for %s = %v, want the range served once", fx.first.rangeHeader(), got)
+			}
+			// Tiny sibling ranges of the refused xorb may still be in flight when the reader fails, so only the served xorb is pinned.
+			healed := fx.heal(t, ctx, cacheDir)
+			if len(filter(healed, fx.big.match)) != 1 || len(filter(healed, xorbOf(fx.first.hash))) != 0 {
+				t.Fatalf("healing fetched %+v, want the refused range once and the served xorb never", healed)
+			}
+		})
+	}
+}
+
+// TestBatchReaderCloseWhileRefreshStalls refuses every first-generation URL
+// and withholds the answer to the first re-query. file2's reader is refused at
+// once and issues that query; small's range answers 503 first, so its reader
+// is refused only after the backoff and waits for file2's answer. Closing the
+// waiting reader must stop its worker without touching the pending query;
+// closing the querying reader must let the waiter re-query on its own context
+// and finish.
+func TestBatchReaderCloseWhileRefreshStalls(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	stalledQuery := func(r record) bool { return r.reconstruction() && r.Fault == stallHeaders && r.End.IsZero() }
+	smallRefused := func(r record) bool {
+		return r.xorbGet() && !fx.file2Xorb(r) && r.Status == http.StatusForbidden && !r.End.IsZero()
+	}
+	expired := expireGen(2)
+	rule := func(r record) fault {
+		switch {
+		case r.reconstruction() && r.Seq == 1:
+			return fault{kind: stallHeaders}
+		case r.xorbGet() && !fx.file2Xorb(r) && r.Seq == 0:
+			return fault{kind: injectStatus, status: http.StatusServiceUnavailable}
+		}
+		return expired(r)
+	}
+
+	for _, closeFirst := range []string{"waiter", "leader"} {
+		t.Run("close "+closeFirst, func(t *testing.T) {
+			fx.proxy.arm(rule)
+			cacheDir := t.TempDir()
+			c := fx.proxyClient(t, cacheDir, client.WithRetryBackoff(600*time.Millisecond))
+			readers, _, err := c.DownloadFiles(ctx, []xet.FileHash{fx.hash2, fx.hashSmall})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range readers {
+				defer r.Close()
+			}
+			fx.proxy.wait(t, func(recs []record, _ int) bool {
+				return len(filter(recs, stalledQuery)) == 1 && len(filter(recs, smallRefused)) == 1
+			})
+			recs := fx.proxy.records()
+			if q, s := filter(recs, stalledQuery)[0], filter(recs, smallRefused)[0]; !q.Start.Before(s.Start) {
+				t.Fatalf("fixture: small was refused at %v before the re-query stalled at %v", s.Start, q.Start)
+			}
+			// file2's workers wait on its answer; small's single worker waits for it too.
+			workers := prefetchWorkers()
+			if workers < 2 {
+				t.Fatalf("%d prefetch workers running, want file2's and small's", workers)
+			}
+
+			leader, waiter := readers[0], readers[1]
+			if closeFirst == "leader" {
+				closedAt := time.Now()
+				leader.Close()
+				if took := time.Since(closedAt); took > 2*time.Second {
+					t.Fatalf("Close returned %v after being called", took)
+				}
+				if small, err := io.ReadAll(waiter); err != nil || !bytes.Equal(small, fx.small) {
+					t.Fatalf("waiting reader after the querying one closed: %d bytes, %v; want small served", len(small), err)
+				}
+				recs = fx.proxy.settle(t)
+				if got := statusLog(filter(recs, record.reconstruction)); !slices.Equal(got, []int{http.StatusOK, 0, http.StatusOK}) {
+					t.Fatalf("reconstruction statuses = %v, want the answer, the abandoned re-query and the waiter's own", got)
+				}
+				if got := filter(recs, func(r record) bool { return !fx.file2Xorb(r) && urlGen(2)(r) }); len(got) != 1 || got[0].Status != http.StatusPartialContent {
+					t.Fatalf("small's fetches through its own answer = %+v, want its range served once", got)
+				}
+			} else {
+				closedAt := time.Now()
+				waiter.Close()
+				if took := time.Since(closedAt); took > 2*time.Second {
+					t.Fatalf("Close returned %v after being called", took)
+				}
+				waitFor(t, "small's worker exit", func() bool { return prefetchWorkers() == workers-1 })
+				if stalled := filter(fx.proxy.records(), stalledQuery); len(stalled) != 1 || ctx.Err() != nil {
+					t.Fatalf("after closing small: pending queries %+v, ctx %v; want file2's query still pending", stalled, ctx.Err())
+				}
+				leader.Close()
+				recs = fx.proxy.settle(t)
+				if got := statusLog(filter(recs, record.reconstruction)); !slices.Equal(got, []int{http.StatusOK, 0}) {
+					t.Fatalf("reconstruction statuses = %v, want the answer and one abandoned re-query", got)
+				}
+			}
+			assertNoPrefetchWorkers(t)
+			fx.heal(t, ctx, cacheDir)
+		})
+	}
+}
+
+// TestForbiddenOnResumeFailsCleanly aborts the multi-chunk range mid-chunk and
+// refuses its resume: a 403 inside a body is not refreshed, so the download
+// must fail at once with the status reported, without re-querying, and the
+// cache must heal. Only the first request of a range is refreshed.
+func TestForbiddenOnResumeFailsCleanly(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	prefix := fx.midChunkPrefix(t, fx.big)
+	fx.proxy.arm(func(r record) fault {
+		switch {
+		case fx.big.match(r):
+			return fault{kind: abortBody, prefix: prefix}
+		case fx.big.within(prefix)(r):
+			return fault{kind: injectStatus, status: http.StatusForbidden}
+		}
+		return fault{}
+	})
+	cacheDir := t.TempDir()
+	err := fx.download(ctx, fx.proxyClient(t, cacheDir), apiV2, newOutput(t, nil))
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("download error = %v, want the 403 reported", err)
+	}
+	recs := fx.proxy.settle(t)
+	if got := statusLog(filter(recs, fx.big.within(prefix))); !slices.Equal(got, []int{http.StatusPartialContent, http.StatusForbidden}) {
+		t.Fatalf("statuses for %s = %v, want the aborted body and one refused resume", fx.big.rangeHeader(), got)
+	}
+	if n := len(filter(recs, record.reconstruction)); n != 1 {
+		t.Fatalf("%d reconstruction queries, want the refused resume left unrefreshed", n)
+	}
+	if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.within(prefix)); len(healed) != 1 {
+		t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
+	}
 }

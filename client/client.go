@@ -252,6 +252,15 @@ func (c *Client) getBaseURL(ctx context.Context, provider AuthProvider) (string,
 
 var errNotFound = fmt.Errorf("404 not found")
 
+// statusError carries the status of a refused request so download can act on a 403.
+type statusError struct {
+	status int
+	msg    string
+}
+
+func (e *statusError) Error() string   { return e.msg }
+func (e *statusError) StatusCode() int { return e.status }
+
 func reqError(req *http.Request, resp *http.Response) error {
 	if resp.StatusCode == http.StatusNotFound {
 		return errNotFound
@@ -262,12 +271,12 @@ func reqError(req *http.Request, resp *http.Response) error {
 	if ranges != "" {
 		if resp.StatusCode != http.StatusPartialContent {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: range: %s: API error (status %s): %s", req.URL.String(), ranges, resp.Status, string(body))
+			return &statusError{resp.StatusCode, fmt.Sprintf("url %s: range: %s: API error (status %s): %s", req.URL.String(), ranges, resp.Status, string(body))}
 		}
 	} else {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: API error (status %s): %s", req.URL.String(), resp.Status, string(body))
+			return &statusError{resp.StatusCode, fmt.Sprintf("url %s: API error (status %s): %s", req.URL.String(), resp.Status, string(body))}
 		}
 	}
 	return nil

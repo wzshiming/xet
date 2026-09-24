@@ -117,8 +117,8 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 		// offset.
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
-				resumeOffset = 0
-				reconstructionResp, err = c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, nil)
+				resumeOffset, header = 0, nil
+				reconstructionResp, err = c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
 			}
 		}
 		if err != nil {
@@ -126,7 +126,12 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, c.downloadOptions(fileHash, resumeOffset)...)
+	// The same query, Range included, replaces expired fetch URLs.
+	refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
+		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
+	}
+	opts := append(c.downloadOptions(fileHash, resumeOffset), download.WithURLRefreshV1(c.retries, refresh))
+	reader, err := download.NewReaderV1(ctx, c, reconstructionResp, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
@@ -140,8 +145,8 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 		// V1, which resumes from the same offset.
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
-				resumeOffset = 0
-				reconstructionResp, err = c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, nil)
+				resumeOffset, header = 0, nil
+				reconstructionResp, err = c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
 			}
 		}
 		if err != nil {
@@ -149,7 +154,11 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, provider AuthProvider,
 		}
 	}
 
-	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, c.downloadOptions(fileHash, resumeOffset)...)
+	refresh := func(ctx context.Context) (*download.ReconstructionResponseV2, error) {
+		return c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
+	}
+	opts := append(c.downloadOptions(fileHash, resumeOffset), download.WithURLRefreshV2(c.retries, refresh))
+	reader, err := download.NewReaderV2(ctx, c, reconstructionResp, opts...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
@@ -194,6 +203,26 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 		return nil, nil, fmt.Errorf("get batch reconstruction: %w", err)
 	}
 
+	// One refresh serves every reader holding the replaced answer; the gate is a channel so Close can interrupt the wait.
+	gate := make(chan struct{}, 1)
+	latest := batchResp
+	next := func(ctx context.Context, have *download.BatchReconstructionResponse) (*download.BatchReconstructionResponse, error) {
+		select {
+		case gate <- struct{}{}:
+			defer func() { <-gate }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if have == latest {
+			fresh, err := c.GetBatchReconstructionWithAuthProvider(ctx, provider, fileHashes)
+			if err != nil {
+				return nil, err
+			}
+			latest = fresh
+		}
+		return latest, nil
+	}
+
 	readers := make([]io.ReadCloser, len(fileHashes))
 	sizes := make([]int64, len(fileHashes))
 	for i, fileHash := range fileHashes {
@@ -209,9 +238,19 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 			Terms:                terms,
 			FetchInfo:            batchResp.FetchInfo,
 		}
+		have := batchResp
+		refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
+			fresh, err := next(ctx, have)
+			if err != nil {
+				return nil, err
+			}
+			have = fresh
+			return &download.ReconstructionResponseV1{Terms: fresh.Files[fileHash.String()], FetchInfo: fresh.FetchInfo}, nil
+		}
 
 		sizes[i] = download.ExpectedLengthV1(singleResp)
-		reader, err := download.NewReaderV1(ctx, c, singleResp, c.downloadOptions(fileHash, 0)...)
+		opts := append(c.downloadOptions(fileHash, 0), download.WithURLRefreshV1(c.retries, refresh))
+		reader, err := download.NewReaderV1(ctx, c, singleResp, opts...)
 		if err != nil {
 			readers[i] = errReader{err: fmt.Errorf("initialize reader for file %s: %w", fileHash.String(), err)}
 		} else {

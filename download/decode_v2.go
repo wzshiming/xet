@@ -56,7 +56,7 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refreshTasksV2(reconstruction, options.refreshV2))
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -249,6 +249,24 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 		})
 	}
 	return selected, tasks, nil
+}
+
+// refreshTasksV2 re-plans from a refreshed answer that still describes the same bytes.
+func refreshTasksV2(orig *ReconstructionResponseV2, refresh func(context.Context) (*ReconstructionResponseV2, error)) func(context.Context) ([]fetchTask, error) {
+	if refresh == nil {
+		return nil
+	}
+	return func(ctx context.Context) ([]fetchTask, error) {
+		fresh, err := refresh(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := sameLayout(orig.OffsetIntoFirstRange, fresh.OffsetIntoFirstRange, orig.Terms, fresh.Terms); err != nil {
+			return nil, err
+		}
+		_, tasks, err := planReaderV2(fresh)
+		return tasks, err
+	}
 }
 
 func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*XorbMultiRangeFetch, *XorbRangeDescriptor, error) {
