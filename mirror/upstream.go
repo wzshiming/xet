@@ -13,26 +13,38 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 )
 
-// authInjector adds the mirror's upstream credential to requests that target
-// the upstream hub host, and never anywhere else, so the token cannot leak to
-// CDN or CAS hosts reached through redirects.
+// authInjector limits context-carried credentials to the selected host.
 type authInjector struct {
 	inner http.RoundTripper
+}
+
+// upstreamAuth is the immutable credential of one selected upstream.
+type upstreamAuth struct {
 	host  string
 	token string
 }
 
+type upstreamAuthKey struct{}
+
 func (t *authInjector) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.token != "" && req.URL.Host == t.host && req.Header.Get("Authorization") == "" {
+	a, _ := req.Context().Value(upstreamAuthKey{}).(upstreamAuth)
+	if a.token != "" && req.URL.Host == a.host && req.Header.Get("Authorization") == "" {
 		req = req.Clone(req.Context())
-		req.Header.Set("Authorization", "Bearer "+t.token)
+		req.Header.Set("Authorization", "Bearer "+a.token)
 	}
 	return t.inner.RoundTrip(req)
 }
 
-// upstreamURL maps a local resolve path to the upstream equivalent.
-func (m *Mirror) upstreamURL(key string) string {
-	return strings.TrimRight(m.upstream.String(), "/") + key
+func (m *Mirror) upstreamTarget(ctx context.Context, repo, pathAndQuery string) (context.Context, string, error) {
+	u, token, err := m.upstreamFunc(ctx, repo)
+	if err != nil {
+		return ctx, "", err
+	}
+	if u == nil {
+		return ctx, "", fmt.Errorf("mirror: no upstream URL selected for %q", repo)
+	}
+	ctx = context.WithValue(ctx, upstreamAuthKey{}, upstreamAuth{host: u.Host, token: token})
+	return ctx, strings.TrimRight(u.String(), "/") + pathAndQuery, nil
 }
 
 // probeResult captures upstream metadata for one resolve path. Everything is
@@ -64,7 +76,10 @@ func pseudoCommit(repo, rev string) string {
 func (m *Mirror) probe(ctx context.Context, key resolveKey) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
-	cur := m.upstreamURL(key.String())
+	ctx, cur, err := m.upstreamTarget(ctx, key.repo, key.String())
+	if err != nil {
+		return nil, err
+	}
 	for range 8 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {

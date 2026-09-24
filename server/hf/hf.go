@@ -366,6 +366,14 @@ type treeLFS struct {
 	Size        int64  `json:"size"`
 }
 
+// repoIdentity is the repo identity as the mirror keys it: the prefix of the typed route's resolve path.
+func repoIdentity(typ, repo string) string {
+	if typ == "models" {
+		return repo
+	}
+	return typ + "/" + repo
+}
+
 // handleTree proxies a tree listing API request, rewriting each entry's
 // xetHash: entries whose lfs sha256 oid resolves in local storage advertise
 // the mirror's own hash so xet clients reconstruct them from the mirror CAS;
@@ -376,13 +384,14 @@ type treeLFS struct {
 // rewritten in a streaming pass, so a listing is never buffered whole; no
 // upstream header is forwarded, only the body is relayed.
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
 	pathAndQuery := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		pathAndQuery += "?" + r.URL.RawQuery
 	}
-	resp, err := h.mirror.FetchUpstream(r.Context(), pathAndQuery)
+	resp, err := h.mirror.FetchUpstream(r.Context(), repoIdentity(vars["type"], vars["repo"]), pathAndQuery)
 	if err != nil {
-		http.Error(w, "upstream tree fetch failed", http.StatusBadGateway)
+		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 		return
 	}
 	defer func() {

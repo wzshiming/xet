@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -104,10 +105,14 @@ func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, o
 	if err != nil {
 		t.Fatal(err)
 	}
+	selector, err := StaticUpstream(upstream, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	m, err := NewMirror(append([]Option{
 		WithStorage(stor),
-		WithUpstream(upstream),
+		WithUpstream(selector),
 		WithCacheDir(cacheDir),
 	}, opts...)...)
 	if err != nil {
@@ -2315,5 +2320,241 @@ func TestMirrorRepoContainingResolve(t *testing.T) {
 	}
 	if _, ok := paths.Load("/" + repo + "/resolve/main/g.bin"); !ok {
 		t.Fatal("g.bin was not fetched through the source branch")
+	}
+}
+
+func TestStaticUpstream(t *testing.T) {
+	selector, err := StaticUpstream("https://hub.example/", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, token, err := selector(context.Background(), "org/repo")
+	if err != nil || u.String() != "https://hub.example/" || token != "tok" {
+		t.Fatalf("selector = %v, %q, %v", u, token, err)
+	}
+	for _, raw := range []string{"hub.example", "http://", "://x"} {
+		if _, err := StaticUpstream(raw, ""); err == nil || err.Error() != fmt.Sprintf("mirror: invalid upstream URL %q", raw) {
+			t.Fatalf("StaticUpstream(%q) err = %v", raw, err)
+		}
+	}
+
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewMirror(WithStorage(stor), WithCacheDir(t.TempDir())); err == nil || err.Error() != "mirror: upstream is required" {
+		t.Fatalf("NewMirror without upstream err = %v", err)
+	}
+
+	t.Run("nil URL from selector", func(t *testing.T) {
+		none := func(context.Context, string) (*url.URL, string, error) { return nil, "", nil }
+		m, _ := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(none))
+		if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); err == nil || errors.Is(err, ErrUpstreamNotFound) {
+			t.Fatalf("ingest with nil upstream URL err = %v, want a plain error", err)
+		}
+		if _, err := m.FetchUpstream(context.Background(), "org/repo", "/api/models/org/repo"); err == nil {
+			t.Fatal("FetchUpstream with nil upstream URL succeeded")
+		}
+	})
+}
+
+func TestMirrorPerRepoUpstream(t *testing.T) {
+	const repoA, repoB = "org/a", "datasets/org/b%20c"
+	upA, upB := newPlainUpstream(), newPlainUpstream()
+	dataA, dataB := []byte("bytes from hub A"), []byte("bytes from hub B")
+	upA.set("/org/a/resolve/main/f.bin", dataA)
+	upB.set("/datasets/org/b c/resolve/main/f.bin", dataB) // the hub sees the decoded path
+	srvA, srvB := httptest.NewServer(upA), httptest.NewServer(upB)
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+	urlA, _ := url.Parse(srvA.URL)
+	urlB, _ := url.Parse(srvB.URL)
+
+	errBoom := errors.New("selector boom")
+	var seen sync.Map
+	selector := func(_ context.Context, repo string) (*url.URL, string, error) {
+		seen.Store(repo, true)
+		switch repo {
+		case repoA:
+			return urlA, "tok-a", nil
+		case repoB:
+			return urlB, "tok-b", nil
+		case "org/boom":
+			return nil, "", errBoom
+		}
+		return nil, "", fmt.Errorf("no upstream for %q: %w", repo, ErrUpstreamNotFound)
+	}
+	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector))
+
+	inA, err := m.Ingest(repoA, "main", "f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inB, err := m.Ingest(repoB, "main", "f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitClosed(t, inA.Done(), "repo A ingest")
+	awaitClosed(t, inB.Done(), "repo B ingest")
+	for _, tc := range []struct {
+		name         string
+		in           *Ingestion
+		up           *plainUpstream
+		data         []byte
+		token, other string
+	}{
+		{"A", inA, upA, dataA, "Bearer tok-a", "Bearer tok-b"},
+		{"B", inB, upB, dataB, "Bearer tok-b", "Bearer tok-a"},
+	} {
+		entry, err := tc.in.Entry()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, tc.data) {
+			t.Fatalf("%s: stored %q, want %q", tc.name, got, tc.data)
+		}
+		if _, ok := tc.up.seenAuth.Load(tc.token); !ok {
+			t.Fatalf("%s: hub did not receive its own token", tc.name)
+		}
+		if _, ok := tc.up.seenAuth.Load(tc.other); ok {
+			t.Fatalf("%s: hub received the other repo's token", tc.name)
+		}
+	}
+	for _, repo := range []string{repoA, repoB} {
+		if _, ok := seen.Load(repo); !ok {
+			t.Fatalf("selector was never asked for %q", repo)
+		}
+	}
+	if _, ok := seen.Load("datasets/org/b c"); ok {
+		t.Fatal("selector was asked with the decoded repo identity")
+	}
+
+	if _, err := ingestWait(t, m, "org/unmapped", "main", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("unmapped repo ingest err = %v, want ErrUpstreamNotFound", err)
+	}
+	if _, err := m.Resolve(context.Background(), "org/unmapped", "main", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("unmapped repo Resolve err = %v, want ErrUpstreamNotFound", err)
+	}
+	if _, err := ingestWait(t, m, "org/boom", "main", "f.bin"); !errors.Is(err, errBoom) || errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("selector failure ingest err = %v, want errBoom only", err)
+	}
+}
+
+func TestMirrorFetchUpstream(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.api["/api/models/org/a"] = []byte(`{"id":"org/a"}`)
+	var queries sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries.Store(r.URL.RawQuery, true)
+		upstream.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	hub, _ := url.Parse(srv.URL)
+
+	type ctxKey struct{}
+	errSelectorCanceled := errors.New("selector saw the cancellation")
+	var seen sync.Map // repo -> caller ctx value observed by the selector
+	selector := func(ctx context.Context, repo string) (*url.URL, string, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, "", errors.Join(errSelectorCanceled, err)
+		}
+		seen.Store(repo, ctx.Value(ctxKey{}))
+		return hub, "tok-a", nil
+	}
+	m, _ := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector))
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller value")
+	resp, err := m.FetchUpstream(ctx, "org/a", "/api/models/org/a?expand=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"id":"org/a"}` {
+		t.Fatalf("FetchUpstream = %d %q, %v", resp.StatusCode, body, err)
+	}
+	if v, _ := seen.Load("org/a"); v != "caller value" {
+		t.Fatalf("selector saw ctx value %v, want the caller's", v)
+	}
+	if _, ok := queries.Load("expand=1"); !ok {
+		t.Fatal("query not preserved on the upstream request")
+	}
+	if _, ok := upstream.seenAuth.Load("Bearer tok-a"); !ok {
+		t.Fatal("hub did not receive the selected token")
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.FetchUpstream(canceled, "org/a", "/api/models/org/a"); !errors.Is(err, errSelectorCanceled) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled FetchUpstream err = %v, want the selector's cancellation error", err)
+	}
+}
+
+func TestMirrorUpstreamAuthHostGuard(t *testing.T) {
+	cdn := newPlainUpstream() // serves the /cdn paths and records Authorization
+	data := []byte("cross-host redirect payload")
+	cdn.set("/org/repo/resolve/main/f.bin", data)
+	cdnSrv := httptest.NewServer(cdn)
+	t.Cleanup(cdnSrv.Close)
+
+	var hubAuth sync.Map // ?probe= marker -> Authorization seen by the hub
+	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hubAuth.Store(r.URL.Query().Get("probe"), r.Header.Get("Authorization"))
+		data, ok := cdn.get(r.URL.Path)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		sum := sha256.Sum256(data)
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+		w.Header().Set("X-Repo-Commit", "commit-1")
+		http.Redirect(w, r, cdnSrv.URL+"/cdn"+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(hubSrv.Close)
+	hub, _ := url.Parse(hubSrv.URL)
+	fixed := func(context.Context, string) (*url.URL, string, error) { return hub, "hub-secret", nil }
+	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(fixed))
+
+	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes mismatch")
+	}
+	if v, _ := hubAuth.Load(""); v != "Bearer hub-secret" {
+		t.Fatalf("hub saw Authorization %q, want the selected token", v)
+	}
+	if _, ok := cdn.seenAuth.Load("Bearer hub-secret"); ok {
+		t.Fatal("hub token leaked to the redirect target on another host")
+	}
+
+	ctx, _, err := m.upstreamTarget(context.Background(), "org/repo", "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		marker, auth string
+		ctx          context.Context
+	}{
+		{"keep", "Bearer keep", ctx},       // an Authorization already set wins
+		{"none", "", context.Background()}, // no selected upstream: nothing injected
+	} {
+		req, err := http.NewRequestWithContext(tc.ctx, http.MethodHead, hubSrv.URL+"/org/repo/resolve/main/f.bin?probe="+tc.marker, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.auth != "" {
+			req.Header.Set("Authorization", tc.auth)
+		}
+		resp, err := m.probeClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if v, _ := hubAuth.Load(tc.marker); v != tc.auth {
+			t.Fatalf("%s: hub saw Authorization %q, want %q", tc.marker, v, tc.auth)
+		}
 	}
 }

@@ -1,42 +1,80 @@
 package hf
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
+	"strings"
+
+	"github.com/wzshiming/xet/mirror"
 )
 
-// NewUpstreamProxy builds a reverse proxy that forwards control-plane
-// requests to the upstream hub with the given credential injected, intended
-// as the Handler's next (WithNext) in mirror mode. Downstream Authorization
-// headers are never forwarded upstream.
-func NewUpstreamProxy(upstream, upstreamToken string) (http.Handler, error) {
-	u, err := url.Parse(upstream)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("hf: invalid upstream URL %q", upstream)
-	}
-	return &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(u)
-			pr.Out.Host = u.Host
-			pr.Out.Header.Del("Authorization")
-			if upstreamToken != "" {
-				pr.Out.Header.Set("Authorization", "Bearer "+upstreamToken)
-			}
-		},
-		// Upstream response headers are dropped except the entity headers
-		// describing the relayed body and the redirect target without which
-		// 3xx cannot work.
-		ModifyResponse: func(resp *http.Response) error {
-			kept := http.Header{}
-			for _, k := range []string{"Content-Type", "Content-Length", "Content-Encoding", "Etag", "Date", "Location"} {
-				if v := resp.Header.Get(k); v != "" {
-					kept.Set(k, v)
+// NewUpstreamProxy forwards to selected upstreams without forwarding downstream credentials.
+func NewUpstreamProxy(upstreamFunc mirror.UpstreamFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if upstreamFunc == nil {
+			serveFetchError(w, false, errors.New("hf: no upstream selector"))
+			return
+		}
+		repo := proxyRepo(r.URL.EscapedPath())
+		upstreamURL, upstreamToken, err := upstreamFunc(r.Context(), repo)
+		if err != nil {
+			serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+			return
+		}
+		if upstreamURL == nil {
+			serveFetchError(w, false, fmt.Errorf("hf: no upstream URL selected for %q", repo))
+			return
+		}
+		proxy := &httputil.ReverseProxy{
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.SetURL(upstreamURL)
+				pr.Out.Host = upstreamURL.Host
+				pr.Out.Header.Del("Authorization")
+				if upstreamToken != "" {
+					pr.Out.Header.Set("Authorization", "Bearer "+upstreamToken)
 				}
-			}
-			resp.Header = kept
-			return nil
-		},
-	}, nil
+			},
+			// Keep entity metadata and redirect targets, not upstream control headers.
+			ModifyResponse: func(resp *http.Response) error {
+				kept := http.Header{}
+				for _, k := range []string{"Content-Type", "Content-Length", "Content-Encoding", "Etag", "Date", "Location"} {
+					if v := resp.Header.Get(k); v != "" {
+						kept.Set(k, v)
+					}
+				}
+				resp.Header = kept
+				return nil
+			},
+		}
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// Legacy single-segment repos with subpaths are ambiguous: gpt2/refs is treated as a repo.
+func proxyRepo(escapedPath string) string {
+	if rest, ok := strings.CutPrefix(escapedPath, "/api/"); ok {
+		segs := strings.SplitN(rest, "/", 4)
+		switch segs[0] {
+		case "models", "datasets", "spaces", "kernels":
+		default:
+			return ""
+		}
+		if len(segs) < 2 || segs[1] == "" {
+			return ""
+		}
+		repo := segs[1]
+		if len(segs) > 2 && segs[2] != "" {
+			repo += "/" + segs[2]
+		}
+		return repoIdentity(segs[0], repo)
+	}
+	if repo, _, ok := strings.Cut(escapedPath, "/resolve/"); ok {
+		return strings.TrimPrefix(repo, "/")
+	}
+	if repo, _, ok := strings.Cut(escapedPath, ".git/"); ok {
+		return strings.TrimPrefix(repo, "/")
+	}
+	return ""
 }

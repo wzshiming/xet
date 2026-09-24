@@ -202,9 +202,9 @@ func (m *Mirror) runTask(t *task, pre *probeResult) {
 		// A previous task already spooled the whole file (e.g. it failed
 		// between fetch and ingest); skip the refetch.
 	case pr.xet:
-		err = m.fetchXet(ctx, t, upath)
+		err = m.fetchXet(ctx, t, t.src)
 	default:
-		err = m.fetchPlain(ctx, t, upath)
+		err = m.fetchPlain(ctx, t, t.src)
 	}
 	if err == nil {
 		if want := t.size.Load(); want >= 0 && t.spool.size() != want {

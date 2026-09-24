@@ -103,16 +103,16 @@ func main() {
 			os.Exit(1)
 		}
 
-		next, err = hf.NewUpstreamProxy(*upstream, *upstreamToken)
+		up, err := mirror.StaticUpstream(*upstream, *upstreamToken)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create upstream proxy: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to create upstream selector: %v\n", err)
 			os.Exit(1)
 		}
+		next = hf.NewUpstreamProxy(up)
 
 		mir, err := mirror.NewMirror(
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(*upstream),
-			mirror.WithUpstreamToken(*upstreamToken),
+			mirror.WithUpstream(up),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
 			mirror.WithClient(xetClient),
 		)
