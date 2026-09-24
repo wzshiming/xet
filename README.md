@@ -1,3 +1,5 @@
+
+
 # XET Protocol (Go Implementation)
 
 Go implementation of the XET content-addressable storage protocol for large-file transfer with chunk-level deduplication.
@@ -18,7 +20,7 @@ Implemented in this repository:
 - Server storage backends: local filesystem, in-memory, or S3-compatible object stores, with optional presigned xorb download URLs
 - Mirror mode: full-cache middle layer bridging xet and plain hubs
 - Hugging Face token/LFS based integration helpers
-- Conformance and unit tests for key protocol paths
+- Conformance and unit tests for key protocol paths (conformance tests build the Rust xet-core reference)
 
 ## Compatibility Notes
 
