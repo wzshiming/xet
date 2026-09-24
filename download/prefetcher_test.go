@@ -180,9 +180,14 @@ type refreshing[T any] struct {
 	retries   int
 	onRefresh func(context.Context) error
 	calls     atomic.Int32
+	mu        sync.Mutex
+	offsets   []int64 // offset of every query, the opening one first
 }
 
-func (r *refreshing[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
+func (r *refreshing[T]) RefreshReconstruction(ctx context.Context, offset int64) (*T, error) {
+	r.mu.Lock()
+	r.offsets = append(r.offsets, offset)
+	r.mu.Unlock()
 	if r.calls.Add(1) == 1 {
 		return r.first, r.firstErr
 	}
@@ -195,6 +200,12 @@ func (r *refreshing[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
 }
 
 func (r *refreshing[T]) RefreshRetries() int { return r.retries }
+
+func (r *refreshing[T]) queried() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.offsets)
+}
 
 // static answers first once and never re-queries.
 func static[T any](first *T) *refreshing[T] { return &refreshing[T]{first: first} }
@@ -226,11 +237,12 @@ func (forbidden403) StatusCode() int { return http.StatusForbidden }
 // before a request is answered; refused receives one value per 403.
 type expiringClient struct {
 	fakeClientAdapter
-	expired string
-	hold    func(url, rng string)
-	refused chan<- struct{}
-	mu      sync.Mutex
-	gets    []string
+	expired      string
+	expiredRange string // when set, only this Range of expired is refused
+	hold         func(url, rng string)
+	refused      chan<- struct{}
+	mu           sync.Mutex
+	gets         []string
 }
 
 func (c *expiringClient) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
@@ -244,7 +256,7 @@ func (c *expiringClient) DownloadXorbWithURL(ctx context.Context, url string, he
 	c.mu.Lock()
 	c.gets = append(c.gets, url+" "+rng)
 	c.mu.Unlock()
-	if url == c.expired {
+	if url == c.expired && (c.expiredRange == "" || rng == c.expiredRange) {
 		if c.refused != nil {
 			c.refused <- struct{}{}
 		}
@@ -510,14 +522,15 @@ func TestNewReaderQueriesProvider(t *testing.T) {
 				opts := []Option{WithCacheManager(NewCacheManager(t.TempDir(), 0)), WithConcurrency(1)}
 				var r io.ReadCloser
 				var calls *atomic.Int32
+				var queried func() []int64
 				var err error
 				if api == "v1" {
 					provider := &refreshing[ReconstructionResponseV1]{first: old.v1, fresh: fresh.v1, retries: 1}
-					calls = &provider.calls
+					calls, queried = &provider.calls, provider.queried
 					r, err = NewReaderV1WithAuthProvider(t.Context(), client, provider, opts...)
 				} else {
 					provider := &refreshing[ReconstructionResponseV2]{first: old.v2, fresh: fresh.v2, retries: 1}
-					calls = &provider.calls
+					calls, queried = &provider.calls, provider.queried
 					r, err = NewReaderV2WithAuthProvider(t.Context(), client, provider, opts...)
 				}
 				if err != nil {
@@ -539,13 +552,89 @@ func TestNewReaderQueriesProvider(t *testing.T) {
 				}
 				ranges := old.v1.FetchInfo[testCacheHash]
 				want := []string{"test://old " + byteRange(ranges[0].URLRange), "test://old " + byteRange(ranges[1].URLRange)}
-				wantCalls := int32(1)
+				wantOffsets := []int64{0}
 				if refused {
 					want = []string{"test://old " + byteRange(ranges[0].URLRange), "test://new " + byteRange(ranges[0].URLRange), "test://new " + byteRange(ranges[1].URLRange)}
-					wantCalls = 2
+					wantOffsets = []int64{0, 0} // nothing was read before the first range was refused
 				}
-				if got, n := client.requests(), calls.Load(); !slices.Equal(got, want) || n != wantCalls {
-					t.Fatalf("requests = %q after %d provider queries, want %q after %d", got, n, want, wantCalls)
+				if got, offsets := client.requests(), queried(); !slices.Equal(got, want) || !slices.Equal(offsets, wantOffsets) {
+					t.Fatalf("requests = %q after queries at %v, want %q after %v", got, offsets, want, wantOffsets)
+				}
+			})
+		}
+	}
+}
+
+// TestRefreshQueriesFromReadOffset reads into the first range before the
+// second is refused: the refresh must carry the bytes read so far, and an
+// answer that omits the consumed first term still serves the rest.
+func TestRefreshQueriesFromReadOffset(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		for _, prefix := range []int{1234, 2000} {
+			t.Run(fmt.Sprintf("%s/prefix=%d", api, prefix), func(t *testing.T) {
+				chunks, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				ranges := old.v1.FetchInfo[testCacheHash]
+				if prefix == 2000 { // the first term was read to its end, so the server omits it
+					fresh.v1.Terms, fresh.v1.FetchInfo[testCacheHash] = fresh.v1.Terms[1:], fresh.v1.FetchInfo[testCacheHash][1:]
+					fresh.v2.Terms, fresh.v2.Xorbs[testCacheHash][0].Ranges = fresh.v2.Terms[1:], fresh.v2.Xorbs[testCacheHash][0].Ranges[1:]
+				} else {
+					fresh.v1.OffsetIntoFirstRange, fresh.v2.OffsetIntoFirstRange = int64(prefix), int64(prefix)
+				}
+				release := make(chan struct{})
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}, expired: "test://old", expiredRange: byteRange(ranges[1].URLRange)}
+				client.hold = func(url, rng string) {
+					if url == "test://old" && rng == byteRange(ranges[1].URLRange) {
+						<-release
+					}
+				}
+				opts := []Option{WithCacheManager(NewCacheManager(t.TempDir(), 0)), WithConcurrency(2)}
+				refreshed := make(chan struct{})
+				onRefresh := func(context.Context) error {
+					close(refreshed)
+					return nil
+				}
+				var r io.ReadCloser
+				var queried func() []int64
+				var err error
+				if api == "v1" {
+					provider := &refreshing[ReconstructionResponseV1]{first: old.v1, fresh: fresh.v1, retries: 1, onRefresh: onRefresh}
+					queried = provider.queried
+					r, err = NewReaderV1WithAuthProvider(t.Context(), client, provider, opts...)
+				} else {
+					provider := &refreshing[ReconstructionResponseV2]{first: old.v2, fresh: fresh.v2, retries: 1, onRefresh: onRefresh}
+					queried = provider.queried
+					r, err = NewReaderV2WithAuthProvider(t.Context(), client, provider, opts...)
+				}
+				if err != nil {
+					close(release)
+					t.Fatal(err)
+				}
+				defer r.Close()
+				unblock := sync.OnceFunc(func() { close(release) })
+				defer unblock()
+				got := make([]byte, prefix)
+				if _, err := io.ReadFull(r, got); err != nil {
+					t.Fatal(err)
+				}
+				unblock()
+				// Reading on would move the offset before the refusal reaches the refresh.
+				if !within(t, "refresh", refreshed) {
+					t.FailNow()
+				}
+				p := readerPrefetcher(t, r)
+				rest, err := io.ReadAll(r)
+				awaitWorkers(t, p)
+				if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(append(got, rest...), want) {
+					t.Fatalf("read %d+%d bytes, %v; want %d", len(got), len(rest), err, len(want))
+				}
+				want := []string{
+					"test://old " + byteRange(ranges[0].URLRange),
+					"test://old " + byteRange(ranges[1].URLRange),
+					"test://new " + byteRange(ranges[1].URLRange),
+				}
+				if got, offsets := client.requests(), queried(); !slices.Equal(got, want) || !slices.Equal(offsets, []int64{0, int64(prefix)}) {
+					t.Fatalf("requests = %q after queries at %v, want %q after [0 %d]", got, offsets, want, prefix)
 				}
 			})
 		}

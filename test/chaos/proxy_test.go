@@ -45,11 +45,12 @@ func (k faultKind) String() string { return faultNames[k] }
 // fault is the action applied to one proxied request.
 type fault struct {
 	kind   faultKind
-	prefix int64         // body bytes relayed before the fault takes effect
-	piece  int64         // trickle write size
-	gap    time.Duration // trickle pause between writes
-	status int           // injectStatus code
-	tag    int           // tagURLs generation
+	prefix int64           // body bytes relayed before the fault takes effect
+	piece  int64           // trickle write size
+	gap    time.Duration   // trickle pause between writes
+	status int             // injectStatus code
+	tag    int             // tagURLs generation
+	gate   <-chan struct{} // injectStatus answers only once this closes
 }
 
 // record is one client request as seen by the proxy: Seq counts earlier
@@ -172,6 +173,9 @@ func (p *faultProxy) serve(w http.ResponseWriter, r *http.Request) {
 
 	switch f.kind {
 	case injectStatus:
+		if f.gate != nil && !p.await(r.Context(), f.gate) {
+			return
+		}
 		p.setStatus(rec, f.status)
 		http.Error(w, http.StatusText(f.status), f.status)
 		return
@@ -283,10 +287,18 @@ func (p *faultProxy) setStatus(rec *record, status int) {
 
 // block holds the handler until the client leaves or the proxy closes.
 func (p *faultProxy) block(ctx context.Context) {
+	p.await(ctx, nil)
+}
+
+// await reports whether ch closed before the client left or the proxy closed.
+func (p *faultProxy) await(ctx context.Context, ch <-chan struct{}) bool {
 	select {
+	case <-ch:
+		return true
 	case <-ctx.Done():
 	case <-p.stop:
 	}
+	return false
 }
 
 // pause sleeps for d and reports whether the handler should keep going.

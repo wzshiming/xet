@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
@@ -177,42 +180,103 @@ func (c *Client) NewReaderV2WithAuthProvider(ctx context.Context, provider AuthP
 	return c.openV2(ctx, provider, fileHash, header, reconstructionResp)
 }
 
-// openV1 plans the reader from reconstructionResp; a 403 re-queries with the same provider and header.
+// openV1 plans the reader from reconstructionResp; a 403 re-queries with the same provider from the bytes already read.
 func (c *Client) openV1(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, reconstructionResp *download.ReconstructionResponseV1) (io.ReadCloser, int64, error) {
-	refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
-		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, header)
+	length := download.ExpectedLengthV1(reconstructionResp)
+	refresh := func(ctx context.Context, offset int64) (*download.ReconstructionResponseV1, error) {
+		h, err := rangeAfter(header, offset, length)
+		if err != nil {
+			return nil, err
+		}
+		return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, h)
 	}
 	reader, err := download.NewReaderV1WithAuthProvider(ctx, c, &refreshingClient[download.ReconstructionResponseV1]{c, reconstructionResp, refresh}, c.downloadOptions(fileHash, header)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v1: %w", err)
 	}
-	return reader, download.ExpectedLengthV1(reconstructionResp), nil
+	return reader, length, nil
 }
 
 func (c *Client) openV2(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header, reconstructionResp *download.ReconstructionResponseV2) (io.ReadCloser, int64, error) {
-	refresh := func(ctx context.Context) (*download.ReconstructionResponseV2, error) {
-		return c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, header)
+	length := download.ExpectedLengthV2(reconstructionResp)
+	refresh := func(ctx context.Context, offset int64) (*download.ReconstructionResponseV2, error) {
+		h, err := rangeAfter(header, offset, length)
+		if err != nil {
+			return nil, err
+		}
+		return c.GetReconstructionV2WithAuthProvider(ctx, provider, fileHash, h)
 	}
 	reader, err := download.NewReaderV2WithAuthProvider(ctx, c, &refreshingClient[download.ReconstructionResponseV2]{c, reconstructionResp, refresh}, c.downloadOptions(fileHash, header)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("initialize reader v2: %w", err)
 	}
-	return reader, download.ExpectedLengthV2(reconstructionResp), nil
+	return reader, length, nil
+}
+
+// Suffix ranges advance using the initial answer's actual length, not the requested suffix length.
+func rangeAfter(header http.Header, offset, length int64) (http.Header, error) {
+	if offset <= 0 {
+		return header, nil
+	}
+	var start, end int64 = 0, -1
+	var suffix bool
+	if spec := header.Get("Range"); spec != "" {
+		rest, isBytes := strings.CutPrefix(spec, "bytes=")
+		first, last, hasDash := strings.Cut(rest, "-")
+		if !isBytes || !hasDash {
+			return header, nil
+		}
+		if first == "" {
+			if _, err := strconv.ParseUint(last, 10, 63); err != nil {
+				return header, nil
+			}
+			suffix = true
+		} else {
+			from, err := strconv.ParseUint(first, 10, 63)
+			if err != nil {
+				return header, nil
+			}
+			start = int64(from)
+			if last != "" {
+				to, err := strconv.ParseUint(last, 10, 63)
+				if err != nil || int64(to) < start {
+					return header, nil
+				}
+				end = int64(to)
+			}
+		}
+	}
+	if start > math.MaxInt64-offset || (end >= 0 && start+offset > end) || (suffix && offset >= length) {
+		return nil, fmt.Errorf("range %q cannot resume after %d bytes", header.Get("Range"), offset)
+	}
+	start += offset
+	rewritten := fmt.Sprintf("bytes=%d-", start)
+	if suffix {
+		rewritten = fmt.Sprintf("bytes=-%d", length-offset)
+	} else if end >= 0 {
+		rewritten = fmt.Sprintf("bytes=%d-%d", start, end)
+	}
+	out := header.Clone()
+	if out == nil {
+		out = http.Header{}
+	}
+	out.Set("Range", rewritten)
+	return out, nil
 }
 
 // refreshingClient answers a reader's first query with first, then re-queries after a fetch URL answers 403.
 type refreshingClient[T any] struct {
 	*Client
 	first   *T
-	refresh func(context.Context) (*T, error)
+	refresh func(context.Context, int64) (*T, error)
 }
 
-func (r *refreshingClient[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
+func (r *refreshingClient[T]) RefreshReconstruction(ctx context.Context, offset int64) (*T, error) {
 	if first := r.first; first != nil {
 		r.first = nil
 		return first, nil
 	}
-	return r.refresh(ctx)
+	return r.refresh(ctx, offset)
 }
 
 func (r *refreshingClient[T]) RefreshRetries() int { return r.retries }
@@ -291,7 +355,11 @@ func (c *Client) DownloadFilesWithAuthProvider(ctx context.Context, provider Aut
 			FetchInfo:            batchResp.FetchInfo,
 		}
 		have := batchResp
-		refresh := func(ctx context.Context) (*download.ReconstructionResponseV1, error) {
+		refresh := func(ctx context.Context, offset int64) (*download.ReconstructionResponseV1, error) {
+			if offset > 0 {
+				// The batch API takes no Range, so a file that has progressed asks for its own remainder.
+				return c.GetReconstructionV1WithAuthProvider(ctx, provider, fileHash, http.Header{"Range": {fmt.Sprintf("bytes=%d-", offset)}})
+			}
 			fresh, err := next(ctx, have)
 			if err != nil {
 				return nil, err

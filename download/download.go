@@ -21,7 +21,8 @@ type options struct {
 
 // ReconstructionProvider supplies initial and refreshed reconstruction metadata.
 type ReconstructionProvider[T any] interface {
-	RefreshReconstruction(context.Context) (*T, error)
+	// offset counts the logical bytes the reader has emitted since its start; the opening query passes 0.
+	RefreshReconstruction(ctx context.Context, offset int64) (*T, error)
 	RefreshRetries() int
 }
 

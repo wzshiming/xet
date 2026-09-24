@@ -45,7 +45,7 @@ func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, prov
 	if provider == nil {
 		return nil, fmt.Errorf("no reconstruction provider")
 	}
-	reconstruction, err := provider.RefreshReconstruction(ctx)
+	reconstruction, err := provider.RefreshReconstruction(ctx, 0)
 	if err != nil {
 		return nil, fmt.Errorf("query reconstruction: %w", err)
 	}
@@ -162,6 +162,7 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 			copied := copy(p[n:], data[r.chunkOffset:])
 			n += copied
 			r.chunkOffset += copied
+			r.prefetcher.emitted.Add(int64(copied))
 
 			if r.chunkOffset >= len(data) {
 				r.chunkIdx++
@@ -261,9 +262,9 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 	return selected, tasks, nil
 }
 
-func refreshTasksV1(refresh func(context.Context) (*ReconstructionResponseV1, error)) func(context.Context) ([]fetchTask, error) {
-	return func(ctx context.Context) ([]fetchTask, error) {
-		fresh, err := refresh(ctx)
+func refreshTasksV1(refresh func(context.Context, int64) (*ReconstructionResponseV1, error)) func(context.Context, int64) ([]fetchTask, error) {
+	return func(ctx context.Context, offset int64) ([]fetchTask, error) {
+		fresh, err := refresh(ctx, offset)
 		if err != nil {
 			return nil, err
 		}

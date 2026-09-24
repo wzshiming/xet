@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/progress"
@@ -68,8 +69,9 @@ type prefetcher struct {
 	workers      sync.WaitGroup // feeder and worker goroutines started by start
 
 	// URL refresh after a 403; refresh is nil when not configured.
-	refresh func(context.Context) ([]fetchTask, error)
+	refresh func(context.Context, int64) ([]fetchTask, error)
 	retries int
+	emitted atomic.Int64           // logical bytes the reader has copied out; a refresh queries from here
 	mu      sync.Mutex             // held across refresh so refused workers share one query
 	gen     int                    // counts successful refreshes
 	fresh   map[fetchKey]fetchTask // tasks of generation gen; nil before the first refresh
@@ -92,7 +94,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cache *CacheManager, opts *options, refresh func(context.Context) ([]fetchTask, error)) (*prefetcher, error) {
+func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []selectedFetch, tasks []fetchTask, cache *CacheManager, opts *options, refresh func(context.Context, int64) ([]fetchTask, error)) (*prefetcher, error) {
 	entries := make(map[fetchKey]*prefetchEntry, len(tasks))
 	items := make([]*prefetchEntry, 0, len(entries))
 	termOrder := make(map[fetchKey]int, len(termFetches))
@@ -337,7 +339,7 @@ func (p *prefetcher) refreshTask(task fetchTask, gen int) (fetchTask, int, error
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if gen == p.gen {
-		tasks, err := p.refresh(p.ctx)
+		tasks, err := p.refresh(p.ctx, p.emitted.Load())
 		if err != nil {
 			return task, gen, err
 		}

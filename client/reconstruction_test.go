@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -761,6 +762,52 @@ func TestNewReader(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestRefreshRangeAfterOffset(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		offset  int64
+		length  int64
+		want    string
+		wantErr bool
+	}{
+		{"", 0, 100, "", false},
+		{"", 10, 100, "bytes=10-", false},
+		{"bytes=100-", 0, 100, "bytes=100-", false},
+		{"bytes=100-", 10, 100, "bytes=110-", false},
+		{"bytes=100-199", 99, 100, "bytes=199-199", false},
+		{"bytes=100-199", 100, 100, "", true},
+		{fmt.Sprintf("bytes=%d-", math.MaxInt64), 1, 1, "", true},
+		{"bytes=-100", 0, 50, "bytes=-100", false},
+		{"bytes=-100", 10, 100, "bytes=-90", false},
+		{"bytes=-100", 10, 50, "bytes=-40", false},
+		{"bytes=-100", 50, 50, "", true},
+		{"bytes=-100", 51, 50, "", true},
+		{"bytes=abc-", 10, 100, "bytes=abc-", false},
+		{"bytes=100-50", 10, 100, "bytes=100-50", false},
+	} {
+		t.Run(fmt.Sprintf("%s+%d", tc.in, tc.offset), func(t *testing.T) {
+			header := http.Header{"X-Test": {"kept"}}
+			if tc.in != "" {
+				header.Set("Range", tc.in)
+			}
+			before := fmt.Sprint(header)
+			got, err := rangeAfter(header, tc.offset, tc.length)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("rangeAfter(%q, %d) error = %v, wantErr %v", tc.in, tc.offset, err, tc.wantErr)
+			}
+			if after := fmt.Sprint(header); after != before {
+				t.Fatalf("caller's header changed from %s to %s", before, after)
+			}
+			if err == nil && (got.Get("Range") != tc.want || got.Get("X-Test") != "kept") {
+				t.Fatalf("header = %v, want Range %q with X-Test kept", got, tc.want)
+			}
+		})
+	}
+	if got, err := rangeAfter(nil, 5, 100); err != nil || got.Get("Range") != "bytes=5-" {
+		t.Fatalf("rangeAfter(nil, 5) = %v, %v; want bytes=5-", got, err)
 	}
 }
 

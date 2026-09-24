@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -818,6 +819,24 @@ func expireGen(n int) rule {
 	}
 }
 
+// refuseFirstGen tags xorb URLs with the count of reconstruction queries so
+// far and refuses the multi-chunk range's first generation once gate closes;
+// with small set, small's range is refused at once.
+func (fx *fixture) refuseFirstGen(gate <-chan struct{}, small bool) rule {
+	var queries atomic.Int32
+	return func(r record) fault {
+		switch {
+		case r.reconstruction():
+			return fault{kind: tagURLs, tag: int(queries.Add(1) - 1)}
+		case fx.big.match(r) && urlGen(0)(r):
+			return fault{kind: injectStatus, status: http.StatusForbidden, gate: gate}
+		case small && r.xorbGet() && !fx.file2Xorb(r) && urlGen(0)(r):
+			return fault{kind: injectStatus, status: http.StatusForbidden}
+		}
+		return fault{}
+	}
+}
+
 // TestForbiddenURLRefreshedThenHeal refuses the first URL generation: the
 // client must repeat the reconstruction query once, unchanged, and fetch every
 // range through the new URLs without rewinding a seeded output. Ranges that
@@ -1057,4 +1076,159 @@ func TestForbiddenOnResumeFailsCleanly(t *testing.T) {
 	if healed := filter(fx.heal(t, ctx, cacheDir), fx.big.within(prefix)); len(healed) != 1 {
 		t.Fatalf("healing fetched %+v, want the multi-chunk range once", healed)
 	}
+}
+
+// TestForbiddenRefreshQueriesFromReadOffset reads part of file2 before the
+// multi-chunk range's first URL is refused: the re-query must start at the
+// bytes already read on top of the opening Range, so the server omits a term
+// consumed to its end, and the served prefix xorb is never fetched again.
+func TestForbiddenRefreshQueriesFromReadOffset(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	term0 := int64(fx.terms[0].UnpackedLength)
+	// The client relies on the server dropping terms that end at or before the Range start.
+	fx.proxy.arm(nil)
+	layout, err := fx.proxyClient(t, t.TempDir()).GetReconstructionV1(ctx, fx.hash2, http.Header{"Range": {fmt.Sprintf("bytes=%d-", term0)}})
+	if err != nil || len(layout.Terms) != len(fx.terms)-1 || layout.Terms[0].Hash != fx.big.hash || layout.OffsetIntoFirstRange != 0 {
+		t.Fatalf("fixture: layout from byte %d = %+v, %v; want term 0 omitted", term0, layout, err)
+	}
+
+	for _, tc := range []struct {
+		api          apiVersion
+		base, prefix int64 // opening Range start and bytes read before the refusal
+		suffix       int64
+	}{
+		{apiV1, 0, term0/2 + 1, 0},
+		{apiV2, 0, term0/2 + 1, 0},
+		{apiV1, 1001, term0 - 1001, 0}, // read to term 0's end: the re-query omits it
+		{apiV2, 1001, term0 - 1001, 0},
+		{apiV1, 1001, term0 - 1001, int64(len(fx.file2)) - 1001},
+		{apiV2, 1001, term0 - 1001, int64(len(fx.file2)) - 1001},
+		{apiV1, 0, term0, int64(len(fx.file2)) + 1001},
+		{apiV2, 0, term0, int64(len(fx.file2)) + 1001},
+	} {
+		t.Run(fmt.Sprintf("%s/base=%d/prefix=%d/suffix=%d", tc.api, tc.base, tc.prefix, tc.suffix), func(t *testing.T) {
+			gate := make(chan struct{})
+			fx.proxy.arm(fx.refuseFirstGen(gate, false))
+			cacheDir := t.TempDir()
+			c := fx.proxyClient(t, cacheDir)
+			var header http.Header
+			if tc.suffix > 0 {
+				header = http.Header{"Range": {fmt.Sprintf("bytes=-%d", tc.suffix)}}
+			} else if tc.base > 0 {
+				header = http.Header{"Range": {fmt.Sprintf("bytes=%d-", tc.base)}}
+			}
+			var r io.ReadCloser
+			var size int64
+			var err error
+			if tc.api == apiV2 {
+				r, size, err = c.NewReaderV2(ctx, fx.hash2, header)
+			} else {
+				r, size, err = c.NewReaderV1(ctx, fx.hash2, header)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			got := make([]byte, tc.prefix)
+			if _, err := io.ReadFull(r, got); err != nil {
+				t.Fatal(err)
+			}
+			close(gate)
+			// Reading on would move the offset before the refusal reaches the re-query.
+			fx.proxy.wait(t, func(recs []record, _ int) bool { return len(filter(recs, record.reconstruction)) == 2 })
+			rest, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got = append(got, rest...); !bytes.Equal(got, fx.file2[tc.base:]) || size != int64(len(fx.file2))-tc.base {
+				t.Fatalf("read %d bytes (size %d) that differ from file2 after byte %d", len(got), size, tc.base)
+			}
+
+			recs := fx.proxy.settle(t)
+			remainingRange := fmt.Sprintf("bytes=%d-", tc.base+tc.prefix)
+			if tc.suffix > 0 {
+				remainingRange = fmt.Sprintf("bytes=-%d", int64(len(fx.file2))-tc.base-tc.prefix)
+			}
+			want := []string{fmt.Sprintf("/%s 200 %s", tc.api, header.Get("Range")), fmt.Sprintf("/%s 200 %s", tc.api, remainingRange)}
+			if got := reconstructionLog(recs); !slices.Equal(got, want) {
+				t.Fatalf("reconstruction requests = %q, want %q", got, want)
+			}
+			gets := filter(recs, record.xorbGet)
+			if got := statusLog(filter(gets, fx.big.match)); !slices.Equal(got, []int{http.StatusForbidden, http.StatusPartialContent}) {
+				t.Fatalf("statuses for %s = %v, want one refusal then the range served", fx.big.rangeHeader(), got)
+			}
+			if fresh := filter(gets, urlGen(1)); len(fresh) != 1 || !fx.big.match(fresh[0]) {
+				t.Fatalf("fetched %+v through the new URLs, want only the refused range", fresh)
+			}
+			served := filter(gets, func(r record) bool { return r.Status == http.StatusPartialContent })
+			fx.requireAccounting(t, served, 0)
+			fx.assertCached(t, ctx, cacheDir)
+		})
+	}
+}
+
+// TestBatchForbiddenRefreshQueriesPerFile refuses small's range at once and
+// file2's multi-chunk range after part of file2 was read: small re-queries the
+// batch without a Range while file2 asks for its own remainder, and each takes
+// the URLs of its own answer.
+func TestBatchForbiddenRefreshQueriesPerFile(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	prefix := int64(fx.terms[0].UnpackedLength)/2 + 1
+	gate := make(chan struct{})
+	fx.proxy.arm(fx.refuseFirstGen(gate, true))
+	cacheDir := t.TempDir()
+	readers, sizes, err := fx.proxyClient(t, cacheDir).DownloadFiles(ctx, []xet.FileHash{fx.hash2, fx.hashSmall})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range readers {
+		defer r.Close()
+	}
+	if sizes[0] != int64(len(fx.file2)) || sizes[1] != int64(len(fx.small)) {
+		t.Fatalf("sizes = %v, want %d and %d", sizes, len(fx.file2), len(fx.small))
+	}
+	got := make([]byte, prefix)
+	if _, err := io.ReadFull(readers[0], got); err != nil {
+		t.Fatal(err)
+	}
+	// small's re-query lands before file2's refusal is released, fixing the order of the log.
+	batchQueries := func(r record) bool {
+		return r.reconstruction() && r.Range == "" && r.Status == http.StatusOK && !r.End.IsZero()
+	}
+	fx.proxy.wait(t, func(recs []record, _ int) bool { return len(filter(recs, batchQueries)) == 2 })
+	close(gate)
+	fx.proxy.wait(t, func(recs []record, _ int) bool { return len(filter(recs, record.reconstruction)) == 3 })
+	rest, err := io.ReadAll(readers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got = append(got, rest...); !bytes.Equal(got, fx.file2) {
+		t.Fatalf("file2 reader returned %d bytes that differ from file2", len(got))
+	}
+	if small, err := io.ReadAll(readers[1]); err != nil || !bytes.Equal(small, fx.small) {
+		t.Fatalf("small reader: %d bytes, %v", len(small), err)
+	}
+
+	recs := fx.proxy.settle(t)
+	recon := filter(recs, record.reconstruction)
+	if len(recon) != 3 || recon[1].Path != recon[0].Path || recon[1].Range != "" || recon[2].Path != "/v1/reconstructions/"+fx.hash2.String() || recon[2].Range != fmt.Sprintf("bytes=%d-", prefix) {
+		t.Fatalf("reconstruction requests = %+v, want the batch repeated once and file2 queried from byte %d", recon, prefix)
+	}
+	smallXorb := func(r record) bool { return r.xorbGet() && !fx.file2Xorb(r) }
+	for _, rg := range []struct {
+		name string
+		gets []record
+		gen  string
+	}{{"small", filter(recs, smallXorb), "gen=1"}, {fx.big.rangeHeader(), filter(recs, fx.big.match), "gen=2"}} {
+		if got := statusLog(rg.gets); !slices.Equal(got, []int{http.StatusForbidden, http.StatusPartialContent}) || rg.gets[1].Query != rg.gen {
+			t.Fatalf("requests for %s = %+v, want one refusal then the range served through %s", rg.name, rg.gets, rg.gen)
+		}
+	}
+	served := filter(recs, func(r record) bool { return r.Status == http.StatusPartialContent })
+	fx.requireAccounting(t, served, 1)
+	fx.assertCached(t, ctx, cacheDir)
 }
