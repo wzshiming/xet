@@ -31,13 +31,8 @@ type ReaderV2 struct {
 	err          error
 }
 
-// NewReaderV2 creates a new V2 reconstruction reader.
-func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
-	return NewReaderV2WithAuthProvider(ctx, client, nil, reconstruction, opts...)
-}
-
 // NewReaderV2WithAuthProvider is NewReaderV1WithAuthProvider for V2 reconstructions.
-func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV2], reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
+func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV2], opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -46,6 +41,16 @@ func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, prov
 	cache := options.cache
 	if cache == nil {
 		return nil, fmt.Errorf("no cache manager provided")
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("no reconstruction provider")
+	}
+	reconstruction, err := provider.RefreshReconstruction(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query reconstruction: %w", err)
+	}
+	if reconstruction == nil {
+		return nil, fmt.Errorf("query reconstruction: nil response")
 	}
 	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
 	if err != nil {
@@ -61,12 +66,8 @@ func NewReaderV2WithAuthProvider(ctx context.Context, client ClientAdapter, prov
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	var refresh func(context.Context) ([]fetchTask, error)
-	if provider != nil {
-		options.retries = provider.RefreshRetries()
-		refresh = refreshTasksV2(provider.RefreshReconstruction)
-	}
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refresh)
+	options.retries = provider.RefreshRetries()
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refreshTasksV2(provider.RefreshReconstruction))
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}

@@ -163,62 +163,56 @@ func splitRangeReaders(t *testing.T) (chunks [][]byte, encoded []byte, split int
 	chunks, encoded, split, a := splitAnswers(t, "test://xorb")
 	readers = map[string]func(context.Context, ClientAdapter, *CacheManager) (io.ReadCloser, error){
 		"v1": func(ctx context.Context, client ClientAdapter, m *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV1(ctx, client, a.v1, WithCacheManager(m), WithConcurrency(1))
+			return NewReaderV1WithAuthProvider(ctx, client, static(a.v1), WithCacheManager(m), WithConcurrency(1))
 		},
 		"v2": func(ctx context.Context, client ClientAdapter, m *CacheManager) (io.ReadCloser, error) {
-			return NewReaderV2(ctx, client, a.v2, WithCacheManager(m), WithConcurrency(1))
+			return NewReaderV2WithAuthProvider(ctx, client, static(a.v2), WithCacheManager(m), WithConcurrency(1))
 		},
 	}
 	return chunks, encoded, split, readers
 }
 
-// refreshing is a ReconstructionProvider: fresh is answered once onRefresh allows it.
+// onRefresh only gates queries after the initial answer.
 type refreshing[T any] struct {
+	first     *T
+	firstErr  error
 	fresh     *T
 	retries   int
 	onRefresh func(context.Context) error
+	calls     atomic.Int32
 }
 
-func (r refreshing[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
-	if err := r.onRefresh(ctx); err != nil {
-		return nil, err
+func (r *refreshing[T]) RefreshReconstruction(ctx context.Context) (*T, error) {
+	if r.calls.Add(1) == 1 {
+		return r.first, r.firstErr
+	}
+	if r.onRefresh != nil {
+		if err := r.onRefresh(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return r.fresh, nil
 }
 
-func (r refreshing[T]) RefreshRetries() int { return r.retries }
+func (r *refreshing[T]) RefreshRetries() int { return r.retries }
+
+// static answers first once and never re-queries.
+func static[T any](first *T) *refreshing[T] { return &refreshing[T]{first: first} }
 
 // openRefreshing opens old through client with concurrency workers and
 // re-plans from fresh after a 403, calling onRefresh first with the refresh context.
 func openRefreshing(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, retries, concurrency int, onRefresh func(context.Context) error) (io.ReadCloser, error) {
 	opts := []Option{WithCacheManager(m), WithConcurrency(concurrency)}
 	if api == "v1" {
-		return NewReaderV1WithAuthProvider(ctx, client, refreshing[ReconstructionResponseV1]{fresh.v1, retries, onRefresh}, old.v1, opts...)
+		return NewReaderV1WithAuthProvider(ctx, client, &refreshing[ReconstructionResponseV1]{first: old.v1, fresh: fresh.v1, retries: retries, onRefresh: onRefresh}, opts...)
 	}
-	return NewReaderV2WithAuthProvider(ctx, client, refreshing[ReconstructionResponseV2]{fresh.v2, retries, onRefresh}, old.v2, opts...)
+	return NewReaderV2WithAuthProvider(ctx, client, &refreshing[ReconstructionResponseV2]{first: old.v2, fresh: fresh.v2, retries: retries, onRefresh: onRefresh}, opts...)
 }
 
 // capable is a ClientAdapter that also implements ReconstructionProvider.
 type capable[T any] struct {
 	ClientAdapter
-	refreshing[T]
-}
-
-// openWithoutProvider opens old through a capable client via NewReaderV1/V2 or an explicit nil provider.
-func openWithoutProvider(ctx context.Context, api string, client ClientAdapter, m *CacheManager, old, fresh *answers, viaNil bool, onRefresh func(context.Context) error) (io.ReadCloser, error) {
-	opts := []Option{WithCacheManager(m), WithConcurrency(1)}
-	if api == "v1" {
-		c := capable[ReconstructionResponseV1]{client, refreshing[ReconstructionResponseV1]{fresh.v1, 2, onRefresh}}
-		if viaNil {
-			return NewReaderV1WithAuthProvider(ctx, c, nil, old.v1, opts...)
-		}
-		return NewReaderV1(ctx, c, old.v1, opts...)
-	}
-	c := capable[ReconstructionResponseV2]{client, refreshing[ReconstructionResponseV2]{fresh.v2, 2, onRefresh}}
-	if viaNil {
-		return NewReaderV2WithAuthProvider(ctx, c, nil, old.v2, opts...)
-	}
-	return NewReaderV2(ctx, c, old.v2, opts...)
+	*refreshing[T]
 }
 
 // forbidden403 is what a refused fetch URL produces, like client's statusError.
@@ -487,7 +481,7 @@ func TestReaderStopsDuringRefresh(t *testing.T) {
 					}
 				}
 
-				r, err = NewReaderV1(t.Context(), &fakeClientAdapter{data: encoded}, fresh.v1, WithCacheManager(NewCacheManager(dir, 0)))
+				r, err = NewReaderV1WithAuthProvider(t.Context(), &fakeClientAdapter{data: encoded}, static(fresh.v1), WithCacheManager(NewCacheManager(dir, 0)))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -501,46 +495,111 @@ func TestReaderStopsDuringRefresh(t *testing.T) {
 	}
 }
 
+func TestNewReaderQueriesProvider(t *testing.T) {
+	for _, api := range []string{"v1", "v2"} {
+		for _, refused := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/refused=%v", api, refused), func(t *testing.T) {
+				chunks, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}}
+				requests := make(chan struct{})
+				client.hold = func(_, _ string) { <-requests }
+				if refused {
+					client.expired = "test://old"
+				}
+				opts := []Option{WithCacheManager(NewCacheManager(t.TempDir(), 0)), WithConcurrency(1)}
+				var r io.ReadCloser
+				var calls *atomic.Int32
+				var err error
+				if api == "v1" {
+					provider := &refreshing[ReconstructionResponseV1]{first: old.v1, fresh: fresh.v1, retries: 1}
+					calls = &provider.calls
+					r, err = NewReaderV1WithAuthProvider(t.Context(), client, provider, opts...)
+				} else {
+					provider := &refreshing[ReconstructionResponseV2]{first: old.v2, fresh: fresh.v2, retries: 1}
+					calls = &provider.calls
+					r, err = NewReaderV2WithAuthProvider(t.Context(), client, provider, opts...)
+				}
+				if err != nil {
+					close(requests)
+					t.Fatal(err)
+				}
+				defer r.Close()
+				release := sync.OnceFunc(func() { close(requests) })
+				defer release()
+				if n := calls.Load(); n != 1 {
+					t.Fatalf("provider queried %d times before releasing fetches, want once", n)
+				}
+				release()
+				p := readerPrefetcher(t, r)
+				got, err := io.ReadAll(r)
+				awaitWorkers(t, p)
+				if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
+				}
+				ranges := old.v1.FetchInfo[testCacheHash]
+				want := []string{"test://old " + byteRange(ranges[0].URLRange), "test://old " + byteRange(ranges[1].URLRange)}
+				wantCalls := int32(1)
+				if refused {
+					want = []string{"test://old " + byteRange(ranges[0].URLRange), "test://new " + byteRange(ranges[0].URLRange), "test://new " + byteRange(ranges[1].URLRange)}
+					wantCalls = 2
+				}
+				if got, n := client.requests(), calls.Load(); !slices.Equal(got, want) || n != wantCalls {
+					t.Fatalf("requests = %q after %d provider queries, want %q after %d", got, n, want, wantCalls)
+				}
+			})
+		}
+	}
+}
+
 func TestNewReaderIgnoresClientRefreshCapability(t *testing.T) {
 	for _, api := range []string{"v1", "v2"} {
-		for _, viaNil := range []bool{false, true} {
-			for _, refused := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/nil=%v/refused=%v", api, viaNil, refused), func(t *testing.T) {
-					chunks, encoded, _, old := splitAnswers(t, "test://old")
-					_, _, _, fresh := splitAnswers(t, "test://new")
-					client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}}
-					if refused {
-						client.expired = "test://old"
+		for _, refused := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/refused=%v", api, refused), func(t *testing.T) {
+				chunks, encoded, _, old := splitAnswers(t, "test://old")
+				_, _, _, fresh := splitAnswers(t, "test://new")
+				client := &expiringClient{fakeClientAdapter: fakeClientAdapter{data: encoded}}
+				if refused {
+					client.expired = "test://old"
+				}
+				var refreshes atomic.Int32
+				onRefresh := func(context.Context) error {
+					refreshes.Add(1)
+					return nil
+				}
+				opts := []Option{WithCacheManager(NewCacheManager(t.TempDir(), 0)), WithConcurrency(1)}
+				var r io.ReadCloser
+				var err error
+				if api == "v1" {
+					c := capable[ReconstructionResponseV1]{client, &refreshing[ReconstructionResponseV1]{first: fresh.v1, fresh: fresh.v1, retries: 2, onRefresh: onRefresh}}
+					r, err = NewReaderV1WithAuthProvider(t.Context(), c, static(old.v1), opts...)
+				} else {
+					c := capable[ReconstructionResponseV2]{client, &refreshing[ReconstructionResponseV2]{first: fresh.v2, fresh: fresh.v2, retries: 2, onRefresh: onRefresh}}
+					r, err = NewReaderV2WithAuthProvider(t.Context(), c, static(old.v2), opts...)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				p := readerPrefetcher(t, r)
+				got, err := io.ReadAll(r)
+				awaitWorkers(t, p)
+				if refused {
+					if !forbidden(err) || len(got) != 0 {
+						t.Fatalf("read %d bytes, %v; want the 403 unrefreshed", len(got), err)
 					}
-					var refreshes atomic.Int32
-					r, err := openWithoutProvider(t.Context(), api, client, NewCacheManager(t.TempDir(), 0), old, fresh, viaNil, func(context.Context) error {
-						refreshes.Add(1)
-						return nil
-					})
-					if err != nil {
-						t.Fatal(err)
+				} else if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
+				}
+				if n := refreshes.Load(); n != 0 {
+					t.Fatalf("refreshed %d times through the client, want none", n)
+				}
+				for _, req := range client.requests() {
+					if strings.HasPrefix(req, "test://new") {
+						t.Fatalf("fetched %q, which only the client's own answers describe", req)
 					}
-					defer r.Close()
-					p := readerPrefetcher(t, r)
-					got, err := io.ReadAll(r)
-					awaitWorkers(t, p)
-					if refused {
-						if !forbidden(err) || len(got) != 0 {
-							t.Fatalf("read %d bytes, %v; want the 403 unrefreshed", len(got), err)
-						}
-					} else if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
-						t.Fatalf("read %d bytes, %v; want %d", len(got), err, len(want))
-					}
-					if n := refreshes.Load(); n != 0 {
-						t.Fatalf("refreshed %d times through the client, want none without a provider", n)
-					}
-					for _, req := range client.requests() {
-						if strings.HasPrefix(req, "test://new") {
-							t.Fatalf("fetched %q without a provider", req)
-						}
-					}
-				})
-			}
+				}
+			})
 		}
 	}
 }
@@ -700,7 +759,7 @@ func TestReaderV2CancelAfterFirstChunkReleasesEntry(t *testing.T) {
 		stalled: make(chan struct{}),
 		closed:  make(chan struct{}),
 	}
-	r, err := NewReaderV2(ctx, client, recon, WithCacheManager(m))
+	r, err := NewReaderV2WithAuthProvider(ctx, client, static(recon), WithCacheManager(m))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,7 +782,7 @@ func TestReaderV2CancelAfterFirstChunkReleasesEntry(t *testing.T) {
 		t.Fatalf("aborted entry was not discarded: %v, %v", info, err)
 	}
 
-	r, err = NewReaderV2(context.Background(), &fakeClientAdapter{data: encoded}, recon, WithCacheManager(m))
+	r, err = NewReaderV2WithAuthProvider(context.Background(), &fakeClientAdapter{data: encoded}, static(recon), WithCacheManager(m))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -957,7 +1016,7 @@ func TestReaderV2CloseBeforeFirstChunkReleasesLateResult(t *testing.T) {
 		stalled: make(chan struct{}),
 		closed:  make(chan struct{}),
 	}
-	r, err := NewReaderV2(context.Background(), client, recon, WithCacheManager(m))
+	r, err := NewReaderV2WithAuthProvider(context.Background(), client, static(recon), WithCacheManager(m))
 	if err != nil {
 		t.Fatal(err)
 	}

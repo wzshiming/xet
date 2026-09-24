@@ -8,7 +8,7 @@ import (
 	"github.com/wzshiming/xet/progress"
 )
 
-// Option is a functional option for NewReaderV1 and NewReaderV2.
+// Option is a functional option for NewReaderV1WithAuthProvider and NewReaderV2WithAuthProvider.
 type Option func(*options)
 
 type options struct {
@@ -19,7 +19,7 @@ type options struct {
 	retries      int
 }
 
-// ReconstructionProvider re-queries a reader's reconstruction after a fetch URL answers 403, up to RefreshRetries times per range.
+// ReconstructionProvider supplies initial and refreshed reconstruction metadata.
 type ReconstructionProvider[T any] interface {
 	RefreshReconstruction(context.Context) (*T, error)
 	RefreshRetries() int

@@ -31,13 +31,8 @@ type ReaderV1 struct {
 	err          error
 }
 
-// NewReaderV1 creates a new V1 reconstruction reader.
-func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
-	return NewReaderV1WithAuthProvider(ctx, client, nil, reconstruction, opts...)
-}
-
-// NewReaderV1WithAuthProvider uses provider to refresh expired URLs; nil disables refreshes.
-func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV1], reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
+// NewReaderV1WithAuthProvider plans the download from provider's first answer and re-queries it after a 403.
+func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, provider ReconstructionProvider[ReconstructionResponseV1], opts ...Option) (io.ReadCloser, error) {
 	options := &options{}
 	for _, opt := range opts {
 		opt(options)
@@ -46,6 +41,16 @@ func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, prov
 	cache := options.cache
 	if cache == nil {
 		return nil, fmt.Errorf("no cache manager provided")
+	}
+	if provider == nil {
+		return nil, fmt.Errorf("no reconstruction provider")
+	}
+	reconstruction, err := provider.RefreshReconstruction(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("query reconstruction: %w", err)
+	}
+	if reconstruction == nil {
+		return nil, fmt.Errorf("query reconstruction: nil response")
 	}
 	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
 	if err != nil {
@@ -61,12 +66,8 @@ func NewReaderV1WithAuthProvider(ctx context.Context, client ClientAdapter, prov
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	var refresh func(context.Context) ([]fetchTask, error)
-	if provider != nil {
-		options.retries = provider.RefreshRetries()
-		refresh = refreshTasksV1(provider.RefreshReconstruction)
-	}
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refresh)
+	options.retries = provider.RefreshRetries()
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options, refreshTasksV1(provider.RefreshReconstruction))
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
