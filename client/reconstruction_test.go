@@ -690,9 +690,7 @@ var (
 	unavailable reply = func(w http.ResponseWriter, _ int, _ []byte) { http.Error(w, "busy", http.StatusServiceUnavailable) }
 )
 
-// replayFixture serves fx's reconstruction answers through replies in request
-// order, repeating the last, while checking that every request carries the
-// client token and wantRange.
+// The last reply repeats until the request budget is exhausted.
 func replayFixture(t *testing.T, fx *downloadFixture, wantRange string, replies ...reply) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	calls := new(atomic.Int32)
@@ -709,8 +707,6 @@ func replayFixture(t *testing.T, fx *downloadFixture, wantRange string, replies 
 	return srv, calls
 }
 
-// TestGetReconstructionRetriesCutBody ends the first metadata answer before
-// its JSON is complete and expects one fresh GET with the same headers.
 func TestGetReconstructionRetriesCutBody(t *testing.T) {
 	fx := newDownloadFixture(t, 1)
 	const resume = "bytes=1-"
@@ -768,8 +764,6 @@ func TestGetReconstructionRetriesCutBody(t *testing.T) {
 	}
 }
 
-// TestGetReconstructionDecodeBudget pins that cut metadata bodies spend the
-// same retries+1 budget as statuses, while malformed JSON is not retried.
 func TestGetReconstructionDecodeBudget(t *testing.T) {
 	fx := newDownloadFixture(t, 1)
 	const retries = 2
@@ -784,6 +778,13 @@ func TestGetReconstructionDecodeBudget(t *testing.T) {
 		{"malformed", []reply{malformed}, 1, func(err error) bool {
 			var syntaxErr *json.SyntaxError
 			return errors.As(err, &syntaxErr)
+		}},
+		{"wrong field type", []reply{func(w http.ResponseWriter, code int, _ []byte) {
+			w.WriteHeader(code)
+			_, _ = io.WriteString(w, `{"offset_into_first_range":"bad"}`)
+		}}, 1, func(err error) bool {
+			var typeErr *json.UnmarshalTypeError
+			return errors.As(err, &typeErr)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -806,8 +807,6 @@ func TestGetReconstructionDecodeBudget(t *testing.T) {
 	}
 }
 
-// TestGetReconstructionCancelDuringBody cancels while the metadata body is
-// held open: the call reports context.Canceled without another GET.
 func TestGetReconstructionCancelDuringBody(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

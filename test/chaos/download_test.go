@@ -305,12 +305,8 @@ func TestStatusBudgets(t *testing.T) {
 	}
 }
 
-// reconstructionPrefix is how many JSON body bytes a faulted metadata answer relays first.
 const reconstructionPrefix = 16
 
-// TestReconstructionBodyFaultThenHeal breaks the first metadata answer after
-// a few JSON bytes and expects one fresh reconstruction GET for the same
-// query before the exact file.
 func TestReconstructionBodyFaultThenHeal(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
@@ -355,9 +351,6 @@ func TestReconstructionBodyFaultThenHeal(t *testing.T) {
 	}
 }
 
-// TestReconstructionBodyFaultBudget pins that cut metadata answers spend the
-// same retries+1 budget as statuses: a 503 followed by a cut answer still
-// heals within it, while permanently cut answers fail after retries+1 GETs.
 func TestReconstructionBodyFaultBudget(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)

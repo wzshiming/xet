@@ -43,9 +43,7 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 	return getJSON[download.ReconstructionResponseV1](c, req, reconstructionError)
 }
 
-// getJSON sends req and decodes the JSON answer into a fresh T. Network
-// errors, retryable statuses and bodies that end before the value is complete
-// share one budget of c.retries+1 attempts; statusErr rejects other statuses.
+// Request and body failures share one retry budget.
 func getJSON[T any](c *Client, req *http.Request, statusErr func(*http.Request, *http.Response) error) (*T, error) {
 	attempts := c.retryAttempts()
 
@@ -67,24 +65,25 @@ func getJSON[T any](c *Client, req *http.Request, statusErr func(*http.Request, 
 			continue
 		}
 		if isRetryableStatus(resp.StatusCode) {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("server error status %s", resp.Status)
 			continue
 		}
 		if err := statusErr(req, resp); err != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil, err
 		}
 
 		v := new(T)
 		err = json.NewDecoder(resp.Body).Decode(v)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err == nil {
 			return v, nil
 		}
 		lastErr = fmt.Errorf("decode response: %w", err)
 		var syntaxErr *json.SyntaxError
-		if errors.As(err, &syntaxErr) {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
 			return nil, lastErr
 		}
 	}
