@@ -256,7 +256,6 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 			_ = rc.Close()
 		}()
 		writeMetadataHeaders(w, etag, size, commit)
-		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = io.Copy(w, rc)
 		return true
 	}
@@ -269,7 +268,6 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		_ = rs.Close()
 	}()
 	writeMetadataHeaders(w, etag, size, commit)
-	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, "", time.Time{}, rs)
 	return true
 }
