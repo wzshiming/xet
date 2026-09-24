@@ -305,6 +305,105 @@ func TestStatusBudgets(t *testing.T) {
 	}
 }
 
+// reconstructionPrefix is how many JSON body bytes a faulted metadata answer relays first.
+const reconstructionPrefix = 16
+
+// TestReconstructionBodyFaultThenHeal breaks the first metadata answer after
+// a few JSON bytes and expects one fresh reconstruction GET for the same
+// query before the exact file.
+func TestReconstructionBodyFaultThenHeal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+
+	cases := []struct {
+		kind faultKind
+		apis []apiVersion
+	}{
+		{abortBody, []apiVersion{apiV1, apiV2, apiBatch}},
+		{shortBody, []apiVersion{apiV1}},
+		{shortChunked, []apiVersion{apiV2}},
+		{resetBody, []apiVersion{apiV1}},
+		{stallBody, []apiVersion{apiV2, apiBatch}},
+	}
+	for _, tc := range cases {
+		for _, api := range tc.apis {
+			t.Run(tc.kind.String()+"/"+api.String(), func(t *testing.T) {
+				fx.proxy.arm(func(r record) fault {
+					if r.reconstruction() && r.Seq == 0 {
+						return fault{kind: tc.kind, prefix: reconstructionPrefix}
+					}
+					return fault{}
+				})
+				cacheDir := t.TempDir()
+				var opts []client.Options
+				if tc.kind == stallBody || tc.kind == resetBody {
+					opts = append(opts, client.WithIdleTimeout(idleTimeout))
+				}
+				fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, opts...), api)
+
+				recs := filter(fx.proxy.settle(t), record.reconstruction)
+				if len(recs) != 2 || recs[0].Fault != tc.kind || recs[0].Status != http.StatusOK || recs[0].Bytes != reconstructionPrefix {
+					t.Fatalf("reconstruction requests = %+v, want the faulted answer (%d bytes) and one retry", recs, reconstructionPrefix)
+				}
+				if retry := recs[1]; retry.Fault != passThrough || retry.Status != http.StatusOK || retry.Query != recs[0].Query || retry.Range != recs[0].Range {
+					t.Fatalf("retry = %+v, want the same query served whole", retry)
+				}
+				fx.assertCached(t, ctx, cacheDir)
+			})
+		}
+	}
+}
+
+// TestReconstructionBodyFaultBudget pins that cut metadata answers spend the
+// same retries+1 budget as statuses: a 503 followed by a cut answer still
+// heals within it, while permanently cut answers fail after retries+1 GETs.
+func TestReconstructionBodyFaultBudget(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	const retries = 2
+
+	t.Run("status then cut then heal", func(t *testing.T) {
+		fx.proxy.arm(func(r record) fault {
+			switch {
+			case r.reconstruction() && r.Seq == 0:
+				return fault{kind: injectStatus, status: http.StatusServiceUnavailable}
+			case r.reconstruction() && r.Seq == 1:
+				return fault{kind: abortBody, prefix: reconstructionPrefix}
+			}
+			return fault{}
+		})
+		cacheDir := t.TempDir()
+		fx.mustDownload(t, ctx, fx.proxyClient(t, cacheDir, client.WithRetries(retries)), apiV1)
+
+		recs := filter(fx.proxy.settle(t), record.reconstruction)
+		want := []int{http.StatusServiceUnavailable, http.StatusOK, http.StatusOK}
+		if got := statusLog(recs); !slices.Equal(got, want) || recs[1].Bytes != reconstructionPrefix {
+			t.Fatalf("reconstruction requests = %+v, want statuses %v with the second cut after %d bytes", recs, want, reconstructionPrefix)
+		}
+		fx.assertCached(t, ctx, cacheDir)
+	})
+
+	t.Run("permanent cut", func(t *testing.T) {
+		fx.proxy.arm(func(r record) fault {
+			if r.reconstruction() {
+				return fault{kind: abortBody, prefix: reconstructionPrefix}
+			}
+			return fault{}
+		})
+		cacheDir := t.TempDir()
+		err := fx.download(ctx, fx.proxyClient(t, cacheDir, client.WithRetries(retries)), apiV1, newOutput(t, nil))
+		if !errors.Is(err, io.ErrUnexpectedEOF) || ctx.Err() != nil {
+			t.Fatalf("download error = %v, want the cut body reported before the context ends", err)
+		}
+		if recs := filter(fx.proxy.settle(t), record.reconstruction); len(recs) != retries+1 {
+			t.Fatalf("reconstruction requests = %+v, want %d attempts", recs, retries+1)
+		}
+		fx.heal(t, ctx, cacheDir)
+	})
+}
+
 // TestRetryBackoffSpacesAttempts answers the reconstruction query and the
 // multi-chunk range with 503 three times: every retry must start no sooner
 // than half the doubled base after the previous answer, the jitter floor.

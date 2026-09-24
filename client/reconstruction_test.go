@@ -671,3 +671,165 @@ func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	_, err = io.ReadAll(readers[1])
 	wantHashMismatch(t, err)
 }
+
+// reply writes one reconstruction response given the healthy status and body.
+type reply func(w http.ResponseWriter, code int, full []byte)
+
+var (
+	healthy   reply = func(w http.ResponseWriter, code int, full []byte) { w.WriteHeader(code); _, _ = w.Write(full) }
+	empty     reply = func(w http.ResponseWriter, code int, _ []byte) { w.WriteHeader(code) }
+	truncated reply = func(w http.ResponseWriter, code int, full []byte) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(full)))
+		w.WriteHeader(code)
+		_, _ = w.Write(full[:len(full)/2])
+	}
+	malformed reply = func(w http.ResponseWriter, code int, _ []byte) {
+		w.WriteHeader(code)
+		_, _ = io.WriteString(w, "<html>")
+	}
+	unavailable reply = func(w http.ResponseWriter, _ int, _ []byte) { http.Error(w, "busy", http.StatusServiceUnavailable) }
+)
+
+// replayFixture serves fx's reconstruction answers through replies in request
+// order, repeating the last, while checking that every request carries the
+// client token and wantRange.
+func replayFixture(t *testing.T, fx *downloadFixture, wantRange string, replies ...reply) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	calls := new(atomic.Int32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(calls.Add(1))
+		if r.Header.Get("Range") != wantRange || r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("request %d: Range %q Authorization %q, want %q and the client token", n, r.Header.Get("Range"), r.Header.Get("Authorization"), wantRange)
+		}
+		rec := httptest.NewRecorder()
+		fx.serveHTTP(rec, r)
+		replies[min(n, len(replies))-1](w, rec.Code, rec.Body.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	return srv, calls
+}
+
+// TestGetReconstructionRetriesCutBody ends the first metadata answer before
+// its JSON is complete and expects one fresh GET with the same headers.
+func TestGetReconstructionRetriesCutBody(t *testing.T) {
+	fx := newDownloadFixture(t, 1)
+	const resume = "bytes=1-"
+	apis := []struct {
+		name  string
+		rng   string
+		terms func(c *Client, ctx context.Context) ([]download.Term, error)
+	}{
+		{"v1", resume, func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetReconstructionV1(ctx, fx.hashes[0], http.Header{"Range": {resume}})
+			if err != nil {
+				return nil, err
+			}
+			return resp.Terms, nil
+		}},
+		{"v2", resume, func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetReconstructionV2(ctx, fx.hashes[0], http.Header{"Range": {resume}})
+			if err != nil {
+				return nil, err
+			}
+			return resp.Terms, nil
+		}},
+		{"batch", "", func(c *Client, ctx context.Context) ([]download.Term, error) {
+			resp, err := c.GetBatchReconstruction(ctx, fx.hashes)
+			if err != nil {
+				return nil, err
+			}
+			return resp.Files[fx.hashes[0].String()], nil
+		}},
+	}
+	cuts := []struct {
+		name string
+		reply
+	}{{"empty", empty}, {"truncated", truncated}}
+	for _, api := range apis {
+		for _, cut := range cuts {
+			t.Run(api.name+"/"+cut.name, func(t *testing.T) {
+				srv, calls := replayFixture(t, fx, api.rng, cut.reply, healthy)
+				c, err := NewClient(WithBaseURL(srv.URL), WithToken("test-token"), WithRetryBackoff(0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				terms, err := api.terms(c, context.Background())
+				if err != nil {
+					t.Fatalf("%s after a %s first answer: %v", api.name, cut.name, err)
+				}
+				if got := calls.Load(); got != 2 {
+					t.Fatalf("%d requests, want the cut answer and one retry", got)
+				}
+				if len(terms) != 1 || terms[0].Hash != fx.xorbHashes[0] {
+					t.Fatalf("terms = %+v, want the fixture's single term", terms)
+				}
+			})
+		}
+	}
+}
+
+// TestGetReconstructionDecodeBudget pins that cut metadata bodies spend the
+// same retries+1 budget as statuses, while malformed JSON is not retried.
+func TestGetReconstructionDecodeBudget(t *testing.T) {
+	fx := newDownloadFixture(t, 1)
+	const retries = 2
+	for _, tc := range []struct {
+		name      string
+		replies   []reply
+		wantCalls int32
+		wantErr   func(error) bool // nil: the call must succeed
+	}{
+		{"status then cut then healthy", []reply{unavailable, truncated, healthy}, 3, nil},
+		{"permanent cut", []reply{truncated}, retries + 1, func(err error) bool { return errors.Is(err, io.ErrUnexpectedEOF) }},
+		{"malformed", []reply{malformed}, 1, func(err error) bool {
+			var syntaxErr *json.SyntaxError
+			return errors.As(err, &syntaxErr)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, calls := replayFixture(t, fx, "", tc.replies...)
+			c, err := NewClient(WithBaseURL(srv.URL), WithToken("test-token"), WithRetries(retries), WithRetryBackoff(0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.GetReconstructionV1(context.Background(), fx.hashes[0], nil)
+			if tc.wantErr == nil && err != nil {
+				t.Fatalf("GetReconstructionV1: %v", err)
+			}
+			if tc.wantErr != nil && (err == nil || !tc.wantErr(err)) {
+				t.Fatalf("GetReconstructionV1 error = %v, want the original failure", err)
+			}
+			if got := calls.Load(); got != tc.wantCalls {
+				t.Fatalf("%d requests, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// TestGetReconstructionCancelDuringBody cancels while the metadata body is
+// held open: the call reports context.Canceled without another GET.
+func TestGetReconstructionCancelDuringBody(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"offset_into_first_range":0,`)
+		_ = http.NewResponseController(w).Flush()
+		cancel()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(WithBaseURL(srv.URL), WithRetryBackoff(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.GetReconstructionV2(ctx, xet.FileHash{}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetReconstructionV2 error = %v, want context.Canceled", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("%d requests, want no retry after cancellation", got)
+	}
+}
