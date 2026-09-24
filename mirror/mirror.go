@@ -116,6 +116,7 @@ type Mirror struct {
 	revalidateInterval time.Duration
 	maxIngests         int
 	ingestSlots        chan struct{}
+	transport          http.RoundTripper
 
 	probeClient  *http.Client // does not follow redirects; used for metadata probes
 	fetchClient  *http.Client // follows redirects; body drops resume via httpseek
@@ -166,6 +167,11 @@ func WithMaxConcurrentIngests(n int) Option {
 	return func(m *Mirror) { m.maxIngests = n }
 }
 
+// WithTransport sets the transport under the upstream auth, idle, and resume wrappers; nil uses a clone of http.DefaultTransport.
+func WithTransport(rt http.RoundTripper) Option {
+	return func(m *Mirror) { m.transport = rt }
+}
+
 // NewMirror creates a mirror engine.
 func NewMirror(opts ...Option) (*Mirror, error) {
 	m := &Mirror{
@@ -201,7 +207,10 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		}
 	}
 
-	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport := m.transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+	}
 	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout)}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,

@@ -2558,3 +2558,115 @@ func TestMirrorUpstreamAuthHostGuard(t *testing.T) {
 		}
 	}
 }
+
+// fakeHubTransport answers hub requests in-process; the file GET holds back its second half until gate closes.
+type fakeHubTransport struct {
+	data   []byte
+	commit string
+	gate   chan struct{}
+	calls  sync.Map // "METHOD path" -> *http.Request as seen by the transport
+}
+
+func (f *fakeHubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls.Store(req.Method+" "+req.URL.Path, req)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}
+	switch {
+	case req.URL.Path == "/api/models/org/repo":
+		resp.Body = io.NopCloser(strings.NewReader(`{"id":"org/repo"}`))
+	case req.URL.Path != "/org/repo/resolve/main/f.bin" && req.URL.Path != "/org/repo/resolve/"+f.commit+"/f.bin":
+		resp.StatusCode = http.StatusNotFound
+	case req.Method == http.MethodHead:
+		resp.Header.Set("ETag", `"`+hashHex(string(f.data))+`"`)
+		resp.Header.Set("X-Linked-Size", fmt.Sprint(len(f.data)))
+		resp.Header.Set("X-Repo-Commit", f.commit)
+	default:
+		reader, writer := io.Pipe()
+		go func() {
+			half := len(f.data) / 2
+			if _, err := writer.Write(f.data[:half]); err == nil {
+				<-f.gate
+				_, _ = writer.Write(f.data[half:])
+			}
+			_ = writer.Close()
+		}()
+		resp.Body, resp.ContentLength = reader, int64(len(f.data))
+	}
+	return resp, nil
+}
+
+func TestMirrorWithTransport(t *testing.T) {
+	data := make([]byte, 64*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeHubTransport{data: data, commit: strings.Repeat("cd", 20), gate: make(chan struct{})}
+	selector, err := StaticUpstream("http://upstream.invalid", "tok-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, stor := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector), WithTransport(fake))
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(fake.gate) }) })
+	ctx := context.Background()
+
+	res, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+	if err != nil || res.Stream == nil {
+		t.Fatalf("Resolve = %+v, %v; want an in-flight stream", res, err)
+	}
+	etag, commit, err := res.Stream.WaitMeta(ctx)
+	if err != nil || etag != hashHex(string(data)) || commit != fake.commit {
+		t.Fatalf("WaitMeta = %q, %q, %v; want the transport's etag and commit", etag, commit, err)
+	}
+	if size, ok := res.Stream.WaitSize(ctx); !ok || size != int64(len(data)) {
+		t.Fatalf("WaitSize = %d, %v, want %d, true", size, ok, len(data))
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rc := res.Stream.NewReader(readCtx, 0)
+	if rc == nil {
+		t.Fatal("NewReader returned nil while the ingest is in flight")
+	}
+	defer rc.Close()
+	head := make([]byte, len(data)/2)
+	if _, err := io.ReadFull(rc, head); err != nil || !bytes.Equal(head, data[:len(head)]) {
+		t.Fatalf("first half before the gate opened: %v", err)
+	}
+	release.Do(func() { close(fake.gate) })
+	tail, err := io.ReadAll(rc)
+	if err != nil || !bytes.Equal(tail, data[len(head):]) {
+		t.Fatalf("second half after the gate opened: %v", err)
+	}
+	awaitClosed(t, res.Stream.t.done, "ingest through the transport")
+	res, err = m.Resolve(ctx, "org/repo", "main", "f.bin")
+	if err != nil || res.Entry == nil || res.Entry.Commit != fake.commit {
+		t.Fatalf("Resolve after ingest = %+v, %v; want the ready entry", res, err)
+	}
+	if got := readStored(t, stor, res.Entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes differ from the transport's data")
+	}
+
+	type ctxKey struct{}
+	resp, err := m.FetchUpstream(context.WithValue(ctx, ctxKey{}, "caller value"), "org/repo", "/api/models/org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"id":"org/repo"}` {
+		t.Fatalf("FetchUpstream = %d %q, %v", resp.StatusCode, body, err)
+	}
+	for _, call := range []string{"HEAD /org/repo/resolve/main/f.bin", "GET /org/repo/resolve/" + fake.commit + "/f.bin", "GET /api/models/org/repo"} {
+		seen, ok := fake.calls.Load(call)
+		if !ok {
+			t.Fatalf("%s never reached the transport", call)
+		}
+		if auth := seen.(*http.Request).Header.Get("Authorization"); auth != "Bearer tok-t" {
+			t.Fatalf("%s: Authorization %q, want the selected token", call, auth)
+		}
+	}
+	seen, _ := fake.calls.Load("GET /api/models/org/repo")
+	if v := seen.(*http.Request).Context().Value(ctxKey{}); v != "caller value" {
+		t.Fatalf("API request context value = %v, want the caller's", v)
+	}
+}
