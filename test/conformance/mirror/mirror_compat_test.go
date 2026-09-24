@@ -203,14 +203,14 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := hf.NewUpstreamProxy(upstream, "")
+	upstreamFunc, err := mirror.StaticUpstream(upstream, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(upstream),
+			mirror.WithUpstream(upstreamFunc),
 			mirror.WithCacheDir(cacheDir),
 		}, opts...)...,
 	)
@@ -226,7 +226,7 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 			}
 			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
 		})),
-		hf.WithNext(proxy),
+		hf.WithNext(hf.NewUpstreamProxy(upstreamFunc)),
 	)
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),

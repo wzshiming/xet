@@ -125,13 +125,13 @@ func (m *Mirror) LookupXetHash(ctx context.Context, oid string) (string, bool) {
 	return fileHash.String(), true
 }
 
-// FetchUpstream issues an authenticated GET for the given escaped path (with
-// optional query) against the upstream hub, following redirects and resuming
-// dropped bodies. Downstream credentials must never be forwarded; the
-// mirror's own upstream token is injected instead. The caller owns the
-// response body.
-func (m *Mirror) FetchUpstream(ctx context.Context, pathAndQuery string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.upstreamURL(pathAndQuery), nil)
+// FetchUpstream follows redirects and resumes body reads using repo's upstream; the caller owns the response body.
+func (m *Mirror) FetchUpstream(ctx context.Context, repo, pathAndQuery string) (*http.Response, error) {
+	ctx, target, err := m.upstreamTarget(ctx, repo, pathAndQuery)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}

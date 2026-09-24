@@ -174,14 +174,14 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := hf.NewUpstreamProxy(upstreamURL, "")
+	upstreamFunc, err := mirror.StaticUpstream(upstreamURL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(upstreamURL),
+			mirror.WithUpstream(upstreamFunc),
 			mirror.WithCacheDir(cacheDir),
 		}, opts...)...,
 	)
@@ -200,7 +200,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 				}
 				return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
 			})),
-			hf.WithNext(proxy),
+			hf.WithNext(hf.NewUpstreamProxy(upstreamFunc)),
 		)),
 	)))
 	return srv

@@ -24,6 +24,7 @@
 package mirror
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -89,6 +90,18 @@ func (k resolveKey) String() string {
 	return "/" + k.repo + "/resolve/" + k.rev + "/" + k.path
 }
 
+// UpstreamFunc selects a hub and bearer token by escaped repo, possibly on a background context.
+type UpstreamFunc func(ctx context.Context, repo string) (*url.URL, string, error)
+
+// StaticUpstream returns a selector that sends every repo to one hub.
+func StaticUpstream(rawURL, token string) (UpstreamFunc, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("mirror: invalid upstream URL %q", rawURL)
+	}
+	return func(context.Context, string) (*url.URL, string, error) { return u, token, nil }, nil
+}
+
 // Mirror is the ingestion engine: resolutions are answered from the local
 // cache (ingesting on miss) while every byte is published to storage as
 // xorbs and shards. It serves the server/hf package's hub front end through
@@ -96,9 +109,7 @@ func (k resolveKey) String() string {
 // downstream HTTP surface are wired there.
 type Mirror struct {
 	storage            storage.Storage
-	upstreamRaw        string
-	upstream           *url.URL
-	upstreamToken      string
+	upstreamFunc       UpstreamFunc
 	cacheDir           string
 	indexDir           string
 	spoolDir           string
@@ -128,15 +139,9 @@ func WithStorage(s storage.Storage) Option {
 	return func(m *Mirror) { m.storage = s }
 }
 
-// WithUpstream sets the upstream hub base URL, e.g. https://huggingface.co. Required.
-func WithUpstream(upstream string) Option {
-	return func(m *Mirror) { m.upstreamRaw = upstream }
-}
-
-// WithUpstreamToken sets the credential the mirror uses against the upstream
-// hub. Downstream Authorization headers are never forwarded upstream.
-func WithUpstreamToken(token string) Option {
-	return func(m *Mirror) { m.upstreamToken = token }
+// WithUpstream sets the per-repo upstream selector. Required.
+func WithUpstream(upstreamFunc UpstreamFunc) Option {
+	return func(m *Mirror) { m.upstreamFunc = upstreamFunc }
 }
 
 // WithCacheDir stores indexes, spools and chunks under dir; defaults to ./xet-mirror.
@@ -179,18 +184,14 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	if m.storage == nil {
 		return nil, fmt.Errorf("mirror: storage is required")
 	}
-	if m.upstreamRaw == "" {
+	if m.upstreamFunc == nil {
 		return nil, fmt.Errorf("mirror: upstream is required")
 	}
+
 	if m.maxIngests <= 0 {
 		m.maxIngests = defaultMaxIngests
 	}
 	m.ingestSlots = make(chan struct{}, m.maxIngests)
-	u, err := url.Parse(m.upstreamRaw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("mirror: invalid upstream URL %q", m.upstreamRaw)
-	}
-	m.upstream = u
 
 	m.indexDir = filepath.Join(m.cacheDir, "index")
 	m.spoolDir = filepath.Join(m.cacheDir, "spool")
@@ -201,7 +202,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
-	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout), host: u.Host, token: m.upstreamToken}
+	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout)}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: injecting,
@@ -219,10 +220,11 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	if m.xetClient == nil {
-		m.xetClient, err = client.NewClient(client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")))
+		xetClient, err := client.NewClient(client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")))
 		if err != nil {
 			return nil, fmt.Errorf("mirror: create xet client: %w", err)
 		}
+		m.xetClient = xetClient
 	}
 
 	m.localAdapter = &localCAS{storage: m.storage, namespace: "default"}
