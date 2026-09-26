@@ -568,7 +568,7 @@ func TestBatchReconstructionKeepsSharedXorbRanges(t *testing.T) {
 	}
 
 	files := [][]byte{[]byte("first file packed into the shared xorb"), []byte("second file packed into the shared xorb")}
-	uploader, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+	uploader, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +616,7 @@ func TestBatchReconstructionKeepsSharedXorbRanges(t *testing.T) {
 				}
 			}
 
-			downloader, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+			downloader, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 			if err != nil {
 				t.Fatal(err)
 			}

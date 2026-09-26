@@ -263,8 +263,12 @@ func TestNewClientKeepsHTTPClientSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.httpClient != hc || c.httpClient.Transport != tr {
-		t.Fatal("raw http client or its transport was replaced")
+	if hc.Transport != tr {
+		t.Fatal("caller's http client was mutated")
+	}
+	auth, ok := c.httpClient.Transport.(*authTransport)
+	if !ok || auth.base != tr || c.httpClient.Timeout != hc.Timeout || c.httpClient.CheckRedirect == nil {
+		t.Fatal("client copy lost the caller's transport, Timeout or CheckRedirect")
 	}
 	if c.getHttpClient.Timeout != hc.Timeout || c.getHttpClient.CheckRedirect == nil {
 		t.Fatal("getHttpClient lost the caller's Timeout or CheckRedirect")

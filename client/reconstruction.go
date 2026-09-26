@@ -9,18 +9,17 @@ import (
 	"strings"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/download"
 )
 
-// GetReconstructionV1 retrieves reconstruction information for a file
+// GetReconstructionV1 retrieves reconstruction information for a file.
 func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
-	return c.GetReconstructionV1WithAuthProvider(ctx, nil, fileHash, header)
+	return c.getReconstructionV1(ctx, c.provider, fileHash, header)
 }
 
-// GetReconstructionV1WithAuthProvider retrieves reconstruction information for
-// a file with a per-call auth provider.
-func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
-	baseURL, err := c.getBaseURL(ctx, provider)
+func (c *Client) getReconstructionV1(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
+	ctx, baseURL, err := c.casContext(ctx, upstream, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -32,12 +31,6 @@ func (c *Client) GetReconstructionV1WithAuthProvider(ctx context.Context, provid
 	}
 
 	maps.Copy(req.Header, header)
-
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 
 	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
@@ -65,15 +58,13 @@ func reconstructionError(req *http.Request, resp *http.Response) error {
 	return reqError(req, resp)
 }
 
-// GetReconstructionV2 retrieves V2 reconstruction information for a file
+// GetReconstructionV2 retrieves V2 reconstruction information for a file.
 func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
-	return c.GetReconstructionV2WithAuthProvider(ctx, nil, fileHash, header)
+	return c.getReconstructionV2(ctx, c.provider, fileHash, header)
 }
 
-// GetReconstructionV2WithAuthProvider retrieves V2 reconstruction information
-// for a file with a per-call auth provider.
-func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provider AuthProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
-	baseURL, err := c.getBaseURL(ctx, provider)
+func (c *Client) getReconstructionV2(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
+	ctx, baseURL, err := c.casContext(ctx, upstream, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -85,12 +76,6 @@ func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provid
 	}
 
 	maps.Copy(req.Header, header)
-
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 
 	resp, err := c.doWithNetworkRetry(req)
 	if err != nil {
@@ -113,12 +98,6 @@ func (c *Client) GetReconstructionV2WithAuthProvider(ctx context.Context, provid
 // GetBatchReconstruction retrieves reconstruction information for multiple files in a single request.
 // It calls GET /reconstructions?file_id=<hex>&file_id=<hex>&... and returns the aggregated response.
 func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.FileHash) (*download.BatchReconstructionResponse, error) {
-	return c.GetBatchReconstructionWithAuthProvider(ctx, nil, fileHashes)
-}
-
-// GetBatchReconstructionWithAuthProvider retrieves reconstruction information
-// for multiple files in a single request with a per-call auth provider.
-func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, provider AuthProvider, fileHashes []xet.FileHash) (*download.BatchReconstructionResponse, error) {
 	if len(fileHashes) == 0 {
 		return &download.BatchReconstructionResponse{
 			Files:     make(map[string][]download.Term),
@@ -126,7 +105,7 @@ func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, pro
 		}, nil
 	}
 
-	baseURL, err := c.getBaseURL(ctx, provider)
+	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -143,11 +122,6 @@ func (c *Client) GetBatchReconstructionWithAuthProvider(ctx context.Context, pro
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create batch reconstruction request: %w", err)
-	}
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.doWithNetworkRetry(req)

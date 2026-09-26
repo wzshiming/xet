@@ -19,17 +19,18 @@ import (
 // task tracks one in-flight ingestion. All concurrent requests for the same
 // key attach to it, so the upstream is downloaded exactly once per file.
 type task struct {
-	key      resolveKey    // pinned (repo, commit, path) the entry publishes under
-	src      resolveKey    // upstream resolve key: the source branch for pseudo commits
-	prev     *fileEntry    // src failure this task retries, retired on success
-	spool    *spool        // set by runTask before probed closes (when the probe succeeded)
-	probed   chan struct{} // closed once probe metadata (or probeErr) is set
-	sized    chan struct{} // closed once size is known or no early source remains
-	done     chan struct{} // closed once the task finished and its entry is published
-	sizeOnce sync.Once
-	probeErr error
-	probe    *probeResult
-	size     atomic.Int64 // final content length, -1 until known
+	key           resolveKey    // pinned (repo, commit, path) the entry publishes under
+	src           resolveKey    // upstream resolve key: the source branch for pseudo commits
+	origin, token string        // upstream credential of the resolver that started the task; later joiners never replace it
+	prev          *fileEntry    // src failure this task retries, retired on success
+	spool         *spool        // set by runTask before probed closes (when the probe succeeded)
+	probed        chan struct{} // closed once probe metadata (or probeErr) is set
+	sized         chan struct{} // closed once size is known or no early source remains
+	done          chan struct{} // closed once the task finished and its entry is published
+	sizeOnce      sync.Once
+	probeErr      error
+	probe         *probeResult
+	size          atomic.Int64 // final content length, -1 until known
 }
 
 // setSize records the content length once known (first value wins) and
@@ -45,8 +46,9 @@ func (t *task) setSize(n int64) {
 // the ingest already completed (or failed and is backing off). Only the task
 // startup itself runs inside the singleflight, so the task is registered
 // exactly once per key. A pre-probe result from the branch mapping refresh is
-// handed to the task so the upstream is not probed twice.
-func (m *Mirror) startTask(key, src resolveKey, pre *probeResult) (*task, *fileEntry, error) {
+// handed to the task so the upstream is not probed twice; origin and token
+// are the starter's upstream credential.
+func (m *Mirror) startTask(key, src resolveKey, pre *probeResult, origin, token string) (*task, *fileEntry, error) {
 	v, err, _ := m.flight.Do(key.String(), func() (any, error) {
 		// A previous flight may have registered a task, or finished the whole
 		// ingest, between the caller's check and this one.
@@ -66,7 +68,7 @@ func (m *Mirror) startTask(key, src resolveKey, pre *probeResult) (*task, *fileE
 				return e, nil
 			}
 		}
-		nt := &task{key: key, src: src, prev: prev, probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
+		nt := &task{key: key, src: src, origin: origin, token: token, prev: prev, probed: make(chan struct{}), sized: make(chan struct{}), done: make(chan struct{})}
 		nt.size.Store(-1)
 		m.mu.Lock()
 		m.tasks[key] = nt
@@ -89,11 +91,13 @@ func (m *Mirror) startTask(key, src resolveKey, pre *probeResult) (*task, *fileE
 // revalidated on the usual cadence, or failed and still inside its retry
 // backoff) — starting a new ingest task when neither exists. Exactly one of
 // the returned task and entry is non-nil; the returned key carries the branch
-// pin. ctx bounds only the revalidation probe.
-func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task, *fileEntry, error) {
+// pin. origin and token name the caller's upstream; ctx bounds only the
+// revalidation probe.
+func (m *Mirror) acquire(ctx context.Context, origin, token string, key resolveKey) (resolveKey, *task, *fileEntry, error) {
+	ctx = withUpstreamAuth(ctx, origin, token)
 	var pre *probeResult
 	if !commitRevRe.MatchString(key.rev) {
-		commit, pr, fe := m.branchCommit(key)
+		commit, pr, fe := m.branchCommit(origin, token, key)
 		if fe != nil {
 			return key, nil, fe, nil
 		}
@@ -117,7 +121,7 @@ func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task
 	if e != nil {
 		switch e.State {
 		case stateReady:
-			if stale && !m.revalidate(ctx, key, src, e, pre) {
+			if stale && !m.revalidate(ctx, origin, key, src, e, pre) {
 				e = nil
 			}
 			if e != nil && !m.entryLive(ctx, e) {
@@ -135,7 +139,7 @@ func (m *Mirror) acquire(ctx context.Context, key resolveKey) (resolveKey, *task
 		}
 	}
 
-	t, e, err := m.startTask(key, src, pre)
+	t, e, err := m.startTask(key, src, pre, origin, token)
 	return key, t, e, err
 }
 
@@ -150,18 +154,19 @@ func probeErr(pr *probeResult) error {
 	return nil
 }
 
-// runTask executes one ingestion end to end on a background context; client
-// disconnects never cancel it. The spool opens after the probe so partial
-// bytes from a previous failed task (or a previous process) are resumed when
-// the upstream etag still matches. A non-nil pre stands in for the probe.
+// runTask executes one ingestion end to end on a background context carrying
+// the task's pinned credential; client disconnects never cancel it. The spool
+// opens after the probe so partial bytes from a previous failed task (or a
+// previous process) are resumed when the upstream etag still matches. A
+// non-nil pre stands in for the probe.
 func (m *Mirror) runTask(t *task, pre *probeResult) {
-	ctx := context.Background()
+	ctx := withUpstreamAuth(context.Background(), t.origin, t.token)
 	upath := t.src.String()
 	defer close(t.done) // the entry is published by then, on every path
 
 	pr, err := pre, error(nil)
 	if pr == nil {
-		pr, err = m.probe(ctx, t.src)
+		pr, err = m.probe(ctx, t.origin, t.src)
 	}
 	if err == nil {
 		err = probeErr(pr)

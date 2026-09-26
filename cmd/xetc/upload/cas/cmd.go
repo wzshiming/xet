@@ -22,7 +22,7 @@ func NewCommand() *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			provider := client.StaticAuthProvider(baseURL, token)
+			provider := client.StaticUpstreamProvider(baseURL, token)
 			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
 		},
 	}

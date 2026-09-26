@@ -5,11 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	iofs "io/fs"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -25,27 +23,30 @@ type Resolution struct {
 	Stream *Stream
 }
 
-// Resolve resolves the file at /{repo}/resolve/{rev}/{path} through the
-// shared acquire flow: branch revisions are pinned to their upstream commit,
-// entries and tasks are keyed by immutable content, ready entries are
-// revalidated on the usual cadence, and a new ingest task is started when no
-// terminal entry or in-flight task exists. It returns the ready entry, the
-// stream of the in-flight ingest, or the terminal ingest failure as an error
-// (not-found matching ErrUpstreamNotFound). The components must be given in
-// escaped URL path form, so Resolve and Ingest share tasks, entries, and
-// spools.
+// Resolve resolves the file at upstreamURL, a hub download URL of the form
+// {origin}/{repo}/resolve/{rev}/{path}, through the shared acquire flow:
+// branch revisions are pinned to their upstream commit, entries and tasks are
+// keyed by immutable content, ready entries are revalidated on the usual
+// cadence, and a new ingest task is started when no terminal entry or
+// in-flight task exists. token is the hub bearer token for that origin (empty
+// for anonymous access); the resolver that starts an ingest pins its origin
+// and token on it, and later resolvers of the same file join it. It returns
+// the ready entry, the stream of the in-flight ingest, or the terminal
+// ingest failure as an error (not-found matching ErrUpstreamNotFound). The
+// URL path is taken in its escaped form, so Resolve and Ingest share tasks,
+// entries, and spools.
 //
 // In one rare interleaving a returned Stream is already useless: its ingest
 // finished and its spool was fully drained before the caller attached, so
 // NewReader and NewSeekReader return nil. Resolve again for the published
 // terminal entry. ctx bounds only the resolution itself, never the
 // background ingest.
-func (m *Mirror) Resolve(ctx context.Context, repo, rev, path string) (*Resolution, error) {
-	if repo == "" || rev == "" || path == "" || strings.Contains(rev, "/") {
-		return nil, fmt.Errorf("mirror: invalid resolve components repo=%q rev=%q path=%q", repo, rev, path)
+func (m *Mirror) Resolve(ctx context.Context, upstreamURL, token string) (*Resolution, error) {
+	origin, key, err := parseUpstreamURL(upstreamURL)
+	if err != nil {
+		return nil, err
 	}
-	key := resolveKey{repo: repo, rev: rev, path: path}
-	key, t, e, err := m.acquire(ctx, key)
+	key, t, e, err := m.acquire(ctx, origin, token, key)
 	if err != nil {
 		return nil, err
 	}
@@ -125,24 +126,24 @@ func (m *Mirror) LookupXetHash(ctx context.Context, oid string) (string, bool) {
 	return fileHash.String(), true
 }
 
-// FetchUpstream follows redirects and resumes body reads using repo's upstream; the caller owns the response body.
-func (m *Mirror) FetchUpstream(ctx context.Context, repo, pathAndQuery string) (*http.Response, error) {
-	ctx, target, err := m.upstreamTarget(ctx, repo, pathAndQuery)
+// FetchUpstream GETs rawURL with token as the bearer credential for its origin, following redirects and resuming body reads; the caller owns the response body.
+func (m *Mirror) FetchUpstream(ctx context.Context, rawURL, token string) (*http.Response, error) {
+	_, origin, err := upstreamOrigin(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	req, err := http.NewRequestWithContext(withUpstreamAuth(ctx, origin, token), http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	return m.fetchClient.Do(req)
 }
 
-// revalidate re-probes a source-backed entry's branch: a changed etag drops it for re-ingest, upstream errors keep it.
-func (m *Mirror) revalidate(ctx context.Context, key, src resolveKey, e *fileEntry, pr *probeResult) bool {
+// revalidate re-probes a source-backed entry's branch on origin: a changed etag drops it for re-ingest, upstream errors keep it.
+func (m *Mirror) revalidate(ctx context.Context, origin string, key, src resolveKey, e *fileEntry, pr *probeResult) bool {
 	if pr == nil {
 		var err error
-		if pr, err = m.probe(ctx, src); err != nil || probeErr(pr) != nil {
+		if pr, err = m.probe(ctx, origin, src); err != nil || probeErr(pr) != nil {
 			return true
 		}
 	}

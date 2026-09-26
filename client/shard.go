@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/upload"
 )
@@ -39,13 +40,7 @@ type shardUploadEventV2 struct {
 
 // UploadShard uploads a serialized shard through the V1 API.
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	return c.UploadShardWithAuthProvider(ctx, nil, shardObj)
-}
-
-// UploadShardWithAuthProvider uploads a serialized shard through the V1 API
-// with a per-call auth provider.
-func (c *Client) UploadShardWithAuthProvider(ctx context.Context, provider AuthProvider, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	req, err := c.newShardUploadRequest(ctx, provider, "v1", shardObj)
+	req, err := c.newShardUploadRequest(ctx, "v1", shardObj)
 	if err != nil {
 		return nil, err
 	}
@@ -68,22 +63,17 @@ func (c *Client) UploadShardWithAuthProvider(ctx context.Context, provider AuthP
 	return &uploadResp, nil
 }
 
-// UploadShardV2 uploads a serialized shard through the V2 NDJSON streaming API.
+// UploadShardV2 uploads a serialized shard through the V2 NDJSON streaming
+// API. Error frames marked retryable retry the whole upload, mirroring the
+// xet-core reference client.
 func (c *Client) UploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	return c.UploadShardV2WithAuthProvider(ctx, nil, shardObj)
-}
-
-// UploadShardV2WithAuthProvider uploads a serialized shard through the V2
-// NDJSON streaming API with a per-call auth provider. Error frames marked
-// retryable retry the whole upload, mirroring the xet-core reference client.
-func (c *Client) UploadShardV2WithAuthProvider(ctx context.Context, provider AuthProvider, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	attempts := c.retryAttempts()
 	var lastErr error
 	for i := range attempts {
 		if i > 0 && ctx.Err() != nil {
 			break
 		}
-		uploadResp, err := c.uploadShardV2(ctx, provider, shardObj)
+		uploadResp, err := c.uploadShardV2(ctx, shardObj)
 		if err == nil {
 			return uploadResp, nil
 		}
@@ -97,9 +87,9 @@ func (c *Client) UploadShardV2WithAuthProvider(ctx context.Context, provider Aut
 }
 
 // newShardUploadRequest builds a POST request carrying the encoded shard for
-// the given API version path, applying auth from the provider.
-func (c *Client) newShardUploadRequest(ctx context.Context, provider AuthProvider, version string, shardObj *shard.Shard) (*http.Request, error) {
-	baseURL, err := c.getBaseURL(ctx, provider)
+// the given API version path.
+func (c *Client) newShardUploadRequest(ctx context.Context, version string, shardObj *shard.Shard) (*http.Request, error) {
+	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -120,17 +110,12 @@ func (c *Client) newShardUploadRequest(ctx context.Context, provider AuthProvide
 	}
 	req.ContentLength = int64(len(bodyBytes))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 	return req, nil
 }
 
 // uploadShardV2 performs a single /v2/shards upload attempt.
-func (c *Client) uploadShardV2(ctx context.Context, provider AuthProvider, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	req, err := c.newShardUploadRequest(ctx, provider, "v2", shardObj)
+func (c *Client) uploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
+	req, err := c.newShardUploadRequest(ctx, "v2", shardObj)
 	if err != nil {
 		return nil, err
 	}
@@ -200,22 +185,17 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 	return nil, fmt.Errorf("v2 shard upload stream ended without a result event")
 }
 
-// QueryDedupShard downloads the deduplication shard for the given chunk hash and
-// returns all chunk locations indexed by that shard, enabling local O(1) lookups
-// for any chunk that shares the same shard (xet-core style local dedup).
+// QueryDedupShard downloads the deduplication shard for the given chunk hash
+// and returns all chunk locations indexed by that shard, enabling local O(1)
+// lookups for any chunk that shares the same shard (xet-core style local
+// dedup).
 //
 // candidates are additional raw chunk hashes the caller wants dedup info for.
 // They are needed for HMAC-keyed shards (production CAS): stored hashes are
 // keyed and cannot be reversed, so only hashes offered as candidates can be
 // matched. Unkeyed shards ignore candidates and index every stored hash.
 func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return c.QueryDedupShardWithAuthProvider(ctx, nil, chunkHash, candidates...)
-}
-
-// QueryDedupShard downloads the deduplication shard for the given chunk hash
-// with a per-call auth provider.
-func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	baseURL, err := c.getBaseURL(ctx, provider)
+	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -224,12 +204,6 @@ func (c *Client) QueryDedupShardWithAuthProvider(ctx context.Context, provider A
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.do(req)
@@ -328,16 +302,10 @@ func matchKeyedDedupShard(shardObj *shard.Shard, chunkHash xet.ChunkHash, candid
 
 // QueryDedupShards checks multiple chunk hashes against the global
 // deduplication index. It prefers the batch endpoint and falls back to single
-// chunk queries when the batch endpoint is unavailable. candidates are the
-// raw chunk hashes matched against HMAC-keyed shards on the fallback path;
-// see QueryDedupShard.
+// chunk queries when the batch endpoint is unavailable. candidates are the raw
+// chunk hashes matched against HMAC-keyed shards on the fallback path; see
+// QueryDedupShard.
 func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return c.QueryDedupShardsWithAuthProvider(ctx, nil, chunkHashes, candidates...)
-}
-
-// QueryDedupShards checks multiple chunk hashes against the global
-// deduplication index with a per-call auth provider.
-func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	if len(chunkHashes) == 0 {
 		return nil, nil
 	}
@@ -352,7 +320,7 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 		return nil, fmt.Errorf("marshal batch chunk query: %w", err)
 	}
 
-	baseURL, err := c.getBaseURL(ctx, provider)
+	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -362,11 +330,6 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 		return nil, fmt.Errorf("create batch request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if token, err := c.getToken(ctx, provider); err != nil {
-		return nil, fmt.Errorf("get token: %w", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -375,7 +338,7 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-		return c.queryChunksDeduplicationFallback(ctx, provider, chunkHashes, candidates)
+		return c.queryChunksDeduplicationFallback(ctx, chunkHashes, candidates)
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -420,10 +383,10 @@ func (c *Client) QueryDedupShardsWithAuthProvider(ctx context.Context, provider 
 	return results, nil
 }
 
-func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, provider AuthProvider, chunkHashes []xet.ChunkHash, candidates []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHashes []xet.ChunkHash, candidates []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
 	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
-		result, err := c.QueryDedupShardWithAuthProvider(ctx, provider, chunkHash, candidates...)
+		result, err := c.QueryDedupShard(ctx, chunkHash, candidates...)
 		if err != nil {
 			return nil, err
 		}

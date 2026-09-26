@@ -1,0 +1,1222 @@
+{
+  "scenario": "ref-anonymous",
+  "recorded": "2026-09-25T08:49:43Z",
+  "upstream": "https://huggingface.co",
+  "repo": "wzshiming/test",
+  "tool": "hf version=1.31.0; huggingface_hub version: 1.31.0; hf_xet: 1.6.0",
+  "exchanges": [
+    {
+      "seq": 1,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/agent-harnesses",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip, deflate"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "User-Agent": [
+          "python-httpx/0.28.1"
+        ],
+        "X-Amzn-Trace-Id": [
+          "e748b2c6-8a39-442c-a900-ea2dd74084d9"
+        ]
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "5711"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:39 GMT"
+        ],
+        "Etag": [
+          "W/\"164f-cVMc19JX8QJwuU/ZVV3kcWXr7tM\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=494;t=201"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=500;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Miss from cloudfront"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a3-40725c9f2eb7aa3a1ac11a91;e748b2c6-8a39-442c-a900-ea2dd74084d9"
+        ]
+      },
+      "response_body": {
+        "size": 5711,
+        "sha256": "e7cea23b05c625a2cd7d7ec8479f55211220f9062b95898db0c38ab9a1ca9d44",
+        "text": "{\"harnesses\":{\"antigravity\":{\"description\":\"Agentic development platform from Google built around Gemini.\",\"docsUrl\":\"https://antigravity.google\",\"envVars\":{\"ANTIGRAVITY_AGENT\":\"*\"},\"prettyLabel\":\"Antigravity\"},\"augment-cli\":{\"description\":\"Auggie, the command-line coding agent from Augment Code.\",\"docsUrl\":\"https://www.augmentcode.com\",\"envVars\":{\"AUGMENT_AGENT\":\"*\"},\"prettyLabel\":\"Augment CLI\",\"repoUrl\":\"https://github.com/augmentcode/auggie\"},\"claude-code\":{\"description\":\"Anthropic's agentic coding tool that lives in your terminal.\",\"docsUrl\":\"https://code.claude.com/docs\",\"envVars\":{\"CLAUDECODE\":\"*\",\"CLAUDE_CODE\":\"*\"},\"prettyLabel\":\"Claude Code\",\"repoUrl\":\"https://github.com/anthropics/claude-code\"},\"cline\":{\"description\":\"Open-source autonomous coding agent for VS Code.\",\"docsUrl\":\"https://cline.bot\",\"envVars\":{\"CLINE_ACTIVE\":\"*\"},\"prettyLabel\":\"Cline\",\"repoUrl\":\"https://github.com/cline/cline\"},\"codex\":{\"description\":\"OpenAI's lightweight coding agent that runs in your terminal.\",\"docsUrl\":\"https://developers.openai.com/codex\",\"envVars\":{\"CODEX_CI\":\"*\",\"CODEX_SANDBOX\":\"*\",\"CODEX_THREAD_ID\":\"*\"},\"prettyLabel\":\"Codex\",\"repoUrl\":\"https://github.com/openai/codex\"},\"cowork\":{\"description\":\"Anthropic's agent for autonomous knowledge work, built on top of Claude Code.\",\"docsUrl\":\"https://claude.com/product/cowork\",\"envVars\":{\"CLAUDE_CODE_IS_COWORK\":\"*\"},\"prettyLabel\":\"Cowork\"},\"crush\":{\"description\":\"Charm's open-source AI coding agent for the terminal.\",\"docsUrl\":\"https://github.com/charmbracelet/crush\",\"envVars\":{\"CRUSH\":\"*\"},\"prettyLabel\":\"Crush\",\"repoUrl\":\"https://github.com/charmbracelet/crush\"},\"cursor\":{\"description\":\"AI-powered code editor.\",\"docsUrl\":\"https://cursor.com\",\"envVars\":{\"CURSOR_TRACE_ID\":\"*\"},\"prettyLabel\":\"Cursor\"},\"cursor-cli\":{\"description\":\"Cursor's coding agent for the command line.\",\"docsUrl\":\"https://cursor.com/docs/cli/overview\",\"envVars\":{\"CURSOR_AGENT\":\"*\"},\"prettyLabel\":\"Cursor CLI\"},\"devin\":{\"description\":\"Autonomous AI software engineer from Cognition.\",\"docsUrl\":\"https://devin.ai\",\"prettyLabel\":\"Devin\"},\"gemini-cli\":{\"description\":\"Google's open-source terminal AI coding agent powered by Gemini models.\",\"docsUrl\":\"https://geminicli.com\",\"envVars\":{\"GEMINI_CLI\":\"*\"},\"prettyLabel\":\"Gemini CLI\",\"repoUrl\":\"https://github.com/google-gemini/gemini-cli\"},\"github-copilot\":{\"description\":\"GitHub's AI coding assistant.\",\"docsUrl\":\"https://docs.github.com/copilot\",\"envVars\":{\"COPILOT_ALLOW_ALL\":\"*\",\"COPILOT_GITHUB_TOKEN\":\"*\",\"COPILOT_MODEL\":\"*\"},\"prettyLabel\":\"GitHub Copilot\"},\"goose\":{\"description\":\"Open-source, extensible AI agent, originally from Block and now part of the Agentic AI Foundation.\",\"docsUrl\":\"https://goose-docs.ai/\",\"envVars\":{\"GOOSE_TERMINAL\":\"*\"},\"prettyLabel\":\"Goose\",\"repoUrl\":\"https://github.com/aaif-goose/goose\"},\"hermes-agent\":{\"description\":\"Nous Research's self-improving, multi-provider terminal AI agent.\",\"docsUrl\":\"https://hermes-agent.nousresearch.com/docs\",\"envVars\":{\"HERMES_SESSION_ID\":\"*\"},\"prettyLabel\":\"Hermes Agent\",\"repoUrl\":\"https://github.com/NousResearch/hermes-agent\"},\"hi\":{\"description\":\"Rust terminal coding agent with verification-in-the-loop.\",\"docsUrl\":\"https://github.com/PipeNetwork/hi#readme\",\"prettyLabel\":\"hi\",\"repoUrl\":\"https://github.com/PipeNetwork/hi\"},\"kilo-code\":{\"description\":\"Open-source agentic coding agent for VS Code, JetBrains, and the terminal.\",\"docsUrl\":\"https://kilocode.ai/docs\",\"envVars\":{\"KILOCODE_FEATURE\":\"*\"},\"prettyLabel\":\"Kilo Code\",\"repoUrl\":\"https://github.com/Kilo-Org/kilocode\"},\"kiro\":{\"description\":\"AWS's agentic IDE for spec-driven AI software development.\",\"docsUrl\":\"https://kiro.dev\",\"envVars\":{\"AGENT_CONTEXT_OUT\":\"*\"},\"prettyLabel\":\"Kiro\"},\"openclaw\":{\"description\":\"Open-source, self-hosted personal AI assistant that runs on your own devices.\",\"docsUrl\":\"https://openclaw.ai\",\"envVars\":{\"OPENCLAW_SHELL\":\"*\"},\"prettyLabel\":\"OpenClaw\",\"repoUrl\":\"https://github.com/openclaw/openclaw\"},\"opencode\":{\"description\":\"Open-source AI coding agent built for the terminal.\",\"docsUrl\":\"https://opencode.ai\",\"envVars\":{\"OPENCODE_CLIENT\":\"*\"},\"prettyLabel\":\"opencode\",\"repoUrl\":\"https://github.com/anomalyco/opencode\"},\"pi\":{\"description\":\"Minimal, self-extensible terminal coding agent with a unified multi-provider LLM API.\",\"docsUrl\":\"https://pi.dev\",\"envVars\":{\"PI_CODING_AGENT\":\"*\"},\"prettyLabel\":\"Pi\",\"repoUrl\":\"https://github.com/earendil-works/pi\"},\"replit\":{\"description\":\"Cloud development environment with an AI coding agent.\",\"docsUrl\":\"https://replit.com\",\"envVars\":{\"REPL_ID\":\"*\"},\"prettyLabel\":\"Replit\"},\"sandbase-harness\":{\"description\":\"Local-first, self-hosted runtime for persistent AI agent sessions and MCP tools.\",\"docsUrl\":\"https://github.com/sandbaseai/sandbase-harness/blob/main/docs/installation.md\",\"prettyLabel\":\"SandBase Harness\",\"repoUrl\":\"https://github.com/sandbaseai/sandbase-harness\"},\"trae\":{\"description\":\"AI-powered IDE from ByteDance.\",\"docsUrl\":\"https://trae.ai\",\"envVars\":{\"TRAE_AI_SHELL_ID\":\"*\"},\"prettyLabel\":\"Trae\"},\"vtcode\":{\"description\":\"Rust coding agent with multi-provider LLM support, OS-native sandboxing, and extensible skills\",\"envVars\":{\"VTCODE\":\"1\"},\"prettyLabel\":\"VTCode\",\"repoUrl\":\"https://github.com/vinhnx/VTCode\"},\"warp\":{\"description\":\"AI-powered terminal with an agentic Agent Mode.\",\"docsUrl\":\"https://docs.warp.dev\",\"envVars\":{\"TERM_PROGRAM\":\"WarpTerminal\"},\"prettyLabel\":\"Warp\",\"repoUrl\":\"https://github.com/warpdotdev/Warp\"},\"zed\":{\"description\":\"High-performance code editor with an integrated AI agent panel and terminal.\",\"docsUrl\":\"https://zed.dev\",\"envVars\":{\"ZED_TERM\":\"*\"},\"prettyLabel\":\"Zed\",\"repoUrl\":\"https://github.com/zed-industries/zed\"}},\"standardEnvVars\":[\"AI_AGENT\",\"AGENT\"]}"
+      }
+    },
+    {
+      "seq": 2,
+      "origin": "hub",
+      "method": "HEAD",
+      "path": "/wzshiming/test/resolve/main/regression/ref-lfs.bin",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "User-Agent": [
+          "huggingface-cli/None; hf_hub/1.31.0; python/3.14.7"
+        ],
+        "X-Amzn-Trace-Id": [
+          "f0964cb7-3413-4881-bba5-cb84f34d2cca"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "29"
+        ],
+        "Content-Type": [
+          "text/plain; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:39 GMT"
+        ],
+        "Etag": [
+          "W/\"1d-DMkJvg8tpLoaQbsiq9Mz7l2CJyI\""
+        ],
+        "Ratelimit": [
+          "\"resolvers\";r=2999;t=201"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"resolvers\";q=3000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a3-0e2e9f8c0d4a8e0a1332464b;f0964cb7-3413-4881-bba5-cb84f34d2cca"
+        ]
+      }
+    },
+    {
+      "seq": 3,
+      "origin": "hub",
+      "method": "HEAD",
+      "path": "/wzshiming/test/resolve/main/regression/ref-lfs.bin",
+      "request_headers": {
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "29"
+        ],
+        "Content-Type": [
+          "text/plain; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:40 GMT"
+        ],
+        "Etag": [
+          "W/\"1d-DMkJvg8tpLoaQbsiq9Mz7l2CJyI\""
+        ],
+        "Ratelimit": [
+          "\"resolvers\";r=2998;t=200"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"resolvers\";q=3000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a4-6c1c62ce301ebb4830e17895"
+        ]
+      }
+    },
+    {
+      "seq": 4,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/xet-read-token/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:40 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=493;t=200"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=500;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a4-357ecbd4422e439e5483caf3"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 5,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/xet-write-token/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:40 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9992;t=200"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a4-152bb93f0ed06c0060b901a4"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 6,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/preupload/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Content-Length": [
+          "89"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "request_body": {
+        "size": 89,
+        "sha256": "3c6137ec359baa670bafd8ca3f48dffc4f46fca2d37f574382a8fc407ffdb21a",
+        "text": "{\"files\":[{\"path\":\"regression/probe.bin\",\"sample\":\"eGV0IHByb2JlIHNhbXBsZQ==\",\"size\":16}]}"
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:40 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9991;t=200"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a4-422d8f5808c4b58e6b2c6dbc"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 7,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/commit/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Content-Length": [
+          "217"
+        ],
+        "Content-Type": [
+          "application/x-ndjson"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "request_body": {
+        "size": 217,
+        "sha256": "2b69ea71279145842054937a982b8187ee9e3d8f539c7ef3e132e0d3a9337c23",
+        "text": "{\"key\":\"header\",\"value\":{\"summary\":\"probe\"}}\n{\"key\":\"lfsFile\",\"value\":{\"algo\":\"sha256\",\"oid\":\"eaa4c27c5e660f94efc807dc355d4977fc69ac1a976e9da0dba3fea2a724d3be\",\"path\":\"regression/probe-missing-object.bin\",\"size\":16}}\n"
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:41 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9990;t=199"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a5-51f0aa9630f6859134560df8"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 8,
+      "origin": "hub",
+      "method": "HEAD",
+      "path": "/wzshiming/test/resolve/main/regression/ref-lfs.bin",
+      "request_headers": {
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "29"
+        ],
+        "Content-Type": [
+          "text/plain; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:41 GMT"
+        ],
+        "Etag": [
+          "W/\"1d-DMkJvg8tpLoaQbsiq9Mz7l2CJyI\""
+        ],
+        "Ratelimit": [
+          "\"resolvers\";r=2997;t=199"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"resolvers\";q=3000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a5-584b43f96e24982e3d06064f"
+        ]
+      }
+    },
+    {
+      "seq": 9,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/xet-read-token/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:41 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=489;t=199"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=500;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a5-2dfcbd244bc01b76234e35e7"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 10,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/xet-write-token/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:41 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9988;t=199"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a5-5854d3d5011ef33d2a734506"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 11,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/preupload/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Content-Length": [
+          "89"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "request_body": {
+        "size": 89,
+        "sha256": "3c6137ec359baa670bafd8ca3f48dffc4f46fca2d37f574382a8fc407ffdb21a",
+        "text": "{\"files\":[{\"path\":\"regression/probe.bin\",\"sample\":\"eGV0IHByb2JlIHNhbXBsZQ==\",\"size\":16}]}"
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:42 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9987;t=198"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a6-41d10bb13275a10e3a411829"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 12,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/commit/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Content-Length": [
+          "217"
+        ],
+        "Content-Type": [
+          "application/x-ndjson"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "request_body": {
+        "size": 217,
+        "sha256": "2b69ea71279145842054937a982b8187ee9e3d8f539c7ef3e132e0d3a9337c23",
+        "text": "{\"key\":\"header\",\"value\":{\"summary\":\"probe\"}}\n{\"key\":\"lfsFile\",\"value\":{\"algo\":\"sha256\",\"oid\":\"eaa4c27c5e660f94efc807dc355d4977fc69ac1a976e9da0dba3fea2a724d3be\",\"path\":\"regression/probe-missing-object.bin\",\"size\":16}}\n"
+      },
+      "status": 401,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "41"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:42 GMT"
+        ],
+        "Etag": [
+          "W/\"29-dEMcHWfJi78ZR1aqzb1ELAhp3Us\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=9986;t=198"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=10000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "Www-Authenticate": [
+          "Bearer realm=\"Authentication required\", charset=\"UTF-8\""
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Invalid username or password."
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a6-36ebab085b9576a140977984"
+        ]
+      },
+      "response_body": {
+        "size": 41,
+        "sha256": "65842e3d84e6b7f62a470c85204e80b953bb8f944e9b69813130a9d7f3eaa1d8",
+        "text": "{\"error\":\"Invalid username or password.\"}"
+      }
+    },
+    {
+      "seq": 13,
+      "origin": "hub",
+      "method": "HEAD",
+      "path": "/wzshiming/test/resolve/main/regression/does-not-exist.bin",
+      "request_headers": {
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "status": 404,
+      "response_headers": {
+        "Accept-Ranges": [
+          "bytes"
+        ],
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "15"
+        ],
+        "Content-Type": [
+          "text/plain; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:42 GMT"
+        ],
+        "Etag": [
+          "W/\"f-mY2VvLxuxB7KhsoOdQTlMTccuAQ\""
+        ],
+        "Ratelimit": [
+          "\"resolvers\";r=4993;t=137"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"resolvers\";q=5000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Code": [
+          "EntryNotFound"
+        ],
+        "X-Error-Message": [
+          "Entry not found"
+        ],
+        "X-Hub-Cache": [
+          "MISS"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Repo-Commit": [
+          "bcf51b2ec6fb5bc8215f4b365a0e48532e26abb8"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a6-47bb11713526319a514f5929"
+        ]
+      }
+    },
+    {
+      "seq": 14,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/commit/main",
+      "request_headers": {
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Content-Length": [
+          "217"
+        ],
+        "Content-Type": [
+          "application/x-ndjson"
+        ],
+        "User-Agent": [
+          "Go-http-client/1.1"
+        ]
+      },
+      "request_body": {
+        "size": 217,
+        "sha256": "2b69ea71279145842054937a982b8187ee9e3d8f539c7ef3e132e0d3a9337c23",
+        "text": "{\"key\":\"header\",\"value\":{\"summary\":\"probe\"}}\n{\"key\":\"lfsFile\",\"value\":{\"algo\":\"sha256\",\"oid\":\"eaa4c27c5e660f94efc807dc355d4977fc69ac1a976e9da0dba3fea2a724d3be\",\"path\":\"regression/probe-missing-object.bin\",\"size\":16}}\n"
+      },
+      "status": 400,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "235"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:43 GMT"
+        ],
+        "Etag": [
+          "W/\"eb-K61pVJaCgR9s4AMzU11+LCcYvLA\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=986;t=136"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=1000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 f614e1bfacc59636f272b6e23efc5592.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "Your push was rejected because an LFS pointer pointed to a file that does not exist. For instance, this can happen if you used git push --no-verify to push your changes. Offending file: - regression/probe-missing-object.bin"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a7-477904b8353b3d3b7325c2de"
+        ]
+      },
+      "response_body": {
+        "size": 235,
+        "sha256": "b4e128eab494bf891231b51708054d8a22d020ced209e4835f65cc1c4206530e",
+        "text": "{\"error\":\"Your push was rejected because an LFS pointer pointed to a file that does not exist. For instance, this can happen if you used git push --no-verify to push your changes. Offending file: - regression/probe-missing-object.bin\"}"
+      }
+    }
+  ]
+}

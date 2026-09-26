@@ -10,20 +10,19 @@ import (
 	"time"
 
 	"github.com/wzshiming/httpseek"
+	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
 )
 
-// AuthProvider provides dynamic base URL and access token values.
-type AuthProvider interface {
-	BaseURL(context.Context) (string, error)
-	Token(context.Context) (string, error)
+// UpstreamProvider selects the CAS endpoint and bearer token for one permission.
+type UpstreamProvider interface {
+	Resolve(ctx context.Context, perm auth.Permission) (baseURL, token string, err error)
 }
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	baseURL       string
-	token         string
+	provider      UpstreamProvider
 	httpClient    *http.Client
 	getHttpClient *http.Client
 	namespace     string
@@ -38,25 +37,10 @@ type Client struct {
 
 type Options func(*Client)
 
-// WithBaseURL sets the base URL for the API endpoints, allowing the client to connect to different servers or environments.
-func WithBaseURL(url string) Options {
-	return func(c *Client) {
-		c.baseURL = url
-	}
-}
-
 // WithHTTPClient allows users to provide a custom HTTP client, which can be used to configure timeouts, TLS settings, or other HTTP behaviors.
 func WithHTTPClient(httpClient *http.Client) Options {
 	return func(c *Client) {
 		c.httpClient = httpClient
-	}
-}
-
-// WithToken sets a static authentication token for the client. The token is
-// included verbatim in the Authorization header of every request.
-func WithToken(token string) Options {
-	return func(c *Client) {
-		c.token = token
 	}
 }
 
@@ -116,6 +100,13 @@ func WithCacheSize(sizeBytes int64) Options {
 	}
 }
 
+// WithUpstreamProvider binds the CAS endpoint and token source; without it every CAS request fails.
+func WithUpstreamProvider(provider UpstreamProvider) Options {
+	return func(c *Client) {
+		c.provider = provider
+	}
+}
+
 // NewClient creates a new API client
 func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
@@ -132,11 +123,13 @@ func NewClient(opts ...Options) (*Client, error) {
 
 	c.cacheManager = download.NewCacheManager(c.cacheDir, c.cacheSize)
 
-	if c.httpClient.Transport == nil {
-		c.httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
+	// Copy the caller's client so wrapping its transport never mutates it.
+	httpClient := *c.httpClient
+	if httpClient.Transport == nil {
+		httpClient.Transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
-
-	
+	httpClient.Transport = &authTransport{base: httpClient.Transport}
+	c.httpClient = &httpClient
 
 	c.getHttpClient = &http.Client{
 		CheckRedirect: c.httpClient.CheckRedirect,
@@ -171,37 +164,10 @@ func (c *Client) Usage(ctx context.Context) (Usage, error) {
 	return Usage{Download: downloadUsage}, nil
 }
 
-// getToken calls the configured tokenFunc and returns the bearer token string.
-// If no tokenFunc is set it returns an empty string.
-func (c *Client) getToken(ctx context.Context, provider AuthProvider) (string, error) {
-	if provider != nil {
-		token, err := provider.Token(ctx)
-		if err != nil {
-			return "", err
-		}
-		if token != "" {
-			return token, nil
-		}
-	}
-	return c.token, nil
-}
-
-// getBaseURL calls the configured baseURLFunc and returns the request base URL.
-// If no baseURLFunc is set it returns the static baseURL configured on client.
-func (c *Client) getBaseURL(ctx context.Context, provider AuthProvider) (string, error) {
-	if provider != nil {
-		baseURL, err := provider.BaseURL(ctx)
-		if err != nil {
-			return "", err
-		}
-		if baseURL != "" {
-			return baseURL, nil
-		}
-	}
-	return c.baseURL, nil
-}
-
-var errNotFound = fmt.Errorf("404 not found")
+var (
+	errNotFound     = fmt.Errorf("404 not found")
+	errUnauthorized = errors.New("401 Unauthorized")
+)
 
 func reqError(req *http.Request, resp *http.Response) error {
 	if resp.StatusCode == http.StatusNotFound {
@@ -213,16 +179,30 @@ func reqError(req *http.Request, resp *http.Response) error {
 	if ranges != "" {
 		if resp.StatusCode != http.StatusPartialContent {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: range: %s: API error (status %s): %s", req.URL.String(), ranges, resp.Status, string(body))
+			return fmt.Errorf("url %s: range: %s: API error (status %w): %s", req.URL.String(), ranges, statusError(resp), string(body))
 		}
 	} else {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("url %s: API error (status %s): %s", req.URL.String(), resp.Status, string(body))
+			return fmt.Errorf("url %s: API error (status %w): %s", req.URL.String(), statusError(resp), string(body))
 		}
 	}
 	return nil
 }
+
+// statusError is resp.Status as an error; a 401 also matches errUnauthorized so callers can keep it terminal.
+func statusError(resp *http.Response) error {
+	if resp.StatusCode == http.StatusUnauthorized {
+		return unauthorizedError{resp.Status}
+	}
+	return errors.New(resp.Status)
+}
+
+type unauthorizedError struct{ status string }
+
+func (e unauthorizedError) Error() string { return e.status }
+
+func (unauthorizedError) Is(target error) bool { return target == errUnauthorized }
 
 func isNetworkError(err error) bool {
 	var netErr interface{ Timeout() bool }

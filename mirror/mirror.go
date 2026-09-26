@@ -24,7 +24,6 @@
 package mirror
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -90,26 +89,39 @@ func (k resolveKey) String() string {
 	return "/" + k.repo + "/resolve/" + k.rev + "/" + k.path
 }
 
-// UpstreamFunc selects a hub and bearer token by escaped repo, possibly on a background context.
-type UpstreamFunc func(ctx context.Context, repo string) (*url.URL, string, error)
-
-// StaticUpstream returns a selector that sends every repo to one hub.
-func StaticUpstream(rawURL, token string) (UpstreamFunc, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("mirror: invalid upstream URL %q", rawURL)
+// upstreamOrigin validates raw as an absolute http(s) URL and returns it with its scheme://host origin.
+func upstreamOrigin(raw string) (*url.URL, string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, "", fmt.Errorf("mirror: invalid upstream URL %q", raw)
 	}
-	return func(context.Context, string) (*url.URL, string, error) { return u, token, nil }, nil
+	return u, u.Scheme + "://" + u.Host, nil
+}
+
+// parseUpstreamURL splits a hub download URL into its origin and path-only key.
+func parseUpstreamURL(raw string) (string, resolveKey, error) {
+	u, origin, err := upstreamOrigin(raw)
+	if err != nil {
+		return "", resolveKey{}, err
+	}
+	key, ok := parseResolveKey(u.EscapedPath())
+	if !ok {
+		return "", resolveKey{}, fmt.Errorf("mirror: %q is not a hub download URL", raw)
+	}
+	return origin, key, nil
 }
 
 // Mirror is the ingestion engine: resolutions are answered from the local
 // cache (ingesting on miss) while every byte is published to storage as
-// xorbs and shards. It serves the server/hf package's hub front end through
-// Resolve, LookupXetHash, and FetchUpstream; token minting and the
-// downstream HTTP surface are wired there.
+// xorbs and shards. Files are named by their hub download path (repo,
+// revision, path) alone; a call's origin and token only say where and how to
+// fetch, and the first resolver of a file pins both on its ingest. A mirror
+// must therefore route each repository to a single upstream, as the
+// server/hf selector does. It serves the server/hf package's hub front end
+// through Resolve, LookupXetHash, and FetchUpstream; upstream selection,
+// token minting and the downstream HTTP surface are wired there.
 type Mirror struct {
 	storage            storage.Storage
-	upstreamFunc       UpstreamFunc
 	cacheDir           string
 	indexDir           string
 	spoolDir           string
@@ -140,11 +152,6 @@ func WithStorage(s storage.Storage) Option {
 	return func(m *Mirror) { m.storage = s }
 }
 
-// WithUpstream sets the per-repo upstream selector. Required.
-func WithUpstream(upstreamFunc UpstreamFunc) Option {
-	return func(m *Mirror) { m.upstreamFunc = upstreamFunc }
-}
-
 // WithCacheDir stores indexes, spools and chunks under dir; defaults to ./xet-mirror.
 func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
@@ -167,7 +174,7 @@ func WithMaxConcurrentIngests(n int) Option {
 	return func(m *Mirror) { m.maxIngests = n }
 }
 
-// WithTransport sets the transport under the upstream auth, idle, and resume wrappers; nil uses a clone of http.DefaultTransport.
+// WithTransport sets the transport under the upstream auth, idle, and resume wrappers, and of the default xet client; nil uses a clone of http.DefaultTransport.
 func WithTransport(rt http.RoundTripper) Option {
 	return func(m *Mirror) { m.transport = rt }
 }
@@ -189,9 +196,6 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 
 	if m.storage == nil {
 		return nil, fmt.Errorf("mirror: storage is required")
-	}
-	if m.upstreamFunc == nil {
-		return nil, fmt.Errorf("mirror: upstream is required")
 	}
 
 	if m.maxIngests <= 0 {
@@ -229,7 +233,10 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	if m.xetClient == nil {
-		xetClient, err := client.NewClient(client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")))
+		xetClient, err := client.NewClient(
+			client.WithHTTPClient(&http.Client{Transport: baseTransport}),
+			client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("mirror: create xet client: %w", err)
 		}

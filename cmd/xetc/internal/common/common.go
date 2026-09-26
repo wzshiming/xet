@@ -30,7 +30,21 @@ func baseName(p string) string {
 	return p
 }
 
-func ExecuteUpload(ctx context.Context, filename string, provider client.AuthProvider, namespace string, concurrency int, cacheDir string, out io.Writer) (err error) {
+// newClient builds a client reporting transfer progress to out.
+func newClient(namespace string, concurrency int, cacheDir string, out io.Writer, opts ...client.Options) (*client.Client, error) {
+	progressSummary := newProgressSummary()
+	return client.NewClient(append(opts,
+		client.WithNamespace(namespace),
+		client.WithProgressFunc(func(name string, current, total int64) {
+			progressSummary.Update(baseName(name), current, total)
+			progressSummary.Output(out)
+		}),
+		client.WithConcurrency(concurrency),
+		client.WithCacheDir(cacheDir),
+	)...)
+}
+
+func ExecuteUpload(ctx context.Context, filename string, provider client.UpstreamProvider, namespace string, concurrency int, cacheDir string, out io.Writer) (err error) {
 	if _, err := fmt.Fprintf(out, "%s Uploading file\n", filename); err != nil {
 		return err
 	}
@@ -41,21 +55,12 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.AuthPro
 	}
 	defer f.Close()
 
-	progressSummary := newProgressSummary()
-	cli, err := client.NewClient(
-		client.WithNamespace(namespace),
-		client.WithProgressFunc(func(name string, current, total int64) {
-			progressSummary.Update(baseName(name), current, total)
-			progressSummary.Output(out)
-		}),
-		client.WithConcurrency(concurrency),
-		client.WithCacheDir(cacheDir),
-	)
+	cli, err := newClient(namespace, concurrency, cacheDir, out, client.WithUpstreamProvider(provider))
 	if err != nil {
 		return fmt.Errorf("upload failed: create client: %w", err)
 	}
 
-	fileHash, err := cli.UploadFileWithAuthProvider(ctx, provider, f)
+	fileHash, err := cli.UploadFile(ctx, f)
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
@@ -70,22 +75,34 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.AuthPro
 	return nil
 }
 
-func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.AuthProvider, namespace string, concurrency int, cacheDir string, resume bool, out io.Writer) (err error) {
-	progressSummary := newProgressSummary()
-	cli, err := client.NewClient(
-		client.WithNamespace(namespace),
-		client.WithProgressFunc(func(name string, current, total int64) {
-			progressSummary.Update(baseName(name), current, total)
-			progressSummary.Output(out)
-		}),
-		client.WithConcurrency(concurrency),
-		client.WithCacheDir(cacheDir),
-	)
+// ExecuteResolveDownload downloads the Hugging Face file behind resolveURL through the hub's xet links, authenticating with token; the destination is opened only once the resolution succeeded.
+func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile string, concurrency int, cacheDir string, resume bool, out io.Writer) error {
+	cli, err := newClient("default", concurrency, cacheDir, out)
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}
+	f, err := cli.Resolve(ctx, resolveURL, token)
+	if err != nil {
+		return fmt.Errorf("resolve download target: %w", err)
+	}
+	if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", outputFile, f.Hash.String()); err != nil {
+		return err
+	}
+	return downloadTo(outputFile, resume, out, func(w io.WriteSeeker) error { return cli.DownloadResolved(ctx, f, w) })
+}
 
+func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.UpstreamProvider, namespace string, concurrency int, cacheDir string, resume bool, out io.Writer) (err error) {
+	cli, err := newClient(namespace, concurrency, cacheDir, out, client.WithUpstreamProvider(provider))
+	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
+	return downloadTo(outputFile, resume, out, func(w io.WriteSeeker) error { return cli.DownloadFile(ctx, fileHash, w) })
+}
+
+// downloadTo runs download into outputFile (opened for resume or created) and reports the final size on out.
+func downloadTo(outputFile string, resume bool, out io.Writer, download func(w io.WriteSeeker) error) error {
 	var file *os.File
+	var err error
 	if resume {
 		file, err = os.OpenFile(outputFile, os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
@@ -99,7 +116,7 @@ func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile stri
 	}
 	defer file.Close()
 
-	if err := cli.DownloadFileWithAuthProvider(ctx, provider, fileHash, file); err != nil {
+	if err := download(file); err != nil {
 		return err
 	}
 

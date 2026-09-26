@@ -85,7 +85,7 @@ func TestHasXorbStalledHeadersFailAfterRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithHTTPClient(countingClient(&attempts)), WithBaseURL(srv.URL), WithIdleTimeout(50*time.Millisecond), WithRetries(1))
+	c, err := NewClient(WithHTTPClient(countingClient(&attempts)), WithIdleTimeout(50*time.Millisecond), WithRetries(1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestRawGETIdleTimeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithIdleTimeout(50*time.Millisecond), WithRetries(3))
+	c, err := NewClient(WithIdleTimeout(50*time.Millisecond), WithRetries(3), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
