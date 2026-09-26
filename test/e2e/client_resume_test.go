@@ -51,7 +51,7 @@ func TestClientDownloadResume(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+	c, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestClientDownloadResume(t *testing.T) {
 			mu.Unlock()
 
 			// A fresh cache dir keeps the suffix xorb fetch observable.
-			dc, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+			dc, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 			if err != nil {
 				t.Fatal(err)
 			}

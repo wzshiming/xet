@@ -13,6 +13,7 @@ package hf
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 // Handler serves the hub front end routes.
 type Handler struct {
 	mirror   *mirror.Mirror
+	upstream UpstreamFunc
 	root     *mux.Router
 	next     http.Handler
 	external string
@@ -69,6 +71,13 @@ type Option func(*Handler)
 func WithMirror(m *mirror.Mirror) Option {
 	return func(h *Handler) {
 		h.mirror = m
+	}
+}
+
+// WithUpstream sets the per-repo selector of the upstream hub and bearer token the resolve and tree routes go through. Required for those routes.
+func WithUpstream(upstreamFunc UpstreamFunc) Option {
+	return func(h *Handler) {
+		h.upstream = upstreamFunc
 	}
 }
 
@@ -156,17 +165,37 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/{repo:.+?}/resolve/{rev}/{path:.+}", h.handleResolve).Methods(http.MethodGet, http.MethodHead)
 }
 
+// upstreamURL joins repo's selected hub with pathAndQuery and returns that hub's bearer token alongside.
+func (h *Handler) upstreamURL(ctx context.Context, repo, pathAndQuery string) (string, string, error) {
+	if h.upstream == nil {
+		return "", "", errors.New("hf: no upstream selector")
+	}
+	u, token, err := h.upstream(ctx, repo)
+	if err != nil {
+		return "", "", err
+	}
+	if u == nil {
+		return "", "", fmt.Errorf("hf: no upstream URL selected for %q", repo)
+	}
+	return strings.TrimRight(u.String(), "/") + pathAndQuery, token, nil
+}
+
 // handleResolve serves GET/HEAD for hub-style download paths through the
 // mirror engine: ready files answer metadata plus links, in-flight ingests
 // stream from the growing spool.
 func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	repo, rev, path := vars["repo"], vars["rev"], vars["path"]
+	target, token, err := h.upstreamURL(r.Context(), repo, "/"+repo+"/resolve/"+rev+"/"+path)
+	if err != nil {
+		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+		return
+	}
 	// Bounded retry: a resolution can hand back a stream whose ingest
 	// finished and whose spool was drained before this request attached;
 	// resolving again returns the published entry.
 	for range 2 {
-		res, err := h.mirror.Resolve(r.Context(), repo, rev, path)
+		res, err := h.mirror.Resolve(r.Context(), target, token)
 		if err != nil {
 			serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 			return
@@ -389,7 +418,12 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		pathAndQuery += "?" + r.URL.RawQuery
 	}
-	resp, err := h.mirror.FetchUpstream(r.Context(), repoIdentity(vars["type"], vars["repo"]), pathAndQuery)
+	target, token, err := h.upstreamURL(r.Context(), repoIdentity(vars["type"], vars["repo"]), pathAndQuery)
+	if err != nil {
+		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+		return
+	}
+	resp, err := h.mirror.FetchUpstream(r.Context(), target, token)
 	if err != nil {
 		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 		return

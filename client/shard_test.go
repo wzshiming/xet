@@ -38,7 +38,7 @@ func TestUploadShardV2ReadsNDJSONUntilResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestUploadShardV2ReportsTerminalError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestUploadShardV2RequiresResultEvent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestUploadShardV2RetriesRetryableError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()), WithRetries(1))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithRetries(1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestUploadShardV2ExhaustsRetryableRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()), WithRetries(1))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithRetries(1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestUploadShardV2SkipsUnknownFrames(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestUploadShardV2RejectsOversizedFrame(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestUploadShardV2HandlesTrailingFrameWithoutNewline(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestQueryDedupShardKeyedShard(t *testing.T) {
 	srv := serveDedupShard(t, shardBytes)
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestQueryDedupShardExpiredKeyIgnoresShard(t *testing.T) {
 	srv := serveDedupShard(t, shardBytes)
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestQueryDedupShardUnkeyedShardIndexesRawHashes(t *testing.T) {
 	srv := serveDedupShard(t, shardBytes)
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestQueryDedupShardsFallbackMatchesKeyedCandidates(t *testing.T) {
 	srv := serveDedupShard(t, shardBytes)
 	defer srv.Close()
 
-	c, err := NewClient(WithBaseURL(srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

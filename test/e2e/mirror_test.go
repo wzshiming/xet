@@ -174,14 +174,13 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamFunc, err := mirror.StaticUpstream(upstreamURL, "")
+	upstreamFunc, err := hf.StaticUpstream(upstreamURL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(upstreamFunc),
 			mirror.WithCacheDir(cacheDir),
 		}, opts...)...,
 	)
@@ -193,6 +192,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 		server.WithAuthorizer(issuer),
 		server.WithNext(hf.NewHandler(
 			hf.WithMirror(m),
+			hf.WithUpstream(upstreamFunc),
 			hf.WithExternalURL(srv.URL),
 			hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
 				if req.Permission != auth.Read {

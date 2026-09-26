@@ -2,22 +2,20 @@ package client
 
 import (
 	"context"
+
+	"github.com/wzshiming/xet/auth"
 )
 
-type staticAuthProvider struct {
+type staticUpstreamProvider struct {
 	baseURL string
 	token   string
 }
 
-// StaticAuthProvider returns an AuthProvider backed by fixed base URL and token values.
-func StaticAuthProvider(baseURL, token string) AuthProvider {
-	return staticAuthProvider{baseURL: baseURL, token: token}
+// StaticUpstreamProvider returns an UpstreamProvider serving the same base URL and token for every permission.
+func StaticUpstreamProvider(baseURL, token string) UpstreamProvider {
+	return staticUpstreamProvider{baseURL: baseURL, token: token}
 }
 
-func (p staticAuthProvider) BaseURL(context.Context) (string, error) {
-	return p.baseURL, nil
-}
-
-func (p staticAuthProvider) Token(context.Context) (string, error) {
-	return p.token, nil
+func (p staticUpstreamProvider) Resolve(context.Context, auth.Permission) (string, string, error) {
+	return p.baseURL, p.token, nil
 }

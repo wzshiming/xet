@@ -74,7 +74,7 @@ func NewCommand() *cobra.Command {
 
 			casToken := batchResult.Upload.Header["X-Xet-Access-Token"]
 
-			provider := client.StaticAuthProvider(casURL, casToken)
+			provider := client.StaticUpstreamProvider(casURL, casToken)
 
 			if err := common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr); err != nil {
 				return err

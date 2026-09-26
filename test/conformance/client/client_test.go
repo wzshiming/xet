@@ -247,8 +247,8 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 						// Upload with native client
 						nativeClient, err := client.NewClient(
-							client.WithBaseURL(nativeHttpSrv.URL),
 							client.WithCacheDir(t.TempDir()),
+							client.WithUpstreamProvider(client.StaticUpstreamProvider(nativeHttpSrv.URL, "")),
 						)
 						if err != nil {
 							t.Fatalf("create native client: %v", err)
@@ -316,8 +316,8 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 						// First upload file using native client
 						nativeClient, err := client.NewClient(
-							client.WithBaseURL(httpSrv.URL),
 							client.WithCacheDir(t.TempDir()),
+							client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 						)
 						if err != nil {
 							t.Fatalf("create native client: %v", err)
@@ -502,8 +502,8 @@ func testClientUploadConformanceWithExistingData(t *testing.T, protocol rustref.
 	nativeProxy = NewRecordingProxy(nativeSrv)
 
 	nativeClient, err := client.NewClient(
-		client.WithBaseURL(nativeHTTP.URL),
 		client.WithCacheDir(t.TempDir()),
+		client.WithUpstreamProvider(client.StaticUpstreamProvider(nativeHTTP.URL, "")),
 	)
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
@@ -1303,8 +1303,8 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 	}
 	srv = server.NewHandler(server.WithStorage(stor))
 	nativeClient, err := client.NewClient(
-		client.WithBaseURL(httpSrv.URL),
 		client.WithCacheDir(t.TempDir()),
+		client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 	)
 	if err != nil {
 		t.Fatalf("create native client: %v", err)
@@ -1495,8 +1495,8 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 
 		// Upload two small files.
 		innerClient, err := client.NewClient(
-			client.WithBaseURL(proxiedSrv.URL),
 			client.WithCacheDir(t.TempDir()),
+			client.WithUpstreamProvider(client.StaticUpstreamProvider(proxiedSrv.URL, "")),
 		)
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
@@ -1585,8 +1585,8 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		cmpProxy = NewRecordingProxy(cmpSrv)
 
 		cmpClient, err := client.NewClient(
-			client.WithBaseURL(cmpHTTP.URL),
 			client.WithCacheDir(t.TempDir()),
+			client.WithUpstreamProvider(client.StaticUpstreamProvider(cmpHTTP.URL, "")),
 		)
 		if err != nil {
 			t.Fatalf("create native client: %v", err)
@@ -1639,8 +1639,8 @@ func TestClientBatchDownloadConformance(t *testing.T) {
 		// Use a fresh client (empty cache) so reconstruction is not served from disk.
 		cmpProxy.ClearRequests()
 		freshClient, err := client.NewClient(
-			client.WithBaseURL(cmpHTTP.URL),
 			client.WithCacheDir(t.TempDir()),
+			client.WithUpstreamProvider(client.StaticUpstreamProvider(cmpHTTP.URL, "")),
 		)
 		if err != nil {
 			t.Fatalf("create native client: %v", err)

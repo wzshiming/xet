@@ -13,7 +13,6 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,6 +25,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 )
@@ -95,24 +95,39 @@ func TestSpoolTailRead(t *testing.T) {
 	})
 }
 
+// testMirror addresses files by (repo, rev, path) on the fixture's upstream, sending token there, so tests read like the hub requests they stand for.
+type testMirror struct {
+	*Mirror
+	upstream string
+	token    string
+}
+
+// resolveURL builds the hub download URL of a file on upstream.
+func resolveURL(upstream, repo, rev, path string) string {
+	return upstream + "/" + repo + "/resolve/" + rev + "/" + path
+}
+
+func (m *testMirror) Resolve(ctx context.Context, repo, rev, path string) (*Resolution, error) {
+	return m.Mirror.Resolve(ctx, resolveURL(m.upstream, repo, rev, path), m.token)
+}
+
+func (m *testMirror) Ingest(repo, rev, path string) (*Ingestion, error) {
+	return m.Mirror.Ingest(resolveURL(m.upstream, repo, rev, path), m.token)
+}
+
 // newTestMirror builds an engine over a file storage rooted at storageDir,
 // pointed at the given upstream. No HTTP surface is involved: tests drive the
 // engine through Ingest and Resolve.
-func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, opts ...Option) (*Mirror, storage.Storage) {
+func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, opts ...Option) (*testMirror, storage.Storage) {
 	t.Helper()
 
 	stor, err := local.NewStorage(local.WithBasePath(storageDir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	selector, err := StaticUpstream(upstream, "")
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	m, err := NewMirror(append([]Option{
 		WithStorage(stor),
-		WithUpstream(selector),
 		WithCacheDir(cacheDir),
 	}, opts...)...)
 	if err != nil {
@@ -142,7 +157,7 @@ func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, o
 			}
 		}
 	})
-	return m, stor
+	return &testMirror{Mirror: m, upstream: upstream}, stor
 }
 
 // readStored fetches the reconstructed bytes for a sha256 hex digest straight
@@ -282,8 +297,8 @@ func TestResolveStream(t *testing.T) {
 	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 	ctx := context.Background()
 
-	if _, err := m.Resolve(ctx, "org/repo", "main/extra", "model.bin"); err == nil {
-		t.Fatal("expected an error for a rev containing a slash")
+	if _, err := m.Mirror.Resolve(ctx, upstreamSrv.URL+"/org/repo/tree/main/model.bin", ""); err == nil {
+		t.Fatal("expected an error for a URL that is not a hub download URL")
 	}
 
 	res, err := m.Resolve(ctx, "org/repo", "main", "model.bin")
@@ -616,7 +631,7 @@ func TestMirrorUsage(t *testing.T) {
 		}
 		canceled, cancel := context.WithCancel(ctx)
 		cancel()
-		for _, mir := range []*Mirror{absent, m} {
+		for _, mir := range []*Mirror{absent, m.Mirror} {
 			if got, err := mir.Usage(canceled); !errors.Is(err, context.Canceled) || got != (Usage{}) {
 				t.Fatalf("usage with canceled ctx = %+v, %v; want zero, context.Canceled", got, err)
 			}
@@ -713,7 +728,7 @@ func rawSource(t *testing.T, path string) string {
 	return src
 }
 
-func ingestWait(t *testing.T, m *Mirror, repo, rev, path string) (*Entry, error) {
+func ingestWait(t *testing.T, m *testMirror, repo, rev, path string) (*Entry, error) {
 	t.Helper()
 	in, err := m.Ingest(repo, rev, path)
 	if err != nil {
@@ -1104,7 +1119,7 @@ func TestMirrorConcurrentPublish(t *testing.T) {
 
 			storageDir, cacheDir := t.TempDir(), t.TempDir()
 			manifestPath := commitPath(filepath.Join(cacheDir, "index"), "org/repo", commit)
-			ingestAll := func(m *Mirror, prefix string) {
+			ingestAll := func(m *testMirror, prefix string) {
 				t.Helper()
 				var wg sync.WaitGroup
 				for i := range n {
@@ -2287,79 +2302,57 @@ func TestMirrorLoadBranchRemembersMisses(t *testing.T) {
 	}
 }
 
+// A URL whose path holds several /resolve/ segments splits at the first one, like the hub route does, and still reaches the upstream byte-exact.
 func TestMirrorRepoContainingResolve(t *testing.T) {
-	const repo = "org/resolve/x"
+	const path = "/org/resolve/x/resolve/main/f.bin"
 	upstream := newPlainUpstream()
 	upstream.commit = ""
 	data := []byte("resolve inside the repo name")
-	upstream.set("/"+repo+"/resolve/main/f.bin", data)
-	upstream.set("/"+repo+"/resolve/main/g.bin", []byte("second"))
+	upstream.set(path, data)
 	srv, _, paths := countingServer(t, upstream)
 	storageDir, cacheDir := t.TempDir(), t.TempDir()
-	pseudo := wantPseudo(repo, "main")
+	pseudo := wantPseudo("org", "x")
 
 	m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir)
-	entry, err := ingestWait(t, m, repo, "main", "f.bin")
+	in, err := m.Mirror.Ingest(srv.URL+path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaitClosed(t, in.Done(), "ingest")
+	entry, err := in.Entry()
 	if err != nil || entry.Commit != pseudo {
-		t.Fatalf("main = %+v, %v; want pseudo commit %s", entry, err, pseudo)
+		t.Fatalf("ingest = %+v, %v; want pseudo commit %s of (org, x)", entry, err, pseudo)
 	}
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
 		t.Fatal("stored bytes differ from upstream data")
 	}
-	if src := rawSource(t, commitPath(filepath.Join(cacheDir, "index"), repo, pseudo)); src != "main" {
-		t.Fatalf("manifest source = %q, want main", src)
+	if _, ok := paths.Load(path); !ok {
+		t.Fatal("upstream was not asked for the exact path")
+	}
+	if src := rawSource(t, commitPath(filepath.Join(cacheDir, "index"), "org", pseudo)); src != "x" {
+		t.Fatalf("manifest source = %q, want x", src)
 	}
 
 	m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
-	res, err := m2.Resolve(context.Background(), repo, pseudo, "f.bin")
+	res, err := m2.Mirror.Resolve(context.Background(), srv.URL+path, "")
 	if err != nil || res.Entry == nil || res.Entry.SHA256 != entry.SHA256 {
-		t.Fatalf("direct pseudo f.bin after restart = %+v, %v; want the cached entry", res, err)
-	}
-	if entry, err = ingestWait(t, m2, repo, pseudo, "g.bin"); err != nil || entry.Commit != pseudo {
-		t.Fatalf("direct pseudo g.bin after restart = %+v, %v", entry, err)
-	}
-	if _, ok := paths.Load("/" + repo + "/resolve/main/g.bin"); !ok {
-		t.Fatal("g.bin was not fetched through the source branch")
+		t.Fatalf("Resolve after restart = %+v, %v; want the cached entry", res, err)
 	}
 }
 
-func TestStaticUpstream(t *testing.T) {
-	selector, err := StaticUpstream("https://hub.example/", "tok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, token, err := selector(context.Background(), "org/repo")
-	if err != nil || u.String() != "https://hub.example/" || token != "tok" {
-		t.Fatalf("selector = %v, %q, %v", u, token, err)
-	}
-	for _, raw := range []string{"hub.example", "http://", "://x"} {
-		if _, err := StaticUpstream(raw, ""); err == nil || err.Error() != fmt.Sprintf("mirror: invalid upstream URL %q", raw) {
-			t.Fatalf("StaticUpstream(%q) err = %v", raw, err)
-		}
-	}
-
+// The engine takes complete upstream URLs per call, so storage and a cache dir are all NewMirror needs.
+func TestNewMirrorWithoutUpstream(t *testing.T) {
 	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewMirror(WithStorage(stor), WithCacheDir(t.TempDir())); err == nil || err.Error() != "mirror: upstream is required" {
-		t.Fatalf("NewMirror without upstream err = %v", err)
+	if _, err := NewMirror(WithStorage(stor), WithCacheDir(t.TempDir())); err != nil {
+		t.Fatalf("NewMirror without upstream: %v", err)
 	}
-
-	t.Run("nil URL from selector", func(t *testing.T) {
-		none := func(context.Context, string) (*url.URL, string, error) { return nil, "", nil }
-		m, _ := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(none))
-		if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); err == nil || errors.Is(err, ErrUpstreamNotFound) {
-			t.Fatalf("ingest with nil upstream URL err = %v, want a plain error", err)
-		}
-		if _, err := m.FetchUpstream(context.Background(), "org/repo", "/api/models/org/repo"); err == nil {
-			t.Fatal("FetchUpstream with nil upstream URL succeeded")
-		}
-	})
 }
 
-func TestMirrorPerRepoUpstream(t *testing.T) {
-	const repoA, repoB = "org/a", "datasets/org/b%20c"
+// Two files on different hubs go through one mirror: each hub sees only the token given with its own URL, decoded like a hub request.
+func TestMirrorUpstreamPerURL(t *testing.T) {
 	upA, upB := newPlainUpstream(), newPlainUpstream()
 	dataA, dataB := []byte("bytes from hub A"), []byte("bytes from hub B")
 	upA.set("/org/a/resolve/main/f.bin", dataA)
@@ -2367,35 +2360,18 @@ func TestMirrorPerRepoUpstream(t *testing.T) {
 	srvA, srvB := httptest.NewServer(upA), httptest.NewServer(upB)
 	t.Cleanup(srvA.Close)
 	t.Cleanup(srvB.Close)
-	urlA, _ := url.Parse(srvA.URL)
-	urlB, _ := url.Parse(srvB.URL)
+	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
 
-	errBoom := errors.New("selector boom")
-	var seen sync.Map
-	selector := func(_ context.Context, repo string) (*url.URL, string, error) {
-		seen.Store(repo, true)
-		switch repo {
-		case repoA:
-			return urlA, "tok-a", nil
-		case repoB:
-			return urlB, "tok-b", nil
-		case "org/boom":
-			return nil, "", errBoom
-		}
-		return nil, "", fmt.Errorf("no upstream for %q: %w", repo, ErrUpstreamNotFound)
-	}
-	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector))
-
-	inA, err := m.Ingest(repoA, "main", "f.bin")
+	inA, err := m.Mirror.Ingest(srvA.URL+"/org/a/resolve/main/f.bin", "tok-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	inB, err := m.Ingest(repoB, "main", "f.bin")
+	inB, err := m.Mirror.Ingest(srvB.URL+"/datasets/org/b%20c/resolve/main/f.bin", "tok-b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, inA.Done(), "repo A ingest")
-	awaitClosed(t, inB.Done(), "repo B ingest")
+	awaitClosed(t, inA.Done(), "hub A ingest")
+	awaitClosed(t, inB.Done(), "hub B ingest")
 	for _, tc := range []struct {
 		name         string
 		in           *Ingestion
@@ -2417,26 +2393,13 @@ func TestMirrorPerRepoUpstream(t *testing.T) {
 			t.Fatalf("%s: hub did not receive its own token", tc.name)
 		}
 		if _, ok := tc.up.seenAuth.Load(tc.other); ok {
-			t.Fatalf("%s: hub received the other repo's token", tc.name)
+			t.Fatalf("%s: hub received the other URL's token", tc.name)
 		}
 	}
-	for _, repo := range []string{repoA, repoB} {
-		if _, ok := seen.Load(repo); !ok {
-			t.Fatalf("selector was never asked for %q", repo)
-		}
-	}
-	if _, ok := seen.Load("datasets/org/b c"); ok {
-		t.Fatal("selector was asked with the decoded repo identity")
-	}
-
-	if _, err := ingestWait(t, m, "org/unmapped", "main", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
-		t.Fatalf("unmapped repo ingest err = %v, want ErrUpstreamNotFound", err)
-	}
-	if _, err := m.Resolve(context.Background(), "org/unmapped", "main", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
-		t.Fatalf("unmapped repo Resolve err = %v, want ErrUpstreamNotFound", err)
-	}
-	if _, err := ingestWait(t, m, "org/boom", "main", "f.bin"); !errors.Is(err, errBoom) || errors.Is(err, ErrUpstreamNotFound) {
-		t.Fatalf("selector failure ingest err = %v, want errBoom only", err)
+	// The escaped path is the key: the same file resolved again is served from the cache.
+	res, err := m.Mirror.Resolve(context.Background(), srvB.URL+"/datasets/org/b%20c/resolve/main/f.bin", "tok-b")
+	if err != nil || res.Entry == nil || res.Entry.SHA256 != hashHex(string(dataB)) {
+		t.Fatalf("Resolve of the escaped URL = %+v, %v; want the cached entry", res, err)
 	}
 }
 
@@ -2449,22 +2412,9 @@ func TestMirrorFetchUpstream(t *testing.T) {
 		upstream.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	hub, _ := url.Parse(srv.URL)
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
 
-	type ctxKey struct{}
-	errSelectorCanceled := errors.New("selector saw the cancellation")
-	var seen sync.Map // repo -> caller ctx value observed by the selector
-	selector := func(ctx context.Context, repo string) (*url.URL, string, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, "", errors.Join(errSelectorCanceled, err)
-		}
-		seen.Store(repo, ctx.Value(ctxKey{}))
-		return hub, "tok-a", nil
-	}
-	m, _ := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector))
-
-	ctx := context.WithValue(context.Background(), ctxKey{}, "caller value")
-	resp, err := m.FetchUpstream(ctx, "org/a", "/api/models/org/a?expand=1")
+	resp, err := m.FetchUpstream(context.Background(), srv.URL+"/api/models/org/a?expand=1", "tok-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2473,20 +2423,17 @@ func TestMirrorFetchUpstream(t *testing.T) {
 	if err != nil || resp.StatusCode != http.StatusOK || string(body) != `{"id":"org/a"}` {
 		t.Fatalf("FetchUpstream = %d %q, %v", resp.StatusCode, body, err)
 	}
-	if v, _ := seen.Load("org/a"); v != "caller value" {
-		t.Fatalf("selector saw ctx value %v, want the caller's", v)
-	}
 	if _, ok := queries.Load("expand=1"); !ok {
 		t.Fatal("query not preserved on the upstream request")
 	}
 	if _, ok := upstream.seenAuth.Load("Bearer tok-a"); !ok {
-		t.Fatal("hub did not receive the selected token")
+		t.Fatal("hub did not receive the token")
 	}
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := m.FetchUpstream(canceled, "org/a", "/api/models/org/a"); !errors.Is(err, errSelectorCanceled) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled FetchUpstream err = %v, want the selector's cancellation error", err)
+	if _, err := m.FetchUpstream(canceled, srv.URL+"/api/models/org/a", "tok-a"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled FetchUpstream err = %v, want context.Canceled", err)
 	}
 }
 
@@ -2512,9 +2459,8 @@ func TestMirrorUpstreamAuthHostGuard(t *testing.T) {
 		http.Redirect(w, r, cdnSrv.URL+"/cdn"+r.URL.Path, http.StatusFound)
 	}))
 	t.Cleanup(hubSrv.Close)
-	hub, _ := url.Parse(hubSrv.URL)
-	fixed := func(context.Context, string) (*url.URL, string, error) { return hub, "hub-secret", nil }
-	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithUpstream(fixed))
+	m, stor := newTestMirror(t, hubSrv.URL, t.TempDir(), t.TempDir())
+	m.token = "hub-secret"
 
 	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
 	if err != nil {
@@ -2524,22 +2470,19 @@ func TestMirrorUpstreamAuthHostGuard(t *testing.T) {
 		t.Fatal("stored bytes mismatch")
 	}
 	if v, _ := hubAuth.Load(""); v != "Bearer hub-secret" {
-		t.Fatalf("hub saw Authorization %q, want the selected token", v)
+		t.Fatalf("hub saw Authorization %q, want the caller's token", v)
 	}
 	if _, ok := cdn.seenAuth.Load("Bearer hub-secret"); ok {
 		t.Fatal("hub token leaked to the redirect target on another host")
 	}
 
-	ctx, _, err := m.upstreamTarget(context.Background(), "org/repo", "/")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := withUpstreamAuth(context.Background(), hubSrv.URL, "hub-secret")
 	for _, tc := range []struct {
 		marker, auth string
 		ctx          context.Context
 	}{
 		{"keep", "Bearer keep", ctx},       // an Authorization already set wins
-		{"none", "", context.Background()}, // no selected upstream: nothing injected
+		{"none", "", context.Background()}, // no upstream credential: nothing injected
 	} {
 		req, err := http.NewRequestWithContext(tc.ctx, http.MethodHead, hubSrv.URL+"/org/repo/resolve/main/f.bin?probe="+tc.marker, nil)
 		if err != nil {
@@ -2600,11 +2543,8 @@ func TestMirrorWithTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &fakeHubTransport{data: data, commit: strings.Repeat("cd", 20), gate: make(chan struct{})}
-	selector, err := StaticUpstream("http://upstream.invalid", "tok-t")
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, stor := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir(), WithUpstream(selector), WithTransport(fake))
+	m, stor := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir(), WithTransport(fake))
+	m.token = "tok-t"
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(fake.gate) }) })
 	ctx := context.Background()
@@ -2647,7 +2587,7 @@ func TestMirrorWithTransport(t *testing.T) {
 	}
 
 	type ctxKey struct{}
-	resp, err := m.FetchUpstream(context.WithValue(ctx, ctxKey{}, "caller value"), "org/repo", "/api/models/org/repo")
+	resp, err := m.FetchUpstream(context.WithValue(ctx, ctxKey{}, "caller value"), "http://upstream.invalid/api/models/org/repo", "tok-t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2669,4 +2609,86 @@ func TestMirrorWithTransport(t *testing.T) {
 	if v := seen.(*http.Request).Context().Value(ctxKey{}); v != "caller value" {
 		t.Fatalf("API request context value = %v, want the caller's", v)
 	}
+}
+
+// recordingTransport carries requests to their real servers, recording "METHOD path" of each.
+type recordingTransport struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, req.Method+" "+req.URL.Path)
+	r.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func (r *recordingTransport) count(substr string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, c := range r.calls {
+		if strings.Contains(c, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// The default xet client rides the mirror's transport: the xet resolve, xet-auth, reconstruction and xorb requests all pass through it; a client given with WithClient keeps its own.
+func TestMirrorXetTransport(t *testing.T) {
+	data := []byte("xet bytes carried by the mirror's transport")
+	up := newXetUpstream(t, "/org/repo/resolve/main/f.bin", data, "cas-token")
+	const resolveHEAD = "HEAD /org/repo/resolve/main/f.bin"
+	xetCalls := []string{"GET /api/xet-read-token", "/reconstructions/", "GET /v1/xorbs/"}
+
+	ingest := func(t *testing.T, opts ...Option) {
+		t.Helper()
+		m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), opts...)
+		m.token = "hub-secret"
+		entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+			t.Fatalf("stored %q, want %q", got, data)
+		}
+	}
+
+	t.Run("default client", func(t *testing.T) {
+		rt := &recordingTransport{}
+		ingest(t, WithTransport(rt))
+		if n := rt.count(resolveHEAD); n != 2 {
+			t.Fatalf("resolve HEADs through the transport = %d, want the probe and the xet resolve", n)
+		}
+		for _, call := range xetCalls {
+			if rt.count(call) == 0 {
+				t.Fatalf("%s never reached the mirror's transport", call)
+			}
+		}
+	})
+
+	t.Run("WithClient keeps its transport", func(t *testing.T) {
+		mirrorRT, clientRT := &recordingTransport{}, &recordingTransport{}
+		xc, err := client.NewClient(client.WithHTTPClient(&http.Client{Transport: clientRT}), client.WithCacheDir(t.TempDir()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ingest(t, WithTransport(mirrorRT), WithClient(xc))
+		if n := mirrorRT.count(resolveHEAD); n != 1 {
+			t.Fatalf("resolve HEADs through the mirror's transport = %d, want only the probe", n)
+		}
+		if n := clientRT.count(resolveHEAD); n != 1 {
+			t.Fatalf("resolve HEADs through the client's transport = %d, want the xet resolve", n)
+		}
+		for _, call := range xetCalls {
+			if clientRT.count(call) == 0 {
+				t.Fatalf("%s never reached the client's transport", call)
+			}
+			if mirrorRT.count(call) != 0 {
+				t.Fatalf("%s went through the mirror's transport instead of the client's", call)
+			}
+		}
+	})
 }

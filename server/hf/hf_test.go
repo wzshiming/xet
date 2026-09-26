@@ -26,7 +26,6 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
@@ -52,9 +51,9 @@ func newHubFixture(t *testing.T, upstream string, storageDir, cacheDir string, o
 	return newHubFixtureNext(t, upstream, nil, storageDir, cacheDir, opts...)
 }
 
-func staticUpstream(t *testing.T, rawURL, token string) mirror.UpstreamFunc {
+func staticUpstream(t *testing.T, rawURL, token string) UpstreamFunc {
 	t.Helper()
-	selector, err := mirror.StaticUpstream(rawURL, token)
+	selector, err := StaticUpstream(rawURL, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +63,12 @@ func staticUpstream(t *testing.T, rawURL, token string) mirror.UpstreamFunc {
 // newHubFixtureNext is newHubFixture with an explicit next handler; when nil
 // an upstream proxy without credential is wired, matching cmd/xetd.
 func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
+	t.Helper()
+	return newHubFixtureSelector(t, staticUpstream(t, upstream, ""), next, storageDir, cacheDir, opts...)
+}
+
+// newHubFixtureSelector wires the hub front end through selector; a nil next proxies through it.
+func newHubFixtureSelector(t *testing.T, selector UpstreamFunc, next http.Handler, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
 	t.Helper()
 	var inner atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,14 +89,12 @@ func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storage
 		t.Fatal(err)
 	}
 
-	selector := staticUpstream(t, upstream, "")
 	if next == nil {
 		next = NewUpstreamProxy(selector)
 	}
 
 	m, err := mirror.NewMirror(append([]mirror.Option{
 		mirror.WithStorage(stor),
-		mirror.WithUpstream(selector),
 		mirror.WithCacheDir(cacheDir),
 	}, opts...)...)
 	if err != nil {
@@ -106,6 +109,7 @@ func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storage
 		server.WithAuthorizer(issuer),
 		server.WithNext(NewHandler(
 			WithMirror(m),
+			WithUpstream(selector),
 			WithExternalURL(srv.URL),
 			WithMinter(MinterFunc(func(r *http.Request, req TokenRequest) (string, int64, error) {
 				fx.mu.Lock()
@@ -157,20 +161,20 @@ func waitReady(t *testing.T, resolveURL string) *http.Response {
 func downloadViaXet(t *testing.T, resolveURL string) []byte {
 	t.Helper()
 	ctx := context.Background()
-	fileHash, provider, err := hfclient.ResolveDownload(ctx, nil, resolveURL)
-	if err != nil {
-		t.Fatalf("resolve download: %v", err)
-	}
 	c, err := client.NewClient()
 	if err != nil {
 		t.Fatal(err)
+	}
+	resolved, err := c.Resolve(ctx, resolveURL, "")
+	if err != nil {
+		t.Fatalf("resolve download: %v", err)
 	}
 	f, err := os.CreateTemp(t.TempDir(), "dl-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if err := c.DownloadFileWithAuthProvider(ctx, provider, fileHash, f); err != nil {
+	if err := c.DownloadResolved(ctx, resolved, f); err != nil {
 		t.Fatalf("xet download: %v", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -286,7 +290,7 @@ func TestMirrorPlainUpstream(t *testing.T) {
 	upstream.set(resolvePath, data)
 
 	storageDir, cacheDir := t.TempDir(), t.TempDir()
-	fx := newHubFixture(t, upstreamSrv.URL, storageDir, cacheDir, mirror.WithUpstream(staticUpstream(t, upstreamSrv.URL, "up-secret")))
+	fx := newHubFixtureSelector(t, staticUpstream(t, upstreamSrv.URL, "up-secret"), nil, storageDir, cacheDir)
 	resolveURL := fx.srv.URL + resolvePath
 
 	t.Run("serve while caching with singleflight", func(t *testing.T) {
@@ -847,8 +851,8 @@ func TestMirrorXetUpstreamUnknownSize(t *testing.T) {
 	waitReady(t, resolveURL)
 }
 
-// Tokens inside the refresh margin force another authenticated hub request during download.
-func TestMirrorXetUpstreamTokenRefresh(t *testing.T) {
+// Tokens inside the renewal margin force another authenticated hub request during download.
+func TestMirrorXetUpstreamTokenRenewal(t *testing.T) {
 	upstream := newXetUpstream(t)
 	upstream.hubToken = "hub-secret"
 	upstream.tokenTTL = time.Second
@@ -860,7 +864,7 @@ func TestMirrorXetUpstreamTokenRefresh(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/refresh.bin"
 	upstream.add(t, resolvePath, data)
 
-	fx := newHubFixture(t, upstream.hubURL, t.TempDir(), t.TempDir(), mirror.WithUpstream(staticUpstream(t, upstream.hubURL, "hub-secret")))
+	fx := newHubFixtureSelector(t, staticUpstream(t, upstream.hubURL, "hub-secret"), nil, t.TempDir(), t.TempDir())
 	resolveURL := fx.srv.URL + resolvePath
 
 	resp, err := http.Get(resolveURL)
@@ -966,7 +970,7 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 	defer upstreamSrv.Close()
 
 	selector := staticUpstream(t, upstreamSrv.URL, "up-secret")
-	fx := newHubFixtureNext(t, upstreamSrv.URL, NewUpstreamProxy(selector), t.TempDir(), t.TempDir(), mirror.WithUpstream(selector))
+	fx := newHubFixtureSelector(t, selector, NewUpstreamProxy(selector), t.TempDir(), t.TempDir())
 
 	req, _ := http.NewRequest(http.MethodGet, fx.srv.URL+"/api/models/org/repo", nil)
 	req.Header.Set("Authorization", "Bearer downstream-junk")
@@ -987,6 +991,22 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 	}
 	if got := upstreamSawAuth.Load(); got != "Bearer up-secret" {
 		t.Fatalf("upstream saw Authorization %q, want injected mirror credential", got)
+	}
+}
+
+func TestStaticUpstream(t *testing.T) {
+	selector, err := StaticUpstream("https://hub.example/", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, token, err := selector(context.Background(), "org/repo")
+	if err != nil || u.String() != "https://hub.example/" || token != "tok" {
+		t.Fatalf("selector = %v, %q, %v", u, token, err)
+	}
+	for _, raw := range []string{"hub.example", "http://", "://x"} {
+		if _, err := StaticUpstream(raw, ""); err == nil || err.Error() != fmt.Sprintf("hf: invalid upstream URL %q", raw) {
+			t.Fatalf("StaticUpstream(%q) err = %v", raw, err)
+		}
 	}
 }
 
@@ -1119,66 +1139,109 @@ func TestUpstreamProxySelection(t *testing.T) {
 	})
 }
 
-func TestMirrorTreeUpstreamSelection(t *testing.T) {
+// Both the resolve and the tree route consult the selector before any upstream request: a selector error or nil URL answers 502, its not-found 404, and the escaped repo reaches the selector and the upstream URL verbatim.
+func TestMirrorUpstreamSelection(t *testing.T) {
 	upstream := newPlainUpstream()
+	upstream.set("/datasets/org/b c/resolve/main/f.bin", []byte("escaped repo bytes"))
 	upstream.api["/api/datasets/org/b c/tree/main"] = []byte(`[{"type":"file","path":"f.bin","size":1,"xetHash":"upstream-hash"}]`)
-	var queries sync.Map
+	var requests atomic.Int32
+	var paths sync.Map // escaped path plus raw query of every upstream request
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		queries.Store(r.URL.RawQuery, true)
+		requests.Add(1)
+		paths.Store(r.URL.EscapedPath()+"?"+r.URL.RawQuery, true)
 		upstream.ServeHTTP(w, r)
 	}))
 	defer upstreamSrv.Close()
 	hub, _ := url.Parse(upstreamSrv.URL)
 
+	errBoom := errors.New("selector boom")
 	var seen sync.Map
 	selector := func(_ context.Context, repo string) (*url.URL, string, error) {
 		seen.Store(repo, true)
-		if repo != "datasets/org/b%20c" {
-			return nil, "", fmt.Errorf("no upstream for %q: %w", repo, mirror.ErrUpstreamNotFound)
+		switch repo {
+		case "datasets/org/b%20c":
+			return hub, "tok-datasets", nil
+		case "org/boom":
+			return nil, "", errBoom
+		case "org/none":
+			return nil, "", nil
 		}
-		return hub, "tok-datasets", nil
+		return nil, "", fmt.Errorf("no upstream for %q: %w", repo, mirror.ErrUpstreamNotFound)
 	}
-	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), mirror.WithUpstream(selector))
+	fx := newHubFixtureSelector(t, selector, nil, t.TempDir(), t.TempDir())
 
-	resp, err := http.Get(fx.srv.URL + "/api/datasets/org/b%20c/tree/main?recursive=true")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var items []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("tree status = %d, decode err = %v", resp.StatusCode, err)
-	}
-	if len(items) != 1 || items[0]["path"] != "f.bin" {
-		t.Fatalf("tree = %v, want the upstream listing", items)
-	}
-	if _, ok := items[0]["xetHash"]; ok {
-		t.Fatal("uncached entry kept the upstream xetHash")
-	}
-	if _, ok := queries.Load("recursive=true"); !ok {
-		t.Fatal("query not preserved on the upstream request")
-	}
-	if _, ok := upstream.seenAuth.Load("Bearer tok-datasets"); !ok {
-		t.Fatal("upstream did not receive the selected token")
-	}
-
-	for path, repo := range map[string]string{
-		"/api/models/org/repo/tree/main":  "org/repo",
-		"/api/kernels/org/repo/tree/main": "kernels/org/repo",
+	for _, tc := range []struct {
+		name, path, repo string
+		status           int
+		errText          string
+	}{
+		{"resolve selector error", "/org/boom/resolve/main/f.bin", "org/boom", http.StatusBadGateway, "selector boom"},
+		{"resolve nil upstream", "/org/none/resolve/main/f.bin", "org/none", http.StatusBadGateway, "no upstream URL selected"},
+		{"resolve unmapped repo", "/org/other/resolve/main/f.bin", "org/other", http.StatusNotFound, "File not found upstream"},
+		{"tree selector error", "/api/models/org/boom/tree/main", "org/boom", http.StatusBadGateway, "selector boom"},
+		{"tree nil upstream", "/api/models/org/none/tree/main", "org/none", http.StatusBadGateway, "no upstream URL selected"},
+		{"tree unmapped repo", "/api/kernels/org/other/tree/main", "kernels/org/other", http.StatusNotFound, "File not found upstream"},
 	} {
-		resp, err := http.Get(fx.srv.URL + path)
+		t.Run(tc.name, func(t *testing.T) {
+			before := requests.Load()
+			resp, err := noRedirect().Get(fx.srv.URL + tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.status || !strings.Contains(string(body), tc.errText) {
+				t.Fatalf("status = %d, body %q; want %d containing %q", resp.StatusCode, body, tc.status, tc.errText)
+			}
+			if _, ok := seen.Load(tc.repo); !ok {
+				t.Fatalf("selector was not asked for %q", tc.repo)
+			}
+			if n := requests.Load() - before; n != 0 {
+				t.Fatalf("upstream saw %d requests, want none", n)
+			}
+		})
+	}
+
+	t.Run("tree escaped repo", func(t *testing.T) {
+		resp, err := http.Get(fx.srv.URL + "/api/datasets/org/b%20c/tree/main?recursive=true")
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, _ = io.Copy(io.Discard, resp.Body)
+		defer func() { _ = resp.Body.Close() }()
+		var items []map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("tree status = %d, decode err = %v", resp.StatusCode, err)
+		}
+		if len(items) != 1 || items[0]["path"] != "f.bin" {
+			t.Fatalf("tree = %v, want the upstream listing", items)
+		}
+		if _, ok := items[0]["xetHash"]; ok {
+			t.Fatal("uncached entry kept the upstream xetHash")
+		}
+		if _, ok := paths.Load("/api/datasets/org/b%20c/tree/main?recursive=true"); !ok {
+			t.Fatal("upstream URL lost the repo escaping or the query")
+		}
+		if _, ok := upstream.seenAuth.Load("Bearer tok-datasets"); !ok {
+			t.Fatal("upstream did not receive the selected token")
+		}
+	})
+
+	t.Run("resolve escaped repo", func(t *testing.T) {
+		resolveURL := fx.srv.URL + "/datasets/org/b%20c/resolve/main/f.bin"
+		resp, err := noRedirect().Head(resolveURL)
+		if err != nil {
+			t.Fatal(err)
+		}
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("%s: status = %d, want 404 for the selector's not-found", path, resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD status = %d, want 200", resp.StatusCode)
 		}
-		if _, ok := seen.Load(repo); !ok {
-			t.Fatalf("%s: selector was not asked for %q", path, repo)
+		waitReady(t, resolveURL)
+		if _, ok := paths.Load("/datasets/org/b%20c/resolve/main/f.bin?"); !ok {
+			t.Fatal("upstream URL lost the repo escaping")
 		}
-	}
+	})
+
 	if _, ok := seen.Load("datasets/org/b c"); ok {
 		t.Fatal("selector was asked with the decoded repo identity")
 	}

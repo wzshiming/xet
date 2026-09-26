@@ -37,7 +37,7 @@ func TestClientCacheEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	cacheDir := t.TempDir()
-	c1, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(cacheDir))
+	c1, err := client.NewClient(client.WithCacheDir(cacheDir), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestClientCacheEndToEnd(t *testing.T) {
 
 	// A fresh client on the same directory re-verifies checksums and must
 	// serve both files from the merged entries without any fetch.
-	c2, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(cacheDir))
+	c2, err := client.NewClient(client.WithCacheDir(cacheDir), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}

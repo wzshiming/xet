@@ -8,28 +8,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/wzshiming/xet/client/hf"
 )
 
-// fetchXet downloads the file through the upstream xet CAS into the spool,
-// resuming from the current spool offset on retries. Resolve and token
-// handling reuse the hf package: the returned provider refreshes short-lived
-// CAS tokens from the upstream's xet-auth endpoint, and term fetches resume
-// dropped bodies via the client's built-in httpseek transport. The resolve
-// itself runs inside the retry loop so a transient failure there does not
-// fail the whole task.
+// fetchXet spools the file over the upstream xet CAS; every attempt re-resolves with the task's pinned hub token.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 	return fetchWithRetries(ctx, "xet download", func() error {
-		ctx, target, err := m.upstreamTarget(ctx, src.repo, src.String())
-		if err != nil {
-			return err
-		}
-		fileHash, provider, err := hf.ResolveDownload(ctx, m.probeClient, target)
+		f, err := m.xetClient.Resolve(ctx, t.origin+src.String(), t.token)
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return m.xetClient.DownloadFileWithAuthProvider(ctx, provider, fileHash, t.spool)
+		return m.xetClient.DownloadResolved(ctx, f, t.spool)
 	})
 }
 
@@ -56,12 +44,8 @@ func fetchWithRetries(ctx context.Context, operation string, fetch func() error)
 }
 
 func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) error {
-	ctx, target, err := m.upstreamTarget(ctx, src.repo, src.String())
-	if err != nil {
-		return err
-	}
 	offset := t.spool.size()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.origin+src.String(), nil)
 	if err != nil {
 		return err
 	}
