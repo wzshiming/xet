@@ -1,4 +1,4 @@
-package hf_test
+package hf
 
 import (
 	"context"
@@ -6,52 +6,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
-
-	"github.com/wzshiming/xet/client/hf"
 )
 
 // resolvePath is f.bin of org/repo at main, the file every hub fixture here serves.
 const resolvePath = "/org/repo/resolve/main/f.bin"
 
-// authRecorder keeps the Authorization header of every request in arrival order per path.
-type authRecorder struct {
-	mu   sync.Mutex
-	seen map[string][]string
-}
-
-func (a *authRecorder) record(r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.seen == nil {
-		a.seen = map[string][]string{}
-	}
-	a.seen[r.URL.Path] = append(a.seen[r.URL.Path], r.Header.Get("Authorization"))
-}
-
-func (a *authRecorder) get(path string) []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]string(nil), a.seen[path]...)
-}
-
-// recordingServer serves handler on a real listener, recording every request's Authorization.
-func recordingServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *authRecorder) {
-	t.Helper()
-	rec := &authRecorder{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rec.record(r)
-		handler(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	return srv, rec
-}
-
 // resolveErr resolves f.bin of hubURL's org/repo with token through httpClient and returns the error.
-func resolveErr(t *testing.T, httpClient *http.Client, hubURL, token string) (*hf.ResolvedFile, error) {
+func resolveErr(t *testing.T, httpClient *http.Client, hubURL, token string) (*ResolvedFile, error) {
 	t.Helper()
-	c, err := hf.NewClient(hf.Repo{Endpoint: hubURL, RepoID: "org/repo"}, hf.WithHTTPClient(httpClient), hf.WithToken(token))
+	c, err := NewClient(Repo{Endpoint: hubURL, RepoID: "org/repo"}, WithHTTPClient(httpClient), WithToken(token))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +23,7 @@ func resolveErr(t *testing.T, httpClient *http.Client, hubURL, token string) (*h
 }
 
 // resolveThrough is resolveErr failing the test on error.
-func resolveThrough(t *testing.T, httpClient *http.Client, hubURL, token string) *hf.ResolvedFile {
+func resolveThrough(t *testing.T, httpClient *http.Client, hubURL, token string) *ResolvedFile {
 	t.Helper()
 	f, err := resolveErr(t, httpClient, hubURL, token)
 	if err != nil {
@@ -115,17 +79,6 @@ func TestResolveHuggingFaceMissingHeaders(t *testing.T) {
 			}
 		})
 	}
-}
-
-// originTransport answers every request in memory through handler, so URLs may name any scheme or host.
-type originTransport struct{ handler http.Handler }
-
-func (t originTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	rec := httptest.NewRecorder()
-	t.handler.ServeHTTP(rec, req)
-	resp := rec.Result()
-	resp.Request = req
-	return resp, nil
 }
 
 // A redirect off the resolve URL is reported, never followed with the hub token.

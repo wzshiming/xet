@@ -1,4 +1,4 @@
-package hf_test
+package hf
 
 import (
 	"bytes"
@@ -24,7 +24,6 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/client/hf/hftest"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage/local"
@@ -37,7 +36,7 @@ const (
 	lfsPath    = "regression/go-lfs.bin"
 	textPath   = "regression/go-regular.txt"
 	textData   = "xet private-repo regression fixture — go-regular.txt\ncommitted by the Go client\n"
-	sampleSize = 512 // leading bytes a preupload entry samples, like the reference's
+	sampleLen  = 512 // leading bytes a preupload entry samples, like the reference's
 )
 
 // deterministic returns n pseudo-random bytes that are the same on every run.
@@ -95,7 +94,7 @@ type privateRepo struct {
 	hub    *hftest.Hub
 	cas    *casLog
 	opts   hftest.Options // the hub's; a second hub on the same CAS varies them
-	target hf.Repo
+	target Repo
 	hc     *http.Client
 }
 
@@ -114,19 +113,19 @@ func newPrivateRepo(t *testing.T) *privateRepo {
 	t.Cleanup(cas.Close)
 	opts := hftest.Options{Token: hubSecret, CAS: cas.URL, Issuer: issuer, Storage: stor}
 	hub := hftest.NewHub(t, opts)
-	return &privateRepo{hub: hub, cas: log, opts: opts, target: hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hc: &http.Client{}}
+	return &privateRepo{hub: hub, cas: log, opts: opts, target: Repo{Endpoint: hub.URL, RepoID: repoID}, hc: &http.Client{}}
 }
 
 // committer returns a client bound to the repository with the hub token.
-func (r *privateRepo) committer(t *testing.T) *hf.Client {
+func (r *privateRepo) committer(t *testing.T) *Client {
 	t.Helper()
 	return r.bound(t, r.target, hubSecret)
 }
 
 // bound returns a client bound to target with hfToken.
-func (r *privateRepo) bound(t *testing.T, target hf.Repo, hfToken string) *hf.Client {
+func (r *privateRepo) bound(t *testing.T, target Repo, hfToken string) *Client {
 	t.Helper()
-	c, err := hf.NewClient(target, hf.WithHTTPClient(r.hc), hf.WithToken(hfToken), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	c, err := NewClient(target, WithHTTPClient(r.hc), WithToken(hfToken), WithClientOptions(client.WithCacheDir(t.TempDir())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,8 +201,8 @@ func download(t *testing.T, fn func(io.WriteSeeker) error) ([]byte, error) {
 	return os.ReadFile(f.Name())
 }
 
-func files(lfsData []byte) []hf.CommitFile {
-	return []hf.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData)}}
+func files(lfsData []byte) []CommitFile {
+	return []CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData)}}
 }
 
 func sha256Hex(data []byte) string {
@@ -290,8 +289,8 @@ func TestNewClientOverridesUserProvider(t *testing.T) {
 	repo := newPrivateRepo(t)
 	ctx := t.Context()
 	lfsData := deterministic(1 << 20)
-	wrong := &spyProvider{inner: hf.NewTokenProvider(repo.hc, repo.target, wrongToken)}
-	c, err := hf.NewClient(repo.target, hf.WithHTTPClient(repo.hc), hf.WithToken(hubSecret), hf.WithClientOptions(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong)))
+	wrong := &spyProvider{inner: NewTokenProvider(repo.hc, repo.target, wrongToken)}
+	c, err := NewClient(repo.target, WithHTTPClient(repo.hc), WithToken(hubSecret), WithClientOptions(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,9 +338,9 @@ func TestBoundClientsShareCache(t *testing.T) {
 	}
 
 	shared := client.NewCache(t.TempDir(), 0)
-	clients := make([]*hf.Client, 2)
+	clients := make([]*Client, 2)
 	for i := range clients {
-		c, err := hf.NewClient(repo.target, hf.WithHTTPClient(repo.hc), hf.WithToken(hubSecret), hf.WithClientOptions(client.WithCache(shared)))
+		c, err := NewClient(repo.target, WithHTTPClient(repo.hc), WithToken(hubSecret), WithClientOptions(client.WithCache(shared)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +350,7 @@ func TestBoundClientsShareCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fetch := func(c *hf.Client) int {
+	fetch := func(c *Client) int {
 		t.Helper()
 		got, err := download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, f.Hash, w) })
 		if err != nil || !bytes.Equal(got, lfsData) {
@@ -375,7 +374,7 @@ func TestCommitEscapedRevision(t *testing.T) {
 	opts := repo.opts
 	opts.Revision = "refs/pr/1"
 	hub := hftest.NewHub(t, opts)
-	target := hf.Repo{Endpoint: hub.URL, RepoID: repoID, Revision: opts.Revision}
+	target := Repo{Endpoint: hub.URL, RepoID: repoID, Revision: opts.Revision}
 	if got, want := target.CommitURL(), hub.URL+"/api/models/"+repoID+"/commit/refs%2Fpr%2F1"; got != want {
 		t.Fatalf("CommitURL = %q, want %q", got, want)
 	}
@@ -533,7 +532,7 @@ func TestCommitUnchanged(t *testing.T) {
 	before := len(repo.hub.Requests())
 
 	commit, err := c.Commit(ctx, "test: again", files(lfsData)...)
-	if !errors.Is(err, hf.ErrNoChanges) || commit != nil {
+	if !errors.Is(err, ErrNoChanges) || commit != nil {
 		t.Fatalf("Commit of unchanged content = %v, %v; want ErrNoChanges", commit, err)
 	}
 	if got := routes(repo.hub.Requests()[before:]); !slices.Equal(got, []string{"POST preupload"}) {
@@ -544,7 +543,7 @@ func TestCommitUnchanged(t *testing.T) {
 	}
 
 	before = len(repo.hub.Requests())
-	changed := []hf.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData + "changed\n")}}
+	changed := []CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData + "changed\n")}}
 	if _, err := c.Commit(ctx, "test: text", changed...); err != nil {
 		t.Fatal(err)
 	}
@@ -622,9 +621,9 @@ func TestCommitDanglingLFS(t *testing.T) {
 	opts := repo.opts
 	opts.Storage = empty
 	hub := hftest.NewHub(t, opts)
-	c := repo.bound(t, hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
+	c := repo.bound(t, Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
 
-	_, err = c.Commit(t.Context(), "test: dangling", hf.CommitFile{Path: lfsPath, Content: bytes.NewReader(deterministic(1 << 20))})
+	_, err = c.Commit(t.Context(), "test: dangling", CommitFile{Path: lfsPath, Content: bytes.NewReader(deterministic(1 << 20))})
 	if err == nil || !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "LFS pointer pointed to a file that does not exist") || !strings.Contains(err.Error(), lfsPath) {
 		t.Fatalf("Commit = %v, want the hub's dangling lfs rejection", err)
 	}
@@ -661,15 +660,15 @@ func TestCommitSharedReader(t *testing.T) {
 			opts := repo.opts
 			opts.UploadMode = lfsByExtension
 			hub := hftest.NewHub(t, opts)
-			c := repo.bound(t, hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
+			c := repo.bound(t, Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
 
 			shared := bytes.NewReader(data)
 			if _, err := shared.Seek(int64(len(data)/2), io.SeekStart); err != nil {
 				t.Fatal(err)
 			}
-			files := make([]hf.CommitFile, 0, len(tc.paths))
+			files := make([]CommitFile, 0, len(tc.paths))
 			for _, path := range tc.paths {
-				files = append(files, hf.CommitFile{Path: path, Content: shared})
+				files = append(files, CommitFile{Path: path, Content: shared})
 			}
 			if _, err := c.Commit(ctx, "test: shared reader", files...); err != nil {
 				t.Fatal(err)
@@ -711,7 +710,7 @@ func TestCommitPathsAndSamples(t *testing.T) {
 		t.Fatal("Commit without files succeeded")
 	}
 	for _, path := range []string{"", "/abs.bin", "a/../b", "./a", "a//b", "a/", ".", ".."} {
-		if _, err := c.Commit(ctx, "test: path", hf.CommitFile{Path: path, Content: strings.NewReader("x")}); err == nil || !strings.Contains(err.Error(), "invalid path") {
+		if _, err := c.Commit(ctx, "test: path", CommitFile{Path: path, Content: strings.NewReader("x")}); err == nil || !strings.Contains(err.Error(), "invalid path") {
 			t.Fatalf("Commit(%q) = %v, want invalid path", path, err)
 		}
 	}
@@ -721,16 +720,16 @@ func TestCommitPathsAndSamples(t *testing.T) {
 
 	ref := exchangeOf(t, hftest.Fixture(t, "ref-upload"), "POST preupload")
 	refFiles := preuploadSamples(t, []byte(ref.RequestBody.Text))
-	if len(refFiles) != 2 || len(refFiles[0].Sample) != sampleSize || refFiles[0].Size <= sampleSize || len(refFiles[1].Sample) != int(refFiles[1].Size) {
+	if len(refFiles) != 2 || len(refFiles[0].Sample) != sampleLen || refFiles[0].Size <= sampleLen || len(refFiles[1].Sample) != int(refFiles[1].Size) {
 		t.Fatalf("reference samples: %d files, %d and %d bytes for sizes %d and %d", len(refFiles), len(refFiles[0].Sample), len(refFiles[1].Sample), refFiles[0].Size, refFiles[1].Size)
 	}
 
 	long, short := deterministic(600), []byte(textData)
-	if _, err := c.Commit(ctx, "test: samples", hf.CommitFile{Path: "a/long.bin", Content: bytes.NewReader(long)}, hf.CommitFile{Path: "a/short.txt", Content: bytes.NewReader(short)}); err != nil {
+	if _, err := c.Commit(ctx, "test: samples", CommitFile{Path: "a/long.bin", Content: bytes.NewReader(long)}, CommitFile{Path: "a/short.txt", Content: bytes.NewReader(short)}); err != nil {
 		t.Fatal(err)
 	}
 	got := preuploadSamples(t, requestOf(t, repo.hub.Requests(), "POST preupload").Body)
-	if len(got) != 2 || got[0].Path != "a/long.bin" || got[0].Size != 600 || !bytes.Equal(got[0].Sample, long[:sampleSize]) || got[1].Path != "a/short.txt" || got[1].Size != int64(len(short)) || !bytes.Equal(got[1].Sample, short) {
+	if len(got) != 2 || got[0].Path != "a/long.bin" || got[0].Size != 600 || !bytes.Equal(got[0].Sample, long[:sampleLen]) || got[1].Path != "a/short.txt" || got[1].Size != int64(len(short)) || !bytes.Equal(got[1].Sample, short) {
 		t.Fatalf("preupload files = %+v", got)
 	}
 }

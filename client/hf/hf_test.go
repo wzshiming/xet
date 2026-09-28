@@ -1,7 +1,6 @@
-package hf_test
+package hf
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,21 +10,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
-	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/client/hf"
 )
-
-const readTokenPath = "/api/models/org/repo/xet-read-token/main"
-
-// resolve returns perm's base URL and token, failing the test on error.
-func resolve(t *testing.T, provider client.UpstreamProvider, perm auth.Permission) (string, string) {
-	t.Helper()
-	baseURL, token, err := provider.Resolve(context.Background(), perm)
-	if err != nil {
-		t.Fatalf("Resolve(%s): %v", perm, err)
-	}
-	return baseURL, token
-}
 
 func TestTokenProviderWrite(t *testing.T) {
 	const wantPath = "/api/datasets/org/repo/xet-write-token/main"
@@ -44,9 +29,9 @@ func TestTokenProviderWrite(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	repo := hf.Repo{Endpoint: tokenSrv.URL, RepoType: "dataset", RepoID: "org/repo", Revision: "main"}
+	repo := Repo{Endpoint: tokenSrv.URL, RepoType: "dataset", RepoID: "org/repo", Revision: "main"}
 
-	baseURL, token := resolve(t, hf.NewTokenProvider(nil, repo, "hf-token"), auth.Write)
+	baseURL, token := resolve(t, NewTokenProvider(nil, repo, "hf-token"), auth.Write)
 	if baseURL != "https://cas-upload.example.com" {
 		t.Fatalf("unexpected baseURL: %s", baseURL)
 	}
@@ -66,14 +51,14 @@ func TestTokenProviderWriteOverrides(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	repo := hf.Repo{
+	repo := Repo{
 		Endpoint: tokenSrv.URL,
 		RepoType: "space",
 		RepoID:   "org/repo",
 		Revision: "custom-rev",
 	}
 
-	baseURL, token := resolve(t, hf.NewTokenProvider(nil, repo, "hf-token"), auth.Write)
+	baseURL, token := resolve(t, NewTokenProvider(nil, repo, "hf-token"), auth.Write)
 	if token != "cas-write-token" {
 		t.Fatalf("unexpected token: %s", token)
 	}
@@ -97,9 +82,9 @@ func TestTokenProviderRead(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	repo := hf.Repo{Endpoint: tokenSrv.URL, RepoID: "org/repo"}
+	repo := Repo{Endpoint: tokenSrv.URL, RepoID: "org/repo"}
 
-	baseURL, token := resolve(t, hf.NewTokenProvider(nil, repo, "hf-token"), auth.Read)
+	baseURL, token := resolve(t, NewTokenProvider(nil, repo, "hf-token"), auth.Read)
 	if baseURL != "https://cas-download.example.com" {
 		t.Fatalf("unexpected baseURL: %s", baseURL)
 	}
@@ -121,9 +106,9 @@ func TestTokenProviderKernel(t *testing.T) {
 	}))
 	defer tokenSrv.Close()
 
-	repo := hf.Repo{Endpoint: tokenSrv.URL, RepoType: "kernels", RepoID: "org/repo", Revision: "main"}
+	repo := Repo{Endpoint: tokenSrv.URL, RepoType: "kernels", RepoID: "org/repo", Revision: "main"}
 
-	_, token := resolve(t, hf.NewTokenProvider(&http.Client{Timeout: 5 * time.Second}, repo, "hf-token"), auth.Read)
+	_, token := resolve(t, NewTokenProvider(&http.Client{Timeout: 5 * time.Second}, repo, "hf-token"), auth.Read)
 	if token != "cas-kernel-token" {
 		t.Fatalf("unexpected token: %s", token)
 	}
@@ -133,14 +118,14 @@ func TestTokenProviderKernel(t *testing.T) {
 func TestRepoCommitURL(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		repo hf.Repo
+		repo Repo
 		want string
 	}{
-		{"model default", hf.Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "https://hub.example/api/models/org/repo/commit/main"},
-		{"default endpoint", hf.Repo{RepoID: "org/repo"}, "https://huggingface.co/api/models/org/repo/commit/main"},
-		{"dataset", hf.Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "https://hub.example/api/datasets/org/repo/commit/dev"},
-		{"escaped revision", hf.Repo{Endpoint: "https://hub.example", RepoID: "org/repo", Revision: "refs/pr/1"}, "https://hub.example/api/models/org/repo/commit/refs%2Fpr%2F1"},
-		{"trailing slashes", hf.Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/"}, "https://hub.example/api/models/org/repo/commit/main"},
+		{"model default", Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "https://hub.example/api/models/org/repo/commit/main"},
+		{"default endpoint", Repo{RepoID: "org/repo"}, "https://huggingface.co/api/models/org/repo/commit/main"},
+		{"dataset", Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "https://hub.example/api/datasets/org/repo/commit/dev"},
+		{"escaped revision", Repo{Endpoint: "https://hub.example", RepoID: "org/repo", Revision: "refs/pr/1"}, "https://hub.example/api/models/org/repo/commit/refs%2Fpr%2F1"},
+		{"trailing slashes", Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/"}, "https://hub.example/api/models/org/repo/commit/main"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.repo.CommitURL(); got != tc.want {
@@ -154,15 +139,15 @@ func TestRepoCommitURL(t *testing.T) {
 func TestRepoResolveURL(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		repo hf.Repo
+		repo Repo
 		path string
 		want string
 	}{
-		{"model default", hf.Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "config.json", "https://hub.example/org/repo/resolve/main/config.json"},
-		{"default endpoint", hf.Repo{RepoID: "org/repo"}, "config.json", "https://huggingface.co/org/repo/resolve/main/config.json"},
-		{"dataset", hf.Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "data/train.parquet", "https://hub.example/datasets/org/repo/resolve/dev/data/train.parquet"},
-		{"kernel", hf.Repo{Endpoint: "https://hub.example", RepoType: "kernel", RepoID: "org/repo"}, "build.toml", "https://hub.example/kernels/org/repo/resolve/main/build.toml"},
-		{"escaped", hf.Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/", Revision: "refs/pr/1"}, "dir/a b.txt", "https://hub.example/org/repo/resolve/refs%2Fpr%2F1/dir/a%20b.txt"},
+		{"model default", Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "config.json", "https://hub.example/org/repo/resolve/main/config.json"},
+		{"default endpoint", Repo{RepoID: "org/repo"}, "config.json", "https://huggingface.co/org/repo/resolve/main/config.json"},
+		{"dataset", Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "data/train.parquet", "https://hub.example/datasets/org/repo/resolve/dev/data/train.parquet"},
+		{"kernel", Repo{Endpoint: "https://hub.example", RepoType: "kernel", RepoID: "org/repo"}, "build.toml", "https://hub.example/kernels/org/repo/resolve/main/build.toml"},
+		{"escaped", Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/", Revision: "refs/pr/1"}, "dir/a b.txt", "https://hub.example/org/repo/resolve/refs%2Fpr%2F1/dir/a%20b.txt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.repo.ResolveURL(tc.path); got != tc.want {
@@ -176,18 +161,18 @@ func TestRepoResolveURL(t *testing.T) {
 func TestParseResolveURL(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		repo hf.Repo
+		repo Repo
 		path string
 	}{
-		{"model default", hf.Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "config.json"},
-		{"dataset", hf.Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "data/train.parquet"},
-		{"kernel", hf.Repo{Endpoint: "https://hub.example", RepoType: "kernel", RepoID: "org/repo"}, "build.toml"},
-		{"escaped", hf.Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/", Revision: "refs/pr/1"}, "dir/a b.txt"},
-		{"single segment", hf.Repo{Endpoint: "https://hub.example", RepoID: "gpt2"}, "config.json"},
+		{"model default", Repo{Endpoint: "https://hub.example", RepoID: "org/repo"}, "config.json"},
+		{"dataset", Repo{Endpoint: "https://hub.example", RepoType: "datasets", RepoID: "org/repo", Revision: "dev"}, "data/train.parquet"},
+		{"kernel", Repo{Endpoint: "https://hub.example", RepoType: "kernel", RepoID: "org/repo"}, "build.toml"},
+		{"escaped", Repo{Endpoint: "https://hub.example/", RepoID: "/org/repo/", Revision: "refs/pr/1"}, "dir/a b.txt"},
+		{"single segment", Repo{Endpoint: "https://hub.example", RepoID: "gpt2"}, "config.json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rawURL := tc.repo.ResolveURL(tc.path)
-			repo, path, err := hf.ParseResolveURL(rawURL)
+			repo, path, err := ParseResolveURL(rawURL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -197,7 +182,7 @@ func TestParseResolveURL(t *testing.T) {
 		})
 	}
 	for _, rawURL := range []string{"ftp://x/a/resolve/b/c", "https://hub.example/org/repo/tree/main/x", "https://hub.example/org/repo/resolve/main"} {
-		if repo, path, err := hf.ParseResolveURL(rawURL); err == nil {
+		if repo, path, err := ParseResolveURL(rawURL); err == nil {
 			t.Errorf("ParseResolveURL(%q) = %+v, %q; want an error", rawURL, repo, path)
 		}
 	}
@@ -212,7 +197,7 @@ func TestNewClientBindsRepo(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"casUrl":%q,"accessToken":"cas-read-token","exp":%d}`, cas.URL, time.Now().Add(time.Hour).Unix())
 	})
 
-	c, err := hf.NewClient(hf.Repo{Endpoint: hub.URL, RepoID: "org/repo"}, hf.WithToken("hf-token"))
+	c, err := NewClient(Repo{Endpoint: hub.URL, RepoID: "org/repo"}, WithToken("hf-token"))
 	if err != nil {
 		t.Fatal(err)
 	}
