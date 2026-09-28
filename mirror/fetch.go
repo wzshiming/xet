@@ -18,11 +18,12 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 	if err != nil {
 		return err
 	}
+	c, err := m.newClient(repo, t.token)
+	if err != nil {
+		return err
+	}
 	return fetchWithRetries(ctx, "xet download", func() error {
-		c, err := m.newClient(repo, t.token)
-		if err != nil {
-			return err
-		}
+
 		f, err := c.Resolve(ctx, path)
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
