@@ -16,16 +16,12 @@ type ResolvedFile struct {
 	Hash xet.FileHash
 }
 
-// Resolve HEADs path at the bound repository revision once, never following redirects, and returns the file behind its xet reconstruction link.
-func (c *Client) Resolve(ctx context.Context, path string) (*ResolvedFile, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.repo.ResolveURL(path), nil)
+// Resolve HEADs file at the bound repository revision once, never following redirects, and returns the file behind its xet reconstruction link.
+func (c *Client) Resolve(ctx context.Context, file string) (*ResolvedFile, error) {
+	req, err := newRequest(ctx, http.MethodHead, c.repo.ResolveURL(file), c.token, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create resolve request: %w", err)
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
 	resp, err := c.hub.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("resolve request: %w", err)
@@ -33,13 +29,9 @@ func (c *Client) Resolve(ctx context.Context, path string) (*ResolvedFile, error
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-
-	return resolveResponse(resp)
-}
-
-func resolveResponse(resp *http.Response) (*ResolvedFile, error) {
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("unexpected status from resolve: %d", resp.StatusCode)
+	// huggingface.co answers with a 302 carrying the links, so only 4xx and 5xx fail.
+	if resp.StatusCode >= 400 {
+		return nil, hubError(req, resp)
 	}
 
 	reconURLStr := ParseLinkHeaders(resp.Header.Values("Link"))["xet-reconstruction-info"]

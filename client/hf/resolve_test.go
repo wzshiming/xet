@@ -100,7 +100,7 @@ func TestResolveHuggingFaceMissingHeaders(t *testing.T) {
 	}{
 		{"no headers", "", http.StatusFound, "missing xet-reconstruction-info link"},
 		{"relative link", `</v1/reconstructions/x>; rel="xet-reconstruction-info"`, http.StatusOK, "invalid reconstruction link"},
-		{"not found", "", http.StatusNotFound, "unexpected status from resolve: 404"},
+		{"not found", "", http.StatusNotFound, "hub API error (status 404"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

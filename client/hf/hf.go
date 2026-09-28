@@ -17,8 +17,7 @@ type Repo struct {
 
 // CommitURL returns the commit endpoint of repo's revision, {endpoint}/api/{type}s/{repo}/commit/{revision}.
 func (r Repo) CommitURL() string {
-	r = r.normalized()
-	return r.apiBase() + "/commit/" + url.PathEscape(r.Revision)
+	return r.apiURL("commit")
 }
 
 // ResolveURL returns the download URL of path at repo's revision, {endpoint}/[{type}s/]{repo}/resolve/{revision}/{path}, escaped like huggingface_hub does.
@@ -58,9 +57,10 @@ func ParseResolveURL(rawURL string) (Repo, string, error) {
 	return r, path, nil
 }
 
-// apiBase is the API prefix of a normalized repository, {endpoint}/api/{type}s/{repo}.
-func (r Repo) apiBase() string {
-	return fmt.Sprintf("%s/api/%ss/%s", r.Endpoint, r.RepoType, r.RepoID)
+// apiURL returns the endpoint of the given kind, such as preupload, at repo's revision: {endpoint}/api/{type}s/{repo}/{kind}/{revision}.
+func (r Repo) apiURL(kind string) string {
+	r = r.normalized()
+	return fmt.Sprintf("%s/api/%ss/%s/%s/%s", r.Endpoint, r.RepoType, r.RepoID, kind, url.PathEscape(r.Revision))
 }
 
 // normalized returns r with its defaults filled in and its endpoint, type and id spelled the way the hub's API paths take them.

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -88,21 +87,28 @@ func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile
 	if len(files) == 0 {
 		return nil, errors.New("commit needs at least one file")
 	}
-	hub := &hubAPI{httpClient: c.hub, token: c.token, base: c.repo.apiBase(), rev: url.PathEscape(c.repo.Revision)}
 	preupload := preuploadRequest{Files: make([]preuploadFile, 0, len(files))}
 	for _, f := range files {
 		if err := validatePath(f.Path); err != nil {
 			return nil, err
 		}
-		size, sample, err := describe(f.Content)
+		size, err := f.Content.Seek(0, io.SeekEnd)
 		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f.Path, err)
+		}
+		if err := rewind(f.Content); err != nil {
+			return nil, fmt.Errorf("read %s: %w", f.Path, err)
+		}
+		sample := make([]byte, min(size, sampleSize))
+		if _, err := io.ReadFull(f.Content, sample); err != nil {
 			return nil, fmt.Errorf("read %s: %w", f.Path, err)
 		}
 		preupload.Files = append(preupload.Files, preuploadFile{Path: f.Path, Sample: sample, Size: size})
 	}
 
+	body, _ := json.Marshal(preupload)
 	var modes preuploadResponse
-	if err := hub.post(ctx, "preupload", "application/json", jsonBody(preupload), &modes); err != nil {
+	if err := c.post(ctx, "preupload", "application/json", body, &modes); err != nil {
 		return nil, err
 	}
 	entries := make(map[string]preuploadEntry, len(modes.Files))
@@ -121,10 +127,14 @@ func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile
 		}
 		switch entry.UploadMode {
 		case "lfs":
-			digest, err := sha256Hex(f.Content)
-			if err != nil {
+			if err := rewind(f.Content); err != nil {
 				return nil, fmt.Errorf("digest %s: %w", f.Path, err)
 			}
+			h := sha256.New()
+			if _, err := io.Copy(h, f.Content); err != nil {
+				return nil, fmt.Errorf("digest %s: %w", f.Path, err)
+			}
+			digest := hex.EncodeToString(h.Sum(nil))
 			if digest == entry.OID {
 				continue
 			}
@@ -143,7 +153,11 @@ func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile
 			if err != nil {
 				return nil, fmt.Errorf("read %s: %w", f.Path, err)
 			}
-			if blobSHA1(content) == entry.OID {
+			// The hub reports a regular file it already holds by its git blob id.
+			h := sha1.New()
+			_, _ = fmt.Fprintf(h, "blob %d\x00", len(content))
+			_, _ = h.Write(content)
+			if hex.EncodeToString(h.Sum(nil)) == entry.OID {
 				continue
 			}
 			lines = append(lines, commitLine{Key: "file", Value: commitRegularFile{Content: content, Encoding: "base64", Path: f.Path}})
@@ -155,37 +169,27 @@ func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile
 		return nil, ErrNoChanges
 	}
 
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for _, line := range lines {
+		_ = enc.Encode(line)
+	}
 	var created commitResponse
-	if err := hub.post(ctx, "commit", "application/x-ndjson", ndjsonBody(lines), &created); err != nil {
+	if err := c.post(ctx, "commit", "application/x-ndjson", buf.Bytes(), &created); err != nil {
 		return nil, err
 	}
 	return &Commit{OID: created.CommitOID, URL: created.CommitURL}, nil
 }
 
-// hubAPI reaches the endpoints of one repository revision with the hub token.
-type hubAPI struct {
-	httpClient *http.Client
-	token      string
-	base       string // origin and path up to the endpoint kind: {endpoint}/api/{type}s/{repo}
-	rev        string // escaped as given
-}
-
-// url returns the revision's endpoint of the given kind, such as preupload or xet-write-token.
-func (h *hubAPI) url(kind string) string {
-	return h.base + "/" + kind + "/" + h.rev
-}
-
-// post sends body to the revision's endpoint of the given kind and decodes the JSON reply into out.
-func (h *hubAPI) post(ctx context.Context, kind, contentType string, body []byte, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.url(kind), bytes.NewReader(body))
+// post sends body to the bound revision's endpoint of the given kind and decodes the JSON reply into out.
+func (c *Client) post(ctx context.Context, kind, contentType string, body []byte, out any) error {
+	req, err := newRequest(ctx, http.MethodPost, c.repo.apiURL(kind), c.token, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create %s request: %w", kind, err)
 	}
 	req.Header.Set("Content-Type", contentType)
-	if h.token != "" {
-		req.Header.Set("Authorization", "Bearer "+h.token)
-	}
-	resp, err := h.httpClient.Do(req)
+	resp, err := c.hub.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s request: %w", kind, err)
 	}
@@ -193,27 +197,12 @@ func (h *hubAPI) post(ctx context.Context, kind, contentType string, body []byte
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: hub API error (status %s): %s", req.Method, req.URL.Path, resp.Status, hubMessage(resp))
+		return hubError(req, resp)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode %s response: %w", kind, err)
 	}
 	return nil
-}
-
-// hubMessage returns the hub's explanation of a failed response: its X-Error-Message, else the JSON error field, else the body text.
-func hubMessage(resp *http.Response) string {
-	if msg := resp.Header.Get("X-Error-Message"); msg != "" {
-		return msg
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var payload struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(body, &payload); err == nil && payload.Error != "" {
-		return payload.Error
-	}
-	return strings.TrimSpace(string(body))
 }
 
 // validatePath accepts clean relative repository paths: no leading slash and no empty, "." or ".." segment.
@@ -230,60 +219,8 @@ func validatePath(p string) error {
 	return nil
 }
 
-// describe returns content's size and its first sampleSize bytes.
-func describe(content io.ReadSeeker) (int64, []byte, error) {
-	size, err := content.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, nil, err
-	}
-	if err := rewind(content); err != nil {
-		return 0, nil, err
-	}
-	sample := make([]byte, min(size, sampleSize))
-	if _, err := io.ReadFull(content, sample); err != nil {
-		return 0, nil, err
-	}
-	return size, sample, nil
-}
-
-// sha256Hex digests content from its start.
-func sha256Hex(content io.ReadSeeker) (string, error) {
-	if err := rewind(content); err != nil {
-		return "", err
-	}
-	h := sha256.New()
-	if _, err := io.Copy(h, content); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// blobSHA1 is the git object id of a blob holding content, the oid the hub reports for a regular file it already holds.
-func blobSHA1(content []byte) string {
-	h := sha1.New()
-	_, _ = fmt.Fprintf(h, "blob %d\x00", len(content))
-	_, _ = h.Write(content)
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 // rewind puts content at its start: every pass over a file begins there, whether files share a reader or one arrives mid-way.
 func rewind(content io.ReadSeeker) error {
 	_, err := content.Seek(0, io.SeekStart)
 	return err
-}
-
-func jsonBody(v any) []byte {
-	body, _ := json.Marshal(v)
-	return body
-}
-
-// ndjsonBody encodes one line per value with a trailing newline, the commit payload format.
-func ndjsonBody(lines []commitLine) []byte {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	for _, line := range lines {
-		_ = enc.Encode(line)
-	}
-	return buf.Bytes()
 }

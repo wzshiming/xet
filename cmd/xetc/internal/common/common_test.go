@@ -229,7 +229,7 @@ func TestExecuteResolveDownloadKeepsDestinationOnFailure(t *testing.T) {
 	defer hub.Close()
 	for _, tc := range []struct{ name, resolveURL, wantErr string }{
 		{"invalid URL", "://hub", "invalid resolve URL"},
-		{"unauthorized", hub.URL + "/org/private/resolve/main/f.bin", "unexpected status from resolve: 401"},
+		{"unauthorized", hub.URL + "/org/private/resolve/main/f.bin", "hub API error (status 401"},
 		{"missing links", hub.URL + "/org/plain/resolve/main/f.bin", "missing xet-reconstruction-info link"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

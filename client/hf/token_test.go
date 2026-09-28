@@ -75,10 +75,7 @@ func countingTokenServer(t *testing.T) (*httptest.Server, func(path string) int)
 
 // repoTokenProvider fetches read and write tokens from srv's counting endpoints.
 func repoTokenProvider(srv *httptest.Server) *tokenProvider {
-	return newTokenProvider(nil, "hf-token", map[auth.Permission]string{
-		auth.Read:  srv.URL + readTokenPath,
-		auth.Write: srv.URL + writeTokenPath,
-	})
+	return newTokenProvider(hubClient(nil), Repo{Endpoint: srv.URL, RepoID: "org/repo"}.normalized(), "hf-token")
 }
 
 // resolve returns perm's base URL and token, failing the test on error.
@@ -155,17 +152,17 @@ func (t originTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // A redirect off the token endpoint is reported, never followed with the hub token, on the first fetch and on renewal alike.
 func TestAuthTokenRedirectNotFollowed(t *testing.T) {
 	const hubOrigin = "https://hub.example"
-	endpoints := map[auth.Permission]string{auth.Read: hubOrigin + readTokenPath}
+	repo := Repo{Endpoint: hubOrigin, RepoID: "org/repo"}
 	scenarios := map[string]struct {
 		redirectAt int // the token fetch that answers with the redirect
 		run        func(t *testing.T, httpClient *http.Client) error
 	}{
 		"provider": {1, func(_ *testing.T, httpClient *http.Client) error {
-			_, _, err := newTokenProvider(httpClient, "hub-token", endpoints).Resolve(context.Background(), auth.Read)
+			_, _, err := NewTokenProvider(httpClient, repo, "hub-token").Resolve(context.Background(), auth.Read)
 			return err
 		}},
 		"provider renewal": {2, func(t *testing.T, httpClient *http.Client) error {
-			p := newTokenProvider(httpClient, "hub-token", endpoints)
+			p := NewTokenProvider(httpClient, repo, "hub-token")
 			if _, _, err := p.Resolve(context.Background(), auth.Read); err != nil {
 				t.Fatalf("initial token fetch: %v", err)
 			}
