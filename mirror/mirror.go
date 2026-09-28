@@ -245,5 +245,5 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 
 // newClient binds a xet client to repo with token for one download: the mirror's transport and cache, the caller's options, and the repository's token endpoints bound last.
 func (m *Mirror) newClient(repo hf.Repo, token string) (*hf.Client, error) {
-	return hf.NewClient(m.hubClient, repo, token, append([]client.Options{client.WithCache(m.cache)}, m.clientOpts...)...)
+	return hf.NewClient(repo, hf.WithHTTPClient(m.hubClient), hf.WithToken(token), hf.WithClientOptions(append([]client.Options{client.WithCache(m.cache)}, m.clientOpts...)...))
 }

@@ -51,7 +51,7 @@ func recordingServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, 
 // resolveErr resolves f.bin of hubURL's org/repo with token through httpClient and returns the error.
 func resolveErr(t *testing.T, httpClient *http.Client, hubURL, token string) (*hf.ResolvedFile, error) {
 	t.Helper()
-	c, err := hf.NewClient(httpClient, hf.Repo{Endpoint: hubURL, RepoID: "org/repo"}, token)
+	c, err := hf.NewClient(hf.Repo{Endpoint: hubURL, RepoID: "org/repo"}, hf.WithHTTPClient(httpClient), hf.WithToken(token))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -77,7 +77,7 @@ func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile s
 	if err != nil {
 		return fmt.Errorf("resolve download target: %w", err)
 	}
-	cli, err := hf.NewClient(nil, repo, token, Options("default", concurrency, cacheDir, out)...)
+	cli, err := hf.NewClient(repo, hf.WithToken(token), hf.WithClientOptions(Options("default", concurrency, cacheDir, out)...))
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}

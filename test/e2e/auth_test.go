@@ -337,7 +337,7 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	waitMirrorReady(t, srv.URL+pathB)
 
 	target := hf.Repo{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
-	anon, err := hf.NewClient(nil, target, "", client.WithCacheDir(t.TempDir()))
+	anon, err := hf.NewClient(target, hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
 	if err != nil {
 		t.Fatal(err)
 	}

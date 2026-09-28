@@ -156,7 +156,7 @@ func downloadViaXet(t *testing.T, resolveURL string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := hfclient.NewClient(nil, repo, "", client.WithCacheDir(t.TempDir()))
+	c, err := hfclient.NewClient(repo, hfclient.WithClientOptions(client.WithCacheDir(t.TempDir())))
 	if err != nil {
 		t.Fatal(err)
 	}

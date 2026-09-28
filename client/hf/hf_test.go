@@ -212,7 +212,7 @@ func TestNewClientBindsRepo(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"casUrl":%q,"accessToken":"cas-read-token","exp":%d}`, cas.URL, time.Now().Add(time.Hour).Unix())
 	})
 
-	c, err := hf.NewClient(nil, hf.Repo{Endpoint: hub.URL, RepoID: "org/repo"}, "hf-token")
+	c, err := hf.NewClient(hf.Repo{Endpoint: hub.URL, RepoID: "org/repo"}, hf.WithToken("hf-token"))
 	if err != nil {
 		t.Fatal(err)
 	}

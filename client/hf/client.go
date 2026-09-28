@@ -9,26 +9,56 @@ import (
 // Client is a xet client bound to one hub repository revision: CAS operations use its tokens and Commit writes to it.
 type Client struct {
 	*client.Client
-	repo  Repo // normalized
-	token string
-	hub   *http.Client // hub requests: no redirects, read-idle guarded
+	repo       Repo // normalized
+	token      string
+	hub        *http.Client // hub requests: no redirects, read-idle guarded
+	httpClient *http.Client // as configured (nil: default); serves the hub and the CAS
+	clientOpts []client.Options
 }
 
-// NewClient binds a client to repo with token (empty: anonymous); httpClient (nil: default) serves the hub and the CAS, opts configure the CAS client.
-func NewClient(httpClient *http.Client, repo Repo, token string, opts ...client.Options) (*Client, error) {
-	repo = repo.normalized()
-	var casOpts []client.Options
-	if httpClient != nil {
-		casOpts = append(casOpts, client.WithHTTPClient(httpClient))
+type Options func(*Client)
+
+// WithToken authenticates hub and token requests as the user (empty: anonymous).
+func WithToken(token string) Options {
+	return func(c *Client) {
+		c.token = token
 	}
-	casOpts = append(casOpts, opts...)
-	// The repo binding wins over any provider in opts.
-	casOpts = append(casOpts, client.WithUpstreamProvider(NewTokenProvider(httpClient, repo, token)))
+}
+
+// WithHTTPClient serves the hub and the CAS (nil: default).
+func WithHTTPClient(httpClient *http.Client) Options {
+	return func(c *Client) {
+		c.httpClient = httpClient
+	}
+}
+
+// WithClientOptions configures the embedded CAS client.
+func WithClientOptions(opts ...client.Options) Options {
+	return func(c *Client) {
+		c.clientOpts = append(c.clientOpts, opts...)
+	}
+}
+
+// NewClient binds a client to repo; opts set the token (default anonymous), the HTTP client and the CAS client options.
+func NewClient(repo Repo, opts ...Options) (*Client, error) {
+	c := &Client{repo: repo.normalized()}
+	for _, opt := range opts {
+		opt(c)
+	}
+	var casOpts []client.Options
+	if c.httpClient != nil {
+		casOpts = append(casOpts, client.WithHTTPClient(c.httpClient))
+	}
+	casOpts = append(casOpts, c.clientOpts...)
+	// The repo binding wins over any provider in the CAS client options.
+	casOpts = append(casOpts, client.WithUpstreamProvider(NewTokenProvider(c.httpClient, c.repo, c.token)))
 	cas, err := client.NewClient(casOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: cas, repo: repo, token: token, hub: hubClient(httpClient)}, nil
+	c.Client = cas
+	c.hub = hubClient(c.httpClient)
+	return c, nil
 }
 
 // hubClient copies httpClient (nil: default) so hub requests never follow a redirect and are read-idle guarded.

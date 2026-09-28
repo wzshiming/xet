@@ -126,7 +126,7 @@ func (r *privateRepo) committer(t *testing.T) *hf.Client {
 // bound returns a client bound to target with hfToken.
 func (r *privateRepo) bound(t *testing.T, target hf.Repo, hfToken string) *hf.Client {
 	t.Helper()
-	c, err := hf.NewClient(r.hc, target, hfToken, client.WithCacheDir(t.TempDir()))
+	c, err := hf.NewClient(target, hf.WithHTTPClient(r.hc), hf.WithToken(hfToken), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestNewClientOverridesUserProvider(t *testing.T) {
 	ctx := t.Context()
 	lfsData := deterministic(1 << 20)
 	wrong := &spyProvider{inner: hf.NewTokenProvider(repo.hc, repo.target, wrongToken)}
-	c, err := hf.NewClient(repo.hc, repo.target, hubSecret, client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong))
+	c, err := hf.NewClient(repo.target, hf.WithHTTPClient(repo.hc), hf.WithToken(hubSecret), hf.WithClientOptions(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestBoundClientsShareCache(t *testing.T) {
 	shared := client.NewCache(t.TempDir(), 0)
 	clients := make([]*hf.Client, 2)
 	for i := range clients {
-		c, err := hf.NewClient(repo.hc, repo.target, hubSecret, client.WithCache(shared))
+		c, err := hf.NewClient(repo.target, hf.WithHTTPClient(repo.hc), hf.WithToken(hubSecret), hf.WithClientOptions(client.WithCache(shared)))
 		if err != nil {
 			t.Fatal(err)
 		}

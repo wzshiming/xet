@@ -47,7 +47,7 @@ func NewCommand() *cobra.Command {
 				Revision: hfRevision,
 			}
 
-			cli, err := hfclient.NewClient(nil, repo, hfToken, common.Options(namespace, concurrency, cacheDir, os.Stderr)...)
+			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(namespace, concurrency, cacheDir, os.Stderr)...))
 			if err != nil {
 				return fmt.Errorf("create client: %w", err)
 			}
