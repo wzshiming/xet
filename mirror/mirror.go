@@ -36,6 +36,8 @@ import (
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/storage"
 	"golang.org/x/sync/singleflight"
 )
@@ -130,9 +132,11 @@ type Mirror struct {
 	ingestSlots        chan struct{}
 	transport          http.RoundTripper
 
-	probeClient  *http.Client // does not follow redirects; used for metadata probes
-	fetchClient  *http.Client // follows redirects; body drops resume via httpseek
-	xetClient    *client.Client
+	probeClient  *http.Client  // does not follow redirects; used for metadata probes
+	fetchClient  *http.Client  // follows redirects; body drops resume via httpseek
+	hubClient    *http.Client  // hub and CAS requests of the per-download hf clients; hf.NewClient adds the no-redirect and idle guards
+	cache        *client.Cache // chunk cache shared by the per-download xet clients
+	clientOpts   []client.Options
 	localAdapter *localCAS
 
 	mu        sync.Mutex
@@ -157,9 +161,9 @@ func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
 }
 
-// WithClient sets the xet client used for upstream xet downloads; unset creates one caching chunks under the cache dir.
-func WithClient(c *client.Client) Option {
-	return func(m *Mirror) { m.xetClient = c }
+// WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache and upstream provider itself (WithCache in opts replaces the mirror's cache).
+func WithClientOptions(opts ...client.Options) Option {
+	return func(m *Mirror) { m.clientOpts = opts }
 }
 
 // WithRevalidateInterval sets how often ready entries for branch (non-commit)
@@ -174,7 +178,7 @@ func WithMaxConcurrentIngests(n int) Option {
 	return func(m *Mirror) { m.maxIngests = n }
 }
 
-// WithTransport sets the transport under the upstream auth, idle, and resume wrappers, and of the default xet client; nil uses a clone of http.DefaultTransport.
+// WithTransport sets the transport under the upstream auth, idle, and resume wrappers, and of the per-download xet clients; nil uses a clone of http.DefaultTransport.
 func WithTransport(rt http.RoundTripper) Option {
 	return func(m *Mirror) { m.transport = rt }
 }
@@ -211,11 +215,10 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		}
 	}
 
-	baseTransport := m.transport
-	if baseTransport == nil {
-		baseTransport = http.DefaultTransport.(*http.Transport).Clone()
+	if m.transport == nil {
+		m.transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
-	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(baseTransport, client.DefaultIdleTimeout)}
+	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(m.transport, client.DefaultIdleTimeout)}
 	m.probeClient = &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: injecting,
@@ -232,18 +235,15 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		}),
 	}
 
-	if m.xetClient == nil {
-		xetClient, err := client.NewClient(
-			client.WithHTTPClient(&http.Client{Transport: baseTransport}),
-			client.WithCacheDir(filepath.Join(m.cacheDir, "chunks")),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("mirror: create xet client: %w", err)
-		}
-		m.xetClient = xetClient
-	}
+	m.hubClient = &http.Client{Transport: m.transport}
+	m.cache = client.NewCache(filepath.Join(m.cacheDir, "chunks"), download.DefaultCacheSize)
 
 	m.localAdapter = &localCAS{storage: m.storage, namespace: "default"}
 
 	return m, nil
+}
+
+// newClient binds a xet client to repo with token for one download: the mirror's transport and cache, the caller's options, and the repository's token endpoints bound last.
+func (m *Mirror) newClient(repo hf.Repo, token string) (*hf.Client, error) {
+	return hf.NewClient(m.hubClient, repo, token, append([]client.Options{client.WithCache(m.cache)}, m.clientOpts...)...)
 }

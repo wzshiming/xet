@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 )
@@ -2636,59 +2635,68 @@ func (r *recordingTransport) count(substr string) int {
 	return n
 }
 
-// The default xet client rides the mirror's transport: the xet resolve, xet-auth, reconstruction and xorb requests all pass through it; a client given with WithClient keeps its own.
+// The per-download xet clients ride the mirror's transport: the xet resolve, the repository's read-token, reconstruction and xorb requests all pass through it.
 func TestMirrorXetTransport(t *testing.T) {
 	data := []byte("xet bytes carried by the mirror's transport")
 	up := newXetUpstream(t, "/org/repo/resolve/main/f.bin", data, "cas-token")
 	const resolveHEAD = "HEAD /org/repo/resolve/main/f.bin"
-	xetCalls := []string{"GET /api/xet-read-token", "/reconstructions/", "GET /v1/xorbs/"}
+	xetCalls := []string{"GET /api/models/org/repo/xet-read-token/main", "/reconstructions/", "GET /v1/xorbs/"}
 
-	ingest := func(t *testing.T, opts ...Option) {
+	rt := &recordingTransport{}
+	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithTransport(rt))
+	m.token = "hub-secret"
+	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatalf("stored %q, want %q", got, data)
+	}
+	if n := rt.count(resolveHEAD); n != 2 {
+		t.Fatalf("resolve HEADs through the transport = %d, want the probe and the xet resolve", n)
+	}
+	for _, call := range xetCalls {
+		if rt.count(call) == 0 {
+			t.Fatalf("%s never reached the mirror's transport", call)
+		}
+	}
+}
+
+// Every xet download on a mirror shares its chunk cache: two files fill it, and a third path holding the first file's bytes is served from the cached xorb without another xorb GET.
+func TestMirrorXetDownloadsShareCache(t *testing.T) {
+	dataA, dataB := []byte("xet bytes shared through the mirror's chunk cache"), []byte("other xet bytes on the same mirror")
+	upA := newXetUpstream(t, "/org/a/resolve/main/f.bin", dataA, "cas-token-a")
+	upB := newXetUpstream(t, "/org/b/resolve/main/f.bin", dataB, "cas-token-b")
+	upC := newXetUpstream(t, "/org/c/resolve/main/f.bin", dataA, "cas-token-c")
+	rt := &recordingTransport{}
+	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir(), WithTransport(rt))
+
+	ingest := func(up *xetUpstream, path string, data []byte) {
 		t.Helper()
-		m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), opts...)
-		m.token = "hub-secret"
-		entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+		in, err := m.Mirror.Ingest(up.hubURL+path, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		awaitClosed(t, in.Done(), path)
+		entry, err := in.Entry()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
-			t.Fatalf("stored %q, want %q", got, data)
+			t.Fatalf("%s: stored %q, want %q", path, got, data)
 		}
 	}
-
-	t.Run("default client", func(t *testing.T) {
-		rt := &recordingTransport{}
-		ingest(t, WithTransport(rt))
-		if n := rt.count(resolveHEAD); n != 2 {
-			t.Fatalf("resolve HEADs through the transport = %d, want the probe and the xet resolve", n)
-		}
-		for _, call := range xetCalls {
-			if rt.count(call) == 0 {
-				t.Fatalf("%s never reached the mirror's transport", call)
-			}
-		}
-	})
-
-	t.Run("WithClient keeps its transport", func(t *testing.T) {
-		mirrorRT, clientRT := &recordingTransport{}, &recordingTransport{}
-		xc, err := client.NewClient(client.WithHTTPClient(&http.Client{Transport: clientRT}), client.WithCacheDir(t.TempDir()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		ingest(t, WithTransport(mirrorRT), WithClient(xc))
-		if n := mirrorRT.count(resolveHEAD); n != 1 {
-			t.Fatalf("resolve HEADs through the mirror's transport = %d, want only the probe", n)
-		}
-		if n := clientRT.count(resolveHEAD); n != 1 {
-			t.Fatalf("resolve HEADs through the client's transport = %d, want the xet resolve", n)
-		}
-		for _, call := range xetCalls {
-			if clientRT.count(call) == 0 {
-				t.Fatalf("%s never reached the client's transport", call)
-			}
-			if mirrorRT.count(call) != 0 {
-				t.Fatalf("%s went through the mirror's transport instead of the client's", call)
-			}
-		}
-	})
+	ingest(upA, "/org/a/resolve/main/f.bin", dataA)
+	ingest(upB, "/org/b/resolve/main/f.bin", dataB)
+	usage, err := m.cache.Usage(context.Background())
+	if err != nil || usage.Download.Count == 0 {
+		t.Fatalf("shared chunk cache after two downloads: %+v, %v; want entries", usage, err)
+	}
+	if n := rt.count("GET /v1/xorbs/"); n != 2 {
+		t.Fatalf("xorb GETs after two distinct files = %d, want 2", n)
+	}
+	ingest(upC, "/org/c/resolve/main/f.bin", dataA)
+	if n := rt.count("GET /v1/xorbs/"); n != 2 {
+		t.Fatalf("xorb GETs after downloading the first file's bytes again = %d, want 2 (served from the shared cache)", n)
+	}
 }

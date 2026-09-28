@@ -20,7 +20,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
-	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
@@ -115,7 +115,7 @@ func mediaType(contentType string) string {
 
 func linkRels(values []string) []string {
 	rels := make([]string, 0, 2)
-	for rel := range client.ParseLinkHeaders(values) {
+	for rel := range hf.ParseLinkHeaders(values) {
 		rels = append(rels, rel)
 	}
 	slices.Sort(rels)
@@ -346,7 +346,7 @@ func TestHubMatchesRecordedShapes(t *testing.T) {
 		ex = exchange(t, refPlain, method+" resolve", http.StatusFound, true)
 		resp, body = replay(t, hub, ex, token, nil)
 		assertShape(t, ex, resp)
-		links := client.ParseLinkHeaders(resp.Header.Values("Link"))
+		links := hf.ParseLinkHeaders(resp.Header.Values("Link"))
 		if got, want := links["xet-reconstruction-info"], cas.URL+"/v1/reconstructions/"+hash.String(); got != want {
 			t.Errorf("%s resolve reconstruction link = %q, want %q", method, got, want)
 		}

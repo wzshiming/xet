@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,6 +25,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
+	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
@@ -51,24 +51,15 @@ func newHubFixture(t *testing.T, upstream string, storageDir, cacheDir string, o
 	return newHubFixtureNext(t, upstream, nil, storageDir, cacheDir, opts...)
 }
 
-func staticUpstream(t *testing.T, rawURL, token string) UpstreamFunc {
-	t.Helper()
-	selector, err := StaticUpstream(rawURL, token)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return selector
-}
-
 // newHubFixtureNext is newHubFixture with an explicit next handler; when nil
 // an upstream proxy without credential is wired, matching cmd/xetd.
 func newHubFixtureNext(t *testing.T, upstream string, next http.Handler, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
 	t.Helper()
-	return newHubFixtureSelector(t, staticUpstream(t, upstream, ""), next, storageDir, cacheDir, opts...)
+	return newHubFixtureSelector(t, client.StaticUpstreamProvider(upstream, ""), next, storageDir, cacheDir, opts...)
 }
 
-// newHubFixtureSelector wires the hub front end through selector; a nil next proxies through it.
-func newHubFixtureSelector(t *testing.T, selector UpstreamFunc, next http.Handler, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
+// newHubFixtureSelector wires the hub front end through provider; a nil next proxies through it.
+func newHubFixtureSelector(t *testing.T, provider client.UpstreamProvider, next http.Handler, storageDir, cacheDir string, opts ...mirror.Option) *hubFixture {
 	t.Helper()
 	var inner atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +81,7 @@ func newHubFixtureSelector(t *testing.T, selector UpstreamFunc, next http.Handle
 	}
 
 	if next == nil {
-		next = NewUpstreamProxy(selector)
+		next = NewUpstreamProxy(provider)
 	}
 
 	m, err := mirror.NewMirror(append([]mirror.Option{
@@ -109,7 +100,7 @@ func newHubFixtureSelector(t *testing.T, selector UpstreamFunc, next http.Handle
 		server.WithAuthorizer(issuer),
 		server.WithNext(NewHandler(
 			WithMirror(m),
-			WithUpstream(selector),
+			WithUpstreamProvider(provider),
 			WithExternalURL(srv.URL),
 			WithMinter(MinterFunc(func(r *http.Request, req TokenRequest) (string, int64, error) {
 				fx.mu.Lock()
@@ -161,11 +152,15 @@ func waitReady(t *testing.T, resolveURL string) *http.Response {
 func downloadViaXet(t *testing.T, resolveURL string) []byte {
 	t.Helper()
 	ctx := context.Background()
-	c, err := client.NewClient()
+	repo, path, err := hfclient.ParseResolveURL(resolveURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := c.Resolve(ctx, resolveURL, "")
+	c, err := hfclient.NewClient(nil, repo, "", client.WithCacheDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := c.Resolve(ctx, path)
 	if err != nil {
 		t.Fatalf("resolve download: %v", err)
 	}
@@ -174,7 +169,7 @@ func downloadViaXet(t *testing.T, resolveURL string) []byte {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if err := c.DownloadResolved(ctx, resolved, f); err != nil {
+	if err := c.DownloadFile(ctx, resolved.Hash, f); err != nil {
 		t.Fatalf("xet download: %v", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
@@ -290,7 +285,7 @@ func TestMirrorPlainUpstream(t *testing.T) {
 	upstream.set(resolvePath, data)
 
 	storageDir, cacheDir := t.TempDir(), t.TempDir()
-	fx := newHubFixtureSelector(t, staticUpstream(t, upstreamSrv.URL, "up-secret"), nil, storageDir, cacheDir)
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(upstreamSrv.URL, "up-secret"), nil, storageDir, cacheDir)
 	resolveURL := fx.srv.URL + resolvePath
 
 	t.Run("serve while caching with singleflight", func(t *testing.T) {
@@ -715,7 +710,7 @@ func (u *xetUpstream) serveHub(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hub credential required", http.StatusUnauthorized)
 		return
 	}
-	if r.URL.Path == "/api/xet-read-token" {
+	if strings.Contains(r.URL.Path, "/xet-read-token/") {
 		u.tokenRequests.Add(1)
 		ttl := u.tokenTTL
 		if ttl == 0 {
@@ -851,7 +846,7 @@ func TestMirrorXetUpstreamUnknownSize(t *testing.T) {
 	waitReady(t, resolveURL)
 }
 
-// Tokens inside the renewal margin force another authenticated hub request during download.
+// A short-lived upstream token is fetched once per download with the mirror's hub credential; each download binds a fresh client, so no renewal happens inside one.
 func TestMirrorXetUpstreamTokenRenewal(t *testing.T) {
 	upstream := newXetUpstream(t)
 	upstream.hubToken = "hub-secret"
@@ -864,7 +859,7 @@ func TestMirrorXetUpstreamTokenRenewal(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/refresh.bin"
 	upstream.add(t, resolvePath, data)
 
-	fx := newHubFixtureSelector(t, staticUpstream(t, upstream.hubURL, "hub-secret"), nil, t.TempDir(), t.TempDir())
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(upstream.hubURL, "hub-secret"), nil, t.TempDir(), t.TempDir())
 	resolveURL := fx.srv.URL + resolvePath
 
 	resp, err := http.Get(resolveURL)
@@ -880,8 +875,8 @@ func TestMirrorXetUpstreamTokenRenewal(t *testing.T) {
 		t.Fatalf("status = %d, %d bytes; want 200 and %d bytes", resp.StatusCode, len(body), len(data))
 	}
 	waitReady(t, resolveURL)
-	if got := upstream.tokenRequests.Load(); got < 2 {
-		t.Fatalf("upstream token requests = %d, want the initial fetch plus a refresh", got)
+	if got := upstream.tokenRequests.Load(); got != 1 {
+		t.Fatalf("upstream token requests = %d, want one for the download", got)
 	}
 	if got := upstream.hubDenied.Load(); got != 0 {
 		t.Fatalf("%d upstream hub requests lacked the mirror credential", got)
@@ -969,8 +964,8 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 	}))
 	defer upstreamSrv.Close()
 
-	selector := staticUpstream(t, upstreamSrv.URL, "up-secret")
-	fx := newHubFixtureSelector(t, selector, NewUpstreamProxy(selector), t.TempDir(), t.TempDir())
+	provider := client.StaticUpstreamProvider(upstreamSrv.URL, "up-secret")
+	fx := newHubFixtureSelector(t, provider, NewUpstreamProxy(provider), t.TempDir(), t.TempDir())
 
 	req, _ := http.NewRequest(http.MethodGet, fx.srv.URL+"/api/models/org/repo", nil)
 	req.Header.Set("Authorization", "Bearer downstream-junk")
@@ -994,54 +989,14 @@ func TestMirrorControlPlaneProxy(t *testing.T) {
 	}
 }
 
-func TestStaticUpstream(t *testing.T) {
-	selector, err := StaticUpstream("https://hub.example/", "tok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, token, err := selector(context.Background(), "org/repo")
-	if err != nil || u.String() != "https://hub.example/" || token != "tok" {
-		t.Fatalf("selector = %v, %q, %v", u, token, err)
-	}
-	for _, raw := range []string{"hub.example", "http://", "://x"} {
-		if _, err := StaticUpstream(raw, ""); err == nil || err.Error() != fmt.Sprintf("hf: invalid upstream URL %q", raw) {
-			t.Fatalf("StaticUpstream(%q) err = %v", raw, err)
-		}
-	}
+// providerFunc adapts a function to client.UpstreamProvider.
+type providerFunc func(ctx context.Context, perm auth.Permission) (string, string, error)
+
+func (f providerFunc) Resolve(ctx context.Context, perm auth.Permission) (string, string, error) {
+	return f(ctx, perm)
 }
 
-func TestProxyRepo(t *testing.T) {
-	for _, tc := range []struct{ path, want string }{
-		{"/api/models/org/repo", "org/repo"},
-		{"/api/models/org/repo/", "org/repo"},
-		{"/api/models/org/repo/tree/main/sub", "org/repo"},
-		{"/api/models/gpt2", "gpt2"},
-		{"/api/models/gpt2/", "gpt2"},
-		{"/api/models/gpt2/refs", "gpt2/refs"},
-		{"/api/datasets/org/repo/tree/main", "datasets/org/repo"},
-		{"/api/spaces/org/repo", "spaces/org/repo"},
-		{"/api/kernels/org/repo/xet-read-token/main", "kernels/org/repo"},
-		{"/api/datasets/org/b%20c/tree/refs%2Fpr%2F1", "datasets/org/b%20c"},
-		{"/org/repo/resolve/main/f.bin", "org/repo"},
-		{"/datasets/org/repo/resolve/refs%2Fpr%2F1/f.bin", "datasets/org/repo"},
-		{"/org/repo.git/info/lfs/objects/batch", "org/repo"},
-		{"/datasets/org/repo.git/info/refs", "datasets/org/repo"},
-		{"/api/models", ""},
-		{"/api/models/", ""},
-		{"/api/models//repo", ""},
-		{"/api/whoami-v2", ""},
-		{"/api/", ""},
-		{"/resolve/main/f.bin", ""},
-		{"/.git/info/refs", ""},
-		{"/", ""},
-		{"", ""},
-	} {
-		if got := proxyRepo(tc.path); got != tc.want {
-			t.Errorf("proxyRepo(%q) = %q, want %q", tc.path, got, tc.want)
-		}
-	}
-}
-
+// The proxy asks the provider with the request context and the method's permission, then forwards to its hub with its token only; a provider error answers 502, its not-found 404, an invalid base 502.
 func TestUpstreamProxySelection(t *testing.T) {
 	echo := func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1057,50 +1012,41 @@ func TestUpstreamProxySelection(t *testing.T) {
 			"body":   string(body),
 		})
 	}
-	srvA, srvB := httptest.NewServer(http.HandlerFunc(echo)), httptest.NewServer(http.HandlerFunc(echo))
-	t.Cleanup(srvA.Close)
-	t.Cleanup(srvB.Close)
-	hubA, _ := url.Parse(srvA.URL + "/hub")
-	hubB, _ := url.Parse(srvB.URL)
+	srv := httptest.NewServer(http.HandlerFunc(echo))
+	t.Cleanup(srv.Close)
 
 	type ctxKey struct{}
-	errBoom := errors.New("selector boom")
-	var seen sync.Map
-	selector := func(ctx context.Context, repo string) (*url.URL, string, error) {
-		seen.Store(repo, ctx.Value(ctxKey{}))
-		switch repo {
-		case "org/a":
-			return hubA, "tok-a", nil
-		case "datasets/org/b%20c":
-			return hubB, "", nil
-		case "org/boom":
-			return nil, "", errBoom
-		case "org/none":
-			return nil, "", nil
-		}
-		return nil, "", fmt.Errorf("no upstream for %q: %w", repo, mirror.ErrUpstreamNotFound)
-	}
-	proxy := NewUpstreamProxy(selector)
+	errBoom := errors.New("provider boom")
+	errNone := fmt.Errorf("no upstream: %w", mirror.ErrUpstreamNotFound)
 
 	for _, tc := range []struct {
 		name, method, target, body string
-		repo                       string
+		base, token                string
+		err                        error
+		perm                       auth.Permission
 		status                     int
 		errText                    string
 		want                       map[string]string
 	}{
-		{"models api under base path with query", http.MethodGet, "/api/models/org/a/tree/main?recursive=true", "", "org/a", http.StatusOK, "",
+		{"models api under base path with query", http.MethodGet, "/api/models/org/a/tree/main?recursive=true", "", srv.URL + "/hub", "tok-a", nil, auth.Read, http.StatusOK, "",
 			map[string]string{"method": "GET", "path": "/hub/api/models/org/a/tree/main", "query": "recursive=true", "auth": "Bearer tok-a", "body": ""}},
-		{"escaped datasets repo, body kept, no token strips downstream auth", http.MethodPost, "/api/datasets/org/b%20c/commit/main", "payload", "datasets/org/b%20c", http.StatusOK, "",
+		{"head asks read", http.MethodHead, "/api/models/org/a", "", srv.URL, "", nil, auth.Read, http.StatusOK, "", nil},
+		{"escaped datasets repo, body kept, no token strips downstream auth", http.MethodPost, "/api/datasets/org/b%20c/commit/main", "payload", srv.URL, "", nil, auth.Write, http.StatusOK, "",
 			map[string]string{"method": "POST", "path": "/api/datasets/org/b%20c/commit/main", "query": "", "auth": "", "body": "payload"}},
-		{"git lfs path", http.MethodPost, "/org/a.git/info/lfs/objects/batch", "{}", "org/a", http.StatusOK, "",
+		{"git lfs path", http.MethodPost, "/org/a.git/info/lfs/objects/batch", "{}", srv.URL + "/hub", "tok-a", nil, auth.Write, http.StatusOK, "",
 			map[string]string{"method": "POST", "path": "/hub/org/a.git/info/lfs/objects/batch", "query": "", "auth": "Bearer tok-a", "body": "{}"}},
-		{"unmapped repo", http.MethodGet, "/api/models/org/other", "", "org/other", http.StatusNotFound, "File not found upstream", nil},
-		{"selector failure", http.MethodGet, "/api/models/org/boom", "", "org/boom", http.StatusBadGateway, "selector boom", nil},
-		{"nil upstream URL", http.MethodGet, "/api/models/org/none", "", "org/none", http.StatusBadGateway, "no upstream", nil},
-		{"no repo in path", http.MethodGet, "/api/whoami-v2", "", "", http.StatusNotFound, "File not found upstream", nil},
+		{"provider not found", http.MethodGet, "/api/models/org/other", "", "", "", errNone, auth.Read, http.StatusNotFound, "File not found upstream", nil},
+		{"provider failure", http.MethodGet, "/api/models/org/boom", "", "", "", errBoom, auth.Read, http.StatusBadGateway, "provider boom", nil},
+		{"empty base", http.MethodGet, "/api/models/org/none", "", "", "", nil, auth.Read, http.StatusBadGateway, `invalid upstream URL ""`, nil},
+		{"scheme-less base", http.MethodPut, "/api/models/org/none", "", "hub.example", "", nil, auth.Write, http.StatusBadGateway, `invalid upstream URL "hub.example"`, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			var gotCtx any
+			var gotPerm auth.Permission
+			proxy := NewUpstreamProxy(providerFunc(func(ctx context.Context, perm auth.Permission) (string, string, error) {
+				gotCtx, gotPerm = ctx.Value(ctxKey{}), perm
+				return tc.base, tc.token, tc.err
+			}))
 			req := httptest.NewRequest(tc.method, tc.target, strings.NewReader(tc.body))
 			req = req.WithContext(context.WithValue(req.Context(), ctxKey{}, tc.name))
 			req.Header.Set("Authorization", "Bearer downstream-junk")
@@ -1109,8 +1055,8 @@ func TestUpstreamProxySelection(t *testing.T) {
 			if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.errText) {
 				t.Fatalf("status = %d, body %q; want %d containing %q", rec.Code, rec.Body, tc.status, tc.errText)
 			}
-			if v, _ := seen.Load(tc.repo); v != tc.name {
-				t.Fatalf("selector saw repo %q with ctx value %v, want this request's", tc.repo, v)
+			if gotCtx != tc.name || gotPerm != tc.perm {
+				t.Fatalf("provider saw ctx value %v, permission %q; want this request's and %q", gotCtx, gotPerm, tc.perm)
 			}
 			if tc.want == nil {
 				return
@@ -1130,16 +1076,16 @@ func TestUpstreamProxySelection(t *testing.T) {
 		})
 	}
 
-	t.Run("nil selector", func(t *testing.T) {
+	t.Run("nil provider", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		NewUpstreamProxy(nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/models/org/a", nil))
-		if rec.Code != http.StatusBadGateway {
-			t.Fatalf("status = %d, body %q; want 502", rec.Code, rec.Body)
+		if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "no upstream provider") {
+			t.Fatalf("status = %d, body %q; want 502 containing no upstream provider", rec.Code, rec.Body)
 		}
 	})
 }
 
-// Both the resolve and the tree route consult the selector before any upstream request: a selector error or nil URL answers 502, its not-found 404, and the escaped repo reaches the selector and the upstream URL verbatim.
+// Both the resolve and the tree route ask the provider for read access before any upstream request: a provider error answers 502, its not-found 404, an invalid base 502; the escaped repo reaches the upstream URL verbatim.
 func TestMirrorUpstreamSelection(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstream.set("/datasets/org/b c/resolve/main/f.bin", []byte("escaped repo bytes"))
@@ -1152,55 +1098,46 @@ func TestMirrorUpstreamSelection(t *testing.T) {
 		upstream.ServeHTTP(w, r)
 	}))
 	defer upstreamSrv.Close()
-	hub, _ := url.Parse(upstreamSrv.URL)
-
-	errBoom := errors.New("selector boom")
-	var seen sync.Map
-	selector := func(_ context.Context, repo string) (*url.URL, string, error) {
-		seen.Store(repo, true)
-		switch repo {
-		case "datasets/org/b%20c":
-			return hub, "tok-datasets", nil
-		case "org/boom":
-			return nil, "", errBoom
-		case "org/none":
-			return nil, "", nil
-		}
-		return nil, "", fmt.Errorf("no upstream for %q: %w", repo, mirror.ErrUpstreamNotFound)
-	}
-	fx := newHubFixtureSelector(t, selector, nil, t.TempDir(), t.TempDir())
 
 	for _, tc := range []struct {
-		name, path, repo string
-		status           int
-		errText          string
+		name, base string
+		err        error
+		status     int
+		errText    string
 	}{
-		{"resolve selector error", "/org/boom/resolve/main/f.bin", "org/boom", http.StatusBadGateway, "selector boom"},
-		{"resolve nil upstream", "/org/none/resolve/main/f.bin", "org/none", http.StatusBadGateway, "no upstream URL selected"},
-		{"resolve unmapped repo", "/org/other/resolve/main/f.bin", "org/other", http.StatusNotFound, "File not found upstream"},
-		{"tree selector error", "/api/models/org/boom/tree/main", "org/boom", http.StatusBadGateway, "selector boom"},
-		{"tree nil upstream", "/api/models/org/none/tree/main", "org/none", http.StatusBadGateway, "no upstream URL selected"},
-		{"tree unmapped repo", "/api/kernels/org/other/tree/main", "kernels/org/other", http.StatusNotFound, "File not found upstream"},
+		{"provider error", "", errors.New("provider boom"), http.StatusBadGateway, "provider boom"},
+		{"provider not found", "", fmt.Errorf("no upstream: %w", mirror.ErrUpstreamNotFound), http.StatusNotFound, "File not found upstream"},
+		{"empty base", "", nil, http.StatusBadGateway, `invalid upstream URL ""`},
+		{"scheme-less base", "hub.example", nil, http.StatusBadGateway, `invalid upstream URL "hub.example"`},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			before := requests.Load()
-			resp, err := noRedirect().Get(fx.srv.URL + tc.path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode != tc.status || !strings.Contains(string(body), tc.errText) {
-				t.Fatalf("status = %d, body %q; want %d containing %q", resp.StatusCode, body, tc.status, tc.errText)
-			}
-			if _, ok := seen.Load(tc.repo); !ok {
-				t.Fatalf("selector was not asked for %q", tc.repo)
-			}
-			if n := requests.Load() - before; n != 0 {
-				t.Fatalf("upstream saw %d requests, want none", n)
-			}
-		})
+		var lastPerm atomic.Value
+		fx := newHubFixtureSelector(t, providerFunc(func(_ context.Context, perm auth.Permission) (string, string, error) {
+			lastPerm.Store(perm)
+			return tc.base, "", tc.err
+		}), nil, t.TempDir(), t.TempDir())
+		for _, path := range []string{"/org/repo/resolve/main/f.bin", "/api/models/org/repo/tree/main"} {
+			t.Run(tc.name+" "+path, func(t *testing.T) {
+				lastPerm.Store(auth.Permission(""))
+				resp, err := noRedirect().Get(fx.srv.URL + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != tc.status || !strings.Contains(string(body), tc.errText) {
+					t.Fatalf("status = %d, body %q; want %d containing %q", resp.StatusCode, body, tc.status, tc.errText)
+				}
+				if got := lastPerm.Load(); got != auth.Read {
+					t.Fatalf("provider was asked for %q, want read", got)
+				}
+				if n := requests.Load(); n != 0 {
+					t.Fatalf("upstream saw %d requests, want none", n)
+				}
+			})
+		}
 	}
+
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(upstreamSrv.URL, "tok-datasets"), nil, t.TempDir(), t.TempDir())
 
 	t.Run("tree escaped repo", func(t *testing.T) {
 		resp, err := http.Get(fx.srv.URL + "/api/datasets/org/b%20c/tree/main?recursive=true")
@@ -1241,10 +1178,6 @@ func TestMirrorUpstreamSelection(t *testing.T) {
 			t.Fatal("upstream URL lost the repo escaping")
 		}
 	})
-
-	if _, ok := seen.Load("datasets/org/b c"); ok {
-		t.Fatal("selector was asked with the decoded repo identity")
-	}
 }
 
 func TestMirrorTokenEndpoint(t *testing.T) {

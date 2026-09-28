@@ -1,4 +1,4 @@
-package client
+package hf
 
 import (
 	"bytes"
@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-
-	"github.com/wzshiming/xet/auth"
 )
 
 // CommitFile is one path of a hub commit and the bytes to store at it.
@@ -85,15 +83,12 @@ type commitResponse struct {
 	CommitURL string `json:"commitUrl"`
 }
 
-// Commit stores files in one commit with summary at the repository revision commitURL names (…/api/{type}s/{repo}/commit/{rev}) the way huggingface_hub does: hub preupload, CAS upload of the large files, one NDJSON commit; token (empty: anonymous) authenticates the hub requests only, and ErrNoChanges reports a revision that already holds or ignores every file.
-func (c *Client) Commit(ctx context.Context, commitURL, token, summary string, files ...CommitFile) (*Commit, error) {
-	hub, err := newHubAPI(c.hubClient(), commitURL, token)
-	if err != nil {
-		return nil, err
-	}
+// Commit stores files in one commit with summary at the bound repository revision the way huggingface_hub does: hub preupload, CAS upload of the large files, one NDJSON commit; ErrNoChanges reports a revision that already holds or ignores every file.
+func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile) (*Commit, error) {
 	if len(files) == 0 {
 		return nil, errors.New("commit needs at least one file")
 	}
+	hub := &hubAPI{httpClient: c.hub, token: c.token, base: c.repo.apiBase(), rev: url.PathEscape(c.repo.Revision)}
 	preupload := preuploadRequest{Files: make([]preuploadFile, 0, len(files))}
 	for _, f := range files {
 		if err := validatePath(f.Path); err != nil {
@@ -115,8 +110,6 @@ func (c *Client) Commit(ctx context.Context, commitURL, token, summary string, f
 		entries[e.Path] = e
 	}
 
-	// The large files go to the CAS with the write token this hub revision mints, whatever provider c is bound to.
-	cas := c.withProvider(NewTokenProvider(hub.httpClient, token, map[auth.Permission]string{auth.Write: hub.url("xet-write-token")}))
 	lines := []commitLine{{Key: "header", Value: commitHeader{Summary: summary}}}
 	for i, f := range files {
 		entry, ok := entries[f.Path]
@@ -138,7 +131,7 @@ func (c *Client) Commit(ctx context.Context, commitURL, token, summary string, f
 			if err := rewind(f.Content); err != nil {
 				return nil, fmt.Errorf("upload %s: %w", f.Path, err)
 			}
-			if _, err := cas.uploadFile(ctx, f.Content, shardAPIVersionV2); err != nil {
+			if _, err := c.Client.UploadFileV2(ctx, f.Content); err != nil {
 				return nil, fmt.Errorf("upload %s: %w", f.Path, err)
 			}
 			lines = append(lines, commitLine{Key: "lfsFile", Value: commitLFSFile{Algo: "sha256", OID: digest, Path: f.Path, Size: preupload.Files[i].Size}})
@@ -169,33 +162,12 @@ func (c *Client) Commit(ctx context.Context, commitURL, token, summary string, f
 	return &Commit{OID: created.CommitOID, URL: created.CommitURL}, nil
 }
 
-// withProvider returns a shallow copy of c bound to p: Client holds no locks, and the copy shares its transports, cache manager and options.
-func (c *Client) withProvider(p UpstreamProvider) *Client {
-	copied := *c
-	copied.provider = p
-	return &copied
-}
-
 // hubAPI reaches the endpoints of one repository revision with the hub token.
 type hubAPI struct {
 	httpClient *http.Client
 	token      string
 	base       string // origin and path up to the endpoint kind: {endpoint}/api/{type}s/{repo}
 	rev        string // escaped as given
-}
-
-// newHubAPI derives the revision's endpoints from commitURL, an absolute http(s) URL ending in /commit/{rev}.
-func newHubAPI(httpClient *http.Client, commitURL, token string) (*hubAPI, error) {
-	u, err := url.Parse(commitURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse commit URL: %w", err)
-	}
-	seg := strings.Split(u.EscapedPath(), "/")
-	n := len(seg)
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || n < 4 || seg[n-2] != "commit" || seg[n-1] == "" {
-		return nil, fmt.Errorf("commit URL %q: want an absolute http(s) URL ending in /{repository}/commit/{revision}", commitURL)
-	}
-	return &hubAPI{httpClient: httpClient, token: token, base: (&url.URL{Scheme: u.Scheme, Host: u.Host}).String() + strings.Join(seg[:n-2], "/"), rev: seg[n-1]}, nil
 }
 
 // url returns the revision's endpoint of the given kind, such as preupload or xet-write-token.

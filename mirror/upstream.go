@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf"
 )
 
 // authInjector limits context-carried credentials to the caller's upstream origin.
@@ -141,7 +141,7 @@ func (p *probeResult) collect(header http.Header) {
 		p.commit = header.Get("X-Repo-Commit")
 	}
 	if !p.xet {
-		links := client.ParseLinkHeaders(header.Values("Link"))
+		links := hf.ParseLinkHeaders(header.Values("Link"))
 		if links["xet-reconstruction-info"] != "" && links["xet-auth"] != "" {
 			p.xet = true
 		}

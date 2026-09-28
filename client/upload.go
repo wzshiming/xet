@@ -61,7 +61,7 @@ func (c *Client) uploadFile(ctx context.Context, readSeeker io.ReadSeeker, shard
 	hash, err := upload.UploadFile(ctx, adapter, readSeeker,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithProgressFunc(c.progressFunc),
-		upload.WithCacheDir(c.cacheDir),
+		upload.WithCacheDir(c.cache.dir),
 		upload.WithEnableSHA256(true),
 	)
 	if err != nil {
@@ -91,7 +91,7 @@ func (c *Client) uploadFiles(ctx context.Context, readSeekers []io.ReadSeeker, s
 	return upload.UploadFiles(ctx, adapter, readSeekers,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithProgressFunc(c.progressFunc),
-		upload.WithCacheDir(c.cacheDir),
+		upload.WithCacheDir(c.cache.dir),
 		upload.WithEnableSHA256(true),
 	)
 }

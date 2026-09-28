@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client/hf/hftest"
 )
 
 const redacted = "<redacted>"

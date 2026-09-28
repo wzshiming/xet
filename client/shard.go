@@ -89,7 +89,7 @@ func (c *Client) UploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upl
 // newShardUploadRequest builds a POST request carrying the encoded shard for
 // the given API version path.
 func (c *Client) newShardUploadRequest(ctx context.Context, version string, shardObj *shard.Shard) (*http.Request, error) {
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
+	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -195,7 +195,7 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 // keyed and cannot be reversed, so only hashes offered as candidates can be
 // matched. Unkeyed shards ignore candidates and index every stored hash.
 func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
+	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -320,7 +320,7 @@ func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHa
 		return nil, fmt.Errorf("marshal batch chunk query: %w", err)
 	}
 
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
+	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}

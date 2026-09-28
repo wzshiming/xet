@@ -648,7 +648,7 @@ func TestWithUpstreamProviderOption(t *testing.T) {
 	if c1.provider != p1 || copied.provider != p2 {
 		t.Fatal("bindings leaked between copies")
 	}
-	if copied.httpClient != c1.httpClient || copied.getHttpClient != c1.getHttpClient || copied.cacheManager != c1.cacheManager {
+	if copied.httpClient != c1.httpClient || copied.getHttpClient != c1.getHttpClient || copied.cache != c1.cache {
 		t.Fatal("copy does not share the HTTP clients and cache")
 	}
 }

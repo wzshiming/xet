@@ -5,7 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/wzshiming/xet/client"
+	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -33,15 +33,18 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("--token is required")
 			}
 
-			repo := client.HubRepo{
+			repo := hfclient.Repo{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
 				RepoID:   hfRepoID,
 				Revision: hfRevision,
 			}
 
-			provider := client.NewHubTokenProvider(nil, repo, hfToken)
-			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
+			cli, err := hfclient.NewClient(nil, repo, hfToken, common.Options(namespace, concurrency, cacheDir, os.Stderr)...)
+			if err != nil {
+				return fmt.Errorf("upload failed: create client: %w", err)
+			}
+			return common.ExecuteUpload(cmd.Context(), args[0], cli.Client, os.Stderr)
 		},
 	}
 

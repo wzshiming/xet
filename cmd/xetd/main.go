@@ -95,25 +95,12 @@ func main() {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
 		// The hub front end handles resolve/token/tree requests through the
 		// mirror engine and proxies the rest to the upstream.
-		xetClient, err := client.NewClient(
-			client.WithCacheDir(filepath.Join(*storageDir, "mirror", "chunks")),
-		)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create xet client: %v\n", err)
-			os.Exit(1)
-		}
-
-		up, err := hf.StaticUpstream(*upstream, *upstreamToken)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create upstream selector: %v\n", err)
-			os.Exit(1)
-		}
+		up := client.StaticUpstreamProvider(*upstream, *upstreamToken)
 		next = hf.NewUpstreamProxy(up)
 
 		mir, err := mirror.NewMirror(
 			mirror.WithStorage(stor),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
-			mirror.WithClient(xetClient),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
@@ -122,7 +109,7 @@ func main() {
 
 		next = hf.NewHandler(
 			hf.WithMirror(mir),
-			hf.WithUpstream(up),
+			hf.WithUpstreamProvider(up),
 			hf.WithExternalURL(*baseURL),
 			hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
 				if req.Permission != auth.Read {

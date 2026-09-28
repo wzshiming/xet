@@ -11,6 +11,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf"
 )
 
 const (
@@ -30,10 +31,10 @@ func baseName(p string) string {
 	return p
 }
 
-// newClient builds a client reporting transfer progress to out.
-func newClient(namespace string, concurrency int, cacheDir string, out io.Writer, opts ...client.Options) (*client.Client, error) {
+// Options returns the client options every xetc transfer uses: namespace, concurrency, chunk cache and progress reporting to out.
+func Options(namespace string, concurrency int, cacheDir string, out io.Writer) []client.Options {
 	progressSummary := newProgressSummary()
-	return client.NewClient(append(opts,
+	return []client.Options{
 		client.WithNamespace(namespace),
 		client.WithProgressFunc(func(name string, current, total int64) {
 			progressSummary.Update(baseName(name), current, total)
@@ -41,10 +42,10 @@ func newClient(namespace string, concurrency int, cacheDir string, out io.Writer
 		}),
 		client.WithConcurrency(concurrency),
 		client.WithCacheDir(cacheDir),
-	)...)
+	}
 }
 
-func ExecuteUpload(ctx context.Context, filename string, provider client.UpstreamProvider, namespace string, concurrency int, cacheDir string, out io.Writer) (err error) {
+func ExecuteUpload(ctx context.Context, filename string, cli *client.Client, out io.Writer) (err error) {
 	if _, err := fmt.Fprintf(out, "%s Uploading file\n", filename); err != nil {
 		return err
 	}
@@ -54,11 +55,6 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.Upstrea
 		return fmt.Errorf("upload failed: open input file: %w", err)
 	}
 	defer f.Close()
-
-	cli, err := newClient(namespace, concurrency, cacheDir, out, client.WithUpstreamProvider(provider))
-	if err != nil {
-		return fmt.Errorf("upload failed: create client: %w", err)
-	}
 
 	fileHash, err := cli.UploadFile(ctx, f)
 	if err != nil {
@@ -75,27 +71,27 @@ func ExecuteUpload(ctx context.Context, filename string, provider client.Upstrea
 	return nil
 }
 
-// ExecuteResolveDownload downloads the Hugging Face file behind resolveURL through the hub's xet links, authenticating with token; the destination is opened only once the resolution succeeded.
+// ExecuteResolveDownload downloads the Hugging Face file behind resolveURL through a client bound to its repository, authenticating with token; the destination is opened only once the resolution succeeded.
 func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile string, concurrency int, cacheDir string, resume bool, out io.Writer) error {
-	cli, err := newClient("default", concurrency, cacheDir, out)
+	repo, path, err := hf.ParseResolveURL(resolveURL)
+	if err != nil {
+		return fmt.Errorf("resolve download target: %w", err)
+	}
+	cli, err := hf.NewClient(nil, repo, token, Options("default", concurrency, cacheDir, out)...)
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}
-	f, err := cli.Resolve(ctx, resolveURL, token)
+	f, err := cli.Resolve(ctx, path)
 	if err != nil {
 		return fmt.Errorf("resolve download target: %w", err)
 	}
 	if _, err := fmt.Fprintf(out, "%s Resolved Hugging Face file hash: %s\n", outputFile, f.Hash.String()); err != nil {
 		return err
 	}
-	return downloadTo(outputFile, resume, out, func(w io.WriteSeeker) error { return cli.DownloadResolved(ctx, f, w) })
+	return downloadTo(outputFile, resume, out, func(w io.WriteSeeker) error { return cli.DownloadFile(ctx, f.Hash, w) })
 }
 
-func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, provider client.UpstreamProvider, namespace string, concurrency int, cacheDir string, resume bool, out io.Writer) (err error) {
-	cli, err := newClient(namespace, concurrency, cacheDir, out, client.WithUpstreamProvider(provider))
-	if err != nil {
-		return fmt.Errorf("create client: %w", err)
-	}
+func ExecuteDownload(ctx context.Context, fileHash xet.FileHash, outputFile string, cli *client.Client, resume bool, out io.Writer) (err error) {
 	return downloadTo(outputFile, resume, out, func(w io.WriteSeeker) error { return cli.DownloadFile(ctx, fileHash, w) })
 }
 

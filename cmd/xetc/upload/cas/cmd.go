@@ -1,6 +1,7 @@
 package cas
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -22,8 +23,11 @@ func NewCommand() *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			provider := client.StaticUpstreamProvider(baseURL, token)
-			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
+			cli, err := client.NewClient(append(common.Options(namespace, concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
+			if err != nil {
+				return fmt.Errorf("upload failed: create client: %w", err)
+			}
+			return common.ExecuteUpload(cmd.Context(), args[0], cli, os.Stderr)
 		},
 	}
 

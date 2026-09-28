@@ -8,16 +8,26 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wzshiming/xet/client/hf"
 )
 
-// fetchXet spools the file over the upstream xet CAS; every attempt re-resolves with the task's pinned hub token.
+// fetchXet spools the file over the upstream xet CAS; every attempt re-resolves through a client bound to the file's repository with the task's pinned hub token.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
+	repo, path, err := hf.ParseResolveURL(t.origin + src.String())
+	if err != nil {
+		return err
+	}
 	return fetchWithRetries(ctx, "xet download", func() error {
-		f, err := m.xetClient.Resolve(ctx, t.origin+src.String(), t.token)
+		c, err := m.newClient(repo, t.token)
+		if err != nil {
+			return err
+		}
+		f, err := c.Resolve(ctx, path)
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return m.xetClient.DownloadResolved(ctx, f, t.spool)
+		return c.DownloadFile(ctx, f.Hash, t.spool)
 	})
 }
 

@@ -26,17 +26,18 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 )
 
 // Handler serves the hub front end routes.
 type Handler struct {
-	mirror   *mirror.Mirror
-	upstream UpstreamFunc
-	root     *mux.Router
-	next     http.Handler
-	external string
-	minter   Minter
+	mirror           *mirror.Mirror
+	upstreamProvider client.UpstreamProvider
+	root             *mux.Router
+	next             http.Handler
+	external         string
+	minter           Minter
 }
 
 // TokenRequest describes a CAS credential request with matched repository variables.
@@ -74,10 +75,10 @@ func WithMirror(m *mirror.Mirror) Option {
 	}
 }
 
-// WithUpstream sets the per-repo selector of the upstream hub and bearer token the resolve and tree routes go through. Required for those routes.
-func WithUpstream(upstreamFunc UpstreamFunc) Option {
+// WithUpstreamProvider sets the provider of the upstream hub URL and bearer token the resolve and tree routes use. Required for those routes.
+func WithUpstreamProvider(upstreamProvider client.UpstreamProvider) Option {
 	return func(h *Handler) {
-		h.upstream = upstreamFunc
+		h.upstreamProvider = upstreamProvider
 	}
 }
 
@@ -165,19 +166,19 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/{repo:.+?}/resolve/{rev}/{path:.+}", h.handleResolve).Methods(http.MethodGet, http.MethodHead)
 }
 
-// upstreamURL joins repo's selected hub with pathAndQuery and returns that hub's bearer token alongside.
-func (h *Handler) upstreamURL(ctx context.Context, repo, pathAndQuery string) (string, string, error) {
-	if h.upstream == nil {
-		return "", "", errors.New("hf: no upstream selector")
+// upstreamURL joins the provider's hub with pathAndQuery and returns that hub's bearer token alongside.
+func (h *Handler) upstreamURL(ctx context.Context, pathAndQuery string) (string, string, error) {
+	if h.upstreamProvider == nil {
+		return "", "", errors.New("hf: no upstream provider")
 	}
-	u, token, err := h.upstream(ctx, repo)
+	base, token, err := h.upstreamProvider.Resolve(ctx, auth.Read)
 	if err != nil {
 		return "", "", err
 	}
-	if u == nil {
-		return "", "", fmt.Errorf("hf: no upstream URL selected for %q", repo)
+	if _, err := upstreamBase(base); err != nil {
+		return "", "", err
 	}
-	return strings.TrimRight(u.String(), "/") + pathAndQuery, token, nil
+	return strings.TrimRight(base, "/") + pathAndQuery, token, nil
 }
 
 // handleResolve serves GET/HEAD for hub-style download paths through the
@@ -186,7 +187,7 @@ func (h *Handler) upstreamURL(ctx context.Context, repo, pathAndQuery string) (s
 func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	repo, rev, path := vars["repo"], vars["rev"], vars["path"]
-	target, token, err := h.upstreamURL(r.Context(), repo, "/"+repo+"/resolve/"+rev+"/"+path)
+	target, token, err := h.upstreamURL(r.Context(), "/"+repo+"/resolve/"+rev+"/"+path)
 	if err != nil {
 		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 		return
@@ -395,14 +396,6 @@ type treeLFS struct {
 	Size        int64  `json:"size"`
 }
 
-// repoIdentity is the repo identity as the mirror keys it: the prefix of the typed route's resolve path.
-func repoIdentity(typ, repo string) string {
-	if typ == "models" {
-		return repo
-	}
-	return typ + "/" + repo
-}
-
 // handleTree proxies a tree listing API request, rewriting each entry's
 // xetHash: entries whose lfs sha256 oid resolves in local storage advertise
 // the mirror's own hash so xet clients reconstruct them from the mirror CAS;
@@ -413,12 +406,11 @@ func repoIdentity(typ, repo string) string {
 // rewritten in a streaming pass, so a listing is never buffered whole; no
 // upstream header is forwarded, only the body is relayed.
 func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
 	pathAndQuery := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		pathAndQuery += "?" + r.URL.RawQuery
 	}
-	target, token, err := h.upstreamURL(r.Context(), repoIdentity(vars["type"], vars["repo"]), pathAndQuery)
+	target, token, err := h.upstreamURL(r.Context(), pathAndQuery)
 	if err != nil {
 		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 		return

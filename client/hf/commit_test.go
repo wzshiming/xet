@@ -1,4 +1,4 @@
-package client_test
+package hf_test
 
 import (
 	"bytes"
@@ -24,7 +24,8 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/client/hf/hftest"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage/local"
 )
@@ -67,6 +68,17 @@ func (l *casLog) requests() []hftest.Request {
 	return slices.Clone(l.reqs)
 }
 
+// xorbFetches counts the CAS requests that reached a xorb, uploads and data fetches alike.
+func (l *casLog) xorbFetches() int {
+	n := 0
+	for _, req := range l.requests() {
+		if strings.Contains(req.Path, "/xorbs/") {
+			n++
+		}
+	}
+	return n
+}
+
 // spyProvider counts the resolutions asked of the provider it wraps.
 type spyProvider struct {
 	inner client.UpstreamProvider
@@ -83,7 +95,7 @@ type privateRepo struct {
 	hub    *hftest.Hub
 	cas    *casLog
 	opts   hftest.Options // the hub's; a second hub on the same CAS varies them
-	target client.HubRepo
+	target hf.Repo
 	hc     *http.Client
 }
 
@@ -102,31 +114,23 @@ func newPrivateRepo(t *testing.T) *privateRepo {
 	t.Cleanup(cas.Close)
 	opts := hftest.Options{Token: hubSecret, CAS: cas.URL, Issuer: issuer, Storage: stor}
 	hub := hftest.NewHub(t, opts)
-	return &privateRepo{hub: hub, cas: log, opts: opts, target: client.HubRepo{Endpoint: hub.URL, RepoID: repoID}, hc: &http.Client{}}
+	return &privateRepo{hub: hub, cas: log, opts: opts, target: hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hc: &http.Client{}}
 }
 
-// committer returns a client with no bound provider: Commit and Resolve need none.
-func (r *privateRepo) committer(t *testing.T) *client.Client {
+// committer returns a client bound to the repository with the hub token.
+func (r *privateRepo) committer(t *testing.T) *hf.Client {
 	t.Helper()
-	c, err := client.NewClient(client.WithHTTPClient(r.hc), client.WithCacheDir(t.TempDir()))
+	return r.bound(t, r.target, hubSecret)
+}
+
+// bound returns a client bound to target with hfToken.
+func (r *privateRepo) bound(t *testing.T, target hf.Repo, hfToken string) *hf.Client {
+	t.Helper()
+	c, err := hf.NewClient(r.hc, target, hfToken, client.WithCacheDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
-}
-
-// bound returns a client bound to target's token endpoints with hfToken.
-func (r *privateRepo) bound(t *testing.T, target client.HubRepo, hfToken string) *client.Client {
-	t.Helper()
-	c, err := client.NewClient(client.WithHTTPClient(r.hc), client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.NewHubTokenProvider(r.hc, target, hfToken)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c
-}
-
-func (r *privateRepo) commitURL() string {
-	return r.target.CommitURL()
 }
 
 func (r *privateRepo) resolveURL(path string) string {
@@ -198,8 +202,8 @@ func download(t *testing.T, fn func(io.WriteSeeker) error) ([]byte, error) {
 	return os.ReadFile(f.Name())
 }
 
-func files(lfsData []byte) []client.CommitFile {
-	return []client.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData)}}
+func files(lfsData []byte) []hf.CommitFile {
+	return []hf.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData)}}
 }
 
 func sha256Hex(data []byte) string {
@@ -207,14 +211,14 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// A commit through the private hub by a client bound to nothing stores the lfs file in the CAS and the text file in the hub; both come back through Resolve, a bound provider and a plain GET, each credential staying on its own origin.
+// A commit through the private hub stores the lfs file in the CAS and the text file in the hub; both come back through Resolve, the bound client and a plain GET, each credential staying on its own origin.
 func TestCommitRoundTrip(t *testing.T) {
 	repo := newPrivateRepo(t)
 	ctx := t.Context()
 	lfsData := deterministic(1 << 20)
 
 	c := repo.committer(t)
-	commit, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: round trip", files(lfsData)...)
+	commit, err := c.Commit(ctx, "test: round trip", files(lfsData)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,16 +230,17 @@ func TestCommitRoundTrip(t *testing.T) {
 	}
 	uploaded := len(repo.hub.Requests())
 
-	f, err := c.Resolve(ctx, repo.resolveURL(lfsPath), hubSecret)
+	f, err := c.Resolve(ctx, lfsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := download(t, func(w io.WriteSeeker) error { return c.DownloadResolved(ctx, f, w) })
+	got, err := download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, f.Hash, w) })
 	if err != nil || !bytes.Equal(got, lfsData) {
-		t.Fatalf("DownloadResolved: %d bytes, %v; want %d", len(got), err, len(lfsData))
+		t.Fatalf("DownloadFile: %d bytes, %v; want %d", len(got), err, len(lfsData))
 	}
+	// Resolve only HEADs; the bound client fetches its read token once for the download.
 	if got := routes(repo.hub.Requests()[uploaded:]); !slices.Equal(got, []string{"HEAD resolve", "GET xet-read-token"}) {
-		t.Fatalf("resolve hub routes = %q", got)
+		t.Fatalf("resolve and download hub routes = %q", got)
 	}
 
 	resp, _ := repo.get(t, http.MethodHead, repo.resolveURL(lfsPath), hubSecret)
@@ -280,17 +285,18 @@ func TestCommitRoundTrip(t *testing.T) {
 	}
 }
 
-// Commit takes its CAS credential from the revision the commit URL names, not from the client's binding: a client bound to a wrong provider commits with the right one, and the binding is neither consulted nor replaced.
-func TestCommitIgnoresBoundProvider(t *testing.T) {
+// NewClient binds the CAS operations to the repository whatever provider opts name: neither Commit nor a download afterwards consults the user's provider.
+func TestNewClientOverridesUserProvider(t *testing.T) {
 	repo := newPrivateRepo(t)
 	ctx := t.Context()
-	wrong := &spyProvider{inner: client.NewHubTokenProvider(repo.hc, repo.target, wrongToken)}
-	c, err := client.NewClient(client.WithHTTPClient(repo.hc), client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong))
+	lfsData := deterministic(1 << 20)
+	wrong := &spyProvider{inner: hf.NewTokenProvider(repo.hc, repo.target, wrongToken)}
+	c, err := hf.NewClient(repo.hc, repo.target, hubSecret, client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(wrong))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	commit, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: bound provider", files(deterministic(1<<20))...)
+	commit, err := c.Commit(ctx, "test: user provider", files(lfsData)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +304,7 @@ func TestCommitIgnoresBoundProvider(t *testing.T) {
 		t.Fatalf("commit = %+v, hub head %s", commit, repo.hub.Head())
 	}
 	if n := wrong.calls.Load(); n != 0 {
-		t.Fatalf("Commit resolved through the bound provider %d times", n)
+		t.Fatalf("Commit resolved through the user's provider %d times", n)
 	}
 	reqs := repo.hub.Requests()
 	if got := routes(reqs); !slices.Equal(got, []string{"POST preupload", "GET xet-write-token", "POST commit"}) {
@@ -310,59 +316,72 @@ func TestCommitIgnoresBoundProvider(t *testing.T) {
 		}
 	}
 
-	// The binding still holds the wrong provider: a download through it is what the hub rejects.
-	_, err = download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, xet.FileHash{}, w) })
-	if err == nil || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("DownloadFile through the bound provider = %v, want the hub's 401", err)
+	f, err := c.Resolve(ctx, lfsPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := wrong.calls.Load(); n != 1 {
-		t.Fatalf("the bound provider was resolved %d times by DownloadFile, want once", n)
+	got, err := download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, f.Hash, w) })
+	if err != nil || !bytes.Equal(got, lfsData) {
+		t.Fatalf("DownloadFile: %d bytes, %v; want %d", len(got), err, len(lfsData))
 	}
-	if got := routes(repo.hub.Requests()[len(reqs):]); !slices.Equal(got, []string{"GET xet-read-token"}) || repo.hub.Requests()[len(reqs)].Authorization != "Bearer <wrong>" {
-		t.Fatalf("download hub routes = %q, want one read-token request with the wrong token", got)
+	if n := wrong.calls.Load(); n != 0 {
+		t.Fatalf("DownloadFile resolved through the user's provider %d times", n)
 	}
 }
 
-// Commit rejects a URL that does not name a revision's commit endpoint before asking the hub or the CAS anything.
-func TestCommitRejectsMalformedURL(t *testing.T) {
+// Two clients bound to the repository sharing one Cache download a resolved file, the second from the shared chunks alone.
+func TestBoundClientsShareCache(t *testing.T) {
 	repo := newPrivateRepo(t)
-	c := repo.committer(t)
-	for _, commitURL := range []string{
-		repo.hub.URL + "/api/models/o/r/main",
-		repo.hub.URL + "/" + repoID + "/resolve/main/x",
-		"api/models/o/r/commit/main",
-		repo.hub.URL + "/commit/main",
-		repo.hub.URL + "/api/models/o/r/commit/",
-		repo.hub.URL + "/api/models/o/r/commit/%zz",
-		"",
-	} {
-		_, err := c.Commit(t.Context(), commitURL, hubSecret, "test: url", client.CommitFile{Path: textPath, Content: strings.NewReader(textData)})
-		if err == nil || !strings.Contains(err.Error(), "commit URL") {
-			t.Fatalf("Commit(%q) = %v, want a commit URL error", commitURL, err)
+	ctx := t.Context()
+	lfsData := deterministic(1 << 20)
+	if _, err := repo.committer(t).Commit(ctx, "test: shared cache", files(lfsData)...); err != nil {
+		t.Fatal(err)
+	}
+
+	shared := client.NewCache(t.TempDir(), 0)
+	clients := make([]*hf.Client, 2)
+	for i := range clients {
+		c, err := hf.NewClient(repo.hc, repo.target, hubSecret, client.WithCache(shared))
+		if err != nil {
+			t.Fatal(err)
 		}
+		clients[i] = c
 	}
-	if n := len(repo.hub.Requests()); n != 0 {
-		t.Fatalf("hub saw %d requests for malformed commit URLs", n)
+	f, err := clients[0].Resolve(ctx, lfsPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := len(repo.cas.requests()); n != 0 {
-		t.Fatalf("the CAS saw %d requests for malformed commit URLs", n)
+	fetch := func(c *hf.Client) int {
+		t.Helper()
+		got, err := download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, f.Hash, w) })
+		if err != nil || !bytes.Equal(got, lfsData) {
+			t.Fatalf("DownloadFile: %d bytes, %v; want %d", len(got), err, len(lfsData))
+		}
+		return repo.cas.xorbFetches()
+	}
+	uploaded := repo.cas.xorbFetches()
+	n1 := fetch(clients[0])
+	if n2 := fetch(clients[1]); n1 == uploaded || n2 != n1 {
+		t.Fatalf("xorb requests = %d after the first client, %d after the second (%d from the upload); want the second served from the shared cache", n1, n2, uploaded)
+	}
+	if u, err := shared.Usage(ctx); err != nil || u.Download.Count == 0 {
+		t.Fatalf("shared usage = %+v, %v; want entries", u, err)
 	}
 }
 
-// The preupload, write-token and commit endpoints derive from the commit URL, its revision kept escaped as given.
+// The preupload, write-token and commit endpoints derive from the bound repository, its revision escaped.
 func TestCommitEscapedRevision(t *testing.T) {
 	repo := newPrivateRepo(t)
 	opts := repo.opts
 	opts.Revision = "refs/pr/1"
 	hub := hftest.NewHub(t, opts)
-	target := client.HubRepo{Endpoint: hub.URL, RepoID: repoID, Revision: opts.Revision}
-	commitURL := target.CommitURL()
-	if want := hub.URL + "/api/models/" + repoID + "/commit/refs%2Fpr%2F1"; commitURL != want {
-		t.Fatalf("CommitURL = %q, want %q", commitURL, want)
+	target := hf.Repo{Endpoint: hub.URL, RepoID: repoID, Revision: opts.Revision}
+	if got, want := target.CommitURL(), hub.URL+"/api/models/"+repoID+"/commit/refs%2Fpr%2F1"; got != want {
+		t.Fatalf("CommitURL = %q, want %q", got, want)
 	}
 
-	c := repo.committer(t)
-	if _, err := c.Commit(t.Context(), commitURL, hubSecret, "test: escaped revision", files(deterministic(1<<16))...); err != nil {
+	c := repo.bound(t, target, hubSecret)
+	if _, err := c.Commit(t.Context(), "test: escaped revision", files(deterministic(1<<16))...); err != nil {
 		t.Fatal(err)
 	}
 	var paths []string
@@ -383,7 +402,7 @@ func TestCommitEscapedRevision(t *testing.T) {
 func TestCommitWireShape(t *testing.T) {
 	repo := newPrivateRepo(t)
 	lfsData := deterministic(1 << 20)
-	if _, err := repo.committer(t).Commit(t.Context(), repo.commitURL(), hubSecret, "test: wire shape", files(lfsData)...); err != nil {
+	if _, err := repo.committer(t).Commit(t.Context(), "test: wire shape", files(lfsData)...); err != nil {
 		t.Fatal(err)
 	}
 	ref := hftest.Fixture(t, "ref-upload")
@@ -508,13 +527,13 @@ func TestCommitUnchanged(t *testing.T) {
 	ctx := t.Context()
 	lfsData := deterministic(1 << 20)
 	c := repo.committer(t)
-	if _, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: first", files(lfsData)...); err != nil {
+	if _, err := c.Commit(ctx, "test: first", files(lfsData)...); err != nil {
 		t.Fatal(err)
 	}
 	before := len(repo.hub.Requests())
 
-	commit, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: again", files(lfsData)...)
-	if !errors.Is(err, client.ErrNoChanges) || commit != nil {
+	commit, err := c.Commit(ctx, "test: again", files(lfsData)...)
+	if !errors.Is(err, hf.ErrNoChanges) || commit != nil {
 		t.Fatalf("Commit of unchanged content = %v, %v; want ErrNoChanges", commit, err)
 	}
 	if got := routes(repo.hub.Requests()[before:]); !slices.Equal(got, []string{"POST preupload"}) {
@@ -525,8 +544,8 @@ func TestCommitUnchanged(t *testing.T) {
 	}
 
 	before = len(repo.hub.Requests())
-	changed := []client.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData + "changed\n")}}
-	if _, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: text", changed...); err != nil {
+	changed := []hf.CommitFile{{Path: lfsPath, Content: bytes.NewReader(lfsData)}, {Path: textPath, Content: strings.NewReader(textData + "changed\n")}}
+	if _, err := c.Commit(ctx, "test: text", changed...); err != nil {
 		t.Fatal(err)
 	}
 	reqs := repo.hub.Requests()[before:]
@@ -562,9 +581,9 @@ func TestPrivateRepoRejectsBadCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newPrivateRepo(t)
 			ctx := t.Context()
-			c := repo.committer(t)
+			c := repo.bound(t, repo.target, tc.token)
 
-			_, err := c.Commit(ctx, repo.commitURL(), tc.token, "test: denied", files(deterministic(4096))...)
+			_, err := c.Commit(ctx, "test: denied", files(deterministic(4096))...)
 			if err == nil || !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "Invalid username or password.") {
 				t.Fatalf("Commit = %v, want the hub's 401", err)
 			}
@@ -576,15 +595,14 @@ func TestPrivateRepoRejectsBadCredentials(t *testing.T) {
 				t.Fatal("the CAS saw a request without a hub credential")
 			}
 
-			if _, err := c.Resolve(ctx, repo.resolveURL(lfsPath), tc.token); err == nil || !strings.Contains(err.Error(), "401") {
+			if _, err := c.Resolve(ctx, lfsPath); err == nil || !strings.Contains(err.Error(), "401") {
 				t.Fatalf("Resolve = %v, want 401", err)
 			}
 			if got := routes(repo.hub.Requests()[1:]); !slices.Equal(got, []string{"HEAD resolve"}) {
 				t.Fatalf("resolve hub routes = %q, want one HEAD", got)
 			}
 
-			bound := repo.bound(t, repo.target, tc.token)
-			if _, err := download(t, func(w io.WriteSeeker) error { return bound.DownloadFile(ctx, xet.FileHash{}, w) }); err == nil || !strings.Contains(err.Error(), "401") {
+			if _, err := download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, xet.FileHash{}, w) }); err == nil || !strings.Contains(err.Error(), "401") {
 				t.Fatalf("DownloadFile = %v, want 401", err)
 			}
 			if got := routes(repo.hub.Requests()[2:]); !slices.Equal(got, []string{"GET xet-read-token"}) {
@@ -604,9 +622,9 @@ func TestCommitDanglingLFS(t *testing.T) {
 	opts := repo.opts
 	opts.Storage = empty
 	hub := hftest.NewHub(t, opts)
-	commitURL := client.HubRepo{Endpoint: hub.URL, RepoID: repoID}.CommitURL()
+	c := repo.bound(t, hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
 
-	_, err = repo.committer(t).Commit(t.Context(), commitURL, hubSecret, "test: dangling", client.CommitFile{Path: lfsPath, Content: bytes.NewReader(deterministic(1 << 20))})
+	_, err = c.Commit(t.Context(), "test: dangling", hf.CommitFile{Path: lfsPath, Content: bytes.NewReader(deterministic(1 << 20))})
 	if err == nil || !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "LFS pointer pointed to a file that does not exist") || !strings.Contains(err.Error(), lfsPath) {
 		t.Fatalf("Commit = %v, want the hub's dangling lfs rejection", err)
 	}
@@ -643,17 +661,17 @@ func TestCommitSharedReader(t *testing.T) {
 			opts := repo.opts
 			opts.UploadMode = lfsByExtension
 			hub := hftest.NewHub(t, opts)
-			c := repo.committer(t)
+			c := repo.bound(t, hf.Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
 
 			shared := bytes.NewReader(data)
 			if _, err := shared.Seek(int64(len(data)/2), io.SeekStart); err != nil {
 				t.Fatal(err)
 			}
-			files := make([]client.CommitFile, 0, len(tc.paths))
+			files := make([]hf.CommitFile, 0, len(tc.paths))
 			for _, path := range tc.paths {
-				files = append(files, client.CommitFile{Path: path, Content: shared})
+				files = append(files, hf.CommitFile{Path: path, Content: shared})
 			}
-			if _, err := c.Commit(ctx, client.HubRepo{Endpoint: hub.URL, RepoID: repoID}.CommitURL(), hubSecret, "test: shared reader", files...); err != nil {
+			if _, err := c.Commit(ctx, "test: shared reader", files...); err != nil {
 				t.Fatal(err)
 			}
 
@@ -661,11 +679,11 @@ func TestCommitSharedReader(t *testing.T) {
 				url := hub.URL + "/" + repoID + "/resolve/main/" + path
 				var got []byte
 				if lfsByExtension(path, nil, 0) == "lfs" {
-					f, err := c.Resolve(ctx, url, hubSecret)
+					f, err := c.Resolve(ctx, path)
 					if err != nil {
 						t.Fatalf("resolve %s: %v", path, err)
 					}
-					if got, err = download(t, func(w io.WriteSeeker) error { return c.DownloadResolved(ctx, f, w) }); err != nil {
+					if got, err = download(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, f.Hash, w) }); err != nil {
 						t.Fatalf("download %s: %v", path, err)
 					}
 				} else {
@@ -689,11 +707,11 @@ func TestCommitPathsAndSamples(t *testing.T) {
 	ctx := t.Context()
 	c := repo.committer(t)
 
-	if _, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: empty"); err == nil {
+	if _, err := c.Commit(ctx, "test: empty"); err == nil {
 		t.Fatal("Commit without files succeeded")
 	}
 	for _, path := range []string{"", "/abs.bin", "a/../b", "./a", "a//b", "a/", ".", ".."} {
-		if _, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: path", client.CommitFile{Path: path, Content: strings.NewReader("x")}); err == nil || !strings.Contains(err.Error(), "invalid path") {
+		if _, err := c.Commit(ctx, "test: path", hf.CommitFile{Path: path, Content: strings.NewReader("x")}); err == nil || !strings.Contains(err.Error(), "invalid path") {
 			t.Fatalf("Commit(%q) = %v, want invalid path", path, err)
 		}
 	}
@@ -708,7 +726,7 @@ func TestCommitPathsAndSamples(t *testing.T) {
 	}
 
 	long, short := deterministic(600), []byte(textData)
-	if _, err := c.Commit(ctx, repo.commitURL(), hubSecret, "test: samples", client.CommitFile{Path: "a/long.bin", Content: bytes.NewReader(long)}, client.CommitFile{Path: "a/short.txt", Content: bytes.NewReader(short)}); err != nil {
+	if _, err := c.Commit(ctx, "test: samples", hf.CommitFile{Path: "a/long.bin", Content: bytes.NewReader(long)}, hf.CommitFile{Path: "a/short.txt", Content: bytes.NewReader(short)}); err != nil {
 		t.Fatal(err)
 	}
 	got := preuploadSamples(t, requestOf(t, repo.hub.Requests(), "POST preupload").Body)

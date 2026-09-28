@@ -17,7 +17,8 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf/hftest"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage/local"
@@ -163,7 +164,7 @@ type casToken struct {
 // never as the downstream, while read tokens are minted locally.
 func TestMirrorPrivateUpstream(t *testing.T) {
 	p := newPrivateHub(t)
-	fx := newHubFixtureSelector(t, staticUpstream(t, p.hub.URL, privateToken), nil, t.TempDir(), t.TempDir())
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(p.hub.URL, privateToken), nil, t.TempDir(), t.TempDir())
 	weightsURL := p.resolveURL(fx.srv.URL, weightsPath)
 	readmeURL := p.resolveURL(fx.srv.URL, readmePath)
 	sum := sha256.Sum256(p.weights)
@@ -337,20 +338,20 @@ func assertUpstreamDenied(t *testing.T, p *privateHub, fx *hubFixture, wantAuth 
 
 func TestMirrorPrivateUpstreamWithoutToken(t *testing.T) {
 	p := newPrivateHub(t)
-	fx := newHubFixtureSelector(t, staticUpstream(t, p.hub.URL, ""), nil, t.TempDir(), t.TempDir())
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(p.hub.URL, ""), nil, t.TempDir(), t.TempDir())
 	assertUpstreamDenied(t, p, fx, "")
 }
 
 func TestMirrorPrivateUpstreamWrongToken(t *testing.T) {
 	p := newPrivateHub(t)
-	fx := newHubFixtureSelector(t, staticUpstream(t, p.hub.URL, "not-the-secret"), nil, t.TempDir(), t.TempDir())
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(p.hub.URL, "not-the-secret"), nil, t.TempDir(), t.TempDir())
 	assertUpstreamDenied(t, p, fx, "Bearer <wrong>")
 }
 
 // Revalidating a ready file re-probes the private upstream with the configured token.
 func TestMirrorPrivateUpstreamRevalidation(t *testing.T) {
 	p := newPrivateHub(t)
-	fx := newHubFixtureSelector(t, staticUpstream(t, p.hub.URL, privateToken), nil, t.TempDir(), t.TempDir(), mirror.WithRevalidateInterval(0))
+	fx := newHubFixtureSelector(t, client.StaticUpstreamProvider(p.hub.URL, privateToken), nil, t.TempDir(), t.TempDir(), mirror.WithRevalidateInterval(0))
 	weightsURL := p.resolveURL(fx.srv.URL, weightsPath)
 
 	resp, body := roundTrip(t, http.DefaultClient, http.MethodGet, weightsURL, "")
