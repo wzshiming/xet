@@ -203,14 +203,13 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamFunc, err := mirror.StaticUpstream(upstream, "")
+	upstreamFunc, err := hf.StaticUpstream(upstream, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(upstreamFunc),
 			mirror.WithCacheDir(cacheDir),
 		}, opts...)...,
 	)
@@ -219,6 +218,7 @@ func startMirror(t *testing.T, upstream, storageDir, cacheDir string, opts ...mi
 	}
 	hfh := hf.NewHandler(
 		hf.WithMirror(m),
+		hf.WithUpstream(upstreamFunc),
 		hf.WithExternalURL(srv.URL),
 		hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
 			if req.Permission != auth.Read {

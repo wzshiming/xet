@@ -1,17 +1,31 @@
 package hf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 
 	"github.com/wzshiming/xet/mirror"
 )
 
+// UpstreamFunc selects the upstream hub and bearer token for an escaped repo; a nil URL means no upstream.
+type UpstreamFunc func(ctx context.Context, repo string) (*url.URL, string, error)
+
+// StaticUpstream returns a selector that sends every repo to one hub.
+func StaticUpstream(rawURL, token string) (UpstreamFunc, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("hf: invalid upstream URL %q", rawURL)
+	}
+	return func(context.Context, string) (*url.URL, string, error) { return u, token, nil }, nil
+}
+
 // NewUpstreamProxy forwards to selected upstreams without forwarding downstream credentials.
-func NewUpstreamProxy(upstreamFunc mirror.UpstreamFunc) http.Handler {
+func NewUpstreamProxy(upstreamFunc UpstreamFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if upstreamFunc == nil {
 			serveFetchError(w, false, errors.New("hf: no upstream selector"))

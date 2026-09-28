@@ -383,7 +383,7 @@ func invertedData(size int) []byte {
 
 func newGCClient(t *testing.T, baseURL string) *client.Client {
 	t.Helper()
-	c, err := client.NewClient(client.WithBaseURL(baseURL), client.WithCacheDir(t.TempDir()))
+	c, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}

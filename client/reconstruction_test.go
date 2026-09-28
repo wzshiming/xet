@@ -64,7 +64,7 @@ func TestGetReconstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	client, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "test-token")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -114,8 +114,8 @@ func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 	defer server.Close()
 
 	c, err := NewClient(
-		WithBaseURL(server.URL),
 		WithRetries(2),
+		WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -139,7 +139,7 @@ func TestGetReconstructionError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithBaseURL(server.URL))
+	client, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestGetReconstructionRange(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithBaseURL(server.URL))
+	client, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestGetReconstructionV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(WithBaseURL(server.URL), WithToken("test-token"))
+	c, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "test-token")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestGetReconstructionV2Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(WithBaseURL(server.URL))
+	c, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestGetReconstructionRangeV2(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(WithBaseURL(server.URL))
+	c, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestGetReconstructionRangeStatusOK(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(WithBaseURL(server.URL))
+	client, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestGetReconstructionRangeV2StatusOK(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(WithBaseURL(server.URL))
+	c, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestGetReconstructionRangeErrorStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := NewClient(WithBaseURL(server.URL))
+	c, err := NewClient(WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			run := func(t *testing.T, fx *downloadFixture, prefix []byte) ([]byte, error) {
 				t.Helper()
-				c, err := NewClient(WithBaseURL(fx.srv.URL), WithCacheDir(t.TempDir()))
+				c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -653,7 +653,7 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	fx := newDownloadFixture(t, 1, 2)
 	fx.substitute(t, 1)
-	c, err := NewClient(WithBaseURL(fx.srv.URL), WithCacheDir(t.TempDir()))
+	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}

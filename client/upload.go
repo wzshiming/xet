@@ -9,9 +9,8 @@ import (
 	"github.com/wzshiming/xet/upload"
 )
 
-type authProviderUploadAdapter struct {
+type uploadAdapter struct {
 	client          *Client
-	provider        AuthProvider
 	shardAPIVersion shardAPIVersion
 }
 
@@ -22,58 +21,43 @@ const (
 	shardAPIVersionV2 shardAPIVersion = 2
 )
 
-func (a authProviderUploadAdapter) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
-	return a.client.HasXorbWithAuthProvider(ctx, a.provider, xorbHash)
+func (a uploadAdapter) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
+	return a.client.HasXorb(ctx, xorbHash)
 }
 
-func (a authProviderUploadAdapter) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
-	return a.client.UploadXorbWithAuthProvider(ctx, a.provider, xorbHash, reader)
+func (a uploadAdapter) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
+	return a.client.UploadXorb(ctx, xorbHash, reader)
 }
 
-func (a authProviderUploadAdapter) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
+func (a uploadAdapter) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
 	if a.shardAPIVersion == shardAPIVersionV2 {
-		return a.client.UploadShardV2WithAuthProvider(ctx, a.provider, shardObj)
+		return a.client.UploadShardV2(ctx, shardObj)
 	}
-	return a.client.UploadShardWithAuthProvider(ctx, a.provider, shardObj)
+	return a.client.UploadShard(ctx, shardObj)
 }
 
-func (a authProviderUploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	return a.client.QueryDedupShardsWithAuthProvider(ctx, a.provider, chunkHashes, candidates...)
+func (a uploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+	return a.client.QueryDedupShards(ctx, chunkHashes, candidates...)
 }
 
-// UploadFile uploads a single file through the V1 shard API and returns its hash.
+// UploadFile uploads a single file through the V1 shard API and returns its
+// hash.
 func (c *Client) UploadFile(ctx context.Context, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.UploadFileWithAuthProvider(ctx, nil, readSeeker)
+	return c.uploadFile(ctx, readSeeker, shardAPIVersionV1)
 }
 
-// UploadFileV1 uploads a single file using the V1 shard API.
+// UploadFileV1 uploads a single file through the V1 shard API.
 func (c *Client) UploadFileV1(ctx context.Context, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.UploadFileV1WithAuthProvider(ctx, nil, readSeeker)
+	return c.uploadFile(ctx, readSeeker, shardAPIVersionV1)
 }
 
-// UploadFileV2 uploads a single file using the V2 shard API.
+// UploadFileV2 uploads a single file through the V2 shard API.
 func (c *Client) UploadFileV2(ctx context.Context, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.UploadFileV2WithAuthProvider(ctx, nil, readSeeker)
+	return c.uploadFile(ctx, readSeeker, shardAPIVersionV2)
 }
 
-// UploadFileWithAuthProvider uploads a single file through the V1 shard API
-// using a per-call auth provider and returns its hash.
-func (c *Client) UploadFileWithAuthProvider(ctx context.Context, provider AuthProvider, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.uploadFileWithAuthProvider(ctx, provider, readSeeker, shardAPIVersionV1)
-}
-
-// UploadFileV1WithAuthProvider uploads a single file through the V1 shard API.
-func (c *Client) UploadFileV1WithAuthProvider(ctx context.Context, provider AuthProvider, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.uploadFileWithAuthProvider(ctx, provider, readSeeker, shardAPIVersionV1)
-}
-
-// UploadFileV2WithAuthProvider uploads a single file through the V2 shard API.
-func (c *Client) UploadFileV2WithAuthProvider(ctx context.Context, provider AuthProvider, readSeeker io.ReadSeeker) (xet.FileHash, error) {
-	return c.uploadFileWithAuthProvider(ctx, provider, readSeeker, shardAPIVersionV2)
-}
-
-func (c *Client) uploadFileWithAuthProvider(ctx context.Context, provider AuthProvider, readSeeker io.ReadSeeker, shardAPIVersion shardAPIVersion) (xet.FileHash, error) {
-	adapter := authProviderUploadAdapter{client: c, provider: provider, shardAPIVersion: shardAPIVersion}
+func (c *Client) uploadFile(ctx context.Context, readSeeker io.ReadSeeker, shardAPIVersion shardAPIVersion) (xet.FileHash, error) {
+	adapter := uploadAdapter{client: c, shardAPIVersion: shardAPIVersion}
 	hash, err := upload.UploadFile(ctx, adapter, readSeeker,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithProgressFunc(c.progressFunc),
@@ -86,39 +70,24 @@ func (c *Client) uploadFileWithAuthProvider(ctx context.Context, provider AuthPr
 	return hash, nil
 }
 
-// UploadFiles uploads multiple files through the V1 shard API and returns their hashes.
+// UploadFiles uploads multiple files through the V1 shard API and returns
+// their hashes.
 func (c *Client) UploadFiles(ctx context.Context, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.UploadFilesWithAuthProvider(ctx, nil, readSeekers)
+	return c.uploadFiles(ctx, readSeekers, shardAPIVersionV1)
 }
 
-// UploadFilesV1 uploads multiple files using the V1 shard API.
+// UploadFilesV1 uploads multiple files through the V1 shard API.
 func (c *Client) UploadFilesV1(ctx context.Context, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.UploadFilesV1WithAuthProvider(ctx, nil, readSeekers)
+	return c.uploadFiles(ctx, readSeekers, shardAPIVersionV1)
 }
 
-// UploadFilesV2 uploads multiple files using the V2 shard API.
+// UploadFilesV2 uploads multiple files through the V2 shard API.
 func (c *Client) UploadFilesV2(ctx context.Context, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.UploadFilesV2WithAuthProvider(ctx, nil, readSeekers)
+	return c.uploadFiles(ctx, readSeekers, shardAPIVersionV2)
 }
 
-// UploadFilesWithAuthProvider uploads multiple files through the V1 shard API
-// using a per-call auth provider and returns their hashes.
-func (c *Client) UploadFilesWithAuthProvider(ctx context.Context, provider AuthProvider, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.uploadFilesWithAuthProvider(ctx, provider, readSeekers, shardAPIVersionV1)
-}
-
-// UploadFilesV1WithAuthProvider uploads multiple files through the V1 shard API.
-func (c *Client) UploadFilesV1WithAuthProvider(ctx context.Context, provider AuthProvider, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.uploadFilesWithAuthProvider(ctx, provider, readSeekers, shardAPIVersionV1)
-}
-
-// UploadFilesV2WithAuthProvider uploads multiple files through the V2 shard API.
-func (c *Client) UploadFilesV2WithAuthProvider(ctx context.Context, provider AuthProvider, readSeekers []io.ReadSeeker) ([]xet.FileHash, error) {
-	return c.uploadFilesWithAuthProvider(ctx, provider, readSeekers, shardAPIVersionV2)
-}
-
-func (c *Client) uploadFilesWithAuthProvider(ctx context.Context, provider AuthProvider, readSeekers []io.ReadSeeker, shardAPIVersion shardAPIVersion) ([]xet.FileHash, error) {
-	adapter := authProviderUploadAdapter{client: c, provider: provider, shardAPIVersion: shardAPIVersion}
+func (c *Client) uploadFiles(ctx context.Context, readSeekers []io.ReadSeeker, shardAPIVersion shardAPIVersion) ([]xet.FileHash, error) {
+	adapter := uploadAdapter{client: c, shardAPIVersion: shardAPIVersion}
 	return upload.UploadFiles(ctx, adapter, readSeekers,
 		upload.WithConcurrency(c.concurrency),
 		upload.WithProgressFunc(c.progressFunc),

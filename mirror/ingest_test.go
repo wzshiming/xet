@@ -30,9 +30,9 @@ func TestIngest(t *testing.T) {
 
 	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 
-	t.Run("rejects invalid components", func(t *testing.T) {
-		if _, err := m.Ingest("org/repo", "main/extra", "model.bin"); err == nil {
-			t.Fatal("expected an error for a rev containing a slash")
+	t.Run("rejects invalid URLs", func(t *testing.T) {
+		if _, err := m.Mirror.Ingest(upstreamSrv.URL+"/org/repo/tree/main/model.bin", ""); err == nil {
+			t.Fatal("expected an error for a URL that is not a hub download URL")
 		}
 		if _, err := m.Ingest("org/repo", "main", ""); err == nil {
 			t.Fatal("expected an error for an empty path")

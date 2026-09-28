@@ -103,7 +103,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		up, err := mirror.StaticUpstream(*upstream, *upstreamToken)
+		up, err := hf.StaticUpstream(*upstream, *upstreamToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create upstream selector: %v\n", err)
 			os.Exit(1)
@@ -112,7 +112,6 @@ func main() {
 
 		mir, err := mirror.NewMirror(
 			mirror.WithStorage(stor),
-			mirror.WithUpstream(up),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
 			mirror.WithClient(xetClient),
 		)
@@ -123,6 +122,7 @@ func main() {
 
 		next = hf.NewHandler(
 			hf.WithMirror(mir),
+			hf.WithUpstream(up),
 			hf.WithExternalURL(*baseURL),
 			hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
 				if req.Permission != auth.Read {

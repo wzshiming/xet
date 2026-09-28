@@ -19,7 +19,6 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
@@ -49,24 +48,24 @@ func newAuthServer(t *testing.T, issuer *auth.Issuer, internalToken string) *htt
 	return srv
 }
 
-type downloadFunc func(context.Context, client.AuthProvider, xet.FileHash, io.WriteSeeker) error
+type downloadFunc func(context.Context, xet.FileHash, io.WriteSeeker) error
 
-func downloadAs(t *testing.T, download downloadFunc, provider client.AuthProvider, fileHash xet.FileHash) ([]byte, error) {
+func downloadAs(t *testing.T, download downloadFunc, fileHash xet.FileHash) ([]byte, error) {
 	t.Helper()
 	out, err := os.Create(filepath.Join(t.TempDir(), "out"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer out.Close()
-	if err := download(context.Background(), provider, fileHash, out); err != nil {
+	if err := download(context.Background(), fileHash, out); err != nil {
 		return nil, err
 	}
 	return os.ReadFile(out.Name())
 }
 
-func assertDownloadAs(t *testing.T, download downloadFunc, provider client.AuthProvider, fileHash xet.FileHash, want []byte) {
+func assertDownloadAs(t *testing.T, download downloadFunc, fileHash xet.FileHash, want []byte) {
 	t.Helper()
-	got, err := downloadAs(t, download, provider, fileHash)
+	got, err := downloadAs(t, download, fileHash)
 	if err != nil {
 		t.Fatalf("download %s: %v", fileHash, err)
 	}
@@ -114,7 +113,7 @@ func TestAuthCASClientFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newAuthServer(t, issuer, "internal-secret")
-	c, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
+	c, err := client.NewClient(client.WithCacheDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +125,12 @@ func TestAuthCASClientFlows(t *testing.T) {
 		}
 		return token
 	}
-	static := func(token string) client.AuthProvider { return client.StaticAuthProvider("", token) }
+	// Every credential drives a copy of one client so all flows share its cache.
+	as := func(token string) *client.Client {
+		bound := *c
+		client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, token))(&bound)
+		return &bound
+	}
 
 	fileA := deterministicData(3*128*1024 + 7919)
 	fileB := invertedData(2*128*1024 + 101)
@@ -156,13 +160,13 @@ func TestAuthCASClientFlows(t *testing.T) {
 			{"signing key", "signing-secret", "status 401"},
 			{"read", readToken, "status 403"},
 		} {
-			_, err := c.UploadFileWithAuthProvider(ctx, static(test.token), bytes.NewReader(fileA))
+			_, err := as(test.token).UploadFile(ctx, bytes.NewReader(fileA))
 			wantErr(t, err, test.want)
 		}
-		if hashA, err = c.UploadFileV1WithAuthProvider(ctx, static(writeToken), bytes.NewReader(fileA)); err != nil {
+		if hashA, err = as(writeToken).UploadFileV1(ctx, bytes.NewReader(fileA)); err != nil {
 			t.Fatal(err)
 		}
-		if hashB, err = c.UploadFileV2WithAuthProvider(ctx, static(writeToken), bytes.NewReader(fileB)); err != nil {
+		if hashB, err = as(writeToken).UploadFileV2(ctx, bytes.NewReader(fileB)); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -180,37 +184,39 @@ func TestAuthCASClientFlows(t *testing.T) {
 			{"internal token", "internal-secret", "status 401"},
 			{"write", writeToken, "status 403"},
 		} {
-			for _, download := range []downloadFunc{c.DownloadFileV1WithAuthProvider, c.DownloadFileV2WithAuthProvider, c.DownloadFileWithAuthProvider} {
-				_, err := downloadAs(t, download, static(test.token), hashA)
+			denied := as(test.token)
+			for _, download := range []downloadFunc{denied.DownloadFileV1, denied.DownloadFileV2, denied.DownloadFile} {
+				_, err := downloadAs(t, download, hashA)
 				wantErr(t, err, test.want)
 			}
 		}
-		for _, download := range []downloadFunc{c.DownloadFileV1WithAuthProvider, c.DownloadFileV2WithAuthProvider, c.DownloadFileWithAuthProvider} {
-			assertDownloadAs(t, download, static(readToken), hashA, fileA)
-			assertDownloadAs(t, download, static(readToken), hashB, fileB)
+		reader := as(readToken)
+		for _, download := range []downloadFunc{reader.DownloadFileV1, reader.DownloadFileV2, reader.DownloadFile} {
+			assertDownloadAs(t, download, hashA, fileA)
+			assertDownloadAs(t, download, hashB, fileB)
 		}
-		if _, err := c.GetBatchReconstructionWithAuthProvider(ctx, static(readToken), []xet.FileHash{hashA, hashB}); err != nil {
+		if _, err := reader.GetBatchReconstruction(ctx, []xet.FileHash{hashA, hashB}); err != nil {
 			t.Fatal(err)
 		}
-		_, err := c.GetBatchReconstructionWithAuthProvider(ctx, static(writeToken), []xet.FileHash{hashA, hashB})
+		_, err := as(writeToken).GetBatchReconstruction(ctx, []xet.FileHash{hashA, hashB})
 		wantErr(t, err, "status 403")
 	})
 
 	t.Run("file-bound read token", func(t *testing.T) {
 		boundToken := sign(auth.Grant{Permission: auth.Read, File: &hashA})
-		bound := static(boundToken)
-		assertDownloadAs(t, c.DownloadFileV1WithAuthProvider, bound, hashA, fileA)
-		assertDownloadAs(t, c.DownloadFileV2WithAuthProvider, bound, hashA, fileA)
-		_, err := downloadAs(t, c.DownloadFileV1WithAuthProvider, bound, hashB)
+		bound := as(boundToken)
+		assertDownloadAs(t, bound.DownloadFileV1, hashA, fileA)
+		assertDownloadAs(t, bound.DownloadFileV2, hashA, fileA)
+		_, err := downloadAs(t, bound.DownloadFileV1, hashB)
 		wantErr(t, err, "status 403")
-		_, err = downloadAs(t, c.DownloadFileV2WithAuthProvider, bound, hashB)
+		_, err = downloadAs(t, bound.DownloadFileV2, hashB)
 		wantErr(t, err, "status 403")
-		if _, err := c.GetBatchReconstructionWithAuthProvider(ctx, bound, []xet.FileHash{hashA}); err != nil {
+		if _, err := bound.GetBatchReconstruction(ctx, []xet.FileHash{hashA}); err != nil {
 			t.Fatal(err)
 		}
-		_, err = c.GetBatchReconstructionWithAuthProvider(ctx, bound, []xet.FileHash{hashA, hashB})
+		_, err = bound.GetBatchReconstruction(ctx, []xet.FileHash{hashA, hashB})
 		wantErr(t, err, "status 403")
-		_, err = c.UploadFileWithAuthProvider(ctx, bound, bytes.NewReader(fileC))
+		_, err = bound.UploadFile(ctx, bytes.NewReader(fileC))
 		wantErr(t, err, "status 403")
 
 		// The empty file's all-zero hash is a real target, not "any file".
@@ -221,25 +227,25 @@ func TestAuthCASClientFlows(t *testing.T) {
 	})
 
 	t.Run("sha256-bound write token", func(t *testing.T) {
-		if hashC, err = c.UploadFileV1WithAuthProvider(ctx, static(shaWriteToken), bytes.NewReader(fileC)); err != nil {
+		if hashC, err = as(shaWriteToken).UploadFileV1(ctx, bytes.NewReader(fileC)); err != nil {
 			t.Fatal(err)
 		}
-		assertDownloadAs(t, c.DownloadFileWithAuthProvider, static(readToken), hashC, fileC)
+		assertDownloadAs(t, as(readToken).DownloadFile, hashC, fileC)
 
-		_, err := c.UploadFileV1WithAuthProvider(ctx, static(shaWriteToken), bytes.NewReader(fileD))
+		_, err := as(shaWriteToken).UploadFileV1(ctx, bytes.NewReader(fileD))
 		wantErr(t, err, "status 403")
-		_, err = c.UploadFileV2WithAuthProvider(ctx, static(shaWriteToken), bytes.NewReader(fileD))
+		_, err = as(shaWriteToken).UploadFileV2(ctx, bytes.NewReader(fileD))
 		wantErr(t, err, "v2 shard upload failed: forbidden")
 		if strings.Contains(err.Error(), "attempts") {
 			t.Fatalf("per-file denial was retried: %v", err)
 		}
 		hashD := xet.ComputeFileHash([]xet.ChunkHash{xet.ComputeChunkHash(fileD)}, []uint64{uint64(len(fileD))})
-		_, err = downloadAs(t, c.DownloadFileWithAuthProvider, static(readToken), hashD)
+		_, err = downloadAs(t, as(readToken).DownloadFile, hashD)
 		wantErr(t, err, "404 not found")
 	})
 
 	t.Run("xorb and bridge downloads stay anonymous", func(t *testing.T) {
-		info, err := c.GetReconstructionV1WithAuthProvider(ctx, static(readToken), hashA, nil)
+		info, err := as(readToken).GetReconstructionV1(ctx, hashA, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -261,10 +267,6 @@ func TestAuthInternalToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newAuthServer(t, issuer, "internal-secret")
-	c, err := client.NewClient(client.WithBaseURL(srv.URL), client.WithCacheDir(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
 	readToken, _, err := issuer.Sign(auth.Grant{Permission: auth.Read})
 	if err != nil {
 		t.Fatal(err)
@@ -273,9 +275,13 @@ func TestAuthInternalToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	writer, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, writeToken)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	fileA := deterministicData(128*1024 + 33)
 	fileB := invertedData(64*1024 + 17)
-	hashes, err := c.UploadFilesWithAuthProvider(ctx, client.StaticAuthProvider("", writeToken), []io.ReadSeeker{bytes.NewReader(fileA), bytes.NewReader(fileB)})
+	hashes, err := writer.UploadFiles(ctx, []io.ReadSeeker{bytes.NewReader(fileA), bytes.NewReader(fileB)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,8 +308,12 @@ func TestAuthInternalToken(t *testing.T) {
 	for _, route := range routes[1:] {
 		assertStatus(t, route.method, route.url, "internal-secret", http.StatusOK)
 	}
-	assertDownloadAs(t, c.DownloadFileWithAuthProvider, client.StaticAuthProvider("", readToken), hashes[0], fileA)
-	_, err = downloadAs(t, c.DownloadFileWithAuthProvider, client.StaticAuthProvider("", readToken), hashes[1])
+	reader, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, readToken)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDownloadAs(t, reader.DownloadFile, hashes[0], fileA)
+	_, err = downloadAs(t, reader.DownloadFile, hashes[1])
 	wantErr(t, err, "404 not found")
 }
 
@@ -329,31 +339,48 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hashA, boundA, err := hfclient.ResolveDownload(ctx, nil, srv.URL+pathA)
+	resolvedA, err := c.Resolve(ctx, srv.URL+pathA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	hashB, _, err := hfclient.ResolveDownload(ctx, nil, srv.URL+pathB)
+	resolvedB, err := c.Resolve(ctx, srv.URL+pathB, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertDownloadAs(t, c.DownloadFileWithAuthProvider, boundA, hashA, fileA)
-	_, err = downloadAs(t, c.DownloadFileWithAuthProvider, boundA, hashB)
-	wantErr(t, err, "status 403")
-	_, err = c.UploadFileWithAuthProvider(ctx, boundA, bytes.NewReader(fileB))
-	wantErr(t, err, "status 403")
-
-	target := hfclient.Target{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
-	repoRead := hfclient.NewReadTokenProvider(nil, target, "")
-	assertDownloadAs(t, c.DownloadFileWithAuthProvider, repoRead, hashA, fileA)
-	assertDownloadAs(t, c.DownloadFileWithAuthProvider, repoRead, hashB, fileB)
-
-	repoWrite := hfclient.NewWriteTokenProvider(nil, target, "hf-user-token")
-	if token, err := repoWrite.Token(ctx); err != nil || token != "upstream-write-token" {
-		t.Fatalf("write token = %q, %v, want the upstream's", token, err)
+	downloadResolved := func(f *client.ResolvedFile) downloadFunc {
+		return func(ctx context.Context, _ xet.FileHash, w io.WriteSeeker) error {
+			return c.DownloadResolved(ctx, f, w)
+		}
 	}
-	if base, err := repoWrite.BaseURL(ctx); err != nil || base != "https://cas.upstream.example" {
-		t.Fatalf("write CAS URL = %q, %v, want the upstream's", base, err)
+	assertDownloadAs(t, downloadResolved(resolvedA), resolvedA.Hash, fileA)
+	// The token behind file A's resolve link opens neither file B nor any write route.
+	var tokenA struct {
+		CASURL string `json:"casUrl"`
+		Token  string `json:"accessToken"`
+	}
+	if err := json.Unmarshal(assertStatus(t, http.MethodGet, srv.URL+"/xet-token/"+resolvedA.Hash.String(), "", http.StatusOK), &tokenA); err != nil {
+		t.Fatal(err)
+	}
+	asA, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(tokenA.CASURL, tokenA.Token)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDownloadAs(t, asA.DownloadFile, resolvedA.Hash, fileA)
+	_, err = downloadAs(t, asA.DownloadFile, resolvedB.Hash)
+	wantErr(t, err, "status 403")
+	_, err = asA.UploadFile(ctx, bytes.NewReader(fileB))
+	wantErr(t, err, "status 403")
+
+	target := client.HubRepo{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
+	repo := client.NewHubTokenProvider(nil, target, "hf-user-token")
+	asRepo, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(repo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDownloadAs(t, asRepo.DownloadFile, resolvedA.Hash, fileA)
+	assertDownloadAs(t, asRepo.DownloadFile, resolvedB.Hash, fileB)
+	if base, token, err := repo.Resolve(ctx, auth.Write); err != nil || base != "https://cas.upstream.example" || token != "upstream-write-token" {
+		t.Fatalf("write upstream = %q %q, %v, want the upstream hub's", base, token, err)
 	}
 
 	assertStatus(t, http.MethodGet, srv.URL+"/xet-token/"+(xet.FileHash{}).String(), "", http.StatusBadRequest)

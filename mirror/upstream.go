@@ -10,41 +10,34 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/client"
 )
 
-// authInjector limits context-carried credentials to the selected host.
+// authInjector limits context-carried credentials to the caller's upstream origin.
 type authInjector struct {
 	inner http.RoundTripper
 }
 
-// upstreamAuth is the immutable credential of one selected upstream.
+// upstreamAuth is the immutable credential of one upstream origin.
 type upstreamAuth struct {
-	host  string
-	token string
+	origin string // scheme://host
+	token  string
 }
 
 type upstreamAuthKey struct{}
 
 func (t *authInjector) RoundTrip(req *http.Request) (*http.Response, error) {
 	a, _ := req.Context().Value(upstreamAuthKey{}).(upstreamAuth)
-	if a.token != "" && req.URL.Host == a.host && req.Header.Get("Authorization") == "" {
+	if a.token != "" && req.URL.Scheme+"://"+req.URL.Host == a.origin && req.Header.Get("Authorization") == "" {
 		req = req.Clone(req.Context())
 		req.Header.Set("Authorization", "Bearer "+a.token)
 	}
 	return t.inner.RoundTrip(req)
 }
 
-func (m *Mirror) upstreamTarget(ctx context.Context, repo, pathAndQuery string) (context.Context, string, error) {
-	u, token, err := m.upstreamFunc(ctx, repo)
-	if err != nil {
-		return ctx, "", err
-	}
-	if u == nil {
-		return ctx, "", fmt.Errorf("mirror: no upstream URL selected for %q", repo)
-	}
-	ctx = context.WithValue(ctx, upstreamAuthKey{}, upstreamAuth{host: u.Host, token: token})
-	return ctx, strings.TrimRight(u.String(), "/") + pathAndQuery, nil
+// withUpstreamAuth marks ctx so the mirror's clients send token to origin only.
+func withUpstreamAuth(ctx context.Context, origin, token string) context.Context {
+	return context.WithValue(ctx, upstreamAuthKey{}, upstreamAuth{origin: origin, token: token})
 }
 
 // probeResult captures upstream metadata for one resolve path. Everything is
@@ -67,19 +60,16 @@ func pseudoCommit(repo, rev string) string {
 	return hex.EncodeToString(sum[:20])
 }
 
-// probe issues HEAD requests for the resolve key, following redirects
-// manually so that metadata headers from the hub hop are retained while later
-// hops can still supply the content length. Upstreams whose HEAD responses
-// carry no size at all (e.g. modelscope.cn) leave size at -1; the ingest
-// download learns it from its first response headers and resolve replies wait
-// for that (task.sized).
-func (m *Mirror) probe(ctx context.Context, key resolveKey) (*probeResult, error) {
+// probe issues HEAD requests for the resolve key on origin, following
+// redirects manually so that metadata headers from the hub hop are retained
+// while later hops can still supply the content length; ctx carries the
+// origin's credential. Upstreams whose HEAD responses carry no size at all
+// (e.g. modelscope.cn) leave size at -1; the ingest download learns it from
+// its first response headers and resolve replies wait for that (task.sized).
+func (m *Mirror) probe(ctx context.Context, origin string, key resolveKey) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
-	ctx, cur, err := m.upstreamTarget(ctx, key.repo, key.String())
-	if err != nil {
-		return nil, err
-	}
+	cur := origin + key.String()
 	for range 8 {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {
@@ -151,7 +141,7 @@ func (p *probeResult) collect(header http.Header) {
 		p.commit = header.Get("X-Repo-Commit")
 	}
 	if !p.xet {
-		links := hf.ParseLinkHeaders(header.Values("Link"))
+		links := client.ParseLinkHeaders(header.Values("Link"))
 		if links["xet-reconstruction-info"] != "" && links["xet-auth"] != "" {
 			p.xet = true
 		}

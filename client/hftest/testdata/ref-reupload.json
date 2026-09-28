@@ -1,0 +1,573 @@
+{
+  "scenario": "ref-reupload",
+  "recorded": "2026-09-25T08:49:38Z",
+  "upstream": "https://huggingface.co",
+  "repo": "wzshiming/test",
+  "tool": "hf version=1.31.0; huggingface_hub version: 1.31.0; hf_xet: 1.6.0",
+  "exchanges": [
+    {
+      "seq": 1,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/agent-harnesses",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip, deflate"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "User-Agent": [
+          "python-httpx/0.28.1"
+        ],
+        "X-Amzn-Trace-Id": [
+          "17e38814-3195-4cf4-9146-b9b28ed2cf97"
+        ]
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "5711"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:35 GMT"
+        ],
+        "Etag": [
+          "W/\"164f-cVMc19JX8QJwuU/ZVV3kcWXr7tM\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=495;t=205"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=500;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 e967e81a9d2eccdf96e93b4a500d15c0.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Miss from cloudfront"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab6359f-7f93ee947fb9134b6fdc791a;17e38814-3195-4cf4-9146-b9b28ed2cf97"
+        ]
+      },
+      "response_body": {
+        "size": 5711,
+        "sha256": "e7cea23b05c625a2cd7d7ec8479f55211220f9062b95898db0c38ab9a1ca9d44",
+        "text": "{\"harnesses\":{\"antigravity\":{\"description\":\"Agentic development platform from Google built around Gemini.\",\"docsUrl\":\"https://antigravity.google\",\"envVars\":{\"ANTIGRAVITY_AGENT\":\"*\"},\"prettyLabel\":\"Antigravity\"},\"augment-cli\":{\"description\":\"Auggie, the command-line coding agent from Augment Code.\",\"docsUrl\":\"https://www.augmentcode.com\",\"envVars\":{\"AUGMENT_AGENT\":\"*\"},\"prettyLabel\":\"Augment CLI\",\"repoUrl\":\"https://github.com/augmentcode/auggie\"},\"claude-code\":{\"description\":\"Anthropic's agentic coding tool that lives in your terminal.\",\"docsUrl\":\"https://code.claude.com/docs\",\"envVars\":{\"CLAUDECODE\":\"*\",\"CLAUDE_CODE\":\"*\"},\"prettyLabel\":\"Claude Code\",\"repoUrl\":\"https://github.com/anthropics/claude-code\"},\"cline\":{\"description\":\"Open-source autonomous coding agent for VS Code.\",\"docsUrl\":\"https://cline.bot\",\"envVars\":{\"CLINE_ACTIVE\":\"*\"},\"prettyLabel\":\"Cline\",\"repoUrl\":\"https://github.com/cline/cline\"},\"codex\":{\"description\":\"OpenAI's lightweight coding agent that runs in your terminal.\",\"docsUrl\":\"https://developers.openai.com/codex\",\"envVars\":{\"CODEX_CI\":\"*\",\"CODEX_SANDBOX\":\"*\",\"CODEX_THREAD_ID\":\"*\"},\"prettyLabel\":\"Codex\",\"repoUrl\":\"https://github.com/openai/codex\"},\"cowork\":{\"description\":\"Anthropic's agent for autonomous knowledge work, built on top of Claude Code.\",\"docsUrl\":\"https://claude.com/product/cowork\",\"envVars\":{\"CLAUDE_CODE_IS_COWORK\":\"*\"},\"prettyLabel\":\"Cowork\"},\"crush\":{\"description\":\"Charm's open-source AI coding agent for the terminal.\",\"docsUrl\":\"https://github.com/charmbracelet/crush\",\"envVars\":{\"CRUSH\":\"*\"},\"prettyLabel\":\"Crush\",\"repoUrl\":\"https://github.com/charmbracelet/crush\"},\"cursor\":{\"description\":\"AI-powered code editor.\",\"docsUrl\":\"https://cursor.com\",\"envVars\":{\"CURSOR_TRACE_ID\":\"*\"},\"prettyLabel\":\"Cursor\"},\"cursor-cli\":{\"description\":\"Cursor's coding agent for the command line.\",\"docsUrl\":\"https://cursor.com/docs/cli/overview\",\"envVars\":{\"CURSOR_AGENT\":\"*\"},\"prettyLabel\":\"Cursor CLI\"},\"devin\":{\"description\":\"Autonomous AI software engineer from Cognition.\",\"docsUrl\":\"https://devin.ai\",\"prettyLabel\":\"Devin\"},\"gemini-cli\":{\"description\":\"Google's open-source terminal AI coding agent powered by Gemini models.\",\"docsUrl\":\"https://geminicli.com\",\"envVars\":{\"GEMINI_CLI\":\"*\"},\"prettyLabel\":\"Gemini CLI\",\"repoUrl\":\"https://github.com/google-gemini/gemini-cli\"},\"github-copilot\":{\"description\":\"GitHub's AI coding assistant.\",\"docsUrl\":\"https://docs.github.com/copilot\",\"envVars\":{\"COPILOT_ALLOW_ALL\":\"*\",\"COPILOT_GITHUB_TOKEN\":\"*\",\"COPILOT_MODEL\":\"*\"},\"prettyLabel\":\"GitHub Copilot\"},\"goose\":{\"description\":\"Open-source, extensible AI agent, originally from Block and now part of the Agentic AI Foundation.\",\"docsUrl\":\"https://goose-docs.ai/\",\"envVars\":{\"GOOSE_TERMINAL\":\"*\"},\"prettyLabel\":\"Goose\",\"repoUrl\":\"https://github.com/aaif-goose/goose\"},\"hermes-agent\":{\"description\":\"Nous Research's self-improving, multi-provider terminal AI agent.\",\"docsUrl\":\"https://hermes-agent.nousresearch.com/docs\",\"envVars\":{\"HERMES_SESSION_ID\":\"*\"},\"prettyLabel\":\"Hermes Agent\",\"repoUrl\":\"https://github.com/NousResearch/hermes-agent\"},\"hi\":{\"description\":\"Rust terminal coding agent with verification-in-the-loop.\",\"docsUrl\":\"https://github.com/PipeNetwork/hi#readme\",\"prettyLabel\":\"hi\",\"repoUrl\":\"https://github.com/PipeNetwork/hi\"},\"kilo-code\":{\"description\":\"Open-source agentic coding agent for VS Code, JetBrains, and the terminal.\",\"docsUrl\":\"https://kilocode.ai/docs\",\"envVars\":{\"KILOCODE_FEATURE\":\"*\"},\"prettyLabel\":\"Kilo Code\",\"repoUrl\":\"https://github.com/Kilo-Org/kilocode\"},\"kiro\":{\"description\":\"AWS's agentic IDE for spec-driven AI software development.\",\"docsUrl\":\"https://kiro.dev\",\"envVars\":{\"AGENT_CONTEXT_OUT\":\"*\"},\"prettyLabel\":\"Kiro\"},\"openclaw\":{\"description\":\"Open-source, self-hosted personal AI assistant that runs on your own devices.\",\"docsUrl\":\"https://openclaw.ai\",\"envVars\":{\"OPENCLAW_SHELL\":\"*\"},\"prettyLabel\":\"OpenClaw\",\"repoUrl\":\"https://github.com/openclaw/openclaw\"},\"opencode\":{\"description\":\"Open-source AI coding agent built for the terminal.\",\"docsUrl\":\"https://opencode.ai\",\"envVars\":{\"OPENCODE_CLIENT\":\"*\"},\"prettyLabel\":\"opencode\",\"repoUrl\":\"https://github.com/anomalyco/opencode\"},\"pi\":{\"description\":\"Minimal, self-extensible terminal coding agent with a unified multi-provider LLM API.\",\"docsUrl\":\"https://pi.dev\",\"envVars\":{\"PI_CODING_AGENT\":\"*\"},\"prettyLabel\":\"Pi\",\"repoUrl\":\"https://github.com/earendil-works/pi\"},\"replit\":{\"description\":\"Cloud development environment with an AI coding agent.\",\"docsUrl\":\"https://replit.com\",\"envVars\":{\"REPL_ID\":\"*\"},\"prettyLabel\":\"Replit\"},\"sandbase-harness\":{\"description\":\"Local-first, self-hosted runtime for persistent AI agent sessions and MCP tools.\",\"docsUrl\":\"https://github.com/sandbaseai/sandbase-harness/blob/main/docs/installation.md\",\"prettyLabel\":\"SandBase Harness\",\"repoUrl\":\"https://github.com/sandbaseai/sandbase-harness\"},\"trae\":{\"description\":\"AI-powered IDE from ByteDance.\",\"docsUrl\":\"https://trae.ai\",\"envVars\":{\"TRAE_AI_SHELL_ID\":\"*\"},\"prettyLabel\":\"Trae\"},\"vtcode\":{\"description\":\"Rust coding agent with multi-provider LLM support, OS-native sandboxing, and extensible skills\",\"envVars\":{\"VTCODE\":\"1\"},\"prettyLabel\":\"VTCode\",\"repoUrl\":\"https://github.com/vinhnx/VTCode\"},\"warp\":{\"description\":\"AI-powered terminal with an agentic Agent Mode.\",\"docsUrl\":\"https://docs.warp.dev\",\"envVars\":{\"TERM_PROGRAM\":\"WarpTerminal\"},\"prettyLabel\":\"Warp\",\"repoUrl\":\"https://github.com/warpdotdev/Warp\"},\"zed\":{\"description\":\"High-performance code editor with an integrated AI agent panel and terminal.\",\"docsUrl\":\"https://zed.dev\",\"envVars\":{\"ZED_TERM\":\"*\"},\"prettyLabel\":\"Zed\",\"repoUrl\":\"https://github.com/zed-industries/zed\"}},\"standardEnvVars\":[\"AI_AGENT\",\"AGENT\"]}"
+      }
+    },
+    {
+      "seq": 2,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/repos/create",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip, deflate"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "57"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7"
+        ],
+        "X-Amzn-Trace-Id": [
+          "23667166-224a-4ff8-82f1-82d2a787a904"
+        ]
+      },
+      "request_body": {
+        "size": 57,
+        "sha256": "527ce94864d2b733b1d9b51d96f9a5b2a662d434c324ccdcbe55a1403d157171",
+        "text": "{\"name\":\"test\",\"organization\":\"wzshiming\",\"type\":\"model\"}"
+      },
+      "status": 409,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "109"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:36 GMT"
+        ],
+        "Etag": [
+          "W/\"6d-92Tjk8SgmDrYFQz8H8Ym0fU0zbc\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=990;t=143"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=1000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 e967e81a9d2eccdf96e93b4a500d15c0.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Error from cloudfront"
+        ],
+        "X-Error-Message": [
+          "You already created this model repo: wzshiming/test"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a0-41a50acc57934b1b0859ce48;23667166-224a-4ff8-82f1-82d2a787a904"
+        ]
+      },
+      "response_body": {
+        "size": 109,
+        "sha256": "db2e20ef37759e39b83ed67c9e2532c03e41cdbd76c4761e1cf66a86a0476443",
+        "text": "{\"error\":\"You already created this model repo: wzshiming/test\",\"url\":\"https://huggingface.co/wzshiming/test\"}"
+      }
+    },
+    {
+      "seq": 3,
+      "origin": "hub",
+      "method": "POST",
+      "path": "/api/models/wzshiming/test/preupload/main",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip, deflate"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "756"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7"
+        ],
+        "X-Amzn-Trace-Id": [
+          "2fddfdf4-6356-48b8-9fe4-4aacf8ccdc3e"
+        ]
+      },
+      "request_body": {
+        "size": 756,
+        "sha256": "37af0b655f2d62476351fb6b189fb9e9f34c7310f8e78f4d9e957f9e3febc7e7",
+        "text": "{\"files\":[{\"path\":\"regression/ref-lfs.bin\",\"sample\":\"SHkdadBcG43hiizoSWbbtyr+sjjeIxgy6AIvw0+faWUU+RuBfw99QF38wKZpFFdST0wyKLOy09JcIabogS7/U/nk5GoJBNgE+PxoNEHWjBb4uU9/hNeH497VRI3RNE9bJp4vMk6K5uGxJuWXW/4cQNcb1wgCNyIF9wZfrQo/ZmBpSA+SXDpKSti3605v1DCj/a2HDUypx9W9IHKl/kamroglPCAIJ4vVSK7DdVLZ9ewCDHCbJOwbMylW5XotKkVDOQuDu4lotkOz9Ox8ejFCS2U7j+flXfOyn3kWiFnIDThgkM1u2ZHD6KAD3mrnruNKhPMJ/c9wz0qBRRU6ewU011YcVoV9cnuordiMGifEP8Cv0JVU5HFzt8MAG1X6UenJzHPsGxEQptiIllIpy34MqBoz+4EBhylc8tYF1+CPW5tsbI2uba4yBBAGB3Tzxu8OmD7c1AfEiGDARm7xWRbYEJuERvKtrvetCKBFVFrwSAkA3cZ5GKptWmNAJWMWcMmyooqI1J6S/2hmRz15s55eB6D0btO5FkvYsOkNT4w95Ub9wM+k4bB/N30zlRsR6YjPtEvtPLF0NsRZNqi5pPJEqlZjS4LgE+B0YhZTCL/R5O+lyMkMH6ihzD5fekP9PZvDr052KBBYu6vMcvSAeJlocJXYg5LDp+TR8S1v2qeohok=\",\"size\":1048576}]}"
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "213"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:36 GMT"
+        ],
+        "Etag": [
+          "W/\"d5-yQEuEeAYQXI1T8NnuNLG7OTfWUk\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=989;t=143"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=1000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 e967e81a9d2eccdf96e93b4a500d15c0.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Miss from cloudfront"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a0-20a1870e00f37f8274e3e7cb;2fddfdf4-6356-48b8-9fe4-4aacf8ccdc3e"
+        ]
+      },
+      "response_body": {
+        "size": 213,
+        "sha256": "465f4f465dfa08e526862a638709327a43dc293d5cb03dc4cc5367251ed9839e",
+        "text": "{\"commitOid\":\"bcf51b2ec6fb5bc8215f4b365a0e48532e26abb8\",\"files\":[{\"oid\":\"cd44947308b4b22228767cab8addd523d1de22abd9b23a10808e5fc295202e4f\",\"path\":\"regression/ref-lfs.bin\",\"shouldIgnore\":false,\"uploadMode\":\"lfs\"}]}"
+      }
+    },
+    {
+      "seq": 4,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/xet-write-token/main",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7"
+        ],
+        "X-Xet-Session-Id": [
+          "01a0d7c1-7b70-78c1-bfdd-744aee2b6648"
+        ]
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "504"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:36 GMT"
+        ],
+        "Etag": [
+          "W/\"201-UG/RFVWkGUytNDrgI2vyA8ZOexI\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=988;t=143"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=1000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 e967e81a9d2eccdf96e93b4a500d15c0.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Miss from cloudfront"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a0-063fcd9f0a4f97d205df55c6"
+        ],
+        "X-Xet-Access-Token": [
+          "<redacted>"
+        ],
+        "X-Xet-Cas-Url": [
+          "http://127.0.0.1:60394"
+        ],
+        "X-Xet-Token-Expiration": [
+          "1790327076"
+        ]
+      },
+      "response_body": {
+        "size": 504,
+        "sha256": "b3110f5fcc326720d64449892cba430a586244f6b7be628081b016390bc104cc",
+        "text": "{\"accessToken\":\"<redacted>\",\"casUrl\":\"http://127.0.0.1:60394\",\"exp\":1790327076}"
+      }
+    },
+    {
+      "seq": 5,
+      "origin": "cas",
+      "method": "GET",
+      "path": "/v1/chunks/default/6a9114639c430dc7a0a1fb59bd0a71d8aaf5fe6e33cf9ee80b0424e895e84242",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7; hf_xet/1.6.0"
+        ],
+        "X-Xet-Session-Id": [
+          "01a0d7c1-7b70-78c1-bfdd-744aee2b6648"
+        ]
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Credentials": [
+          "true"
+        ],
+        "Content-Length": [
+          "1352"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:37 GMT"
+        ],
+        "Vary": [
+          "accept-encoding",
+          "origin, access-control-request-method, access-control-request-headers"
+        ],
+        "X-Request-Id": [
+          "01M3BW2ZQZ4ZV5D51D30DXJ9VT"
+        ]
+      },
+      "response_body": {
+        "size": 1352,
+        "sha256": "ee7412e69db1251b11cc9e080d62d781898c9ad2d8d7aa7d5d6de22038f73d8f"
+      }
+    },
+    {
+      "seq": 6,
+      "origin": "cas",
+      "method": "POST",
+      "path": "/v2/shards",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Content-Length": [
+          "336"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7; hf_xet/1.6.0"
+        ],
+        "X-Xet-Session-Id": [
+          "01a0d7c1-7b70-78c1-bfdd-744aee2b6648"
+        ]
+      },
+      "request_body": {
+        "size": 336,
+        "sha256": "a979f9cfc21de9800d91b6fc5a2a5949c33153fa325bb9c58a7bd62583608c4b"
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Credentials": [
+          "true"
+        ],
+        "Cache-Control": [
+          "no-cache"
+        ],
+        "Content-Type": [
+          "application/x-ndjson"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:37 GMT"
+        ],
+        "Vary": [
+          "origin, access-control-request-method, access-control-request-headers"
+        ],
+        "X-Request-Id": [
+          "01M3BW3007ACXXXXYKRBX4HBED"
+        ]
+      },
+      "response_body": {
+        "size": 145,
+        "sha256": "67cf2e3b4fd30074ec47114734fa705b191d63939ae3e9ec721a83c2d6bf9fbd",
+        "text": "{\"total\":0,\"type\":\"validating\",\"verified\":0}\n{\"stage\":\"uploading\",\"type\":\"committing\"}\n{\"stage\":\"syncing\",\"type\":\"committing\"}\n{\"type\":\"result\"}\n"
+      }
+    },
+    {
+      "seq": 7,
+      "origin": "hub",
+      "method": "GET",
+      "path": "/api/models/wzshiming/test/revision/main",
+      "request_headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip, deflate"
+        ],
+        "Authorization": [
+          "Bearer <redacted>"
+        ],
+        "Connection": [
+          "keep-alive"
+        ],
+        "User-Agent": [
+          "huggingface-cli/1.31.0; hf_hub/1.31.0; python/3.14.7"
+        ],
+        "X-Amzn-Trace-Id": [
+          "823362f6-523a-48ff-ba23-d77791e4ab59"
+        ]
+      },
+      "status": 200,
+      "response_headers": {
+        "Access-Control-Allow-Origin": [
+          "https://huggingface.co"
+        ],
+        "Access-Control-Expose-Headers": [
+          "X-Repo-Commit,X-Request-Id,X-Error-Code,X-Error-Message,X-Total-Count,ETag,Link,Accept-Ranges,Content-Range,X-Linked-Size,X-Linked-ETag,X-Xet-Hash"
+        ],
+        "Access-Control-Max-Age": [
+          "86400"
+        ],
+        "Alt-Svc": [
+          "h3=\":443\"; ma=86400"
+        ],
+        "Content-Length": [
+          "1323"
+        ],
+        "Content-Type": [
+          "application/json; charset=utf-8"
+        ],
+        "Cross-Origin-Opener-Policy": [
+          "same-origin"
+        ],
+        "Date": [
+          "Fri, 25 Sep 2026 08:49:38 GMT"
+        ],
+        "Etag": [
+          "W/\"52b-2FZLWbl4KM3sGdG67d9GLQepYu0\""
+        ],
+        "Ratelimit": [
+          "\"api\";r=987;t=141"
+        ],
+        "Ratelimit-Policy": [
+          "\"fixed window\";\"api\";q=1000;w=300"
+        ],
+        "Referrer-Policy": [
+          "strict-origin-when-cross-origin"
+        ],
+        "Strict-Transport-Security": [
+          "max-age=31536000"
+        ],
+        "Vary": [
+          "Origin"
+        ],
+        "Via": [
+          "1.1 e967e81a9d2eccdf96e93b4a500d15c0.cloudfront.net (CloudFront)"
+        ],
+        "X-Cache": [
+          "Miss from cloudfront"
+        ],
+        "X-Powered-By": [
+          "huggingface-moon"
+        ],
+        "X-Request-Id": [
+          "Root=1-6ab635a2-650005f8400b40795cbf7b6f;823362f6-523a-48ff-ba23-d77791e4ab59"
+        ]
+      },
+      "response_body": {
+        "size": 1323,
+        "sha256": "c9d044e4465ba326b6443b7941d9ed4241d8cdadbdf594ea34b9dbe1e57868a4",
+        "text": "{\"_id\":\"<redacted>\",\"author\":\"wzshiming\",\"cardData\":{},\"config\":{},\"createdAt\":\"2026-01-21T03:45:36.000Z\",\"disabled\":false,\"downloads\":0,\"gated\":false,\"id\":\"wzshiming/test\",\"lastModified\":\"2026-09-25T08:49:23.000Z\",\"library_name\":\"<redacted>\",\"likes\":0,\"model-index\":null,\"modelId\":\"wzshiming/test\",\"pipeline_tag\":\"<redacted>\",\"private\":true,\"sha\":\"bcf51b2ec6fb5bc8215f4b365a0e48532e26abb8\",\"siblings\":[{\"rfilename\":\"regression/ref-lfs.bin\"},{\"rfilename\":\"regression/ref-regular.txt\"}],\"spaces\":[],\"tags\":[],\"transformersInfo\":{},\"usedStorage\":0,\"widgetData\":{}}"
+      }
+    }
+  ]
+}

@@ -365,8 +365,8 @@ func download(t *testing.T, kind clientKind, protocol rustref.ProtocolVersion, e
 func newGoClient(t *testing.T, endpoint string) *client.Client {
 	t.Helper()
 	c, err := client.NewClient(
-		client.WithBaseURL(endpoint),
 		client.WithCacheDir(t.TempDir()),
+		client.WithUpstreamProvider(client.StaticUpstreamProvider(endpoint, "")),
 	)
 	if err != nil {
 		t.Fatalf("create Go client: %v", err)

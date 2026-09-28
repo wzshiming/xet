@@ -85,8 +85,8 @@ func authoritative(pr *probeResult) bool {
 	return pr != nil && pr.status >= 400 && pr.status < 500 && pr.status != http.StatusTooManyRequests
 }
 
-// branchCommit resolves a branch rev to its pinned commit, probing when stale; only a 2xx probe pins.
-func (m *Mirror) branchCommit(key resolveKey) (string, *probeResult, *fileEntry) {
+// branchCommit resolves a branch rev to its pinned commit, probing origin with token when stale; only a 2xx probe pins.
+func (m *Mirror) branchCommit(origin, token string, key resolveKey) (string, *probeResult, *fileEntry) {
 	name := key.repo + "\x00" + key.rev
 	m.mu.Lock()
 	b, fe := m.branchState(key)
@@ -110,7 +110,7 @@ func (m *Mirror) branchCommit(key resolveKey) (string, *probeResult, *fileEntry)
 			return &branchProbe{b: b}, nil
 		}
 		// Background context: the probe is shared by every requester of the file, so one disconnect must not fail it.
-		pr, err := m.probe(context.Background(), key)
+		pr, err := m.probe(withUpstreamAuth(context.Background(), origin, token), origin, key)
 		if err == nil {
 			err = probeErr(pr)
 		}

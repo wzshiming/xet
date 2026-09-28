@@ -214,7 +214,7 @@ func (u *flakyUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // clearBackoff lets the next ingest start a fresh task immediately.
-func clearBackoff(m *Mirror, key string) {
+func clearBackoff(m *testMirror, key string) {
 	k, _ := parseResolveKey(key)
 	m.mu.Lock()
 	if e := m.entries[k]; e != nil && e.State == stateFailed {

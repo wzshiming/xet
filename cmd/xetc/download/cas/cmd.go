@@ -30,7 +30,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			provider := client.StaticAuthProvider(baseURL, token)
+			provider := client.StaticUpstreamProvider(baseURL, token)
 			return common.ExecuteDownload(cmd.Context(), hash, args[0], provider, namespace, concurrency, cacheDir, resume, os.Stderr)
 		},
 	}

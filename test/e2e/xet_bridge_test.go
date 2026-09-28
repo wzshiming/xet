@@ -28,8 +28,8 @@ func TestXetBridgeUploadRestartAndDownload(t *testing.T) {
 	uploadServer := httptest.NewServer(server.NewHandler(server.WithStorage(uploadStorage)))
 
 	uploadClient, err := client.NewClient(
-		client.WithBaseURL(uploadServer.URL),
 		client.WithCacheDir(t.TempDir()),
+		client.WithUpstreamProvider(client.StaticUpstreamProvider(uploadServer.URL, "")),
 	)
 	if err != nil {
 		t.Fatal(err)

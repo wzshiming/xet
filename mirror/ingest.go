@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // Entry describes a fully ingested file, exporting what the index persists.
@@ -70,25 +69,26 @@ func (in *Ingestion) Entry() (*Entry, error) {
 	}
 }
 
-// Ingest starts ingesting the file at /{repo}/resolve/{rev}/{path} into local
-// storage — bytes fetched, xorbs and shards landed, index entry persisted —
-// or joins the in-flight ingest, and returns immediately: wait on Done, then
-// read Entry. The components must be given in escaped URL path form, so
-// Ingest and Resolve share tasks, entries, and spools.
+// Ingest starts ingesting the file at upstreamURL (a hub download URL, see
+// Resolve) into local storage — bytes fetched, xorbs and shards landed, index
+// entry persisted — or joins the in-flight ingest, and returns immediately:
+// wait on Done, then read Entry. token is the hub bearer token for the URL's
+// origin. The URL path is taken in its escaped form, so Ingest and Resolve
+// share tasks, entries, and spools.
 //
 // The whole resolution (branch pinning, upstream probes, task wait) runs off
-// the calling goroutine, deduplicated per key: concurrent Ingests of one file
-// share a single flight. Ready entries resolve quickly (revalidated on the
-// usual cadence), as do failed ingests still inside their retry backoff.
-func (m *Mirror) Ingest(repo, rev, path string) (*Ingestion, error) {
-	if repo == "" || rev == "" || path == "" || strings.Contains(rev, "/") {
-		return nil, fmt.Errorf("mirror: invalid resolve components repo=%q rev=%q path=%q", repo, rev, path)
+// the calling goroutine, deduplicated per file: concurrent Ingests of one
+// file share a single flight. Ready entries resolve quickly (revalidated on
+// the usual cadence), as do failed ingests still inside their retry backoff.
+func (m *Mirror) Ingest(upstreamURL, token string) (*Ingestion, error) {
+	origin, key, err := parseUpstreamURL(upstreamURL)
+	if err != nil {
+		return nil, err
 	}
-	key := resolveKey{repo: repo, rev: rev, path: path}
 
 	in := &Ingestion{done: make(chan struct{})}
 	ch := m.flight.DoChan("ingest\x00"+key.String(), func() (any, error) {
-		return m.ingest(key)
+		return m.ingest(origin, token, key)
 	})
 	go func() {
 		res := <-ch
@@ -103,8 +103,8 @@ func (m *Mirror) Ingest(repo, rev, path string) (*Ingestion, error) {
 
 // ingest resolves one Ingest flight through the shared acquire flow and
 // blocks until the entry is ready or failed.
-func (m *Mirror) ingest(key resolveKey) (*Entry, error) {
-	key, t, e, err := m.acquire(context.Background(), key)
+func (m *Mirror) ingest(origin, token string, key resolveKey) (*Entry, error) {
+	key, t, e, err := m.acquire(context.Background(), origin, token, key)
 	if err != nil {
 		return nil, err
 	}

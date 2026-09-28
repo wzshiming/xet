@@ -5,7 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -33,14 +33,14 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("--token is required")
 			}
 
-			target := hf.Target{
+			repo := client.HubRepo{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
 				RepoID:   hfRepoID,
 				Revision: hfRevision,
 			}
 
-			provider := hf.NewWriteTokenProvider(nil, target, hfToken)
+			provider := client.NewHubTokenProvider(nil, repo, hfToken)
 			return common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr)
 		},
 	}
