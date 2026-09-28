@@ -24,7 +24,8 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/client/hf/hftest"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	hfserver "github.com/wzshiming/xet/server/hf"
@@ -100,11 +101,14 @@ func (n *native) upload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), hfTimeout)
 	defer cancel()
 	hc := &http.Client{}
-	target := client.HubRepo{Endpoint: rec.HubURL(), RepoID: n.repo}
-	c := newClient(t, hc, nil)
-	commit, err := c.Commit(ctx, target.CommitURL(), n.token, "test: go client private repo regression",
-		client.CommitFile{Path: repoDir + "/" + nativeLFSName, Content: bytes.NewReader(n.lfs)},
-		client.CommitFile{Path: repoDir + "/" + nativeRegularName, Content: bytes.NewReader(n.regular)},
+	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
+	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := c.Commit(ctx, "test: go client private repo regression",
+		hf.CommitFile{Path: repoDir + "/" + nativeLFSName, Content: bytes.NewReader(n.lfs)},
+		hf.CommitFile{Path: repoDir + "/" + nativeRegularName, Content: bytes.NewReader(n.regular)},
 	)
 	if err != nil {
 		t.Fatalf("commit: %s", hubtrace.Redact(err.Error()))
@@ -164,28 +168,31 @@ func (n *native) uploadVerify(t *testing.T) {
 	}
 }
 
-// download fetches the reference fixtures with the Go client: ref-lfs.bin through Resolve and through a bound token provider, ref-regular.txt over plain HTTP.
+// download fetches the reference fixtures with the Go client: ref-lfs.bin through a bound client's Resolve and through a bound token provider, ref-regular.txt over plain HTTP.
 func (n *native) download(t *testing.T) {
 	rec := n.record(t, "go-download", n.tool)
 	ctx, cancel := context.WithTimeout(t.Context(), hfTimeout)
 	defer cancel()
 	hc := &http.Client{}
-	c := newClient(t, hc, nil)
-	resolved, err := c.Resolve(ctx, rec.HubURL()+n.resolvePath(lfsName), n.token)
+	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
+	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := c.Resolve(ctx, repoDir+"/"+lfsName)
 	if err != nil {
 		t.Fatalf("resolve %s: %s", lfsName, hubtrace.Redact(err.Error()))
 	}
 	n.refHash = resolved.Hash
 	t.Logf("%s resolves to %s", lfsName, resolved.Hash)
-	got, err := downloadInto(t, func(w io.WriteSeeker) error { return c.DownloadResolved(ctx, resolved, w) })
+	got, err := downloadInto(t, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, resolved.Hash, w) })
 	if err != nil {
-		t.Errorf("DownloadResolved: %s", hubtrace.Redact(err.Error()))
+		t.Errorf("resolved DownloadFile: %s", hubtrace.Redact(err.Error()))
 	} else if got != n.refFx.lfsSHA256 {
-		t.Errorf("DownloadResolved sha256 = %s, want %s", got, n.refFx.lfsSHA256)
+		t.Errorf("resolved DownloadFile sha256 = %s, want %s", got, n.refFx.lfsSHA256)
 	}
 
-	target := client.HubRepo{Endpoint: rec.HubURL(), RepoID: n.repo}
-	bound := newClient(t, hc, client.NewHubTokenProvider(hc, target, n.token))
+	bound := newClient(t, hc, hf.NewTokenProvider(hc, target, n.token))
 	got, err = downloadInto(t, func(w io.WriteSeeker) error { return bound.DownloadFile(ctx, resolved.Hash, w) })
 	if err != nil {
 		t.Errorf("DownloadFile: %s", hubtrace.Redact(err.Error()))
@@ -219,17 +226,24 @@ func (n *native) anonymous(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), hfTimeout)
 	defer cancel()
 	hc := &http.Client{}
-	c := newClient(t, hc, nil)
+	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
 	for _, cred := range []struct{ name, token string }{{"anonymous", ""}, {"wrong-token", wrongToken}} {
-		_, err := c.Resolve(ctx, rec.HubURL()+n.resolvePath(lfsName), cred.token)
+		c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(cred.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.Resolve(ctx, repoDir+"/"+lfsName)
 		want401(t, cred.name+" Resolve", err)
 	}
-	target := client.HubRepo{Endpoint: rec.HubURL(), RepoID: n.repo}
-	wrong := newClient(t, hc, client.NewHubTokenProvider(hc, target, wrongToken))
+	wrong := newClient(t, hc, hf.NewTokenProvider(hc, target, wrongToken))
 	_, err := downloadInto(t, func(w io.WriteSeeker) error { return wrong.DownloadFile(ctx, n.fileHash(), w) })
 	want401(t, "wrong-token DownloadFile", err)
-	_, err = c.Commit(ctx, target.CommitURL(), "", "test: anonymous commit",
-		client.CommitFile{Path: repoDir + "/" + nativeRegularName, Content: bytes.NewReader(n.regular)})
+	anon, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = anon.Commit(ctx, "test: anonymous commit",
+		hf.CommitFile{Path: repoDir + "/" + nativeRegularName, Content: bytes.NewReader(n.regular)})
 	want401(t, "anonymous Commit", err)
 
 	tr := rec.trace()
@@ -522,17 +536,14 @@ func startMirror(t *testing.T, upstream, token string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamFunc, err := hfserver.StaticUpstream(upstream, token)
-	if err != nil {
-		t.Fatal(err)
-	}
+	upstreamProvider := client.StaticUpstreamProvider(upstream, token)
 	m, err := mirror.NewMirror(mirror.WithStorage(stor), mirror.WithCacheDir(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	hfh := hfserver.NewHandler(
 		hfserver.WithMirror(m),
-		hfserver.WithUpstream(upstreamFunc),
+		hfserver.WithUpstreamProvider(upstreamProvider),
 		hfserver.WithExternalURL(srv.URL),
 		hfserver.WithMinter(hfserver.MinterFunc(func(r *http.Request, req hfserver.TokenRequest) (string, int64, error) {
 			if req.Permission != auth.Read {
@@ -540,7 +551,7 @@ func startMirror(t *testing.T, upstream, token string) string {
 			}
 			return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
 		})),
-		hfserver.WithNext(hfserver.NewUpstreamProxy(upstreamFunc)),
+		hfserver.WithNext(hfserver.NewUpstreamProxy(upstreamProvider)),
 	)
 	inner.Store(http.Handler(server.NewHandler(
 		server.WithStorage(stor),

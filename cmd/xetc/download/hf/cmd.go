@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/client"
+	hfclient "github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/cmd/xetc/internal/common"
 )
 
@@ -40,15 +40,18 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			repo := client.HubRepo{
+			repo := hfclient.Repo{
 				Endpoint: hfEndpoint,
 				RepoType: hfRepoType,
 				RepoID:   hfRepoID,
 				Revision: hfRevision,
 			}
 
-			provider := client.NewHubTokenProvider(nil, repo, hfToken)
-			return common.ExecuteDownload(cmd.Context(), fileHash, args[1], provider, namespace, concurrency, cacheDir, resume, os.Stderr)
+			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(namespace, concurrency, cacheDir, os.Stderr)...))
+			if err != nil {
+				return fmt.Errorf("create client: %w", err)
+			}
+			return common.ExecuteDownload(cmd.Context(), fileHash, args[1], cli.Client, resume, os.Stderr)
 		},
 	}
 

@@ -50,7 +50,7 @@ func newTestServer(t *testing.T) (client.UpstreamProvider, func() string) {
 func TestExecuteUploadMissingInputFile(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "missing")
 	var out bytes.Buffer
-	err := ExecuteUpload(context.Background(), filename, nil, "default", 1, "", &out)
+	err := ExecuteUpload(context.Background(), filename, nil, &out)
 	if !errors.Is(err, fs.ErrNotExist) || !strings.HasPrefix(err.Error(), "upload failed: open input file: ") {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestExecuteDownloadOutputFileErrors(t *testing.T) {
 		t.Run(tc.prefix, func(t *testing.T) {
 			output := filepath.Join(t.TempDir(), "missing-dir", "out")
 			var out bytes.Buffer
-			err := ExecuteDownload(context.Background(), xet.FileHash{}, output, nil, "default", 1, "", tc.resume, &out)
+			err := ExecuteDownload(context.Background(), xet.FileHash{}, output, nil, tc.resume, &out)
 			if !errors.Is(err, fs.ErrNotExist) || !strings.HasPrefix(err.Error(), tc.prefix) {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -92,7 +92,11 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := ExecuteUpload(context.Background(), input, provider, "ns-a", 2, t.TempDir(), &out); err != nil {
+	cli, err := client.NewClient(append(Options("ns-a", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExecuteUpload(context.Background(), input, cli, &out); err != nil {
 		t.Fatal(err)
 	}
 	got := out.String()
@@ -127,7 +131,11 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 			}
 			before := requests()
 			var out bytes.Buffer
-			if err := ExecuteDownload(context.Background(), fileHash, output, provider, "ns-a", 2, t.TempDir(), tc.resume, &out); err != nil {
+			cli, err := client.NewClient(append(Options("ns-a", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ExecuteDownload(context.Background(), fileHash, output, cli, tc.resume, &out); err != nil {
 				t.Fatal(err)
 			}
 			if want := fmt.Sprintf("Download complete! (%d bytes)\r", len(data)); !strings.HasSuffix(out.String(), want) {
@@ -163,22 +171,26 @@ func TestExecuteResolveDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := ExecuteUpload(context.Background(), input, provider, "default", 2, t.TempDir(), &out); err != nil {
+	cli, err := client.NewClient(append(Options("default", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExecuteUpload(context.Background(), input, cli, &out); err != nil {
 		t.Fatal(err)
 	}
 	_, hashLine, _ := strings.Cut(out.String(), "File hash: ")
 	fileHash := strings.TrimSpace(hashLine)
 
-	const resolvePath = "/org/repo/resolve/main/f.bin"
+	const resolvePath, tokenPath = "/org/repo/resolve/main/f.bin", "/api/models/org/repo/xet-read-token/main"
 	var hubAuth sync.Map // path -> Authorization
 	var hub *httptest.Server
 	hub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hubAuth.Store(r.URL.Path, r.Header.Get("Authorization"))
-		if r.URL.Path == "/xet-auth" {
+		if strings.Contains(r.URL.Path, "/xet-read-token/") {
 			_, _ = fmt.Fprintf(w, `{"casUrl":%q,"accessToken":"","exp":%d}`, casURL, time.Now().Add(time.Hour).Unix())
 			return
 		}
-		w.Header().Set("Link", fmt.Sprintf(`<%s/xet-auth>; rel="xet-auth", <%s/v1/reconstructions/%s>; rel="xet-reconstruction-info"`, hub.URL, casURL, fileHash))
+		w.Header().Set("Link", fmt.Sprintf(`<%s%s>; rel="xet-auth", <%s/v1/reconstructions/%s>; rel="xet-reconstruction-info"`, hub.URL, tokenPath, casURL, fileHash))
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hub.Close()
@@ -198,7 +210,7 @@ func TestExecuteResolveDownload(t *testing.T) {
 	if content, err := os.ReadFile(output); err != nil || !bytes.Equal(content, data) {
 		t.Fatalf("downloaded %d bytes, %v; want %d", len(content), err, len(data))
 	}
-	for _, p := range []string{resolvePath, "/xet-auth"} {
+	for _, p := range []string{resolvePath, tokenPath} {
 		if v, _ := hubAuth.Load(p); v != "Bearer hub-token" {
 			t.Fatalf("hub %s saw Authorization %q, want the hub token", p, v)
 		}
@@ -208,7 +220,7 @@ func TestExecuteResolveDownload(t *testing.T) {
 // A destination that already exists keeps its bytes when the resolution fails before any download starts.
 func TestExecuteResolveDownloadKeepsDestinationOnFailure(t *testing.T) {
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/private" {
+		if strings.HasPrefix(r.URL.Path, "/org/private/") {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -216,9 +228,9 @@ func TestExecuteResolveDownloadKeepsDestinationOnFailure(t *testing.T) {
 	}))
 	defer hub.Close()
 	for _, tc := range []struct{ name, resolveURL, wantErr string }{
-		{"invalid URL", "://hub", "create resolve request"},
-		{"unauthorized", hub.URL + "/private", "unexpected status from resolve: 401"},
-		{"missing links", hub.URL + "/plain", "missing xet-reconstruction-info link"},
+		{"invalid URL", "://hub", "invalid resolve URL"},
+		{"unauthorized", hub.URL + "/org/private/resolve/main/f.bin", "hub API error (status 401"},
+		{"missing links", hub.URL + "/org/plain/resolve/main/f.bin", "missing xet-reconstruction-info link"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			output := filepath.Join(t.TempDir(), "out")

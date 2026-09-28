@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
@@ -174,10 +175,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstreamFunc, err := hf.StaticUpstream(upstreamURL, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	upstreamProvider := client.StaticUpstreamProvider(upstreamURL, "")
 	m, err := mirror.NewMirror(
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
@@ -192,7 +190,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 		server.WithAuthorizer(issuer),
 		server.WithNext(hf.NewHandler(
 			hf.WithMirror(m),
-			hf.WithUpstream(upstreamFunc),
+			hf.WithUpstreamProvider(upstreamProvider),
 			hf.WithExternalURL(srv.URL),
 			hf.WithMinter(hf.MinterFunc(func(r *http.Request, req hf.TokenRequest) (string, int64, error) {
 				if req.Permission != auth.Read {
@@ -200,7 +198,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 				}
 				return issuer.Sign(auth.Grant{Permission: auth.Read, File: req.File})
 			})),
-			hf.WithNext(hf.NewUpstreamProxy(upstreamFunc)),
+			hf.WithNext(hf.NewUpstreamProxy(upstreamProvider)),
 		)),
 	)))
 	return srv

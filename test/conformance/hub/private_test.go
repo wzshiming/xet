@@ -1,5 +1,5 @@
 // Package hub_test records the official hf CLI's behaviour against a private
-// Hugging Face repository as redacted traces in the client/hftest format:
+// Hugging Face repository as redacted traces in the client/hf/hftest format:
 // a folder upload, downloads over xet and over plain HTTP, a re-upload of
 // identical content, and the hub's answers to anonymous and wrong-token
 // requests.

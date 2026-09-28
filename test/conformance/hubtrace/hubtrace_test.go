@@ -16,8 +16,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/client/hf/hftest"
 	"github.com/wzshiming/xet/test/conformance/hubtrace"
 )
 
@@ -162,7 +162,7 @@ func TestRecorderRewritesAndRedacts(t *testing.T) {
 	if got := resp.Header.Get("X-Xet-Hash"); got != fileHash {
 		t.Errorf("X-Xet-Hash = %q, want %q", got, fileHash)
 	}
-	links := client.ParseLinkHeaders(resp.Header.Values("Link"))
+	links := hf.ParseLinkHeaders(resp.Header.Values("Link"))
 	if got := links["xet-auth"]; got != h+tokenPath {
 		t.Fatalf("xet-auth link = %q, want %q", got, h+tokenPath)
 	}
@@ -259,7 +259,7 @@ func TestRecorderRewritesAndRedacts(t *testing.T) {
 			t.Errorf("resolve %s = %q, want the CloudFront trace header dropped", name, got)
 		}
 	}
-	links = client.ParseLinkHeaders(resolve.ResponseHeaders.Values("Link"))
+	links = hf.ParseLinkHeaders(resolve.ResponseHeaders.Values("Link"))
 	if links["xet-auth"] != h+tokenPath || links["xet-reconstruction-info"] != reconLink {
 		t.Errorf("recorded links = %v, want xet-auth on %s and the reconstruction link untouched", links, h)
 	}

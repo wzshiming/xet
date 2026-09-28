@@ -556,7 +556,7 @@ func newXetStallUpstream(t *testing.T, resolvePath string, head, tail []byte) *x
 	u.fileHash, u.sha256, u.size = fileHash.String(), hex.EncodeToString(sum[:]), len(data)
 
 	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/xet-read-token" {
+		if strings.Contains(r.URL.Path, "/xet-read-token/") {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": u.casURL, "accessToken": "upstream-cas-token", "exp": time.Now().Add(time.Hour).Unix()})
 			return
@@ -578,16 +578,6 @@ func newXetStallUpstream(t *testing.T, resolvePath string, head, tail []byte) *x
 	return u
 }
 
-// shortIdleClient is a xet client whose GET/HEAD read-idle guard fires after 200ms.
-func shortIdleClient(t *testing.T) *client.Client {
-	t.Helper()
-	c, err := client.NewClient(client.WithIdleTimeout(200*time.Millisecond), client.WithCacheDir(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c
-}
-
 // A stalled term body is resumed by the client at the compressed offset: no new attempt, no second reconstruction query.
 func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	head, tail := make([]byte, 256*1024), make([]byte, 256*1024)
@@ -599,7 +589,7 @@ func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	}
 	const resolvePath = "/org/repo/resolve/main/stall.bin"
 	up := newXetStallUpstream(t, resolvePath, head, tail)
-	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithClient(shortIdleClient(t)))
+	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithClientOptions(client.WithIdleTimeout(200*time.Millisecond)))
 	t.Cleanup(func() { close(up.abort) }) // runs first: unblocks a still-stalled handler before servers close
 
 	in, err := m.Ingest("org/repo", "main", "stall.bin")
@@ -654,13 +644,10 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/slow.bin"
 	up := newXetStallUpstream(t, resolvePath, head, tail)
 	up.slowFeed = true
-	xc := shortIdleClient(t)
+	own := client.NewCache(t.TempDir(), 0)
 	cacheDir := t.TempDir()
-	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir, WithClient(xc))
+	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir, WithClientOptions(client.WithIdleTimeout(200*time.Millisecond), client.WithCache(own)))
 	t.Cleanup(func() { close(up.abort) })
-	if m.xetClient != xc {
-		t.Fatal("WithClient not used")
-	}
 
 	in, err := m.Ingest("org/repo", "main", "slow.bin")
 	if err != nil {
@@ -680,11 +667,11 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, append(head, tail...)) {
 		t.Fatal("stored bytes mismatch")
 	}
-	usage, err := xc.Usage(context.Background())
+	usage, err := own.Usage(context.Background())
 	if err != nil || usage.Download.Count == 0 {
-		t.Fatalf("supplied client chunk cache: %+v, %v; want entries", usage.Download, err)
+		t.Fatalf("supplied chunk cache: %+v, %v; want entries", usage, err)
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, "chunks")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("mirror created its own chunk cache despite WithClient: %v", err)
+		t.Fatalf("mirror used its own chunk cache despite WithCache: %v", err)
 	}
 }

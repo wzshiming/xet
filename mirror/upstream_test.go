@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,7 +22,7 @@ import (
 	"github.com/wzshiming/xet/upload"
 )
 
-// xetUpstream is a hub+CAS pair serving one xet file: the hub hands out casTokens in turn (repeating the last, issuing every earlier one inside the client's renewal margin) and both record the Authorization headers they see.
+// xetUpstream is a hub+CAS pair serving one xet file: the hub mints casToken at the repository's read-token route and both record the Authorization headers they see.
 type xetUpstream struct {
 	hubURL   string
 	sha256   string
@@ -38,7 +39,7 @@ func (u *xetUpstream) tokenRequests() []string {
 	return slices.Clone(u.tokenAuth)
 }
 
-func newXetUpstream(t *testing.T, resolvePath string, data []byte, casTokens ...string) *xetUpstream {
+func newXetUpstream(t *testing.T, resolvePath string, data []byte, casToken string) *xetUpstream {
 	t.Helper()
 	u := &xetUpstream{}
 	var cas http.Handler
@@ -60,21 +61,15 @@ func newXetUpstream(t *testing.T, resolvePath string, data []byte, casTokens ...
 	sum := sha256.Sum256(data)
 	u.sha256 = hex.EncodeToString(sum[:])
 
-	var fetches atomic.Int32
 	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/xet-read-token":
+		switch {
+		case strings.Contains(r.URL.Path, "/xet-read-token/"):
 			u.mu.Lock()
 			u.tokenAuth = append(u.tokenAuth, r.Header.Get("Authorization"))
 			u.mu.Unlock()
-			n := min(int(fetches.Add(1)), len(casTokens))
-			ttl := time.Hour
-			if n < len(casTokens) {
-				ttl = 30 * time.Second // inside the client's one-minute renewal margin
-			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": casSrv.URL, "accessToken": casTokens[n-1], "exp": time.Now().Add(ttl).Unix()})
-		case resolvePath:
+			_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": casSrv.URL, "accessToken": casToken, "exp": time.Now().Add(time.Hour).Unix()})
+		case r.URL.Path == resolvePath:
 			u.mu.Lock()
 			u.hubAuth = r.Header.Get("Authorization")
 			u.mu.Unlock()
@@ -197,10 +192,10 @@ func TestAuthInjectorOrigin(t *testing.T) {
 	}
 }
 
-// The hub token of the resolver that started the ingest authenticates the resolve, the xet-read-token fetch, and the renewal of a CAS token issued inside the expiry margin; the CAS only ever sees the renewed token.
-func TestMirrorXetHubTokenRenewal(t *testing.T) {
-	data := []byte("xet bytes behind a rotating CAS token")
-	up := newXetUpstream(t, "/org/repo/resolve/main/f.bin", data, "cas-1", "cas-2")
+// The hub token of the resolver that started the ingest authenticates the resolve and the one read-token fetch at the repository's own endpoint; the CAS sees the minted token and never the hub's.
+func TestMirrorXetHubToken(t *testing.T) {
+	data := []byte("xet bytes behind a hub-minted CAS token")
+	up := newXetUpstream(t, "/org/repo/resolve/main/f.bin", data, "cas-1")
 	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir())
 	m.token = "hub-secret"
 
@@ -211,14 +206,14 @@ func TestMirrorXetHubTokenRenewal(t *testing.T) {
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
 		t.Fatalf("stored %q, want %q", got, data)
 	}
-	if got := up.tokenRequests(); !slices.Equal(got, []string{"Bearer hub-secret", "Bearer hub-secret"}) {
-		t.Fatalf("xet-read-token Authorization = %q, want the hub token on the fetch and the renewal", got)
+	if got := up.tokenRequests(); !slices.Equal(got, []string{"Bearer hub-secret"}) {
+		t.Fatalf("xet-read-token Authorization = %q, want the hub token once", got)
 	}
-	if _, ok := up.seenAuth.Load("Bearer cas-2"); !ok {
-		t.Fatal("CAS never saw the renewed token")
+	if _, ok := up.seenAuth.Load("Bearer cas-1"); !ok {
+		t.Fatal("CAS never saw the minted token")
 	}
-	if _, ok := up.seenAuth.Load("Bearer cas-1"); ok {
-		t.Fatal("CAS saw the expiring token")
+	if _, ok := up.seenAuth.Load("Bearer hub-secret"); ok {
+		t.Fatal("CAS saw the hub token")
 	}
 	up.mu.Lock()
 	defer up.mu.Unlock()

@@ -30,8 +30,11 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			provider := client.StaticUpstreamProvider(baseURL, token)
-			return common.ExecuteDownload(cmd.Context(), hash, args[0], provider, namespace, concurrency, cacheDir, resume, os.Stderr)
+			cli, err := client.NewClient(append(common.Options(namespace, concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
+			if err != nil {
+				return fmt.Errorf("create client: %w", err)
+			}
+			return common.ExecuteDownload(cmd.Context(), hash, args[0], cli, resume, os.Stderr)
 		},
 	}
 

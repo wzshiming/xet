@@ -74,9 +74,12 @@ func NewCommand() *cobra.Command {
 
 			casToken := batchResult.Upload.Header["X-Xet-Access-Token"]
 
-			provider := client.StaticUpstreamProvider(casURL, casToken)
+			cli, err := client.NewClient(append(common.Options(namespace, concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(casURL, casToken)))...)
+			if err != nil {
+				return fmt.Errorf("upload failed: create client: %w", err)
+			}
 
-			if err := common.ExecuteUpload(cmd.Context(), args[0], provider, namespace, concurrency, cacheDir, os.Stderr); err != nil {
+			if err := common.ExecuteUpload(cmd.Context(), args[0], cli, os.Stderr); err != nil {
 				return err
 			}
 

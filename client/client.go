@@ -32,7 +32,7 @@ type Client struct {
 	progressFunc  progress.ProgressFunc
 	cacheDir      string
 	cacheSize     int64
-	cacheManager  *download.CacheManager
+	cache         *Cache
 }
 
 type Options func(*Client)
@@ -100,6 +100,13 @@ func WithCacheSize(sizeBytes int64) Options {
 	}
 }
 
+// WithCache shares an existing chunk cache; it takes precedence over WithCacheDir and WithCacheSize.
+func WithCache(cache *Cache) Options {
+	return func(c *Client) {
+		c.cache = cache
+	}
+}
+
 // WithUpstreamProvider binds the CAS endpoint and token source; without it every CAS request fails.
 func WithUpstreamProvider(provider UpstreamProvider) Options {
 	return func(c *Client) {
@@ -121,7 +128,9 @@ func NewClient(opts ...Options) (*Client, error) {
 		opt(c)
 	}
 
-	c.cacheManager = download.NewCacheManager(c.cacheDir, c.cacheSize)
+	if c.cache == nil {
+		c.cache = NewCache(c.cacheDir, c.cacheSize)
+	}
 
 	// Copy the caller's client so wrapping its transport never mutates it.
 	httpClient := *c.httpClient
@@ -151,17 +160,9 @@ func NewClient(opts ...Options) (*Client, error) {
 	return c, nil
 }
 
-type Usage struct {
-	Download download.CacheUsage
-}
-
-// Usage includes temporary and incomplete files in the cache directory.
+// Usage reports the client's cache directory, shared or private.
 func (c *Client) Usage(ctx context.Context) (Usage, error) {
-	downloadUsage, err := c.cacheManager.Usage(ctx)
-	if err != nil {
-		return Usage{}, err
-	}
-	return Usage{Download: downloadUsage}, nil
+	return c.cache.Usage(ctx)
 }
 
 var (

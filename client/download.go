@@ -25,15 +25,10 @@ const (
 // determine the current size for resume support.
 // Full downloads are hash-verified; resumed suffixes are not.
 func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
-	return c.download(ctx, c.provider, fileHash, w)
-}
-
-// download reconstructs fileHash from upstream through V2, falling back to V1 when the endpoint is missing.
-func (c *Client) download(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, w io.WriteSeeker) error {
-	err := c.downloadFile(ctx, upstream, fileHash, w, reconstructionAPIVersionV2)
+	err := c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV2)
 	if err != nil {
 		if errors.Is(err, errNotFound) {
-			return c.downloadFile(ctx, upstream, fileHash, w, reconstructionAPIVersionV1)
+			return c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV1)
 		}
 		return err
 	}
@@ -43,18 +38,18 @@ func (c *Client) download(ctx context.Context, upstream UpstreamProvider, fileHa
 // DownloadFileV1 downloads and reconstructs a file from its hash into w
 // through the V1 API. It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
-	return c.downloadFile(ctx, c.provider, fileHash, w, reconstructionAPIVersionV1)
+	return c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV1)
 }
 
 // DownloadFileV2 downloads and reconstructs a file from its hash into w
 // through the V2 API. It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV2(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
-	return c.downloadFile(ctx, c.provider, fileHash, w, reconstructionAPIVersionV2)
+	return c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV2)
 }
 
 // downloadFile downloads and reconstructs a file from its hash into w through
 // the reconstruction API version selected by apiVersion.
-func (c *Client) downloadFile(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, w io.WriteSeeker, apiVersion reconstructionAPIVersion) error {
+func (c *Client) downloadFile(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker, apiVersion reconstructionAPIVersion) error {
 	resumeOffset, err := w.Seek(0, io.SeekEnd)
 	if err != nil {
 		resumeOffset = 0
@@ -67,7 +62,7 @@ func (c *Client) downloadFile(ctx context.Context, upstream UpstreamProvider, fi
 		}
 	}
 
-	reader, expectedLength, err := c.newDownloadReader(ctx, upstream, fileHash, header, resumeOffset, w, apiVersion)
+	reader, expectedLength, err := c.newDownloadReader(ctx, fileHash, header, resumeOffset, w, apiVersion)
 	if err != nil {
 		return err
 	}
@@ -89,15 +84,15 @@ func (c *Client) downloadFile(ctx context.Context, upstream UpstreamProvider, fi
 // and returns a reader plus the expected reconstructed length. When a resume
 // (Range) query is rejected, it retries once from the start without a Range
 // header.
-func (c *Client) newDownloadReader(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker, apiVersion reconstructionAPIVersion) (io.ReadCloser, int64, error) {
+func (c *Client) newDownloadReader(ctx context.Context, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker, apiVersion reconstructionAPIVersion) (io.ReadCloser, int64, error) {
 	if apiVersion == reconstructionAPIVersionV1 {
-		return c.newDownloadReaderV1(ctx, upstream, fileHash, header, resumeOffset, w)
+		return c.newDownloadReaderV1(ctx, fileHash, header, resumeOffset, w)
 	}
-	return c.newDownloadReaderV2(ctx, upstream, fileHash, header, resumeOffset, w)
+	return c.newDownloadReaderV2(ctx, fileHash, header, resumeOffset, w)
 }
 
-func (c *Client) newDownloadReaderV1(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
-	reconstructionResp, err := c.getReconstructionV1(ctx, upstream, fileHash, header)
+func (c *Client) newDownloadReaderV1(ctx context.Context, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
+	reconstructionResp, err := c.getReconstructionV1(ctx, fileHash, header)
 	if err != nil {
 		// Only a rejected Range query warrants restarting from scratch; a 404
 		// means the file is absent and rewinding would just lose the resume
@@ -105,7 +100,7 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, upstream UpstreamProvi
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
-				reconstructionResp, err = c.getReconstructionV1(ctx, upstream, fileHash, nil)
+				reconstructionResp, err = c.getReconstructionV1(ctx, fileHash, nil)
 			}
 		}
 		if err != nil {
@@ -120,15 +115,15 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, upstream UpstreamProvi
 	return reader, download.ExpectedLengthV1(reconstructionResp), nil
 }
 
-func (c *Client) newDownloadReaderV2(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
-	reconstructionResp, err := c.getReconstructionV2(ctx, upstream, fileHash, header)
+func (c *Client) newDownloadReaderV2(ctx context.Context, fileHash xet.FileHash, header http.Header, resumeOffset int64, w io.WriteSeeker) (io.ReadCloser, int64, error) {
+	reconstructionResp, err := c.getReconstructionV2(ctx, fileHash, header)
 	if err != nil {
 		// A missing V2 endpoint must not rewind w: the caller falls back to
 		// V1, which resumes from the same offset.
 		if resumeOffset > 0 && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
-				reconstructionResp, err = c.getReconstructionV2(ctx, upstream, fileHash, nil)
+				reconstructionResp, err = c.getReconstructionV2(ctx, fileHash, nil)
 			}
 		}
 		if err != nil {
@@ -147,7 +142,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, upstream UpstreamProvi
 func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithCacheManager(c.cacheManager),
+		download.WithCacheManager(c.cache.manager),
 	}
 	if resumeOffset == 0 {
 		opts = append(opts, download.WithExpectedFileHash(fileHash))

@@ -21,13 +21,13 @@ type casAuth struct {
 
 type casAuthKey struct{}
 
-// casContext resolves the CAS endpoint for perm through upstream and marks ctx so authTransport authenticates requests to that origin.
-func (c *Client) casContext(ctx context.Context, upstream UpstreamProvider, perm auth.Permission) (context.Context, string, error) {
-	if upstream == nil {
+// casContext resolves the CAS endpoint for perm through the bound provider and marks ctx so authTransport authenticates requests to that origin.
+func (c *Client) casContext(ctx context.Context, perm auth.Permission) (context.Context, string, error) {
+	if c.provider == nil {
 		return nil, "", errNoUpstreamProvider
 	}
 	// A provider may fetch its token through this client's transport; the mark of an enclosing operation must not authenticate that.
-	baseURL, token, err := upstream.Resolve(context.WithValue(ctx, casAuthKey{}, nil), perm)
+	baseURL, token, err := c.provider.Resolve(context.WithValue(ctx, casAuthKey{}, nil), perm)
 	if err != nil {
 		return nil, "", &authError{err}
 	}

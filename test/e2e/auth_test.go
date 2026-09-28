@@ -19,6 +19,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/internalapi"
 	"github.com/wzshiming/xet/storage"
@@ -318,9 +319,9 @@ func TestAuthInternalToken(t *testing.T) {
 }
 
 // TestAuthHubTokenFlow runs the hub-side credential flow a xet client
-// performs against the mirror: the resolve Link hands out a token bound to
-// that file, the repository read-token route hands out an unbound one, and
-// write-token requests fall through to the upstream hub.
+// performs against the mirror: the resolve names the file, the token behind
+// its Link is bound to that file, the repository read-token route hands out
+// an unbound one, and write-token requests fall through to the upstream hub.
 func TestAuthHubTokenFlow(t *testing.T) {
 	ctx := context.Background()
 	hub := newFakeHub()
@@ -335,24 +336,20 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	waitMirrorReady(t, srv.URL+pathA)
 	waitMirrorReady(t, srv.URL+pathB)
 
-	c, err := client.NewClient(client.WithCacheDir(t.TempDir()))
+	target := hf.Repo{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
+	anon, err := hf.NewClient(target, hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolvedA, err := c.Resolve(ctx, srv.URL+pathA, "")
+	resolvedA, err := anon.Resolve(ctx, "a.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolvedB, err := c.Resolve(ctx, srv.URL+pathB, "")
+	resolvedB, err := anon.Resolve(ctx, "b.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	downloadResolved := func(f *client.ResolvedFile) downloadFunc {
-		return func(ctx context.Context, _ xet.FileHash, w io.WriteSeeker) error {
-			return c.DownloadResolved(ctx, f, w)
-		}
-	}
-	assertDownloadAs(t, downloadResolved(resolvedA), resolvedA.Hash, fileA)
+	assertDownloadAs(t, anon.DownloadFile, resolvedA.Hash, fileA)
 	// The token behind file A's resolve link opens neither file B nor any write route.
 	var tokenA struct {
 		CASURL string `json:"casUrl"`
@@ -371,8 +368,7 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	_, err = asA.UploadFile(ctx, bytes.NewReader(fileB))
 	wantErr(t, err, "status 403")
 
-	target := client.HubRepo{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
-	repo := client.NewHubTokenProvider(nil, target, "hf-user-token")
+	repo := hf.NewTokenProvider(nil, target, "hf-user-token")
 	asRepo, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(repo))
 	if err != nil {
 		t.Fatal(err)

@@ -15,11 +15,11 @@ import (
 
 // GetReconstructionV1 retrieves reconstruction information for a file.
 func (c *Client) GetReconstructionV1(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
-	return c.getReconstructionV1(ctx, c.provider, fileHash, header)
+	return c.getReconstructionV1(ctx, fileHash, header)
 }
 
-func (c *Client) getReconstructionV1(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
-	ctx, baseURL, err := c.casContext(ctx, upstream, auth.Read)
+func (c *Client) getReconstructionV1(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV1, error) {
+	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -60,11 +60,11 @@ func reconstructionError(req *http.Request, resp *http.Response) error {
 
 // GetReconstructionV2 retrieves V2 reconstruction information for a file.
 func (c *Client) GetReconstructionV2(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
-	return c.getReconstructionV2(ctx, c.provider, fileHash, header)
+	return c.getReconstructionV2(ctx, fileHash, header)
 }
 
-func (c *Client) getReconstructionV2(ctx context.Context, upstream UpstreamProvider, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
-	ctx, baseURL, err := c.casContext(ctx, upstream, auth.Read)
+func (c *Client) getReconstructionV2(ctx context.Context, fileHash xet.FileHash, header http.Header) (*download.ReconstructionResponseV2, error) {
+	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -105,7 +105,7 @@ func (c *Client) GetBatchReconstruction(ctx context.Context, fileHashes []xet.Fi
 		}, nil
 	}
 
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Read)
+	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}

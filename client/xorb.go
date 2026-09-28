@@ -18,7 +18,7 @@ import (
 
 // HasXorb checks whether a xorb already exists on the server.
 func (c *Client) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
+	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return false, fmt.Errorf("get base URL: %w", err)
 	}
@@ -65,7 +65,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 		return nil, fmt.Errorf("seek to start offset: %w", err)
 	}
 
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Write)
+	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -113,7 +113,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 // DownloadXorb fetches the raw xorb bytes for the given hash directly from
 // the bound CAS server. The caller must close the returned ReadCloser.
 func (c *Client) DownloadXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadCloser, error) {
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Read)
+	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
@@ -260,7 +260,7 @@ func (c *Client) FetchXorbRangeWithURL(ctx context.Context, rawURL string, heade
 // FetchXorbRange fetches a raw xorb byte range from the bound CAS server
 // endpoint. Useful as a fallback when no CDN URL is known for a given xorb hash.
 func (c *Client) FetchXorbRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, header http.Header) (*http.Response, error) {
-	ctx, baseURL, err := c.casContext(ctx, c.provider, auth.Read)
+	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}

@@ -18,7 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/wzshiming/xet/client/hftest"
+	"github.com/wzshiming/xet/client/hf/hftest"
 )
 
 // maxText bounds the body text kept in a trace.
