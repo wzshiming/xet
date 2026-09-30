@@ -15,14 +15,22 @@ import (
 	"github.com/wzshiming/xet"
 )
 
+// TokenPrefix labels every token this package signs so callers can tell them from hub or static bearers.
+const TokenPrefix = "xet."
+
+// IsToken reports whether s carries TokenPrefix; only Validate decides validity.
+func IsToken(s string) bool {
+	return strings.HasPrefix(s, TokenPrefix)
+}
+
 type claims struct {
 	Permission Permission `json:"permission"`
 	ExpiresAt  *int64     `json:"exp"`
-	File       string     `json:"file,omitempty"`
-	SHA256     string     `json:"sha256,omitempty"`
+	File       *string    `json:"file,omitempty"`
+	SHA256     *string    `json:"sha256,omitempty"`
 }
 
-// Issuer signs and validates HMAC-SHA256 tokens carrying a Grant and verifies bindings against route targets.
+// Issuer signs and validates TokenPrefix-labelled HMAC-SHA256 tokens carrying a Grant and verifies bindings against route targets.
 type Issuer struct {
 	secret []byte
 	ttl    time.Duration
@@ -59,21 +67,22 @@ func (t *Issuer) Sign(g Grant) (token string, exp int64, err error) {
 		ExpiresAt:  &exp,
 	}
 	if g.File != nil {
-		claim.File = g.File.String()
+		file := g.File.String()
+		claim.File = &file
 	}
 	if g.SHA256 != "" {
 		digest, ok := canonicalSHA256(g.SHA256)
 		if !ok {
 			return "", 0, fmt.Errorf("invalid sha256 %q", g.SHA256)
 		}
-		claim.SHA256 = digest
+		claim.SHA256 = &digest
 	}
 	payload, err := json.Marshal(claim)
 	if err != nil {
 		return "", exp, err
 	}
 	input := base64.RawURLEncoding.EncodeToString(payload)
-	return input + "." + base64.RawURLEncoding.EncodeToString(t.mac(input)), exp, nil
+	return TokenPrefix + input + "." + base64.RawURLEncoding.EncodeToString(t.mac(input)), exp, nil
 }
 
 func (t *Issuer) mac(input string) []byte {
@@ -93,7 +102,11 @@ func canonicalSHA256(digest string) (string, bool) {
 
 // Validate returns the Grant carried by a valid, unexpired token signed with this issuer's secret.
 func (t *Issuer) Validate(token string) (Grant, bool) {
-	parts := strings.SplitN(token, ".", 3)
+	rest, ok := strings.CutPrefix(token, TokenPrefix)
+	if !ok {
+		return Grant{}, false
+	}
+	parts := strings.SplitN(rest, ".", 3)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Grant{}, false
 	}
@@ -105,11 +118,7 @@ func (t *Issuer) Validate(token string) (Grant, bool) {
 	if err != nil {
 		return Grant{}, false
 	}
-	var claim struct {
-		claims
-		File   json.RawMessage `json:"file"`
-		SHA256 json.RawMessage `json:"sha256"`
-	}
+	var claim claims
 	if err := json.Unmarshal(payload, &claim); err != nil || claim.ExpiresAt == nil || t.now().Unix() >= *claim.ExpiresAt {
 		return Grant{}, false
 	}
@@ -120,22 +129,14 @@ func (t *Issuer) Validate(token string) (Grant, bool) {
 	}
 	grant := Grant{Permission: claim.Permission}
 	if claim.File != nil {
-		var file string
-		if err := json.Unmarshal(claim.File, &file); err != nil {
-			return Grant{}, false
-		}
-		parsed, err := xet.ParseFileHash(file)
+		parsed, err := xet.ParseFileHash(*claim.File)
 		if err != nil {
 			return Grant{}, false
 		}
 		grant.File = &parsed
 	}
 	if claim.SHA256 != nil {
-		var digest string
-		if err := json.Unmarshal(claim.SHA256, &digest); err != nil {
-			return Grant{}, false
-		}
-		canonical, ok := canonicalSHA256(digest)
+		canonical, ok := canonicalSHA256(*claim.SHA256)
 		if !ok {
 			return Grant{}, false
 		}

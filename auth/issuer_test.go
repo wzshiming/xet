@@ -23,7 +23,7 @@ func signPayload(t *testing.T, secret []byte, payloadJSON string) string {
 	segment := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(segment))
-	return segment + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return TokenPrefix + segment + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func TestIssuerTokenFormat(t *testing.T) {
@@ -48,13 +48,13 @@ func TestIssuerTokenFormat(t *testing.T) {
 			name:     "unbound",
 			grant:    Grant{Permission: Read},
 			payload:  `{"permission":"read","exp":1800000060}`,
-			expected: "eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MH0.0WWkE-UPuM7RihXpgpCHp1czYeo_YcNLdPzacVmC30A",
+			expected: "xet.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MH0.0WWkE-UPuM7RihXpgpCHp1czYeo_YcNLdPzacVmC30A",
 		},
 		{
 			name:     "bound",
 			grant:    Grant{Permission: Read, File: &file, SHA256: digest},
 			payload:  `{"permission":"read","exp":1800000060,"file":"1111111111111111111111111111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}`,
-			expected: "eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MCwiZmlsZSI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGEyNTYiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0.by-PDp7AAvzdldlFpQ0pKZMuw1WYLkSna4COvI651RI",
+			expected: "xet.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MCwiZmlsZSI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGEyNTYiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0.by-PDp7AAvzdldlFpQ0pKZMuw1WYLkSna4COvI651RI",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -73,10 +73,10 @@ func TestIssuerTokenFormat(t *testing.T) {
 				t.Fatalf("Sign() = (%q, %d), want (%q, 1800000060)", token, exp, test.expected)
 			}
 			parts := strings.Split(token, ".")
-			if len(parts) != 2 {
-				t.Fatalf("token has %d parts, want 2", len(parts))
+			if len(parts) != 3 || parts[0] != "xet" {
+				t.Fatalf("token parts = %q, want xet prefix and 3 parts", parts)
 			}
-			decoded, err := base64.RawURLEncoding.DecodeString(parts[0])
+			decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -97,6 +97,31 @@ func TestIssuerTokenFormat(t *testing.T) {
 	}
 }
 
+func TestIsToken(t *testing.T) {
+	issuer, err := NewIssuer(nil, time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := issuer.Sign(Grant{Permission: Read})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		token string
+		want  bool
+	}{
+		{token, true},
+		{"", false},
+		{"xet", false},
+		{"hf_abc", false},
+		{strings.TrimPrefix(token, TokenPrefix), false},
+	} {
+		if got := IsToken(test.token); got != test.want {
+			t.Errorf("IsToken(%q) = %v, want %v", test.token, got, test.want)
+		}
+	}
+}
+
 func TestIssuerRejectsInvalidTokens(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	now := time.Unix(1_800_000_000, 0)
@@ -107,7 +132,8 @@ func TestIssuerRejectsInvalidTokens(t *testing.T) {
 	payload := `{"permission":"read","exp":1800000060}`
 	token := signPayload(t, secret, payload)
 	parts := strings.Split(token, ".")
-	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payload64, sig := parts[1], parts[2]
+	signature, err := base64.RawURLEncoding.DecodeString(sig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,19 +146,24 @@ func TestIssuerRejectsInvalidTokens(t *testing.T) {
 		token string
 	}{
 		{"empty", ""},
-		{"one segment", parts[0]},
-		{"old JWT shape", "header.payload.sig"},
+		{"one segment", TokenPrefix + payload64},
+		{"old JWT shape", TokenPrefix + "header.payload.sig"},
 		{"extra segment", token + ".extra"},
-		{"empty payload", "." + parts[1]},
-		{"empty signature", parts[0] + "."},
-		{"empty segments", "."},
-		{"many dots", strings.Repeat(".", 1024)},
-		{"bad payload base64 with valid signature", "!." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))},
-		{"bad signature base64", parts[0] + ".!"},
+		{"empty payload", TokenPrefix + "." + sig},
+		{"empty signature", TokenPrefix + payload64 + "."},
+		{"empty segments", TokenPrefix + "."},
+		{"many dots", TokenPrefix + strings.Repeat(".", 1024)},
+		{"bad payload base64 with valid signature", TokenPrefix + "!." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))},
+		{"bad signature base64", TokenPrefix + payload64 + ".!"},
 		{"wrong secret", signPayload(t, []byte("another secret"), payload)},
-		{"flipped signature", parts[0] + "." + base64.RawURLEncoding.EncodeToString(signature)},
-		{"different payload signature", parts[0] + "." + other[1]},
-		{"payload tamper", base64.RawURLEncoding.EncodeToString([]byte(strings.Replace(payload, "read", "write", 1))) + "." + parts[1]},
+		{"flipped signature", TokenPrefix + payload64 + "." + base64.RawURLEncoding.EncodeToString(signature)},
+		{"different payload signature", TokenPrefix + payload64 + "." + other[2]},
+		{"payload tamper", TokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(strings.Replace(payload, "read", "write", 1))) + "." + sig},
+		{"missing prefix", payload64 + "." + sig},
+		{"wrong prefix", "xtk." + payload64 + "." + sig},
+		{"prefix only", TokenPrefix},
+		{"uppercase prefix", "XET." + payload64 + "." + sig},
+		{"doubled prefix", TokenPrefix + token},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got, ok := issuer.Validate(test.token); ok || got != (Grant{}) {
@@ -157,6 +188,8 @@ func TestIssuerClaims(t *testing.T) {
 		{"valid", `{"permission":"read","exp":1800000060}`, true},
 		{"formatted payload", `{ "exp": 1800000060, "permission": "read" }`, true},
 		{"unknown keys ignored", `{"permission":"read","exp":1800000060,"nbf":1800000061}`, true},
+		{"null file binding", `{"permission":"read","exp":1800000060,"file":null}`, true},
+		{"null sha256 binding", `{"permission":"read","exp":1800000060,"sha256":null}`, true},
 		{"expired", `{"permission":"read","exp":1799999999}`, false},
 		{"at expiry", `{"permission":"read","exp":1800000000}`, false},
 		{"missing expiry", `{"permission":"read"}`, false},
@@ -182,7 +215,7 @@ func TestIssuerClaims(t *testing.T) {
 		})
 	}
 	for _, field := range []string{"file", "sha256"} {
-		for _, value := range []string{`""`, `"ab"`, `"` + strings.Repeat("a", 63) + `"`, `"` + strings.Repeat("a", 66) + `"`, `"` + strings.Repeat("z", 64) + `"`, `null`, `123`} {
+		for _, value := range []string{`""`, `"ab"`, `"` + strings.Repeat("a", 63) + `"`, `"` + strings.Repeat("a", 66) + `"`, `"` + strings.Repeat("z", 64) + `"`, `123`} {
 			t.Run(field+"/"+value, func(t *testing.T) {
 				payload := fmt.Sprintf(`{"permission":"read","exp":1800000060,%q:%s}`, field, value)
 				if got, ok := issuer.Validate(signPayload(t, secret, payload)); ok || got != (Grant{}) {
