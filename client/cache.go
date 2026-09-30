@@ -2,31 +2,54 @@ package client
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/upload"
 )
 
-// Cache is the chunk cache directory shared by every Client built with WithCache.
+// Cache is the cache root shared by every Client built with WithCache:
+// <root>/download holds decoded chunks, <root>/upload holds upload staging
+// and cached chunk locations.
 type Cache struct {
-	dir     string
-	manager *download.CacheManager
+	Download *download.CacheManager
+	Upload   *upload.CacheManager
 }
 
-// Usage is the space the cache directory holds per kind of data.
+// Usage is the space the cache root holds per kind of data.
 type Usage struct {
 	Download download.CacheUsage
+	Upload   upload.CacheUsage
 }
 
-// NewCache opens the chunk cache at dir ("" = the default directory) bounded to size bytes (<= 0 unbounded).
-func NewCache(dir string, size int64) *Cache {
-	return &Cache{dir: dir, manager: download.NewCacheManager(dir, size)}
-}
-
-// Usage includes temporary and incomplete files in the cache directory.
-func (c *Cache) Usage(ctx context.Context) (Usage, error) {
-	downloadUsage, err := c.manager.Usage(ctx)
-	if err != nil {
-		return Usage{}, err
+// NewCache opens the cache root at dir ("" = <os temp dir>/xet-cache);
+// downloadSize bounds the chunk cache and uploadSize the cached chunk
+// locations, in bytes (<= 0 unbounded).
+func NewCache(dir string, downloadSize, uploadSize int64) *Cache {
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "xet-cache")
 	}
-	return Usage{Download: downloadUsage}, nil
+	return &Cache{
+		Download: download.NewCacheManager(filepath.Join(dir, "download"), downloadSize),
+		Upload:   upload.NewCacheManager(filepath.Join(dir, "upload"), uploadSize),
+	}
+}
+
+// Usage includes temporary and incomplete files in the cache directory; a nil
+// manager counts as empty.
+func (c *Cache) Usage(ctx context.Context) (Usage, error) {
+	var usage Usage
+	var err error
+	if c.Download != nil {
+		if usage.Download, err = c.Download.Usage(ctx); err != nil {
+			return Usage{}, err
+		}
+	}
+	if c.Upload != nil {
+		if usage.Upload, err = c.Upload.Usage(ctx); err != nil {
+			return Usage{}, err
+		}
+	}
+	return usage, nil
 }

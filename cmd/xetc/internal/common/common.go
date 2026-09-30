@@ -12,6 +12,8 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/client/hf"
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/upload"
 )
 
 const (
@@ -41,7 +43,7 @@ func Options(namespace string, concurrency int, cacheDir string, out io.Writer) 
 			progressSummary.Output(out)
 		}),
 		client.WithConcurrency(concurrency),
-		client.WithCacheDir(cacheDir),
+		client.WithCache(client.NewCache(cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)),
 	}
 }
 

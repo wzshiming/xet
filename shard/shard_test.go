@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"maps"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 )
@@ -65,6 +67,93 @@ func TestBuildShardMarksGlobalDedupEligibleChunks(t *testing.T) {
 	}
 	if entries[2].Flags&ChunkGlobalDedupEligible == 0 {
 		t.Error("hash-sampled chunk is missing GLOBAL_DEDUP_ELIGIBLE")
+	}
+}
+
+// twinShards builds two CAS blocks of three chunks each as a raw shard and
+// its keyed twin, whose stored hashes are the raw ones HMAC-keyed with key.
+// want maps each raw hash to its location in either shard.
+func twinShards() (raw, keyed *Shard, key [32]byte, want map[xet.ChunkHash]ChunkLocation) {
+	key = [32]byte{7}
+	raw, keyed = NewShard(), NewShard()
+	want = make(map[xet.ChunkHash]ChunkLocation)
+	for b := range byte(2) {
+		rawBlock := CASBlock{CASHash: xet.XorbHash{0: b + 1}}
+		keyedBlock := CASBlock{CASHash: rawBlock.CASHash}
+		for i := range byte(3) {
+			h := xet.ChunkHash{0: b + 1, 1: i + 1}
+			rawBlock.Chunks = append(rawBlock.Chunks, CASChunkSequenceEntry{ChunkHash: h})
+			keyedBlock.Chunks = append(keyedBlock.Chunks, CASChunkSequenceEntry{ChunkHash: h.HMAC(key)})
+			want[h] = ChunkLocation{XorbHash: rawBlock.CASHash, ChunkIndex: uint32(i)}
+		}
+		raw.AddCASBlock(rawBlock)
+		keyed.AddCASBlock(keyedBlock)
+	}
+	keyed.SetFooter(time.Now())
+	keyed.Footer.ChunkHashKey = key
+	return raw, keyed, key, want
+}
+
+func TestChunkLocations(t *testing.T) {
+	raw, keyed, key, want := twinShards()
+	if got := raw.ChunkLocations(); !maps.Equal(got, want) {
+		t.Fatalf("raw shard indexed %v, want all %d chunks", got, len(want))
+	}
+
+	wantStored := make(map[xet.ChunkHash]ChunkLocation, len(want))
+	for h, loc := range want {
+		wantStored[h.HMAC(key)] = loc
+	}
+	if got := keyed.ChunkLocations(); !maps.Equal(got, wantStored) {
+		t.Fatalf("keyed shard indexed %v, want its stored hashes %v", got, wantStored)
+	}
+}
+
+func TestLookupChunk(t *testing.T) {
+	raw, keyed, key, want := twinShards()
+	h := raw.CASInfos[1].Chunks[2].ChunkHash
+	unknown := xet.ChunkHash{9}
+
+	if loc, ok := raw.LookupChunk(h); !ok || loc != want[h] {
+		t.Fatalf("raw shard found %+v, %v; want %+v", loc, ok, want[h])
+	}
+	if loc, ok := raw.LookupChunk(unknown); ok {
+		t.Fatalf("raw shard found %+v for an unknown hash", loc)
+	}
+	if loc, ok := keyed.LookupChunk(h); !ok || loc != want[h] {
+		t.Fatalf("keyed shard found %+v, %v for a raw hash; want %+v", loc, ok, want[h])
+	}
+	if loc, ok := keyed.LookupChunk(h.HMAC(key)); ok {
+		t.Fatalf("keyed shard found %+v for its stored hash", loc)
+	}
+}
+
+func TestResolveChunks(t *testing.T) {
+	raw, keyed, key, want := twinShards()
+	unknown := xet.ChunkHash{9}
+	offered := []xet.ChunkHash{raw.CASInfos[0].Chunks[2].ChunkHash, raw.CASInfos[1].Chunks[0].ChunkHash, raw.CASInfos[1].Chunks[1].ChunkHash}
+	wantOffered := make(map[xet.ChunkHash]ChunkLocation, len(offered))
+	for _, h := range offered {
+		wantOffered[h] = want[h]
+	}
+
+	if got := raw.ResolveChunks(append(offered, unknown)...); !maps.Equal(got, wantOffered) {
+		t.Fatalf("raw shard resolved %v, want only the %d offered", got, len(offered))
+	}
+	if got := keyed.ResolveChunks(append(offered, unknown)...); !maps.Equal(got, wantOffered) {
+		t.Fatalf("keyed shard resolved %v, want the %d offered", got, len(offered))
+	}
+
+	stored := make([]xet.ChunkHash, 0, len(offered))
+	for _, h := range offered {
+		stored = append(stored, h.HMAC(key))
+	}
+	if got := keyed.ResolveChunks(stored...); len(got) != 0 {
+		t.Fatalf("stored keyed hashes resolved as raw: %v", got)
+	}
+
+	if got := raw.ResolveChunks(); got == nil || len(got) != 0 {
+		t.Fatalf("no hashes resolved %v, want an empty map", got)
 	}
 }
 

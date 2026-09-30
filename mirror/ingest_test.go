@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -28,7 +31,8 @@ func TestIngest(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/model.bin"
 	upstream.set(resolvePath, data)
 
-	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
+	cacheDir := t.TempDir()
+	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
 
 	t.Run("rejects invalid URLs", func(t *testing.T) {
 		if _, err := m.Mirror.Ingest(upstreamSrv.URL+"/org/repo/tree/main/model.bin", ""); err == nil {
@@ -81,6 +85,12 @@ func TestIngest(t *testing.T) {
 		}
 		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
 			t.Fatalf("stored bytes mismatch: got %d bytes, want %d", len(got), len(data))
+		}
+		if _, err := os.Stat(filepath.Join(cacheDir, "upload")); err != nil {
+			t.Fatalf("ingest did not stage under the mirror cache root: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(cacheDir, "upload", "chunks")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("ingest touched the chunk location cache: %v", err)
 		}
 	})
 

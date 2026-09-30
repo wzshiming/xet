@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,6 +55,34 @@ func newTestS3Storage(t *testing.T, opts ...Option) *Storage {
 		t.Fatal(err)
 	}
 	return ss
+}
+
+// Offsets are cached per process, so a range read is where a xorb deleted elsewhere first goes missing.
+func TestS3StorageMissingXorbRangeIsNotExist(t *testing.T) {
+	if _, err := newTestS3Storage(t).GetXorbRangeReadCloser(context.Background(), "default", xet.XorbHash{1}, 0, 9); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("GetXorbRangeReadCloser(missing) = %v, want fs.ErrNotExist", err)
+	}
+}
+
+// The whole-xorb reader opens lazily, so a xorb deleted after its HEAD goes missing at the first read.
+func TestS3StorageVanishedXorbReadIsNotExist(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("chunk"))
+	if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := ss.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if err := ss.DeleteXorb(ctx, "default", xorbHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rc.Read(make([]byte, 1)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Read after the object vanished = %v, want fs.ErrNotExist", err)
+	}
 }
 
 func TestS3StorageXorbRoundTrip(t *testing.T) {

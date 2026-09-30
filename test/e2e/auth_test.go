@@ -114,7 +114,7 @@ func TestAuthCASClientFlows(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newAuthServer(t, issuer, "internal-secret")
-	c, err := client.NewClient(client.WithCacheDir(t.TempDir()))
+	c, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestAuthInternalToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, writeToken)))
+	writer, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, writeToken)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestAuthInternalToken(t *testing.T) {
 	for _, route := range routes[1:] {
 		assertStatus(t, route.method, route.url, "internal-secret", http.StatusOK)
 	}
-	reader, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, readToken)))
+	reader, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, readToken)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	waitMirrorReady(t, srv.URL+pathB)
 
 	target := hf.Repo{Endpoint: srv.URL, RepoType: "model", RepoID: "org/repo", Revision: "main"}
-	anon, err := hf.NewClient(target, hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	anon, err := hf.NewClient(target, hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	if err := json.Unmarshal(assertStatus(t, http.MethodGet, srv.URL+"/xet-token/"+resolvedA.Hash.String(), "", http.StatusOK), &tokenA); err != nil {
 		t.Fatal(err)
 	}
-	asA, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(client.StaticUpstreamProvider(tokenA.CASURL, tokenA.Token)))
+	asA, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(client.StaticUpstreamProvider(tokenA.CASURL, tokenA.Token)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +369,7 @@ func TestAuthHubTokenFlow(t *testing.T) {
 	wantErr(t, err, "status 403")
 
 	repo := hf.NewTokenProvider(nil, target, "hf-user-token")
-	asRepo, err := client.NewClient(client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(repo))
+	asRepo, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(repo))
 	if err != nil {
 		t.Fatal(err)
 	}

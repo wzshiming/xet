@@ -271,7 +271,7 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 
 func defaultCacheDir(cacheDir string) string {
 	if cacheDir == "" {
-		return filepath.Join(os.TempDir(), "xet-cache")
+		return filepath.Join(os.TempDir(), "xet-cache", "download")
 	}
 	return cacheDir
 }

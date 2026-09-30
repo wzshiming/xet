@@ -644,7 +644,7 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/slow.bin"
 	up := newXetStallUpstream(t, resolvePath, head, tail)
 	up.slowFeed = true
-	own := client.NewCache(t.TempDir(), 0)
+	own := client.NewCache(t.TempDir(), 0, 0)
 	cacheDir := t.TempDir()
 	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir, WithClientOptions(client.WithIdleTimeout(200*time.Millisecond), client.WithCache(own)))
 	t.Cleanup(func() { close(up.abort) })
@@ -671,7 +671,7 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	if err != nil || usage.Download.Count == 0 {
 		t.Fatalf("supplied chunk cache: %+v, %v; want entries", usage, err)
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "chunks")); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(cacheDir, "download")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("mirror used its own chunk cache despite WithCache: %v", err)
 	}
 }

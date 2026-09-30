@@ -142,7 +142,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, fileHash xet.FileHash,
 func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
-		download.WithCacheManager(c.cache.manager),
+		download.WithCacheManager(c.cache.Download),
 	}
 	if resumeOffset == 0 {
 		opts = append(opts, download.WithExpectedFileHash(fileHash))

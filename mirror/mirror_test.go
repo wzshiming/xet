@@ -569,8 +569,8 @@ func TestMirrorUsage(t *testing.T) {
 	writeRaw(t, pointer, pointerJSON)
 	writeRaw(t, manifest+".tmp", []byte("partial"))
 	wantIndex := storage.ObjectUsage{Count: 3, Bytes: int64(len(manifestJSON) + len(pointerJSON) + len("partial"))}
-	writeRaw(t, filepath.Join(cacheDir, "chunks", "aa", "bb", "cc", "x.json"), []byte(`{}`))
-	writeRaw(t, filepath.Join(cacheDir, "chunks", "y.spool"), []byte("not ours"))
+	writeRaw(t, filepath.Join(cacheDir, "download", "aa", "bb", "cc", "x.json"), []byte(`{}`))
+	writeRaw(t, filepath.Join(cacheDir, "upload", "y.spool"), []byte("not ours"))
 	if runtime.GOOS != "windows" {
 		if err := os.Symlink(manifest, filepath.Join(filepath.Dir(pointer), "link.json")); err != nil {
 			t.Fatal(err)

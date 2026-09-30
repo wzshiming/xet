@@ -594,7 +594,7 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			run := func(t *testing.T, fx *downloadFixture, prefix []byte) ([]byte, error) {
 				t.Helper()
-				c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+				c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -653,7 +653,7 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	fx := newDownloadFixture(t, 1, 2)
 	fx.substitute(t, 1)
-	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}

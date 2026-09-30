@@ -156,7 +156,7 @@ func downloadViaXet(t *testing.T, resolveURL string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := hfclient.NewClient(repo, hfclient.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	c, err := hfclient.NewClient(repo, hfclient.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,12 +615,8 @@ func (l testCAS) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 	return &upload.ShardUploadResponse{Result: result}, nil
 }
 
-func (l testCAS) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, _ ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
-	for _, chunkHash := range chunkHashes {
-		results[chunkHash] = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
-	}
-	return results, nil
+func (l testCAS) QueryDedupShards(context.Context, []xet.ChunkHash, ...xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
+	return map[xet.ChunkHash]shard.ChunkLocation{}, nil
 }
 
 // xetUpstream is a hub with xet support: resolve responses carry the xet link

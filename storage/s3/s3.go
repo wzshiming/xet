@@ -260,6 +260,9 @@ func (ss *Storage) getObjectRange(ctx context.Context, key string, start, end in
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 	})
 	if err != nil {
+		if isS3NotFound(err) {
+			return nil, fmt.Errorf("object %s: %w", key, iofs.ErrNotExist)
+		}
 		return nil, err
 	}
 	return out.Body, nil
@@ -955,6 +958,9 @@ func (o *s3Opener) OpenRange(_ string, start, end int64) (httpseek.OpenResult, e
 		var respErr *awshttp.ResponseError
 		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
 			return res, httpseek.ErrRangeNotSatisfiable
+		}
+		if isS3NotFound(err) {
+			return res, fmt.Errorf("object %s: %w", o.key, iofs.ErrNotExist)
 		}
 		return res, err
 	}

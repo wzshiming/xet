@@ -514,7 +514,7 @@ func TestChunkCacheContenderRebuildsAfterWriterFailure(t *testing.T) {
 }
 
 func TestDefaultCacheDir(t *testing.T) {
-	if got, want := defaultCacheDir(""), filepath.Join(os.TempDir(), "xet-cache"); got != want {
+	if got, want := defaultCacheDir(""), filepath.Join(os.TempDir(), "xet-cache", "download"); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
