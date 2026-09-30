@@ -47,12 +47,8 @@ func (s storeCAS) UploadShard(ctx context.Context, sh *shard.Shard) (*upload.Sha
 	return &upload.ShardUploadResponse{Result: 1}, nil
 }
 
-func (s storeCAS) QueryDedupShards(_ context.Context, hashes []xet.ChunkHash, _ ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	out := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(hashes))
-	for _, h := range hashes {
-		out[h] = &upload.DeduplicationResult{ChunkHash: h, IsNew: true}
-	}
-	return out, nil
+func (s storeCAS) QueryDedupShards(context.Context, []xet.ChunkHash, ...xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
+	return map[xet.ChunkHash]shard.ChunkLocation{}, nil
 }
 
 // deterministic returns n pseudo-random bytes that are the same on every run.

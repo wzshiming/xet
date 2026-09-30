@@ -44,36 +44,24 @@ func (l *localCAS) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upl
 	return &upload.ShardUploadResponse{Result: result}, nil
 }
 
-// Local shards are stored with raw chunk hashes, so keyed-shard candidates
-// are unnecessary here.
-func (l *localCAS) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, _ ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
+// QueryDedupShards resolves chunkHashes against the shards stored locally;
+// every chunk of a found shard is returned, matching the remote global-dedup
+// behavior where one probe yields the whole shard. Local shards store raw
+// chunk hashes, so keyed-shard candidates are unnecessary here.
+func (l *localCAS) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, _ ...xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
+	results := make(map[xet.ChunkHash]shard.ChunkLocation, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
 		if _, ok := results[chunkHash]; ok {
 			continue
 		}
 		shardObj, err := l.storage.GetShardByChunkHash(ctx, l.namespace, chunkHash)
 		if err != nil || shardObj == nil {
-			results[chunkHash] = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
 			continue
 		}
-		// Register every chunk of the found shard, matching the remote
-		// global-dedup behavior where one probe yields the whole shard.
-		for _, casBlock := range shardObj.CASInfos {
-			for i, casChunk := range casBlock.Chunks {
-				if _, ok := results[casChunk.ChunkHash]; ok {
-					continue
-				}
-				results[casChunk.ChunkHash] = &upload.DeduplicationResult{
-					ChunkHash:  casChunk.ChunkHash,
-					IsNew:      false,
-					XorbHash:   casBlock.CASHash,
-					ChunkIndex: uint32(i),
-				}
+		for h, loc := range shardObj.ChunkLocations() {
+			if _, ok := results[h]; !ok {
+				results[h] = loc
 			}
-		}
-		if _, ok := results[chunkHash]; !ok {
-			results[chunkHash] = &upload.DeduplicationResult{ChunkHash: chunkHash, IsNew: true}
 		}
 	}
 	return results, nil

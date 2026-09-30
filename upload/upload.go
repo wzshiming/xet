@@ -8,7 +8,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/wzshiming/xet"
@@ -17,14 +16,6 @@ import (
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
-
-// DeduplicationResult represents the result of deduplication for a chunk.
-type DeduplicationResult struct {
-	ChunkHash  xet.ChunkHash
-	IsNew      bool
-	XorbHash   xet.XorbHash
-	ChunkIndex uint32
-}
 
 type Chunk struct {
 	Reader *syncReadSeeker
@@ -70,7 +61,7 @@ type xorbGroup struct {
 }
 
 type options struct {
-	cacheDir     string
+	cache        *CacheManager
 	concurrency  int
 	enableSHA256 bool
 	progressFunc progress.ProgressFunc
@@ -86,7 +77,8 @@ func WithConcurrency(concurrency int) Option {
 	}
 }
 
-// WithEnableSHA256 configures whether to compute and include SHA-256 hashes in the shard metadata.
+// WithEnableSHA256 configures whether to compute and include SHA-256 hashes
+// in the shard metadata.
 func WithEnableSHA256(enabled bool) Option {
 	return func(o *options) {
 		o.enableSHA256 = enabled
@@ -102,14 +94,16 @@ func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	}
 }
 
-// WithCacheDir sets the directory to use for temporary cache files during upload.
-func WithCacheDir(cacheDir string) Option {
+// WithCacheManager sets the manager for upload staging files and cached
+// chunk locations.
+func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
-		o.cacheDir = cacheDir
+		o.cache = cache
 	}
 }
 
-// UploadFile chunks, deduplicates, and uploads a single file using the provided client adapter.
+// UploadFile chunks, deduplicates, and uploads a single file using the
+// provided client adapter.
 func UploadFile(ctx context.Context, client ClientAdapter, readSeeker io.ReadSeeker, opts ...Option) (xet.FileHash, error) {
 	hashes, err := UploadFiles(ctx, client, []io.ReadSeeker{readSeeker}, opts...)
 	if err != nil {
@@ -125,6 +119,10 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	for _, opt := range opts {
 		opt(options)
 	}
+	if options.cache == nil {
+		options.cache = NewCacheManager("", DefaultCacheSize)
+	}
+	options.cache.prepare()
 
 	concurrency := max(1, options.concurrency)
 
@@ -202,7 +200,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		uniqueHashes[i] = chunk.Hash
 	}
 	globalDedupProbeChunkHashes := selectChunkHashesForGlobalDedupAcrossFiles(fileChunkHashes)
-	localChunkCache, err := deduplicateChunks(ctx, client, uniqueHashes, globalDedupProbeChunkHashes, concurrency)
+	located, err := deduplicateChunks(ctx, client, uniqueHashes, globalDedupProbeChunkHashes, concurrency)
 	if err != nil {
 		return nil, fmt.Errorf("deduplicate chunks: %w", err)
 	}
@@ -210,7 +208,7 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	// Step 3: Group new chunks into xorbs
 	var newChunks []chunkInfo
 	for _, chunk := range allChunks {
-		if localChunkCache[chunk.Hash].IsNew {
+		if _, found := located[chunk.Hash]; !found {
 			newChunks = append(newChunks, chunk)
 		}
 	}
@@ -241,25 +239,25 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 		xorbs = append(xorbs, group)
 	}
 
-	if options.cacheDir == "" {
-		options.cacheDir = os.TempDir()
-	}
-
 	// Step 4: Upload xorbs
-	if err := uploadXorbs(ctx, client, localChunkCache, xorbs, concurrency, options.cacheDir, options.progressFunc); err != nil {
+	uploaded := make(map[xet.ChunkHash]shard.ChunkLocation)
+	if err := uploadXorbs(ctx, client, uploaded, xorbs, concurrency, options.cache, options.progressFunc); err != nil {
 		return nil, fmt.Errorf("upload xorbs: %w", err)
 	}
 
 	// Step 5: Build and upload shard
 	chunkInfos := make([]shard.ChunkInfo, len(allChunks))
 	for i, chunk := range allChunks {
-		dedup := localChunkCache[chunk.Hash]
+		loc, isNew := uploaded[chunk.Hash]
+		if !isNew {
+			loc = located[chunk.Hash]
+		}
 		chunkInfos[i] = shard.ChunkInfo{
 			Hash:       chunk.Hash,
 			Size:       chunk.Chunk.Size,
-			IsNew:      dedup.IsNew,
-			XorbHash:   dedup.XorbHash,
-			ChunkIndex: dedup.ChunkIndex,
+			IsNew:      isNew,
+			XorbHash:   loc.XorbHash,
+			ChunkIndex: loc.ChunkIndex,
 		}
 	}
 
@@ -271,17 +269,19 @@ func UploadFiles(ctx context.Context, client ClientAdapter, readSeekers []io.Rea
 	return fileHashes, nil
 }
 
-func queryShards(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, probes []xet.ChunkHash, candidates []xet.ChunkHash) error {
+func queryShards(ctx context.Context, client ClientAdapter, located map[xet.ChunkHash]shard.ChunkLocation, probes []xet.ChunkHash, candidates []xet.ChunkHash) error {
 	m, err := client.QueryDedupShards(ctx, probes, candidates...)
 	if err != nil {
 		return fmt.Errorf("query dedup shards: %w", err)
 	}
 
-	maps.Copy(cache, m)
+	maps.Copy(located, m)
 	return nil
 }
 
-func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []xet.ChunkHash, globalDedupProbeChunkHashes []xet.ChunkHash, concurrency int) (map[xet.ChunkHash]*DeduplicationResult, error) {
+// deduplicateChunks returns where the CAS already stores chunkHashes; a hash
+// absent from the result is new.
+func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []xet.ChunkHash, globalDedupProbeChunkHashes []xet.ChunkHash, concurrency int) (map[xet.ChunkHash]shard.ChunkLocation, error) {
 	if len(chunkHashes) == 0 {
 		return nil, nil
 	}
@@ -294,25 +294,15 @@ func deduplicateChunks(ctx context.Context, client ClientAdapter, chunkHashes []
 		concurrency = 1
 	}
 
-	cache := make(map[xet.ChunkHash]*DeduplicationResult, len(chunkHashes))
+	located := make(map[xet.ChunkHash]shard.ChunkLocation, len(chunkHashes))
 
 	// Pass every chunk hash as a keyed-shard candidate so entries in
 	// HMAC-keyed shards can be matched back to raw hashes.
-	if err := queryShards(ctx, client, cache, globalDedupProbeChunkHashes, chunkHashes); err != nil {
+	if err := queryShards(ctx, client, located, globalDedupProbeChunkHashes, chunkHashes); err != nil {
 		return nil, fmt.Errorf("query shards: %w", err)
 	}
 
-	for _, chunkHash := range chunkHashes {
-		if _, hit := cache[chunkHash]; hit {
-			continue
-		}
-		cache[chunkHash] = &DeduplicationResult{
-			ChunkHash: chunkHash,
-			IsNew:     true,
-		}
-	}
-
-	return cache, nil
+	return located, nil
 }
 
 func selectChunkHashesForGlobalDedupAcrossFiles(fileChunkHashes [][]xet.ChunkHash) []xet.ChunkHash {
@@ -363,7 +353,6 @@ func selectChunkHashesForGlobalDedup(chunkHashes []xet.ChunkHash) []xet.ChunkHas
 	return probes
 }
 
-// uploadXorbs serializes and uploads all xorbs.
 type preparedXorb struct {
 	hash        xet.XorbHash
 	path        string
@@ -371,7 +360,9 @@ type preparedXorb struct {
 	chunkHashes []xet.ChunkHash
 }
 
-func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkHash]*DeduplicationResult, groups []*xorbGroup, concurrency int, cacheDir string, progressFunc progress.ProgressFunc) error {
+// uploadXorbs serializes and uploads all xorbs, recording in uploaded where
+// each chunk of groups ended up.
+func uploadXorbs(ctx context.Context, client ClientAdapter, uploaded map[xet.ChunkHash]shard.ChunkLocation, groups []*xorbGroup, concurrency int, staging *CacheManager, progressFunc progress.ProgressFunc) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -393,9 +384,18 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 
 	var firstErr error
 	var errOnce sync.Once
-	var cacheMu sync.Mutex
+	var uploadedMu sync.Mutex
 	prepared := make([]preparedXorb, 0, len(groups))
 	var preparedMu sync.Mutex
+	var staged []string
+	var stagedMu sync.Mutex
+	defer func() {
+		stagedMu.Lock()
+		defer stagedMu.Unlock()
+		for _, path := range staged {
+			_ = os.Remove(path)
+		}
+	}()
 	var wg sync.WaitGroup
 	wg.Add(concurrency)
 	for range concurrency {
@@ -408,7 +408,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 					return
 				}
 
-				tmpFile, err := os.CreateTemp(cacheDir, "xet-upload-xorb-*")
+				tmpFile, err := staging.create()
 				if err != nil {
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("create temp file: %w", err)
@@ -417,12 +417,14 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 					return
 				}
 				tmpPath := tmpFile.Name()
+				stagedMu.Lock()
+				staged = append(staged, tmpPath)
+				stagedMu.Unlock()
 
 				encoder := xorb.NewEncoder(tmpFile, true)
 				for _, chunk := range group.Chunks {
 					if err := chunk.Reader.readAt(buf[:chunk.Size], chunk.Offset); err != nil {
-						tmpFile.Close()
-						os.Remove(tmpPath)
+						_ = tmpFile.Close()
 						errOnce.Do(func() {
 							firstErr = fmt.Errorf("read chunk data: %w", err)
 							cancel()
@@ -430,8 +432,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 						return
 					}
 					if _, err := encoder.Write(buf[:chunk.Size]); err != nil {
-						tmpFile.Close()
-						os.Remove(tmpPath)
+						_ = tmpFile.Close()
 						errOnce.Do(func() {
 							firstErr = fmt.Errorf("encode chunk: %w", err)
 							cancel()
@@ -441,8 +442,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				}
 
 				if err := encoder.Close(); err != nil {
-					tmpFile.Close()
-					os.Remove(tmpPath)
+					_ = tmpFile.Close()
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("finalize xorb: %w", err)
 						cancel()
@@ -453,8 +453,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				xorbHash := encoder.SummoryHash()
 				stat, err := tmpFile.Stat()
 				if err != nil {
-					tmpFile.Close()
-					os.Remove(tmpPath)
+					_ = tmpFile.Close()
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("stat xorb temp file: %w", err)
 						cancel()
@@ -464,7 +463,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				size := stat.Size()
 
 				if err := tmpFile.Close(); err != nil {
-					os.Remove(tmpPath)
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("close xorb temp file: %w", err)
 						cancel()
@@ -474,7 +472,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 
 				exists, err := client.HasXorb(ctx, xorbHash)
 				if err != nil {
-					os.Remove(tmpPath)
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("check xorb %s exists: %w", xorbHash.String(), err)
 						cancel()
@@ -483,15 +480,12 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 				}
 
 				if exists {
-					os.Remove(tmpPath)
-					cacheMu.Lock()
+					_ = os.Remove(tmpPath)
+					uploadedMu.Lock()
 					for i, chunkHash := range group.ChunkHashes {
-						if result, ok := cache[chunkHash]; ok && result.IsNew {
-							result.XorbHash = xorbHash
-							result.ChunkIndex = uint32(i)
-						}
+						uploaded[chunkHash] = shard.ChunkLocation{XorbHash: xorbHash, ChunkIndex: uint32(i)}
 					}
-					cacheMu.Unlock()
+					uploadedMu.Unlock()
 					continue
 				}
 
@@ -513,9 +507,6 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 		firstErr = ctx.Err()
 	}
 	if firstErr != nil {
-		for _, item := range prepared {
-			_ = os.Remove(item.path)
-		}
 		return firstErr
 	}
 
@@ -541,7 +532,7 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 					return
 				}
 
-				f, err := os.Open(filepath.Clean(item.path))
+				f, err := os.Open(item.path)
 				if err != nil {
 					errOnce.Do(func() {
 						firstErr = fmt.Errorf("open xorb temp file: %w", err)
@@ -561,14 +552,11 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 					return
 				}
 
-				cacheMu.Lock()
+				uploadedMu.Lock()
 				for i, chunkHash := range item.chunkHashes {
-					if result, ok := cache[chunkHash]; ok && result.IsNew {
-						result.XorbHash = item.hash
-						result.ChunkIndex = uint32(i)
-					}
+					uploaded[chunkHash] = shard.ChunkLocation{XorbHash: item.hash, ChunkIndex: uint32(i)}
 				}
-				cacheMu.Unlock()
+				uploadedMu.Unlock()
 
 				if progressFunc != nil {
 					progressFunc(item.hash.String(), item.size, item.size)
@@ -581,12 +569,5 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, cache map[xet.ChunkH
 	if firstErr == nil {
 		firstErr = ctx.Err()
 	}
-	if firstErr != nil {
-		for _, item := range prepared {
-			_ = os.Remove(item.path)
-		}
-		return firstErr
-	}
-
-	return nil
+	return firstErr
 }

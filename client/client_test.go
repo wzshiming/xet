@@ -73,7 +73,7 @@ func casCalls(t *testing.T, ctx context.Context, c *Client) map[string]casCall {
 
 func TestUnboundClientRejectsRequests(t *testing.T) {
 	var attempts atomic.Int32
-	c, err := NewClient(WithCacheDir(t.TempDir()), WithHTTPClient(countingClient(&attempts)))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithHTTPClient(countingClient(&attempts)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestOperationsResolvePermission(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newFakeProvider(srv.URL, "A")
-	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(p))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(p))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestPermissionsUseDistinctUpstreams(t *testing.T) {
 		defer srv.Close()
 		p.slots[perm] = &fakeSlot{baseURL: srv.URL, token: strings.TrimPrefix(cas.accept, "Bearer ")}
 	}
-	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(p))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(p))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,8 @@ func TestPermissionsUseDistinctUpstreams(t *testing.T) {
 					other = after[perm] - before[perm]
 				}
 			}
-			if own == 0 || other != 0 || len(p.perms())-resolves != own {
+			// A cache hit in QueryDedupShards resolves the endpoint it is scoped to without a request.
+			if own == 0 || other != 0 || len(p.perms())-resolves < own {
 				t.Fatalf("%d requests on the %s endpoint, %d elsewhere, %d resolves; want every request on %s after its own Resolve", own, call.perm, other, len(p.perms())-resolves, call.perm)
 			}
 		})
@@ -253,7 +254,7 @@ func TestProviderResolveUnmarked(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newFakeProvider(srv.URL, "A")
-	c, err := NewClient(WithCacheDir(t.TempDir()), WithUpstreamProvider(p))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(p))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,5 +651,28 @@ func TestWithUpstreamProviderOption(t *testing.T) {
 	}
 	if copied.httpClient != c1.httpClient || copied.getHttpClient != c1.getHttpClient || copied.cache != c1.cache {
 		t.Fatal("copy does not share the HTTP clients and cache")
+	}
+}
+
+// Clients built without WithCache share one default cache root instead of each opening their own.
+func TestNewClientSharesDefaultCache(t *testing.T) {
+	c1, err := NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1.cache == nil || c1.cache != c2.cache {
+		t.Fatalf("default caches %p and %p; want one shared instance", c1.cache, c2.cache)
+	}
+	own := NewCache(t.TempDir(), 0, 0)
+	c3, err := NewClient(WithCache(own))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.cache != own || c3.cache == c1.cache {
+		t.Fatalf("WithCache bound %p; want %p, distinct from the default", c3.cache, own)
 	}
 }

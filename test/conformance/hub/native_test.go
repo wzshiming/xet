@@ -102,7 +102,7 @@ func (n *native) upload(t *testing.T) {
 	defer cancel()
 	hc := &http.Client{}
 	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
-	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func (n *native) download(t *testing.T) {
 	defer cancel()
 	hc := &http.Client{}
 	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
-	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(n.token), hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func (n *native) anonymous(t *testing.T) {
 	hc := &http.Client{}
 	target := hf.Repo{Endpoint: rec.HubURL(), RepoID: n.repo}
 	for _, cred := range []struct{ name, token string }{{"anonymous", ""}, {"wrong-token", wrongToken}} {
-		c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(cred.token), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+		c, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithToken(cred.token), hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -238,7 +238,7 @@ func (n *native) anonymous(t *testing.T) {
 	wrong := newClient(t, hc, hf.NewTokenProvider(hc, target, wrongToken))
 	_, err := downloadInto(t, func(w io.WriteSeeker) error { return wrong.DownloadFile(ctx, n.fileHash(), w) })
 	want401(t, "wrong-token DownloadFile", err)
-	anon, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithClientOptions(client.WithCacheDir(t.TempDir())))
+	anon, err := hf.NewClient(target, hf.WithHTTPClient(hc), hf.WithClientOptions(client.WithCache(client.NewCache(t.TempDir(), 0, 0))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func (n *native) record(t *testing.T, scenario, tool string) *recording {
 // newClient returns a Go client sending through hc, bound to provider when one is given.
 func newClient(t *testing.T, hc *http.Client, provider client.UpstreamProvider) *client.Client {
 	t.Helper()
-	c, err := client.NewClient(client.WithHTTPClient(hc), client.WithCacheDir(t.TempDir()), client.WithUpstreamProvider(provider))
+	c, err := client.NewClient(client.WithHTTPClient(hc), client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(provider))
 	if err != nil {
 		t.Fatal(err)
 	}

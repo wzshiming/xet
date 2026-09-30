@@ -64,7 +64,7 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 
 	uploadServer := httptest.NewServer(server.NewHandler(server.WithStorage(newStorage())))
 	uploadClient, err := client.NewClient(
-		client.WithCacheDir(t.TempDir()),
+		client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 		client.WithUpstreamProvider(client.StaticUpstreamProvider(uploadServer.URL, "")),
 	)
 	if err != nil {
@@ -93,7 +93,7 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 	downloadServer := httptest.NewServer(server.NewHandler(server.WithStorage(newStorage())))
 	defer downloadServer.Close()
 	downloadClient, err := client.NewClient(
-		client.WithCacheDir(t.TempDir()),
+		client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 		client.WithUpstreamProvider(client.StaticUpstreamProvider(downloadServer.URL, "")),
 	)
 	if err != nil {

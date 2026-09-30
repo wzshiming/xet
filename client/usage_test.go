@@ -8,11 +8,14 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
+
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/upload"
 )
 
 func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 	cacheDir := t.TempDir()
-	cacheClient, err := NewClient(WithCacheDir(cacheDir))
+	cacheClient, err := NewClient(WithCache(NewCache(cacheDir, 0, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,8 +23,8 @@ func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 		t.Fatalf("usage of empty cache = %+v, %v; want zero", got, err)
 	}
 
-	var want Usage
-	for name, data := range map[string]string{"chunks/entry": "cached bytes", "staging.tmp": "partial"} {
+	files := map[string]string{"download/aa/bb/entry": "cached bytes", "upload/xet-upload-xorb-1": "staged", "upload/chunks/entry": "cached location", "stray": "neither"}
+	for name, data := range files {
 		filePath := filepath.Join(cacheDir, name)
 		if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 			t.Fatal(err)
@@ -29,8 +32,10 @@ func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 		if err := os.WriteFile(filePath, []byte(data), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		want.Download.Count++
-		want.Download.Bytes += int64(len(data))
+	}
+	want := Usage{
+		Download: download.CacheUsage{Count: 1, Bytes: int64(len(files["download/aa/bb/entry"]))},
+		Upload:   upload.CacheUsage{Count: 2, Bytes: int64(len(files["upload/xet-upload-xorb-1"]) + len(files["upload/chunks/entry"]))},
 	}
 	if got, err := cacheClient.Usage(t.Context()); err != nil || got != want {
 		t.Fatalf("usage = %+v, %v; want %+v", got, err, want)
@@ -38,7 +43,7 @@ func TestCacheUsageReportsConfiguredCacheDir(t *testing.T) {
 }
 
 func TestCacheUsageForwardsContextAndDirectoryErrors(t *testing.T) {
-	c, err := NewClient(WithCacheDir(filepath.Join(t.TempDir(), "missing")))
+	c, err := NewClient(WithCache(NewCache(filepath.Join(t.TempDir(), "missing"), 0, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +60,7 @@ func TestCacheUsageForwardsContextAndDirectoryErrors(t *testing.T) {
 	if err := os.WriteFile(file, []byte("not a directory"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err = NewClient(WithCacheDir(filepath.Join(file, "cache")))
+	c, err = NewClient(WithCache(NewCache(filepath.Join(file, "cache"), 0, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}

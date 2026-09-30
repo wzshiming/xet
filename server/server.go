@@ -604,30 +604,18 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
-		xorbHash, chunkIndex, ok := findChunkLocationInShard(shardObj, chunkHash)
+		loc, ok := shardObj.LookupChunk(chunkHash)
 		if !ok {
 			results = append(results, res)
 			continue
 		}
 
 		res.Found = true
-		res.XorbHash = xorbHash.String()
-		res.ChunkIndex = chunkIndex
+		res.XorbHash = loc.XorbHash.String()
+		res.ChunkIndex = loc.ChunkIndex
 		results = append(results, res)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchChunkDedupQueryResponse{Results: results})
-}
-
-func findChunkLocationInShard(shardObj *shard.Shard, chunkHash xet.ChunkHash) (xet.XorbHash, uint32, bool) {
-	for _, casBlock := range shardObj.CASInfos {
-		for i, casChunk := range casBlock.Chunks {
-			if casChunk.ChunkHash == chunkHash {
-				return casBlock.CASHash, uint32(i), true
-			}
-		}
-	}
-
-	return xet.XorbHash{}, 0, false
 }

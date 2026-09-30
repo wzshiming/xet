@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/progress"
+	"github.com/wzshiming/xet/upload"
 )
 
 // UpstreamProvider selects the CAS endpoint and bearer token for one permission.
@@ -30,8 +32,6 @@ type Client struct {
 	retries       int
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
-	cacheDir      string
-	cacheSize     int64
 	cache         *Cache
 }
 
@@ -83,29 +83,15 @@ func WithIdleTimeout(timeout time.Duration) Options {
 	}
 }
 
-// WithCacheDir enables the persistent disk chunk cache at the given directory.
-func WithCacheDir(cacheDir string) Options {
-	return func(c *Client) {
-		c.cacheDir = cacheDir
-	}
-}
-
-// WithCacheSize bounds the total size in bytes of the persistent disk chunk
-// cache; least recently used entries are evicted once the limit is exceeded.
-// Zero or negative keeps the cache unbounded. Defaults to
-// download.DefaultCacheSize (10 GB), matching xet-core.
-func WithCacheSize(sizeBytes int64) Options {
-	return func(c *Client) {
-		c.cacheSize = sizeBytes
-	}
-}
-
-// WithCache shares an existing chunk cache; it takes precedence over WithCacheDir and WithCacheSize.
+// WithCache shares a cache root; without it the client shares the default NewCache("", download.DefaultCacheSize, upload.DefaultCacheSize).
 func WithCache(cache *Cache) Options {
 	return func(c *Client) {
 		c.cache = cache
 	}
 }
+
+// defaultCache is the cache root every client built without WithCache shares.
+var defaultCache = sync.OnceValue(func() *Cache { return NewCache("", download.DefaultCacheSize, upload.DefaultCacheSize) })
 
 // WithUpstreamProvider binds the CAS endpoint and token source; without it every CAS request fails.
 func WithUpstreamProvider(provider UpstreamProvider) Options {
@@ -122,14 +108,13 @@ func NewClient(opts ...Options) (*Client, error) {
 		concurrency: 4,
 		retries:     5,
 		idleTimeout: DefaultIdleTimeout,
-		cacheSize:   download.DefaultCacheSize,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 
 	if c.cache == nil {
-		c.cache = NewCache(c.cacheDir, c.cacheSize)
+		c.cache = defaultCache()
 	}
 
 	// Copy the caller's client so wrapping its transport never mutates it.
@@ -168,6 +153,7 @@ func (c *Client) Usage(ctx context.Context) (Usage, error) {
 var (
 	errNotFound     = fmt.Errorf("404 not found")
 	errUnauthorized = errors.New("401 Unauthorized")
+	errForbidden    = errors.New("403 Forbidden")
 )
 
 func reqError(req *http.Request, resp *http.Response) error {
@@ -191,19 +177,27 @@ func reqError(req *http.Request, resp *http.Response) error {
 	return nil
 }
 
-// statusError is resp.Status as an error; a 401 also matches errUnauthorized so callers can keep it terminal.
+// statusError is resp.Status as an error; a 401 also matches errUnauthorized and a 403 errForbidden so callers can keep them terminal.
 func statusError(resp *http.Response) error {
-	if resp.StatusCode == http.StatusUnauthorized {
-		return unauthorizedError{resp.Status}
-	}
-	return errors.New(resp.Status)
+	return statusCodeError{resp.StatusCode, resp.Status}
 }
 
-type unauthorizedError struct{ status string }
+type statusCodeError struct {
+	code   int
+	status string
+}
 
-func (e unauthorizedError) Error() string { return e.status }
+func (e statusCodeError) Error() string { return e.status }
 
-func (unauthorizedError) Is(target error) bool { return target == errUnauthorized }
+func (e statusCodeError) Is(target error) bool {
+	switch target {
+	case errUnauthorized:
+		return e.code == http.StatusUnauthorized
+	case errForbidden:
+		return e.code == http.StatusForbidden
+	}
+	return false
+}
 
 func isNetworkError(err error) bool {
 	var netErr interface{ Timeout() bool }

@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -38,9 +41,9 @@ type shardUploadEventV2 struct {
 	Retryable bool   `json:"retryable,omitempty"`
 }
 
-// UploadShard uploads a serialized shard through the V1 API.
+// UploadShard uploads a serialized shard through the V1 API and caches its chunk locations for later dedup lookups.
 func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	req, err := c.newShardUploadRequest(ctx, "v1", shardObj)
+	req, scope, err := c.newShardUploadRequest(ctx, "v1", shardObj)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +63,7 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
+	_ = c.cache.Upload.Store(scope, shardObj.ChunkLocations())
 	return &uploadResp, nil
 }
 
@@ -87,35 +91,35 @@ func (c *Client) UploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upl
 }
 
 // newShardUploadRequest builds a POST request carrying the encoded shard for
-// the given API version path.
-func (c *Client) newShardUploadRequest(ctx context.Context, version string, shardObj *shard.Shard) (*http.Request, error) {
+// the given API version path, and the dedup cache scope of its CAS.
+func (c *Client) newShardUploadRequest(ctx context.Context, version string, shardObj *shard.Shard) (*http.Request, string, error) {
 	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
-		return nil, fmt.Errorf("get base URL: %w", err)
+		return nil, "", fmt.Errorf("get base URL: %w", err)
 	}
 	url := fmt.Sprintf("%s/%s/shards", baseURL, version)
 
 	reader, err := shardObj.Encode(false)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	bodyBytes, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, fmt.Errorf("read shard payload: %w", err)
+		return nil, "", fmt.Errorf("read shard payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, "", fmt.Errorf("create request: %w", err)
 	}
 	req.ContentLength = int64(len(bodyBytes))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	return req, nil
+	return req, c.dedupScope(baseURL), nil
 }
 
-// uploadShardV2 performs a single /v2/shards upload attempt.
+// uploadShardV2 performs a single /v2/shards upload attempt, caching the shard's chunk locations on success.
 func (c *Client) uploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	req, err := c.newShardUploadRequest(ctx, "v2", shardObj)
+	req, scope, err := c.newShardUploadRequest(ctx, "v2", shardObj)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +133,12 @@ func (c *Client) uploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upl
 		return nil, err
 	}
 
-	return parseShardUploadNDJSON(resp.Body)
+	uploadResp, err := parseShardUploadNDJSON(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = c.cache.Upload.Store(scope, shardObj.ChunkLocations())
+	return uploadResp, nil
 }
 
 // retryableShardUploadError reports a terminal /v2/shards error frame marked
@@ -185,16 +194,13 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 	return nil, fmt.Errorf("v2 shard upload stream ended without a result event")
 }
 
-// QueryDedupShard downloads the deduplication shard for the given chunk hash
-// and returns all chunk locations indexed by that shard, enabling local O(1)
-// lookups for any chunk that shares the same shard (xet-core style local
-// dedup).
+// QueryDedupShard downloads the deduplication shard for chunkHash and
+// resolves where it stores chunkHash and candidates; hashes the shard does
+// not store are absent from the result.
 //
-// candidates are additional raw chunk hashes the caller wants dedup info for.
-// They are needed for HMAC-keyed shards (production CAS): stored hashes are
-// keyed and cannot be reversed, so only hashes offered as candidates can be
-// matched. Unkeyed shards ignore candidates and index every stored hash.
-func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+// HMAC-keyed shards (production CAS) store keyed hashes that cannot be
+// reversed, so only hashes offered here can be matched.
+func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
 	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
@@ -213,12 +219,7 @@ func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, c
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return map[xet.ChunkHash]*upload.DeduplicationResult{
-			chunkHash: {
-				ChunkHash: chunkHash,
-				IsNew:     true,
-			},
-		}, nil
+		return map[xet.ChunkHash]shard.ChunkLocation{}, nil
 	}
 
 	if err := reqError(req, resp); err != nil {
@@ -230,175 +231,175 @@ func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, c
 		return nil, fmt.Errorf("deserialize shard: %w", err)
 	}
 
-	results := map[xet.ChunkHash]*upload.DeduplicationResult{
-		chunkHash: {
-			ChunkHash: chunkHash,
-			IsNew:     true,
-		},
-	}
-
 	if shardObj.Footer != nil && shardObj.Footer.IsExpired(time.Now()) {
 		// The shard key has expired, so its xorb references can no longer be
 		// relied on for dedup; treat the probe as new data.
-		return results, nil
+		return map[xet.ChunkHash]shard.ChunkLocation{}, nil
 	}
 
-	if shardObj.Footer != nil && shardObj.Footer.IsKeyed() {
-		return matchKeyedDedupShard(shardObj, chunkHash, candidates, results), nil
-	}
-
-	for _, casBlock := range shardObj.CASInfos {
-		for i, casChunk := range casBlock.Chunks {
-			results[casChunk.ChunkHash] = &upload.DeduplicationResult{
-				ChunkHash:  casChunk.ChunkHash,
-				IsNew:      false,
-				XorbHash:   casBlock.CASHash,
-				ChunkIndex: uint32(i),
-			}
-		}
-	}
-
-	return results, nil
+	return shardObj.ResolveChunks(append([]xet.ChunkHash{chunkHash}, candidates...)...), nil
 }
 
-// matchKeyedDedupShard resolves raw candidate hashes against a shard whose
-// stored chunk hashes are HMAC-keyed with the footer's ChunkHashKey
-// (xet-core MDBShardInfo::keyed_chunk_hash semantics).
-func matchKeyedDedupShard(shardObj *shard.Shard, chunkHash xet.ChunkHash, candidates []xet.ChunkHash, results map[xet.ChunkHash]*upload.DeduplicationResult) map[xet.ChunkHash]*upload.DeduplicationResult {
-	type chunkLocation struct {
-		xorbHash   xet.XorbHash
-		chunkIndex uint32
-	}
-
-	keyed := make(map[xet.ChunkHash]chunkLocation)
-	for _, casBlock := range shardObj.CASInfos {
-		for i, casChunk := range casBlock.Chunks {
-			keyed[casChunk.ChunkHash] = chunkLocation{
-				xorbHash:   casBlock.CASHash,
-				chunkIndex: uint32(i),
-			}
-		}
-	}
-
-	key := shardObj.Footer.ChunkHashKey
-	for _, candidate := range append([]xet.ChunkHash{chunkHash}, candidates...) {
-		if existing, ok := results[candidate]; ok && !existing.IsNew {
-			continue
-		}
-		location, ok := keyed[candidate.HMAC(key)]
-		if !ok {
-			continue
-		}
-		results[candidate] = &upload.DeduplicationResult{
-			ChunkHash:  candidate,
-			IsNew:      false,
-			XorbHash:   location.xorbHash,
-			ChunkIndex: location.chunkIndex,
-		}
-	}
-
-	return results
+// dedupScope names the CAS whose xorb locations the cache entries describe; the length prefix keeps a namespace with slashes from aliasing another base URL.
+func (c *Client) dedupScope(baseURL string) string {
+	return fmt.Sprintf("%d:%s/%s", len(baseURL), baseURL, c.namespace)
 }
 
-// QueryDedupShards checks multiple chunk hashes against the global
-// deduplication index. It prefers the batch endpoint and falls back to single
-// chunk queries when the batch endpoint is unavailable. candidates are the raw
-// chunk hashes matched against HMAC-keyed shards on the fallback path; see
-// QueryDedupShard.
-func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+// QueryDedupShards resolves chunkHashes and candidates from the cached chunk locations first, then the batch endpoint (or per-chunk queries when it is unavailable), fetching hit shards while candidates around them are still unresolved; hashes the CAS does not store are absent from the result.
+func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (results map[xet.ChunkHash]shard.ChunkLocation, err error) {
 	if len(chunkHashes) == 0 {
 		return nil, nil
 	}
-
-	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
-	requestBody := batchChunkDedupQueryRequest{ChunkHashes: make([]string, len(chunkHashes))}
-	for i, chunkHash := range chunkHashes {
-		requestBody.ChunkHashes[i] = chunkHash.String()
-	}
-	bodyBytes, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal batch chunk query: %w", err)
-	}
-
 	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/v1/chunks/%s:query", baseURL, c.namespace)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("create batch request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("do batch request: %w", err)
+	// Probes double as keyed-shard candidates so one fetched shard settles every probe it lists.
+	candidates = append(slices.Clone(chunkHashes), candidates...)
+	scope := c.dedupScope(baseURL)
+	local := c.cache.Upload.Lookup(ctx, scope, candidates)
+	results = make(map[xet.ChunkHash]shard.ChunkLocation, len(chunkHashes)+len(local))
+	maps.Copy(results, local)
+	remaining := make([]xet.ChunkHash, 0, len(chunkHashes))
+	requested := make(map[xet.ChunkHash]bool, len(chunkHashes))
+	for _, chunkHash := range chunkHashes {
+		if _, ok := results[chunkHash]; !ok {
+			remaining = append(remaining, chunkHash)
+			requested[chunkHash] = true
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-		return c.queryChunksDeduplicationFallback(ctx, chunkHashes, candidates)
-	}
-
-	if err := reqError(req, resp); err != nil {
-		return nil, err
+	if len(remaining) == 0 && !slices.ContainsFunc(candidates, unresolvedIn(results)) {
+		return results, nil
 	}
 
 	var batchResp batchChunkDedupQueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
-		return nil, fmt.Errorf("decode batch chunk query response: %w", err)
+	if len(remaining) > 0 {
+		requestBody := batchChunkDedupQueryRequest{ChunkHashes: make([]string, len(remaining))}
+		for i, chunkHash := range remaining {
+			requestBody.ChunkHashes[i] = chunkHash.String()
+		}
+		bodyBytes, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, fmt.Errorf("marshal batch chunk query: %w", err)
+		}
+
+		url := fmt.Sprintf("%s/v1/chunks/%s:query", baseURL, c.namespace)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("create batch request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("do batch request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			fallback, err := c.queryChunksDeduplicationFallback(ctx, remaining, candidates)
+			if err != nil {
+				return nil, err
+			}
+			mergeDedupResults(results, fallback)
+		} else if err := reqError(req, resp); err != nil {
+			return nil, err
+		} else if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+			return nil, fmt.Errorf("decode batch chunk query response: %w", err)
+		}
 	}
 
+	var hits []xet.ChunkHash
 	for _, item := range batchResp.Results {
 		chunkHash, err := xet.ParseChunkHash(item.ChunkHash)
+		if err != nil || !item.Found || !requested[chunkHash] {
+			continue
+		}
+		xorbHash, err := xet.ParseXorbHash(item.XorbHash)
 		if err != nil {
 			continue
 		}
-
-		result := &upload.DeduplicationResult{
-			ChunkHash: chunkHash,
-			IsNew:     true,
+		if _, ok := results[chunkHash]; ok {
+			continue
 		}
-		if item.Found {
-			if item.XorbHash != "" {
-				if xorbHash, err := xet.ParseXorbHash(item.XorbHash); err == nil {
-					result.IsNew = false
-					result.XorbHash = xorbHash
-					result.ChunkIndex = item.ChunkIndex
-				}
-			}
-		}
-		results[chunkHash] = result
+		results[chunkHash] = shard.ChunkLocation{XorbHash: xorbHash, ChunkIndex: item.ChunkIndex}
+		hits = append(hits, chunkHash)
 	}
-
+	// The shard behind a cached probe may list the neighbours the cache does not know.
 	for _, chunkHash := range chunkHashes {
-		if _, ok := results[chunkHash]; !ok {
-			results[chunkHash] = &upload.DeduplicationResult{
-				ChunkHash: chunkHash,
-				IsNew:     true,
-			}
+		if _, ok := local[chunkHash]; ok {
+			hits = append(hits, chunkHash)
 		}
 	}
+	c.fetchHitShards(ctx, results, hits, candidates)
+
+	// Only the requested hashes are cached, never the unrelated chunks a fetched shard lists.
+	learned := make(map[xet.ChunkHash]shard.ChunkLocation)
+	for _, h := range candidates {
+		if _, cached := local[h]; cached {
+			continue
+		}
+		if loc, ok := results[h]; ok {
+			learned[h] = loc
+		}
+	}
+	_ = c.cache.Upload.Store(scope, learned)
 	return results, nil
 }
 
-func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHashes []xet.ChunkHash, candidates []xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
-	results := make(map[xet.ChunkHash]*upload.DeduplicationResult, len(chunkHashes))
+// unresolvedIn reports which hashes results holds no location for.
+func unresolvedIn(results map[xet.ChunkHash]shard.ChunkLocation) func(xet.ChunkHash) bool {
+	return func(h xet.ChunkHash) bool { _, ok := results[h]; return !ok }
+}
+
+// fetchHitShards fetches the shards around batch hits while some candidate is still unresolved: one first, since a previous session's shard often lists every hit, then concurrency at a time, skipping hits a fetched shard already listed.
+func (c *Client) fetchHitShards(ctx context.Context, results map[xet.ChunkHash]shard.ChunkLocation, hits, candidates []xet.ChunkHash) {
+	listed := make(map[xet.ChunkHash]bool)
+	unresolved := unresolvedIn(results)
+	for width := 1; len(hits) > 0 && slices.ContainsFunc(candidates, unresolved); width = max(c.concurrency, 1) {
+		var wave []xet.ChunkHash
+		for ; len(hits) > 0 && len(wave) < width; hits = hits[1:] {
+			if !listed[hits[0]] {
+				wave = append(wave, hits[0])
+			}
+		}
+		fetched := make([]map[xet.ChunkHash]shard.ChunkLocation, len(wave))
+		var wg sync.WaitGroup
+		for i, probe := range wave {
+			wg.Go(func() { fetched[i], _ = c.QueryDedupShard(ctx, probe, candidates...) })
+		}
+		wg.Wait()
+		for _, shardResults := range fetched {
+			for h := range shardResults {
+				listed[h] = true
+			}
+			mergeDedupResults(results, shardResults)
+		}
+	}
+}
+
+// mergeDedupResults copies src into dst; a location already in dst is never overwritten.
+func mergeDedupResults(dst, src map[xet.ChunkHash]shard.ChunkLocation) {
+	for chunkHash, loc := range src {
+		if _, ok := dst[chunkHash]; ok {
+			continue
+		}
+		dst[chunkHash] = loc
+	}
+}
+
+func (c *Client) queryChunksDeduplicationFallback(ctx context.Context, chunkHashes []xet.ChunkHash, candidates []xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
+	results := make(map[xet.ChunkHash]shard.ChunkLocation, len(chunkHashes))
 	for _, chunkHash := range chunkHashes {
-		result, err := c.QueryDedupShard(ctx, chunkHash, candidates...)
+		if _, ok := results[chunkHash]; ok {
+			continue // listed by an earlier probe's shard
+		}
+		found, err := c.QueryDedupShard(ctx, chunkHash, candidates...)
 		if err != nil {
 			return nil, err
 		}
-
-		for _, dedupResult := range result {
-			// Keep found locations; a hash marked new by one probe's shard
-			// may still be found in a later probe's shard.
-			if existing, ok := results[dedupResult.ChunkHash]; ok && !existing.IsNew {
-				continue
-			}
-			results[dedupResult.ChunkHash] = dedupResult
-		}
+		mergeDedupResults(results, found)
 	}
 	return results, nil
 }

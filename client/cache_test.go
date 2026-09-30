@@ -2,16 +2,24 @@ package client
 
 import (
 	"bytes"
-	"errors"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/upload"
 )
+
+// A Cache built with only one manager reports the other as empty.
+func TestCacheUsageSkipsNilManagers(t *testing.T) {
+	for _, c := range []*Cache{{}, {Download: download.NewCacheManager(t.TempDir(), 0)}, {Upload: upload.NewCacheManager(t.TempDir(), 0)}} {
+		if u, err := c.Usage(t.Context()); err != nil || u != (Usage{}) {
+			t.Fatalf("Usage(%+v) = %+v, %v; want zero", c, u, err)
+		}
+	}
+}
 
 // authRecorder keeps the Authorization header of every request in arrival order per path.
 type authRecorder struct {
@@ -46,15 +54,15 @@ func recordingServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, 
 	return srv, rec
 }
 
-// Two clients built on one Cache serve each other's chunks, whatever WithCacheDir each was given.
+// Two clients built on one Cache serve each other's chunks.
 func TestSharedCacheAvoidsRefetch(t *testing.T) {
 	fx := newDownloadFixture(t, 1)
 	cas, rec := recordingServer(t, fx.serveHTTP)
 	fx.srv = cas // reconstructions name xorb URLs on fx.srv
-	shared := NewCache(t.TempDir(), 0)
+	shared := NewCache(t.TempDir(), 0, 0)
 	ctx := t.Context()
 	fetch := func() *Client {
-		c, err := NewClient(WithCacheDir(t.TempDir()), WithCache(shared), WithUpstreamProvider(newFakeProvider(cas.URL, "t")))
+		c, err := NewClient(WithCache(shared), WithUpstreamProvider(newFakeProvider(cas.URL, "t")))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -77,32 +85,6 @@ func TestSharedCacheAvoidsRefetch(t *testing.T) {
 	for _, c := range []*Client{c1, c2} {
 		if got, err := c.Usage(ctx); err != nil || got != want {
 			t.Fatalf("client usage = %+v, %v; want %+v", got, err, want)
-		}
-	}
-}
-
-func TestWithCachePrecedesCacheDir(t *testing.T) {
-	fx := newDownloadFixture(t, 1)
-	ctx := t.Context()
-	for _, cacheFirst := range []bool{false, true} {
-		own, dirB := NewCache(t.TempDir(), 0), filepath.Join(t.TempDir(), "unused")
-		opts := []Options{WithCacheDir(dirB), WithCache(own), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, ""))}
-		if cacheFirst {
-			opts[0], opts[1] = opts[1], opts[0]
-		}
-		c, err := NewClient(opts...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := downloadInto(t, nil, func(w io.WriteSeeker) error { return c.DownloadFile(ctx, fx.hashes[0], w) })
-		if err != nil || !bytes.Equal(got, fx.data[0]) {
-			t.Fatalf("cacheFirst=%v: download: %d bytes, %v; want %d", cacheFirst, len(got), err, len(fx.data[0]))
-		}
-		if u, err := own.Usage(ctx); err != nil || u.Download.Count == 0 {
-			t.Fatalf("cacheFirst=%v: own cache usage = %+v, %v; want entries", cacheFirst, u, err)
-		}
-		if _, err := os.Stat(dirB); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("cacheFirst=%v: stat %s: %v; want it never created", cacheFirst, dirB, err)
 		}
 	}
 }

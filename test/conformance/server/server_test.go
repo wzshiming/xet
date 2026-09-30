@@ -95,7 +95,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 					// Create native client
 					nativeClient, err := client.NewClient(
-						client.WithCacheDir(t.TempDir()),
+						client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 						client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 					)
 					if err != nil {
@@ -252,7 +252,7 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 
 			// Create native client
 			nativeClient, err := client.NewClient(
-				client.WithCacheDir(t.TempDir()),
+				client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 				client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 			)
 			if err != nil {
@@ -393,7 +393,7 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 
 	srv = server.NewHandler(server.WithStorage(stor))
 	nativeClient, err := client.NewClient(
-		client.WithCacheDir(t.TempDir()),
+		client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 		client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 	)
 	if err != nil {
@@ -520,7 +520,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 
 	srv = server.NewHandler(server.WithStorage(stor))
 	nativeClient, err := client.NewClient(
-		client.WithCacheDir(t.TempDir()),
+		client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 		client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 	)
 	if err != nil {
@@ -832,7 +832,7 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 
 		// Native client downloads all files via DownloadFiles (batch endpoint).
 		nativeClient, err := client.NewClient(
-			client.WithCacheDir(t.TempDir()),
+			client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 			client.WithUpstreamProvider(client.StaticUpstreamProvider(httpSrv.URL, "")),
 		)
 		if err != nil {

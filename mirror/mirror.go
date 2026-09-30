@@ -39,6 +39,7 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/upload"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -156,7 +157,7 @@ func WithStorage(s storage.Storage) Option {
 	return func(m *Mirror) { m.storage = s }
 }
 
-// WithCacheDir stores indexes, spools and chunks under dir; defaults to ./xet-mirror.
+// WithCacheDir stores indexes, spools, the chunk cache and upload staging under dir (index, spool, download, upload); defaults to ./xet-mirror.
 func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
 }
@@ -236,7 +237,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	}
 
 	m.hubClient = &http.Client{Transport: m.transport}
-	m.cache = client.NewCache(filepath.Join(m.cacheDir, "chunks"), download.DefaultCacheSize)
+	m.cache = client.NewCache(m.cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)
 
 	m.localAdapter = &localCAS{storage: m.storage, namespace: "default"}
 

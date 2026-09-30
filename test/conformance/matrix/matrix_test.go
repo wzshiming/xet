@@ -365,7 +365,7 @@ func download(t *testing.T, kind clientKind, protocol rustref.ProtocolVersion, e
 func newGoClient(t *testing.T, endpoint string) *client.Client {
 	t.Helper()
 	c, err := client.NewClient(
-		client.WithCacheDir(t.TempDir()),
+		client.WithCache(client.NewCache(t.TempDir(), 0, 0)),
 		client.WithUpstreamProvider(client.StaticUpstreamProvider(endpoint, "")),
 	)
 	if err != nil {

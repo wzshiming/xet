@@ -55,6 +55,6 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
 	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of xorb ranges to prefetch concurrently")
-	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Directory for temporary upload files (default: <os temp dir>)")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Cache root: <dir>/download holds the chunk cache, <dir>/upload holds upload staging and cached chunk locations (default: <os temp dir>/xet-cache)")
 	return cmd
 }

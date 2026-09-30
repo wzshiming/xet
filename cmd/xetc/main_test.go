@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io/fs"
 	"math/rand"
 	"net/http"
@@ -67,11 +68,21 @@ func TestCacheDirRoundTrip(t *testing.T) {
 	}
 	uploadDir := t.TempDir()
 	var stagedSeen atomic.Int64
+	var counting atomic.Bool
+	var chunkQueries, xorbWrites atomic.Int64
 	handler := server.NewHandler(server.WithStorage(stor))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1/xorbs/") {
-			staged, _ := filepath.Glob(filepath.Join(uploadDir, "xet-upload-xorb-*"))
+			staged, _ := filepath.Glob(filepath.Join(uploadDir, "upload", "staging", "xorb-*"))
 			stagedSeen.Add(int64(len(staged)))
+		}
+		if counting.Load() {
+			if strings.HasPrefix(r.URL.Path, "/v1/chunks") {
+				chunkQueries.Add(1)
+			}
+			if strings.HasPrefix(r.URL.Path, "/v1/xorbs/") && (r.Method == http.MethodPost || r.Method == http.MethodHead) {
+				xorbWrites.Add(1)
+			}
 		}
 		handler.ServeHTTP(w, r)
 	}))
@@ -95,10 +106,56 @@ func TestCacheDirRoundTrip(t *testing.T) {
 
 	run("upload", "cas", input, "--url", srv.URL, "--cache-dir", uploadDir)
 	if stagedSeen.Load() == 0 {
-		t.Fatal("no xet-upload-xorb-* staging file observed in --cache-dir during upload")
+		t.Fatal("no staging/xorb-* file observed in --cache-dir during upload")
 	}
-	if leftover, _ := filepath.Glob(filepath.Join(uploadDir, "xet-upload-xorb-*")); len(leftover) != 0 {
+	if leftover, _ := filepath.Glob(filepath.Join(uploadDir, "upload", "staging", "xorb-*")); len(leftover) != 0 {
 		t.Fatalf("upload staging leftover: %v", leftover)
+	}
+	dirs, err := os.ReadDir(filepath.Join(uploadDir, "upload"))
+	if err != nil || len(dirs) != 2 {
+		t.Fatalf("upload cache dir = %v, %v; want the chunks and staging dirs", dirs, err)
+	}
+	for i, want := range []string{"chunks", "staging"} {
+		if dirs[i].Name() != want || !dirs[i].IsDir() {
+			t.Fatalf("upload cache dir = %v; want the chunks and staging dirs", dirs)
+		}
+	}
+	if staged, err := os.ReadDir(filepath.Join(uploadDir, "upload", "staging")); err != nil || len(staged) != 0 {
+		t.Fatalf("staging after upload = %v, %v; want empty", staged, err)
+	}
+	entryPath := regexp.MustCompile(`^[0-9a-f]{16}/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}$`)
+	chunkEntries := func() int {
+		t.Helper()
+		root := filepath.Join(uploadDir, "upload", "chunks")
+		n := 0
+		err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil || !entry.Type().IsRegular() {
+				return err
+			}
+			if rel, _ := filepath.Rel(root, path); !entryPath.MatchString(filepath.ToSlash(rel)) {
+				return fmt.Errorf("unexpected file under chunks: %s", rel)
+			}
+			n++
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	cached := chunkEntries()
+	if cached == 0 {
+		t.Fatal("first upload cached no chunk locations")
+	}
+
+	counting.Store(true)
+	run("upload", "cas", input, "--url", srv.URL, "--cache-dir", uploadDir)
+	counting.Store(false)
+	if q, x := chunkQueries.Load(), xorbWrites.Load(); q != 0 || x != 0 {
+		t.Fatalf("second upload made %d /v1/chunks requests and %d xorb HEAD/POST requests; want 0 (dedup from the cached locations)", q, x)
+	}
+	if n := chunkEntries(); n != cached {
+		t.Fatalf("cached chunk locations after second upload = %d; want still %d, a shard without new chunks adds none", n, cached)
 	}
 
 	var hashes []xet.ChunkHash
@@ -123,7 +180,7 @@ func TestCacheDirRoundTrip(t *testing.T) {
 		t.Fatalf("downloaded %d bytes differ from uploaded %d bytes", len(got), len(content))
 	}
 
-	entryPattern := regexp.MustCompile(`^[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/\d+-\d+_\d+-\d+$`)
+	entryPattern := regexp.MustCompile(`^download/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{60}/\d+-\d+_\d+-\d+$`)
 	var entries []string
 	err = filepath.WalkDir(downloadDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {

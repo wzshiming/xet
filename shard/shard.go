@@ -8,7 +8,8 @@ import (
 	"github.com/wzshiming/xet"
 )
 
-// Shard represents a binary metadata structure that describes file reconstructions and xorb contents
+// Shard represents a binary metadata structure that describes file
+// reconstructions and xorb contents
 type Shard struct {
 	FooterSize uint64 // 0 if footer omitted
 	Files      []FileBlock
@@ -174,12 +175,69 @@ func (s *Shard) AddCASBlock(cb CASBlock) {
 	s.CASInfos = append(s.CASInfos, cb)
 }
 
+// ChunkLocation is where a shard stores a chunk: the xorb and the chunk's
+// index within it.
+type ChunkLocation struct {
+	XorbHash   xet.XorbHash
+	ChunkIndex uint32
+}
+
+// ChunkLocations indexes every chunk the shard stores by its stored hash.
+// A keyed shard stores HMAC-keyed hashes; LookupChunk and ResolveChunks
+// apply the footer key for the caller.
+func (s *Shard) ChunkLocations() map[xet.ChunkHash]ChunkLocation {
+	stored := make(map[xet.ChunkHash]ChunkLocation)
+	for _, block := range s.CASInfos {
+		for i, chunk := range block.Chunks {
+			stored[chunk.ChunkHash] = ChunkLocation{XorbHash: block.CASHash, ChunkIndex: uint32(i)}
+		}
+	}
+	return stored
+}
+
+// LookupChunk finds where the shard stores chunk h.
+func (s *Shard) LookupChunk(h xet.ChunkHash) (ChunkLocation, bool) {
+	stored := s.storedHash(h)
+	for _, block := range s.CASInfos {
+		for i, chunk := range block.Chunks {
+			if chunk.ChunkHash == stored {
+				return ChunkLocation{XorbHash: block.CASHash, ChunkIndex: uint32(i)}, true
+			}
+		}
+	}
+	return ChunkLocation{}, false
+}
+
+// ResolveChunks finds where the shard stores each of hashes; hashes the
+// shard does not store are absent from the result.
+func (s *Shard) ResolveChunks(hashes ...xet.ChunkHash) map[xet.ChunkHash]ChunkLocation {
+	stored := s.ChunkLocations()
+	results := make(map[xet.ChunkHash]ChunkLocation, len(hashes))
+	for _, h := range hashes {
+		if loc, ok := stored[s.storedHash(h)]; ok {
+			results[h] = loc
+		}
+	}
+	return results
+}
+
+// storedHash is the hash the shard stores for chunk h: its HMAC with the
+// footer key in a keyed shard, otherwise h itself.
+func (s *Shard) storedHash(h xet.ChunkHash) xet.ChunkHash {
+	if s.Footer != nil && s.Footer.IsKeyed() {
+		return h.HMAC(s.Footer.ChunkHashKey)
+	}
+	return h
+}
+
 // EncodedSize returns the exact number of bytes that Encode will produce.
 //
 // Layout:
 //
 //	48 bytes  header
-//	per file: 48 (block header) + 48*len(Entries) [+ 48*len(Verification) if FileWithVerification] [+ 48 if FileWithMetadataExt]
+//	per file: 48 (block header) + 48*len(Entries)
+//	          [+ 48*len(Verification) if FileWithVerification]
+//	          [+ 48 if FileWithMetadataExt]
 //	48 bytes  file bookend
 //	per CAS:  48 (block header) + 48*len(Chunks)
 //	48 bytes  CAS bookend

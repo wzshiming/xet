@@ -30,13 +30,17 @@ func (a uploadAdapter) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, re
 }
 
 func (a uploadAdapter) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
+	var resp *upload.ShardUploadResponse
+	var err error
 	if a.shardAPIVersion == shardAPIVersionV2 {
-		return a.client.UploadShardV2(ctx, shardObj)
+		resp, err = a.client.UploadShardV2(ctx, shardObj)
+	} else {
+		resp, err = a.client.UploadShard(ctx, shardObj)
 	}
-	return a.client.UploadShard(ctx, shardObj)
+	return resp, err
 }
 
-func (a uploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]*upload.DeduplicationResult, error) {
+func (a uploadAdapter) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (map[xet.ChunkHash]shard.ChunkLocation, error) {
 	return a.client.QueryDedupShards(ctx, chunkHashes, candidates...)
 }
 
@@ -57,17 +61,11 @@ func (c *Client) UploadFileV2(ctx context.Context, readSeeker io.ReadSeeker) (xe
 }
 
 func (c *Client) uploadFile(ctx context.Context, readSeeker io.ReadSeeker, shardAPIVersion shardAPIVersion) (xet.FileHash, error) {
-	adapter := uploadAdapter{client: c, shardAPIVersion: shardAPIVersion}
-	hash, err := upload.UploadFile(ctx, adapter, readSeeker,
-		upload.WithConcurrency(c.concurrency),
-		upload.WithProgressFunc(c.progressFunc),
-		upload.WithCacheDir(c.cache.dir),
-		upload.WithEnableSHA256(true),
-	)
+	hashes, err := c.uploadFiles(ctx, []io.ReadSeeker{readSeeker}, shardAPIVersion)
 	if err != nil {
 		return xet.FileHash{}, err
 	}
-	return hash, nil
+	return hashes[0], nil
 }
 
 // UploadFiles uploads multiple files through the V1 shard API and returns
@@ -87,11 +85,12 @@ func (c *Client) UploadFilesV2(ctx context.Context, readSeekers []io.ReadSeeker)
 }
 
 func (c *Client) uploadFiles(ctx context.Context, readSeekers []io.ReadSeeker, shardAPIVersion shardAPIVersion) ([]xet.FileHash, error) {
-	adapter := uploadAdapter{client: c, shardAPIVersion: shardAPIVersion}
-	return upload.UploadFiles(ctx, adapter, readSeekers,
+	opts := []upload.Option{
 		upload.WithConcurrency(c.concurrency),
 		upload.WithProgressFunc(c.progressFunc),
-		upload.WithCacheDir(c.cache.dir),
+		upload.WithCacheManager(c.cache.Upload),
 		upload.WithEnableSHA256(true),
-	)
+	}
+	adapter := &uploadAdapter{client: c, shardAPIVersion: shardAPIVersion}
+	return upload.UploadFiles(ctx, adapter, readSeekers, opts...)
 }

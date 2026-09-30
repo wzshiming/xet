@@ -336,6 +336,7 @@ func (m *Mirror) ingestSpool(ctx context.Context, t *task) (*fileEntry, error) {
 		fileHash, err := upload.UploadFile(ctx, m.localAdapter, f,
 			upload.WithEnableSHA256(true),
 			upload.WithConcurrency(4),
+			upload.WithCacheManager(m.cache.Upload),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("ingest into storage: %w", err)
