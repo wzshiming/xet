@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/groupcache/lru"
 	"github.com/wzshiming/xet/internal/flock"
+	"github.com/wzshiming/xet/internal/lru"
 )
 
 // DefaultCacheSize is the default chunk cache capacity in bytes, matching
@@ -39,9 +39,9 @@ type cacheEntry struct {
 	refs int // active in-process users; entries with refs > 0 are never evicted
 }
 
-// evictedEntry is one (key, entry) pair reported by the LRU's OnEvicted.
-type evictedEntry struct {
-	key   string
+// trackedEntry is one (path, entry) pair popped from the LRU.
+type trackedEntry struct {
+	path  string
 	entry *cacheEntry
 }
 
@@ -64,7 +64,7 @@ type CacheManager struct {
 	mu       sync.Mutex
 	dir      string
 	capacity int64 // bytes; <= 0 disables eviction
-	lru      *lru.Cache
+	lru      *lru.Cache[string, *cacheEntry]
 	total    int64
 
 	// lastReconcile is when reconcileLocked last walked the directory; the
@@ -75,11 +75,6 @@ type CacheManager struct {
 	// with every candidate pinned or flocked; eviction is paused until
 	// evictBackoff elapses or a release frees a candidate.
 	lastEvictFailed time.Time
-
-	// evicted accumulates entries popped from the LRU via RemoveOldest;
-	// evictLocked drains it for eviction candidates and reconcileLocked
-	// uses it to rebuild the LRU.
-	evicted []evictedEntry
 
 	// verified remembers published entries whose checksum already passed,
 	// keyed by final path, so each entry is verified at most once per
@@ -102,18 +97,12 @@ type CacheManager struct {
 // zero or negative disables eviction. Callers should create one manager per
 // cache directory and pass it to every reader sharing that directory.
 func NewCacheManager(cacheDir string, capacity int64) *CacheManager {
-	m := &CacheManager{
+	return &CacheManager{
 		dir:        defaultCacheDir(cacheDir),
 		capacity:   capacity,
-		lru:        lru.New(0),
+		lru:        lru.New[string, *cacheEntry](0),
 		mergeQuiet: mergeDebounce,
 	}
-	m.lru.OnEvicted = func(key lru.Key, value any) {
-		k, _ := key.(string)
-		e, _ := value.(*cacheEntry)
-		m.evicted = append(m.evicted, evictedEntry{key: k, entry: e})
-	}
-	return m
 }
 
 // prepare runs the one-time directory scan that adopts pre-existing entries
@@ -133,8 +122,7 @@ func (m *CacheManager) prepare() {
 func (m *CacheManager) acquire(path string, size int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if v, ok := m.lru.Get(path); ok {
-		e := v.(*cacheEntry)
+	if e, ok := m.lru.Get(path); ok {
 		e.refs++
 		// The name may back a recreated file; refresh the tracked size.
 		m.total += size - e.size
@@ -149,13 +137,11 @@ func (m *CacheManager) acquire(path string, size int64) {
 func (m *CacheManager) release(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if v, ok := m.lru.Get(path); ok {
-		if e := v.(*cacheEntry); e.refs > 0 {
-			e.refs--
-			if e.refs == 0 {
-				// A candidate became evictable; lift the eviction pause.
-				m.lastEvictFailed = time.Time{}
-			}
+	if e, ok := m.lru.Get(path); ok && e.refs > 0 {
+		e.refs--
+		if e.refs == 0 {
+			// A candidate became evictable; lift the eviction pause.
+			m.lastEvictFailed = time.Time{}
 		}
 	}
 }
@@ -213,30 +199,17 @@ func (m *CacheManager) mergeWorker() {
 // entries are kept for normal eviction. Returns true when the name is gone.
 func (m *CacheManager) forgetIfIdle(path string) bool {
 	m.mu.Lock()
-	if v, ok := m.lru.Get(path); ok {
-		if e := v.(*cacheEntry); e.refs > 0 {
-			m.mu.Unlock()
-			return false
-		}
+	if e, ok := m.lru.Get(path); ok && e.refs > 0 {
+		m.mu.Unlock()
+		return false
 	}
 	m.mu.Unlock()
 	if !removeCacheEntry(path) {
 		return false
 	}
 	m.mu.Lock()
-	if v, ok := m.lru.Get(path); ok {
-		e := v.(*cacheEntry)
+	if e, ok := m.lru.Remove(path); ok {
 		m.total -= e.size
-		m.lru.Remove(path)
-		// Remove fires OnEvicted; drop the bookkeeping entry it queued so
-		// the next eviction pass does not double-count this file.
-		kept := m.evicted[:0]
-		for _, ev := range m.evicted {
-			if ev.key != path {
-				kept = append(kept, ev)
-			}
-		}
-		m.evicted = kept
 	}
 	m.verified.Delete(path)
 	m.mu.Unlock()
@@ -286,31 +259,21 @@ func (m *CacheManager) evictLocked() {
 	if m.capacity <= 0 {
 		return
 	}
-	var skipped []evictedEntry
+	var skipped []trackedEntry
 	for m.total > m.capacity && m.lru.Len() > 0 {
-		m.lru.RemoveOldest()
-		if len(m.evicted) == 0 {
-			break
+		path, e, _ := m.lru.RemoveOldest()
+		// Entries in use here or locked by another process are kept and
+		// become most recently used.
+		if e.refs > 0 || !removeCacheEntry(path) {
+			skipped = append(skipped, trackedEntry{path, e})
+			continue
 		}
-		batch := m.evicted
-		m.evicted = nil
-		for _, ev := range batch {
-			if ev.entry == nil {
-				continue
-			}
-			// Entries in use here or locked by another process are kept and
-			// become most recently used.
-			if ev.entry.refs > 0 || !removeCacheEntry(ev.key) {
-				skipped = append(skipped, ev)
-				continue
-			}
-			// A future file reusing this name must be verified afresh.
-			m.verified.Delete(ev.key)
-			m.total -= ev.entry.size
-		}
+		// A future file reusing this name must be verified afresh.
+		m.verified.Delete(path)
+		m.total -= e.size
 	}
 	for _, s := range skipped {
-		m.lru.Add(s.key, s.entry)
+		m.lru.Add(s.path, s.entry)
 	}
 	if m.total > m.capacity {
 		// Everything left is pinned or flocked elsewhere; pause eviction.
@@ -407,29 +370,25 @@ func (m *CacheManager) reconcileLocked() {
 
 	// Rebuild the LRU by popping everything oldest-first and re-adding the
 	// entries whose names are still on disk, preserving their recency order.
-	m.evicted = nil
+	tracked := make([]trackedEntry, 0, m.lru.Len())
 	for m.lru.Len() > 0 {
-		m.lru.RemoveOldest()
+		path, e, _ := m.lru.RemoveOldest()
+		tracked = append(tracked, trackedEntry{path, e})
 	}
-	tracked := m.evicted
-	m.evicted = nil
 	m.total = 0
 	kept := make(map[string]bool, len(tracked))
-	for _, ev := range tracked {
-		if ev.entry == nil {
-			continue
-		}
-		size, ok := onDisk[ev.key]
+	for _, te := range tracked {
+		size, ok := onDisk[te.path]
 		if !ok {
 			// The name vanished (evicted by another process); open handles
 			// keep the data alive but it no longer occupies the directory.
-			m.verified.Delete(ev.key)
+			m.verified.Delete(te.path)
 			continue
 		}
-		ev.entry.size = size
-		m.lru.Add(ev.key, ev.entry)
+		te.entry.size = size
+		m.lru.Add(te.path, te.entry)
 		m.total += size
-		kept[ev.key] = true
+		kept[te.path] = true
 	}
 
 	// Adopt entries this manager has not seen yet, oldest first so they are

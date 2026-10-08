@@ -471,10 +471,10 @@ func TestReaderCloseKeepsCompletedRange(t *testing.T) {
 				}
 			}
 			m.mu.Lock()
-			v, ok := m.lru.Get(path)
+			e, ok := m.lru.Get(path)
 			m.mu.Unlock()
-			if !ok || v.(*cacheEntry).refs != 0 {
-				t.Fatalf("sealed entry tracked = %v, refs after Close = %v; want tracked with 0 refs", ok, v)
+			if !ok || e.refs != 0 {
+				t.Fatalf("sealed entry tracked = %v, refs after Close = %v; want tracked with 0 refs", ok, e)
 			}
 		})
 	}
@@ -550,9 +550,9 @@ func TestReaderV2CloseBeforeFirstChunkReleasesLateResult(t *testing.T) {
 	}
 	assertEntryUnlocked(t, path)
 	m.mu.Lock()
-	v, ok := m.lru.Get(path)
+	e, ok := m.lru.Get(path)
 	m.mu.Unlock()
-	if ok && v.(*cacheEntry).refs != 0 {
-		t.Fatalf("late result pinned %d refs after Close", v.(*cacheEntry).refs)
+	if ok && e.refs != 0 {
+		t.Fatalf("late result pinned %d refs after Close", e.refs)
 	}
 }

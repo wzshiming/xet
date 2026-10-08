@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/groupcache/lru"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/lru"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -28,8 +28,7 @@ type Storage struct {
 	basePath  string
 	baseURL   string
 	caches    *storage.IndexCaches
-	xorbIndex *lru.Cache // bounded xorb hash -> *xorbFile
-	xorbMut   sync.Mutex // guards xorbIndex
+	xorbIndex *lru.Cache[xet.XorbHash, *xorbFile] // bounded xorb handle cache
 }
 
 // xorbFile wraps an open xorb handle with its own mutex so that only uses of
@@ -58,10 +57,10 @@ func WithBaseURL(baseURL string) Option {
 
 // WithXorbCacheSize sets the maximum number of concurrently open xorb file
 // handles retained in memory while computing shard SHA-256 digests. Values
-// less than one disable xorb handle caching.
+// less than one leave the handle cache unbounded.
 func WithXorbCacheSize(size int) Option {
 	return func(fs *Storage) {
-		fs.xorbIndex = lru.New(size)
+		fs.xorbIndex = lru.New[xet.XorbHash, *xorbFile](size)
 	}
 }
 
@@ -71,7 +70,7 @@ func NewStorage(opts ...Option) (*Storage, error) {
 		basePath:  "./xet",
 		baseURL:   "",
 		caches:    storage.NewIndexCaches(),
-		xorbIndex: lru.New(defaultXorbCacheSize),
+		xorbIndex: lru.New[xet.XorbHash, *xorbFile](defaultXorbCacheSize),
 	}
 
 	for _, opt := range opts {
@@ -81,8 +80,7 @@ func NewStorage(opts ...Option) (*Storage, error) {
 	// Close evicted xorb handles when the LRU cache drops them. Blocking on
 	// the handle's own lock ensures we never close a file while another
 	// goroutine is reading through it.
-	fs.xorbIndex.OnEvicted = func(_ lru.Key, value any) {
-		xf := value.(*xorbFile)
+	fs.xorbIndex.OnEvicted = func(_ xet.XorbHash, xf *xorbFile) {
 		xf.mut.Lock()
 		defer xf.mut.Unlock()
 		_ = xf.f.Close()
@@ -286,10 +284,7 @@ func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash
 
 // HasXorb checks whether an xorb exists.
 func (fs *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) (bool, error) {
-	fs.xorbMut.Lock()
-	_, ok := fs.xorbIndex.Get(xorbHash)
-	fs.xorbMut.Unlock()
-	if ok {
+	if _, ok := fs.xorbIndex.Get(xorbHash); ok {
 		return true, nil
 	}
 
@@ -359,23 +354,18 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 // evicted handles are closed via the cache's OnEvicted callback. The handle's
 // own lock must be held while seeking and reading through it.
 func (fs *Storage) openXorb(casHash xet.XorbHash) (*xorbFile, error) {
-	fs.xorbMut.Lock()
-	defer fs.xorbMut.Unlock()
-
-	v, ok := fs.xorbIndex.Get(casHash)
-	if ok {
-		xf := v.(*xorbFile)
-		if !xf.closed {
-			return xf, nil
+	var openErr error
+	xf, ok := fs.xorbIndex.GetOrNew(casHash, func() (*xorbFile, bool) {
+		f, err := os.Open(fs.objectPath("xorbs", casHash.String()))
+		if err != nil {
+			openErr = fmt.Errorf("open xorb %s: %w", casHash.String(), err)
+			return nil, false
 		}
+		return &xorbFile{f: f}, true
+	})
+	if !ok {
+		return nil, openErr
 	}
-	xorbPath := fs.objectPath("xorbs", casHash.String())
-	f, err := os.Open(xorbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open xorb %s: %w", casHash.String(), err)
-	}
-	xf := &xorbFile{f: f}
-	fs.xorbIndex.Add(casHash, xf)
 	return xf, nil
 }
 
@@ -666,9 +656,7 @@ func (fs *Storage) DeleteXorb(ctx context.Context, _ string, xorbHash xet.XorbHa
 	// Evict before removing: OnEvicted closes the cached handle once any
 	// in-flight read through it finishes, and Windows cannot delete a file
 	// that still has an open handle.
-	fs.xorbMut.Lock()
 	fs.xorbIndex.Remove(xorbHash)
-	fs.xorbMut.Unlock()
 	fs.caches.Offsets.Remove(xorbHash)
 	err := os.Remove(fs.objectPath("xorbs", xorbHash.String()))
 	if err != nil && !os.IsNotExist(err) {

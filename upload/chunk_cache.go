@@ -62,7 +62,7 @@ func (m *CacheManager) Store(endpoint string, locations map[xet.ChunkHash]shard.
 	m.mu.Lock()
 	if m.capacity > 0 {
 		for _, key := range stored {
-			m.lru.Add(key, nil)
+			m.lru.Add(key, struct{}{})
 		}
 		m.evaluateLocked()
 	}
@@ -112,7 +112,7 @@ func (m *CacheManager) Lookup(ctx context.Context, endpoint string, hashes []xet
 	m.mu.Lock()
 	if m.capacity > 0 {
 		for h := range results {
-			m.lru.Add(entryKey{tag: tag, hash: h}, nil)
+			m.lru.Add(entryKey{tag: tag, hash: h}, struct{}{})
 		}
 	}
 	m.mu.Unlock()

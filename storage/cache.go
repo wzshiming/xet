@@ -1,10 +1,8 @@
 package storage
 
 import (
-	"sync"
-
-	"github.com/golang/groupcache/lru"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/lru"
 	"github.com/wzshiming/xet/shard"
 )
 
@@ -15,8 +13,7 @@ const (
 
 // Cache is a bounded, goroutine-safe LRU cache.
 type Cache[K comparable, V any] struct {
-	mut sync.Mutex
-	lru *lru.Cache // nil when caching is disabled
+	lru *lru.Cache[K, V] // nil when caching is disabled
 }
 
 // Non-positive sizes disable caching.
@@ -24,21 +21,16 @@ func NewCache[K comparable, V any](size int) *Cache[K, V] {
 	if size < 1 {
 		return &Cache[K, V]{}
 	}
-	return &Cache[K, V]{lru: lru.New(size)}
+	return &Cache[K, V]{lru: lru.New[K, V](size)}
 }
 
 // Get returns the cached value for key, marking it most recently used.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
-	var zero V
 	if c.lru == nil {
+		var zero V
 		return zero, false
 	}
-	c.mut.Lock()
-	defer c.mut.Unlock()
-	if v, ok := c.lru.Get(key); ok {
-		return v.(V), true
-	}
-	return zero, false
+	return c.lru.Get(key)
 }
 
 // Add stores value under key, evicting the least recently used entry when full.
@@ -46,8 +38,6 @@ func (c *Cache[K, V]) Add(key K, value V) {
 	if c.lru == nil {
 		return
 	}
-	c.mut.Lock()
-	defer c.mut.Unlock()
 	c.lru.Add(key, value)
 }
 
@@ -56,8 +46,6 @@ func (c *Cache[K, V]) Remove(key K) {
 	if c.lru == nil {
 		return
 	}
-	c.mut.Lock()
-	defer c.mut.Unlock()
 	c.lru.Remove(key)
 }
 
@@ -66,8 +54,6 @@ func (c *Cache[K, V]) Len() int {
 	if c.lru == nil {
 		return 0
 	}
-	c.mut.Lock()
-	defer c.mut.Unlock()
 	return c.lru.Len()
 }
 
