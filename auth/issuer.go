@@ -16,7 +16,7 @@ import (
 )
 
 // TokenPrefix labels every token this package signs so callers can tell them from hub or static bearers.
-const TokenPrefix = "xet."
+const TokenPrefix = "xetd."
 
 // IsToken reports whether s carries TokenPrefix; only Validate decides validity.
 func IsToken(s string) bool {

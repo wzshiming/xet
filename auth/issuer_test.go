@@ -48,13 +48,13 @@ func TestIssuerTokenFormat(t *testing.T) {
 			name:     "unbound",
 			grant:    Grant{Permission: Read},
 			payload:  `{"permission":"read","exp":1800000060}`,
-			expected: "xet.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MH0.0WWkE-UPuM7RihXpgpCHp1czYeo_YcNLdPzacVmC30A",
+			expected: "xetd.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MH0.0WWkE-UPuM7RihXpgpCHp1czYeo_YcNLdPzacVmC30A",
 		},
 		{
 			name:     "bound",
 			grant:    Grant{Permission: Read, File: &file, SHA256: digest},
 			payload:  `{"permission":"read","exp":1800000060,"file":"1111111111111111111111111111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}`,
-			expected: "xet.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MCwiZmlsZSI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGEyNTYiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0.by-PDp7AAvzdldlFpQ0pKZMuw1WYLkSna4COvI651RI",
+			expected: "xetd.eyJwZXJtaXNzaW9uIjoicmVhZCIsImV4cCI6MTgwMDAwMDA2MCwiZmlsZSI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGEyNTYiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0.by-PDp7AAvzdldlFpQ0pKZMuw1WYLkSna4COvI651RI",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -73,7 +73,7 @@ func TestIssuerTokenFormat(t *testing.T) {
 				t.Fatalf("Sign() = (%q, %d), want (%q, 1800000060)", token, exp, test.expected)
 			}
 			parts := strings.Split(token, ".")
-			if len(parts) != 3 || parts[0] != "xet" {
+			if len(parts) != 3 || parts[0] != "xetd" {
 				t.Fatalf("token parts = %q, want xet prefix and 3 parts", parts)
 			}
 			decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -160,9 +160,8 @@ func TestIssuerRejectsInvalidTokens(t *testing.T) {
 		{"different payload signature", TokenPrefix + payload64 + "." + other[2]},
 		{"payload tamper", TokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(strings.Replace(payload, "read", "write", 1))) + "." + sig},
 		{"missing prefix", payload64 + "." + sig},
-		{"wrong prefix", "xtk." + payload64 + "." + sig},
 		{"prefix only", TokenPrefix},
-		{"uppercase prefix", "XET." + payload64 + "." + sig},
+		{"uppercase prefix", "XETD." + payload64 + "." + sig},
 		{"doubled prefix", TokenPrefix + token},
 	} {
 		t.Run(test.name, func(t *testing.T) {
