@@ -10,9 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/groupcache/lru"
-
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/lru"
 )
 
 // DefaultCacheSize is the default capacity of the chunk location cache in
@@ -44,11 +43,7 @@ type CacheManager struct {
 	capacity int64 // bytes; <= 0 disables tracking and eviction
 
 	// lru holds the tracked entries; Add on a known key refreshes its recency.
-	lru *lru.Cache
-
-	// evicted collects the keys popped via RemoveOldest; evictLocked unlinks
-	// them and reconcileLocked rebuilds the LRU from them.
-	evicted []entryKey
+	lru *lru.Cache[entryKey, struct{}]
 
 	// lastReconcile is when reconcileLocked last walked the directory; zero
 	// means the initial scan has not happened yet.
@@ -59,9 +54,7 @@ type CacheManager struct {
 // directory); capacity bounds <dir>/chunks in bytes (<= 0 unbounded),
 // charging each entry entryCost.
 func NewCacheManager(cacheDir string, capacity int64) *CacheManager {
-	m := &CacheManager{dir: defaultCacheDir(cacheDir), capacity: capacity, lru: lru.New(0)}
-	m.lru.OnEvicted = func(key lru.Key, _ any) { m.evicted = append(m.evicted, key.(entryKey)) }
-	return m
+	return &CacheManager{dir: defaultCacheDir(cacheDir), capacity: capacity, lru: lru.New[entryKey, struct{}](0)}
 }
 
 func defaultCacheDir(cacheDir string) string {
@@ -115,14 +108,11 @@ func (m *CacheManager) evictLocked() {
 	kept := int(m.capacity / entryCost)
 	kept -= kept / 10
 	for m.lru.Len() > kept {
-		m.lru.RemoveOldest()
-	}
-	for _, key := range m.evicted {
+		key, _, _ := m.lru.RemoveOldest()
 		path := m.entryPath(key)
 		_ = os.Remove(path)
 		removeEmptyCacheDirs(path)
 	}
-	m.evicted = nil
 }
 
 // reconcileLocked removes stale staging xorbs and, for a capped manager,
@@ -203,22 +193,21 @@ func (m *CacheManager) reconcileLocked() {
 	for _, de := range found {
 		onDisk[de.key] = true
 	}
-	m.evicted = nil
+	tracked := make([]entryKey, 0, m.lru.Len())
 	for m.lru.Len() > 0 {
-		m.lru.RemoveOldest()
+		key, _, _ := m.lru.RemoveOldest()
+		tracked = append(tracked, key)
 	}
-	tracked := m.evicted
-	m.evicted = nil
 	for _, key := range tracked {
 		if onDisk[key] {
-			m.lru.Add(key, nil)
+			m.lru.Add(key, struct{}{})
 			delete(onDisk, key)
 		}
 	}
 	slices.SortFunc(found, func(a, b diskEntry) int { return a.modTime.Compare(b.modTime) })
 	for _, de := range found {
 		if onDisk[de.key] {
-			m.lru.Add(de.key, nil)
+			m.lru.Add(de.key, struct{}{})
 		}
 	}
 }
