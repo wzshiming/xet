@@ -36,11 +36,14 @@ type Resolution struct {
 // URL path is taken in its escaped form, so Resolve and Ingest share tasks,
 // entries, and spools.
 //
-// In one rare interleaving a returned Stream is already useless: its ingest
-// finished and its spool was fully drained before the caller attached, so
-// NewReader and NewSeekReader return nil. Resolve again for the published
-// terminal entry. ctx bounds only the resolution itself, never the
-// background ingest.
+// The upstream probe runs before anything is returned: content local storage
+// already holds comes back as an Entry, and a probe failure as the error. A
+// returned Stream always has a spool to read; its readers are nil only in one
+// rare interleaving, when that spool was fully drained before the caller
+// attached, and resolving again then returns the published terminal entry.
+// ctx bounds only the resolution itself, including the wait for the probe
+// and task start that resolvers of one file share, never the background
+// ingest.
 func (m *Mirror) Resolve(ctx context.Context, upstreamURL, token string) (*Resolution, error) {
 	origin, key, err := parseUpstreamURL(upstreamURL)
 	if err != nil {
@@ -67,16 +70,10 @@ type Stream struct {
 	t *task
 }
 
-// WaitMeta must succeed before calling the remaining Stream methods.
+// WaitMeta reports the upstream etag and the pinned commit. The probe ran
+// before the Stream was handed out, so it never blocks or fails; ctx is
+// accepted for callers written against the former asynchronous probe.
 func (st *Stream) WaitMeta(ctx context.Context) (etag, commit string, err error) {
-	select {
-	case <-st.t.probed:
-	case <-ctx.Done():
-		return "", "", ctx.Err()
-	}
-	if st.t.probeErr != nil {
-		return "", "", st.t.probeErr
-	}
 	return st.t.probe.etag, st.t.key.rev, nil
 }
 
@@ -96,17 +93,20 @@ func (st *Stream) WaitSize(ctx context.Context) (size int64, ok bool) {
 }
 
 // NewReader returns a reader over the file bytes starting at offset off,
-// tailing the growing spool until the ingest finishes. It returns nil when
-// the ingest finished and the spool was already drained. ctx interrupts
-// blocked reads, never the ingest.
+// tailing the growing spool until the ingest finishes. It returns nil only
+// when the spool was already retired — the ingest finished and every reader
+// detached before this caller attached: Resolve again for the entry. ctx
+// interrupts blocked reads, never the ingest.
 func (st *Stream) NewReader(ctx context.Context, off int64) io.ReadCloser {
 	return st.t.spool.newReader(ctx, off)
 }
 
 // NewSeekReader returns a ReadSeekCloser over the final size of the file,
 // fit for http.ServeContent: reads of regions not yet spooled block until
-// the data lands. It returns nil when the ingest finished and the spool was
-// already drained. ctx interrupts blocked reads, never the ingest.
+// the data lands. It returns nil only when the spool was already retired —
+// the ingest finished and every reader detached before this caller attached:
+// Resolve again for the entry. ctx interrupts blocked reads, never the
+// ingest.
 func (st *Stream) NewSeekReader(ctx context.Context, size int64) io.ReadSeekCloser {
 	return st.t.spool.newSeekReader(ctx, size)
 }

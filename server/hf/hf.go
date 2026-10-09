@@ -198,6 +198,9 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	for range 2 {
 		res, err := h.mirror.Resolve(r.Context(), target, token)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
 			return
 		}

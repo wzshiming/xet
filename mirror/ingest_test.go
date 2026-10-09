@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -491,5 +493,290 @@ func TestWithMaxConcurrentIngestsDefault(t *testing.T) {
 	m, _ := newTestMirror(t, "http://upstream.invalid", t.TempDir(), t.TempDir())
 	if got := cap(m.ingestSlots); got != 16 {
 		t.Fatalf("default slots = %d, want 16", got)
+	}
+}
+
+// Two keys whose upstream etag is the same content hash share one download:
+// the second task follows the first, reading its spool while the upstream
+// is still transferring and publishing the same stored file under its own key.
+func TestIngestSharesDownloadByETag(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.gate = make(chan struct{})
+	upstream.gateHit = make(chan struct{})
+	upstream.commit = strings.Repeat("ab", 20)
+	data := make([]byte, 128*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	upstream.set("/org/repo/resolve/main/a.bin", data)
+	upstream.set("/org/repo/resolve/main/b.bin", data)
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+	release := sync.OnceFunc(func() { close(upstream.gate) })
+	t.Cleanup(release) // Close blocks on the gated handler
+
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	a, err := m.Resolve(ctx, "org/repo", "main", "a.bin")
+	if err != nil || a.Stream == nil {
+		t.Fatalf("Resolve a.bin = %+v, %v; want an in-flight stream", a, err)
+	}
+	awaitClosed(t, upstream.gateHit, "upstream transfer")
+	b, err := m.Resolve(ctx, "org/repo", "main", "b.bin")
+	if err != nil || b.Stream == nil {
+		t.Fatalf("Resolve b.bin = %+v, %v; want an in-flight stream", b, err)
+	}
+	for name, st := range map[string]*Stream{"a.bin": a.Stream, "b.bin": b.Stream} {
+		if etag, commit, err := st.WaitMeta(ctx); err != nil || etag != hashHex(string(data)) || commit != upstream.commit {
+			t.Fatalf("%s WaitMeta = %q, %q, %v; want the shared etag at %s", name, etag, commit, err, upstream.commit)
+		}
+		if size, ok := st.WaitSize(ctx); !ok || size != int64(len(data)) {
+			t.Fatalf("%s WaitSize = %d, %v; want %d, true", name, size, ok, len(data))
+		}
+	}
+
+	// The follower's first half arrives from the leader's spool while the upstream is still gated.
+	rc := b.Stream.NewReader(ctx, 0)
+	if rc == nil {
+		t.Fatal("NewReader on the follower returned nil")
+	}
+	defer rc.Close()
+	half := make([]byte, len(data)/2)
+	if _, err := io.ReadFull(rc, half); err != nil || !bytes.Equal(half, data[:len(half)]) {
+		t.Fatalf("follower's first half while gated: %v", err)
+	}
+	m.mu.Lock()
+	inflight, tasks := len(m.inflight), len(m.tasks)
+	m.mu.Unlock()
+	if inflight != 1 || tasks != 2 || a.Stream.t == b.Stream.t || a.Stream.t.spool != b.Stream.t.spool {
+		t.Fatalf("inflight %d, tasks %d, same task %v, shared spool %v; want 1, 2, false, true", inflight, tasks, a.Stream.t == b.Stream.t, a.Stream.t.spool == b.Stream.t.spool)
+	}
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream GETs while gated = %d, want 1", got)
+	}
+
+	release()
+	tail, err := io.ReadAll(rc)
+	if err != nil || !bytes.Equal(tail, data[len(half):]) {
+		t.Fatalf("follower's second half after the gate opened: %v", err)
+	}
+	_ = rc.Close()
+	awaitClosed(t, a.Stream.t.done, "leader")
+	awaitClosed(t, b.Stream.t.done, "follower")
+	var entries [2]*Entry
+	for i, p := range []string{"a.bin", "b.bin"} {
+		res, err := m.Resolve(ctx, "org/repo", "main", p)
+		if err != nil || res.Entry == nil {
+			t.Fatalf("Resolve %s after the ingest = %+v, %v; want the ready entry", p, res, err)
+		}
+		entries[i] = res.Entry
+	}
+	ea, eb := entries[0], entries[1]
+	if ea.FileHash == "" || eb.FileHash != ea.FileHash || eb.SHA256 != ea.SHA256 || eb.Size != ea.Size || ea.Commit != upstream.commit || eb.Commit != upstream.commit {
+		t.Fatalf("entries differ: a.bin %+v, b.bin %+v", ea, eb)
+	}
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream GETs = %d, want 1 (the follower must share the download)", got)
+	}
+	// The leader leaves inflight after done closes, so give it a moment.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		inflight, tasks = len(m.inflight), len(m.tasks)
+		m.mu.Unlock()
+		if inflight == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if inflight != 0 || tasks != 0 {
+		t.Fatalf("inflight %d, tasks %d after both tasks finished; want 0, 0", inflight, tasks)
+	}
+	if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
+		t.Fatalf("spool files after the shared ingest = %v, want none", files)
+	}
+	if got := readStored(t, stor, ea.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes differ from upstream data")
+	}
+}
+
+// Content whose sha256 local storage already holds is published without a
+// download: a branch moving to a commit with the same bytes costs no GET and
+// no spool, and the first resolve under the new key already answers the
+// published entry, with no task in between.
+func TestIngestSkipsDownloadWhenStored(t *testing.T) {
+	for _, noSize := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noSize=%v", noSize), func(t *testing.T) {
+			upstream := newPlainUpstream()
+			upstream.noSize = noSize
+			c1, c2, c3 := strings.Repeat("ab", 20), strings.Repeat("cd", 20), strings.Repeat("ef", 20)
+			data := make([]byte, 64*1024)
+			if _, err := rand.Read(data); err != nil {
+				t.Fatal(err)
+			}
+			upstream.commit = c1
+			upstream.set("/org/repo/resolve/main/f.bin", data)
+			srv := httptest.NewServer(upstream)
+			t.Cleanup(srv.Close)
+			m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithRevalidateInterval(0))
+			ctx := context.Background()
+
+			e1, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+			if err != nil || e1.Commit != c1 || e1.Size != int64(len(data)) {
+				t.Fatalf("first ingest = %+v, %v; want %d bytes at %s", e1, err, len(data), c1)
+			}
+			if got := upstream.dataGETs.Load(); got != 1 {
+				t.Fatalf("upstream GETs after the first ingest = %d, want 1", got)
+			}
+
+			// The branch moves to a commit holding the same bytes.
+			upstream.commit = c2
+			upstream.set("/org/repo/resolve/main/f.bin", data)
+			e2, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+			if err != nil || e2.Commit != c2 || e2.FileHash != e1.FileHash || e2.SHA256 != e1.SHA256 || e2.Size != e1.Size || e2.ETag != e1.ETag {
+				t.Fatalf("ingest at the moved branch = %+v, %v; want %s with the stored file of %+v", e2, err, c2, e1)
+			}
+			if got := upstream.dataGETs.Load(); got != 1 {
+				t.Fatalf("upstream GETs after the move = %d, want 1 (stored content must not be downloaded)", got)
+			}
+			if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
+				t.Fatalf("spool files after publishing stored content = %v, want none", files)
+			}
+
+			// Resolve under a cold key: the stored content is the answer at once.
+			upstream.commit = c3
+			upstream.set("/org/repo/resolve/main/f.bin", data)
+			res, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
+			if err != nil || res.Entry == nil || res.Entry.Commit != c3 || res.Entry.FileHash != e1.FileHash || res.Entry.Size != e1.Size || res.Entry.ETag != e1.ETag {
+				t.Fatalf("first resolve at %s = %+v, %v; want the stored file of %+v published at once", c3, res, err, e1)
+			}
+			m.mu.Lock()
+			tasks := len(m.tasks)
+			m.mu.Unlock()
+			if tasks != 0 {
+				t.Fatalf("tasks after publishing stored content = %d, want none", tasks)
+			}
+			res, err = m.Resolve(ctx, "org/repo", "main", "f.bin")
+			if err != nil || res.Entry == nil || res.Entry.Commit != c3 || res.Entry.FileHash != e1.FileHash || res.Entry.Size != e1.Size {
+				t.Fatalf("second resolve at %s = %+v, %v; want the published entry of %+v", c3, res, err, e1)
+			}
+			if got := upstream.dataGETs.Load(); got != 1 {
+				t.Fatalf("upstream GETs after three commits = %d, want 1", got)
+			}
+			if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
+				t.Fatalf("spool files after the cold resolve = %v, want none", files)
+			}
+			if got := readStored(t, stor, e1.SHA256); !bytes.Equal(got, data) {
+				t.Fatal("stored bytes differ from upstream data")
+			}
+		})
+	}
+}
+
+// An uppercase sha256 etag is the same digest: the bytes are verified
+// against it, a key whose content storage already holds is published without
+// a download, and the entry keeps the etag as the hub sent it.
+func TestIngestVerifiesUppercaseSHA256(t *testing.T) {
+	data, unstored, served := make([]byte, 32*1024), make([]byte, 32*1024), make([]byte, 32*1024)
+	for _, b := range [][]byte{data, unstored, served} {
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upper := strings.ToUpper(hashHex(string(data)))
+	upstream := newPlainUpstream()
+	upstream.commit = strings.Repeat("ab", 20)
+	upstream.set("/org/repo/resolve/main/a.bin", data)
+	upstream.set("/org/repo/resolve/main/b.bin", data)
+	upstream.set("/org/repo/resolve/main/c.bin", served) // advertised as unstored's digest
+	advertised := map[string]string{"a.bin": upper, "b.bin": upper, "c.bin": strings.ToUpper(hashHex(string(unstored)))}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/cdn") {
+			upstream.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := upstream.get(r.URL.Path); !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"`+advertised[path.Base(r.URL.Path)]+`"`)
+		w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+		w.Header().Set("X-Repo-Commit", upstream.commit)
+		http.Redirect(w, r, "/cdn"+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+
+	entry, err := ingestWait(t, m, "org/repo", "main", "a.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.SHA256 != hashHex(string(data)) || entry.ETag != upper {
+		t.Fatalf("entry = %+v, want sha256 %s under etag %s", entry, hashHex(string(data)), upper)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes differ from upstream data")
+	}
+	held, err := ingestWait(t, m, "org/repo", "main", "b.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.FileHash != entry.FileHash || held.ETag != upper || upstream.dataGETs.Load() != 1 {
+		t.Fatalf("b.bin = %+v after %d data GETs, want %+v published from storage", held, upstream.dataGETs.Load(), entry)
+	}
+
+	if _, err := ingestWait(t, m, "org/repo", "main", "c.bin"); !errors.Is(err, errSpoolCorrupt) {
+		t.Fatalf("c.bin err = %v, want the bytes rejected against the uppercase digest", err)
+	}
+	if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
+		t.Fatalf("spool files after the rejected download = %v, want none", files)
+	}
+}
+
+// Stored content is published without a download only when the upstream's
+// size agrees with it: a key claiming a held digest at another length is
+// downloaded, and that download fails on the size it advertised.
+func TestHeldEntryRejectsSizeDisagreement(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = strings.Repeat("ab", 20)
+	data := make([]byte, 32*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	upstream.set("/org/repo/resolve/main/a.bin", data)
+	upstream.set("/org/repo/resolve/main/b.bin", data)
+	// b.bin advertises a.bin's digest at one byte more than its length.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/b.bin") && !strings.HasPrefix(r.URL.Path, "/cdn") {
+			w.Header().Set("ETag", `"`+hashHex(string(data))+`"`)
+			w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)+1))
+			w.Header().Set("X-Repo-Commit", upstream.commit)
+			http.Redirect(w, r, "/cdn"+r.URL.Path, http.StatusFound)
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+
+	stored, err := ingestWait(t, m, "org/repo", "main", "a.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := upstream.dataGETs.Load()
+	if _, err := ingestWait(t, m, "org/repo", "main", "b.bin"); err == nil || !strings.Contains(err.Error(), "upstream size mismatch") {
+		t.Fatalf("b.bin err = %v, want the download to fail on the advertised size", err)
+	}
+	if got := upstream.dataGETs.Load(); got != before+1 {
+		t.Fatalf("data GETs went %d -> %d, want the disagreeing key downloaded rather than published from storage", before, got)
+	}
+	key := resolveKey{repo: "org/repo", rev: upstream.commit, path: "b.bin"}
+	m.mu.Lock()
+	e, published := m.entries[key], m.commits[key.revKey()].files["b.bin"]
+	m.mu.Unlock()
+	if e == nil || e.State != stateFailed || e.FileHash != "" || published != nil {
+		t.Fatalf("b.bin holds %+v (manifest %+v); want a failure without %s's file", e, published, stored.FileHash)
 	}
 }

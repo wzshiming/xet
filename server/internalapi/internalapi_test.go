@@ -7,14 +7,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
@@ -54,6 +60,29 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 		t.Fatal(err)
 	}
 	return fileHash
+}
+
+// decodeSweep returns the storage pass of a recorded GC sweep response.
+func decodeSweep(t *testing.T, rec *httptest.ResponseRecorder) storage.SweepResult {
+	t.Helper()
+	var resp sweepResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode sweep: %v", err)
+	}
+	if resp.Storage == nil {
+		t.Fatal("sweep response carries no storage pass")
+	}
+	return *resp.Storage
+}
+
+// responseKeys returns the sorted top-level keys of a recorded JSON response without consuming its body.
+func responseKeys(t *testing.T, rec *httptest.ResponseRecorder) []string {
+	t.Helper()
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode response keys: %v", err)
+	}
+	return slices.Sorted(maps.Keys(raw))
 }
 
 func TestInternalRoutesRequirePermission(t *testing.T) {
@@ -331,10 +360,7 @@ func TestUnlinkSHA256Endpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("sweep after sha256 unlink alone = %+v", result)
 	}
@@ -353,10 +379,7 @@ func TestUnlinkSHA256Endpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode second sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("sweep after both unlinks = %+v", result)
 	}
@@ -417,10 +440,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("dry run status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode dry run: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if !result.DryRun || len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("dry run result = %+v", result)
 	}
@@ -430,10 +450,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if result.DryRun || len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("sweep result = %+v", result)
 	}
@@ -441,10 +458,7 @@ func TestGCSweepEndpoint(t *testing.T) {
 	// Everything is gone: a second sweep finds nothing.
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode second sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("second sweep result = %+v", result)
 	}
@@ -466,14 +480,18 @@ func TestGCSweepEndpoint(t *testing.T) {
 // TestGCSweepEndpointStepped drains a two-file store one dead object per
 // request. Every request runs an independent pass that re-marks from
 // scratch and reports only its own work, so the union of the steps covers
-// the whole store.
+// the whole store; the mirror passes run once, on the step that finishes it.
 func TestGCSweepEndpointStepped(t *testing.T) {
 	ctx := context.Background()
 	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(WithStorage(fs))
+	mir, err := mirror.NewMirror(mirror.WithStorage(fs), mirror.WithCacheDir(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithMirror(mir))
 	for i, content := range [][]byte{[]byte("stepped sweep one"), []byte("stepped sweep two")} {
 		fileHash := putTestFile(t, ctx, fs, content)
 		rec := httptest.NewRecorder()
@@ -498,10 +516,8 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("step %d status = %d: %s", steps, rec.Code, rec.Body.String())
 		}
-		result = storage.SweepResult{}
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("decode step %d: %v", steps, err)
-		}
+		keys := responseKeys(t, rec)
+		result = decodeSweep(t, rec)
 		steps++
 		if got := len(result.SweptShards) + len(result.SweptXorbs); got != 1 {
 			t.Fatalf("step %d swept %d objects, want exactly 1", steps, got)
@@ -509,7 +525,13 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 		sweptShards += len(result.SweptShards)
 		sweptXorbs += len(result.SweptXorbs)
 		if result.Done {
+			if !slices.Equal(keys, []string{"index", "spools", "storage"}) {
+				t.Fatalf("final step keys = %v, want the storage pass with both mirror passes", keys)
+			}
 			break
+		}
+		if !slices.Equal(keys, []string{"storage"}) {
+			t.Fatalf("step %d keys = %v, want the storage pass alone before done", steps, keys)
 		}
 		if steps > 10 {
 			t.Fatalf("stepping not done after %d steps: %+v", steps, result)
@@ -529,10 +551,10 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 	// Nothing is left for a full pass.
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode full pass: %v", err)
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"index", "spools", "storage"}) {
+		t.Fatalf("full pass keys = %v, want the storage pass with both mirror passes", keys)
 	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("full pass after drain = %+v", result)
 	}
@@ -606,10 +628,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("sweep with disabled server grace = %+v", result)
 	}
@@ -628,10 +647,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("default sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode default sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("default-window sweep = %+v", result)
 	}
@@ -643,10 +659,7 @@ func TestGCSweepEndpointServerGrace(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("override sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode override sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("override sweep = %+v", result)
 	}
@@ -676,10 +689,7 @@ func TestGCSweepEndpointNeedsBothUnlinks(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("sweep after file unlink alone = %+v", result)
 	}
@@ -694,10 +704,7 @@ func TestGCSweepEndpointNeedsBothUnlinks(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode second sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("sweep after both unlinks = %+v", result)
 	}
@@ -730,10 +737,7 @@ func TestGCSweepEndpointServerAnchor(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("server-default sha256 sweep = %+v", result)
 	}
@@ -753,10 +757,7 @@ func TestGCSweepEndpointServerAnchor(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("anchor=both sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode anchor=both sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
 		t.Fatalf("anchor=both sweep after sha256 unlink alone = %+v", result)
 	}
@@ -773,10 +774,7 @@ func TestGCSweepEndpointServerAnchor(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("final sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	result = storage.SweepResult{}
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode final sweep: %v", err)
-	}
+	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("anchor=both sweep after both unlinks = %+v", result)
 	}
@@ -808,10 +806,7 @@ func TestGCSweepEndpointSHA256AnchorLFS(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var result storage.SweepResult
-	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-		t.Fatalf("decode sweep: %v", err)
-	}
+	result := decodeSweep(t, rec)
 	if len(result.SweptShards) != 1 || len(result.SweptXorbs) != 1 {
 		t.Fatalf("anchor=sha256 sweep = %+v", result)
 	}
@@ -883,5 +878,133 @@ func TestGCSweepEndpointBusy(t *testing.T) {
 	close(blocking.release)
 	if code := <-first; code != http.StatusOK {
 		t.Fatalf("first sweep status = %d, want %d", code, http.StatusOK)
+	}
+}
+
+// sweepRequest posts a GC sweep with query and returns the decoded report.
+func sweepRequest(t *testing.T, handler *Handler, query string) sweepResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep"+query, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep %q status = %d: %s", query, rec.Code, rec.Body.String())
+	}
+	var result sweepResponse
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode sweep %q: %v", query, err)
+	}
+	return result
+}
+
+// TestGCSweepEndpointSpools: without a mirror the sweep report carries the
+// storage pass alone; with one, dry_run only reports (and says so), the
+// default grace removes only spools idle past it, and grace=0 removes every
+// idle spool.
+func TestGCSweepEndpointSpools(t *testing.T) {
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sweepRequest(t, NewHandler(WithStorage(fs)), "?grace=0"); got.Storage == nil || got.Spools != nil || got.Index != nil {
+		t.Fatalf("sweep without a mirror = %+v, want a storage pass alone", got)
+	}
+	rec := httptest.NewRecorder()
+	NewHandler(WithStorage(fs)).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"storage"}) {
+		t.Fatalf("sweep keys without a mirror = %v, want storage alone", keys)
+	}
+
+	cacheDir := t.TempDir()
+	mir, err := mirror.NewMirror(mirror.WithStorage(fs), mirror.WithCacheDir(cacheDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithMirror(mir))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"index", "spools", "storage"}) {
+		t.Fatalf("sweep keys with a mirror = %v, want storage, spools and index", keys)
+	}
+	stale := filepath.Join(cacheDir, "spool", "x.spool")
+	if err := os.WriteFile(stale, []byte("stale spool content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatal(err)
+	}
+	fresh := filepath.Join(cacheDir, "spool", "y.spool")
+	if err := os.WriteFile(fresh, []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := &mirror.SpoolSweepResult{DryRun: true, SweptSpools: 2, ReclaimedBytes: int64(len("stale spool content") + len("fresh"))}
+	if got := sweepRequest(t, handler, "?dry_run=true&grace=0"); got.Storage == nil || !got.Storage.DryRun || !reflect.DeepEqual(got.Spools, want) {
+		t.Fatalf("dry-run sweep storage = %+v, spools = %+v; want a dry-run storage pass and %+v", got.Storage, got.Spools, want)
+	}
+	for _, p := range []string{stale, fresh} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("dry run removed %s: %v", filepath.Base(p), err)
+		}
+	}
+
+	want = &mirror.SpoolSweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("stale spool content"))}
+	if got := sweepRequest(t, handler, ""); !reflect.DeepEqual(got.Spools, want) {
+		t.Fatalf("default-grace spools = %+v, want %+v", got.Spools, want)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("default grace removed the fresh spool: %v", err)
+	}
+
+	want = &mirror.SpoolSweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("fresh"))}
+	if got := sweepRequest(t, handler, "?grace=0"); !reflect.DeepEqual(got.Spools, want) {
+		t.Fatalf("grace=0 spools = %+v, want %+v", got.Spools, want)
+	}
+	if _, err := os.Stat(fresh); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh spool after grace=0 sweep: %v, want removed", err)
+	}
+}
+
+// TestGCSweepEndpointIndex: with a mirror, the same dry_run drives the index
+// pass, which drops the entries of files storage no longer holds and the
+// manifests that leaves empty.
+func TestGCSweepEndpointIndex(t *testing.T) {
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cacheDir := t.TempDir()
+	mir, err := mirror.NewMirror(mirror.WithStorage(fs), mirror.WithCacheDir(cacheDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithMirror(mir))
+
+	// Laid out as mirror/index.go does: index/<sha256(repo)>/commits/<commit>.json, naming a file hash storage never saw.
+	repoSum := sha256.Sum256([]byte("org/repo"))
+	commit := strings.Repeat("ab", 20)
+	manifest := filepath.Join(cacheDir, "index", hex.EncodeToString(repoSum[:]), "commits", commit+".json")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"repo":"org/repo","commit":"` + commit + `","files":{"f.bin":{"file_hash":"` + strings.Repeat("ef", 32) + `","sha256":"` + strings.Repeat("cd", 32) + `","size":5,"etag":"e","checked_at":"2026-01-01T00:00:00Z"}}}`
+	if err := os.WriteFile(manifest, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := &mirror.IndexSweepResult{DryRun: true, DroppedEntries: 1, RemovedManifests: 1}
+	if got := sweepRequest(t, handler, "?dry_run=true&grace=0"); !reflect.DeepEqual(got.Index, want) {
+		t.Fatalf("dry-run index = %+v, want %+v", got.Index, want)
+	}
+	if _, err := os.Stat(manifest); err != nil {
+		t.Fatalf("dry run removed the manifest: %v", err)
+	}
+
+	want = &mirror.IndexSweepResult{DroppedEntries: 1, RemovedManifests: 1}
+	if got := sweepRequest(t, handler, "?grace=0"); !reflect.DeepEqual(got.Index, want) {
+		t.Fatalf("grace=0 index = %+v, want %+v", got.Index, want)
+	}
+	if _, err := os.Stat(manifest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest after the sweep: %v, want removed", err)
 	}
 }

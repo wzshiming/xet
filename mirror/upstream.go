@@ -46,13 +46,17 @@ type probeResult struct {
 	status    int
 	size      int64 // -1 when unknown
 	etag      string
-	sha256    string // set when the upstream etag looks like a SHA-256
+	sha256    string // lowercase digest when the upstream etag looks like a SHA-256
+	content   string // lowercase etag when it is a content hash: with the origin, the identity shared downloads and spools are keyed by
 	commit    string // always a 40-hex: the upstream's own or a synthesized one
 	synthetic bool   // commit is the pseudo commit of the requested branch
 	xet       bool   // upstream advertised xet link headers on the resolve response
 }
 
-var hexSHA256Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var hexSHA256Re = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// hashETagRe matches etags that are content hashes: the git blob sha1 of regular hub files or the LFS sha256.
+var hashETagRe = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
 
 // pseudoCommit is the stable stand-in commit for a branch of an upstream that sends no 40-hex X-Repo-Commit.
 func pseudoCommit(repo, rev string) string {
@@ -108,7 +112,10 @@ func (m *Mirror) probe(ctx context.Context, origin string, key resolveKey) (*pro
 	}
 
 	if hexSHA256Re.MatchString(res.etag) {
-		res.sha256 = res.etag
+		res.sha256 = strings.ToLower(res.etag)
+	}
+	if hashETagRe.MatchString(res.etag) {
+		res.content = strings.ToLower(res.etag)
 	}
 	// Hub clients refuse resolves without a 40-hex X-Repo-Commit; synthesize one when the upstream sends none.
 	if commitRevRe.MatchString(key.rev) {

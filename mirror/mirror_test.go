@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,7 +31,7 @@ import (
 )
 
 func TestSpoolTailRead(t *testing.T) {
-	sp, err := openSpool(t.TempDir(), "k", "", -1)
+	sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestSpoolTailRead(t *testing.T) {
 	}
 
 	t.Run("canceled context unblocks reader", func(t *testing.T) {
-		sp, err := openSpool(t.TempDir(), "k", "", -1)
+		sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +81,7 @@ func TestSpoolTailRead(t *testing.T) {
 	})
 
 	t.Run("no readers after removal", func(t *testing.T) {
-		sp, err := openSpool(t.TempDir(), "k", "", -1)
+		sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,6 +187,7 @@ type plainUpstream struct {
 	files    map[string][]byte
 	api      map[string][]byte // raw JSON served under /api/ paths
 	commit   string
+	noSize   bool // advertise no size on probes: neither X-Linked-Size nor a Content-Length on the CDN HEAD
 	dataGETs atomic.Int64
 	seenAuth sync.Map // Authorization values observed on any request
 	gate     chan struct{}
@@ -242,6 +244,10 @@ func (u *plainUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			u.dataGETs.Add(1)
 		}
+		if u.noSize && r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if u.gate != nil && r.Method == http.MethodGet && r.Header.Get("Range") == "" {
 			// Stream in two halves so tests can observe serve-while-caching.
 			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
@@ -270,7 +276,9 @@ func (u *plainUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	etag := hex.EncodeToString(sum[:])
 	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("X-Linked-Etag", `"`+etag+`"`)
-	w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+	if !u.noSize {
+		w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+	}
 	w.Header().Set("X-Repo-Commit", u.commit)
 	http.Redirect(w, r, "/cdn"+r.URL.Path, http.StatusFound)
 }
@@ -367,27 +375,13 @@ func TestResolveStream(t *testing.T) {
 		t.Fatal("stored bytes differ from upstream data")
 	}
 
-	// Missing files surface ErrUpstreamNotFound: first through the stream's
-	// WaitMeta, then directly from Resolve once the failure is recorded.
-	missing, err := m.Resolve(ctx, "org/repo", "main", "missing.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if missing.Stream == nil {
-		t.Fatal("resolve of a missing file did not return a stream")
-	}
-	if _, _, err := missing.Stream.WaitMeta(ctx); !errors.Is(err, ErrUpstreamNotFound) {
-		t.Fatalf("WaitMeta err = %v, want ErrUpstreamNotFound", err)
-	}
-	deadline = time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err = m.Resolve(ctx, "org/repo", "main", "missing.bin"); err != nil {
-			break
+	// Missing files surface ErrUpstreamNotFound straight from Resolve: the
+	// probe runs before any stream is handed out, and the recorded failure
+	// answers the next Resolve the same way.
+	for _, when := range []string{"first", "recorded"} {
+		if _, err := m.Resolve(ctx, "org/repo", "main", "missing.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+			t.Fatalf("%s Resolve of a missing file err = %v, want ErrUpstreamNotFound", when, err)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !errors.Is(err, ErrUpstreamNotFound) {
-		t.Fatalf("Resolve err = %v, want ErrUpstreamNotFound", err)
 	}
 }
 
@@ -580,7 +574,7 @@ func TestMirrorUsage(t *testing.T) {
 		t.Fatalf("usage with index files = %+v, %v; want %+v", got, err, Usage{Index: wantIndex})
 	}
 
-	sp, err := openSpool(m.spoolDir, "/org/repo/resolve/main/f.bin", "etag1", 100)
+	sp, err := openSpool(m.spoolDir, "http://upstream.invalid", "/org/repo/resolve/main/f.bin", "etag1", 100, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +585,7 @@ func TestMirrorUsage(t *testing.T) {
 		t.Fatalf("usage with in-flight spool = %+v, %v; want spool count 1 bytes 40", got, err)
 	}
 	sp.finish(errors.New("interrupted"))
-	consumed, err := openSpool(m.spoolDir, "/org/repo/resolve/main/g.bin", "etag2", 100)
+	consumed, err := openSpool(m.spoolDir, "http://upstream.invalid", "/org/repo/resolve/main/g.bin", "etag2", 100, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -914,8 +908,8 @@ func TestMirrorSyntheticPin(t *testing.T) {
 	t.Run("concurrent source pin waits for persistence", func(t *testing.T) {
 		engine := &Mirror{
 			indexDir: t.TempDir(),
-			commits: map[string]*commitState{
-				"org/repo\x00" + pseudo: {source: "main"},
+			commits: map[revKey]*commitState{
+				{repo: "org/repo", rev: pseudo}: {source: "main"},
 			},
 		}
 		engine.persistMu.Lock()
@@ -1538,7 +1532,7 @@ func TestMirrorIndexRecoveryDuringRevalidation(t *testing.T) {
 	}
 	m.mu.Lock()
 	ready := m.entries[resolveKey{repo: "org/repo", rev: commit, path: "a.bin"}]
-	indexed := m.commits["org/repo\x00"+commit].files["a.bin"]
+	indexed := m.commits[revKey{repo: "org/repo", rev: commit}].files["a.bin"]
 	m.mu.Unlock()
 	if ready == nil || ready != indexed {
 		t.Errorf("ready entry %+v differs from commit entry %+v", ready, indexed)
@@ -1614,7 +1608,7 @@ func TestMirrorPersistWaitsForLock(t *testing.T) {
 	e := &fileEntry{State: stateReady, Size: 1, ETag: "e", CheckedAt: time.Unix(1, 0).UTC()}
 	m.mu.Lock()
 	m.entries[key] = e
-	m.loadCommit(key.repo, key.rev).publish(key.path, e)
+	m.openCommit(key.repo, key.rev).publish(key.path, e)
 
 	m.persistMu.Lock()
 	var release sync.Once
@@ -1697,9 +1691,9 @@ func TestMirrorIndexHostileNames(t *testing.T) {
 				publish := func(p pin) {
 					e := &fileEntry{State: stateReady, Size: 1, ETag: p.etag, CheckedAt: time.Unix(1, 0).UTC()}
 					m.mu.Lock()
-					m.branches[p.repo+"\x00"+p.rev] = &branchEntry{Commit: p.commit, CheckedAt: time.Unix(1, 0).UTC()}
+					m.branches[revKey{repo: p.repo, rev: p.rev}] = &branchEntry{Commit: p.commit, CheckedAt: time.Unix(1, 0).UTC()}
 					m.entries[resolveKey{repo: p.repo, rev: p.commit, path: p.path}] = e
-					m.loadCommit(p.repo, p.commit).publish(p.path, e)
+					m.openCommit(p.repo, p.commit).publish(p.path, e)
 					m.mu.Unlock()
 					if err := m.persistBranch(p.repo, p.rev); err != nil {
 						t.Fatal(err)
@@ -1874,7 +1868,7 @@ func TestMirrorBranchProbeFailureAfterPin(t *testing.T) {
 				pinned := func() string {
 					m.mu.Lock()
 					defer m.mu.Unlock()
-					if b := m.branches["org/repo\x00main"]; b != nil {
+					if b := m.branches[revKey{repo: "org/repo", rev: "main"}]; b != nil {
 						return b.Commit
 					}
 					return ""
@@ -1888,7 +1882,7 @@ func TestMirrorBranchProbeFailureAfterPin(t *testing.T) {
 						fe.nextRetry = time.Time{}
 						n += fe.failures
 					}
-					if b := m.branches["org/repo\x00main"]; b != nil {
+					if b := m.branches[revKey{repo: "org/repo", rev: "main"}]; b != nil {
 						b.nextRetry = time.Time{}
 						n += b.failures
 					}
@@ -1958,7 +1952,7 @@ func TestMirrorBranchProbeFailureAfterPin(t *testing.T) {
 					t.Fatalf("recovered main = %+v, %v", res, err)
 				}
 				m.mu.Lock()
-				fe, b := m.entries[branchKey], m.branches["org/repo\x00main"]
+				fe, b := m.entries[branchKey], m.branches[revKey{repo: "org/repo", rev: "main"}]
 				m.mu.Unlock()
 				if fe != nil || b == nil || b.failures != 0 {
 					t.Fatalf("failure state after recovery: entry %+v, pin %+v; want none", fe, b)
@@ -1972,11 +1966,12 @@ func TestMirrorSourcelessFailureRetiredOnPin(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstream.commit = ""
 	data := []byte("sourceless then sourced")
+	bad := []byte("sourceless then sourced!") // its own content: shared bytes would be served from storage, never downloaded
 	upstream.set("/org/repo/resolve/main/f.bin", data)
-	upstream.set("/org/repo/resolve/main/bad.bin", data)
+	upstream.set("/org/repo/resolve/main/bad.bin", bad)
 	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/cdn/org/repo/resolve/main/bad.bin" {
-			corrupt := bytes.Repeat([]byte("x"), len(data))
+			corrupt := bytes.Repeat([]byte("x"), len(bad))
 			w.Header().Set("Content-Length", fmt.Sprint(len(corrupt)))
 			_, _ = w.Write(corrupt)
 			return
@@ -2015,12 +2010,12 @@ func TestMirrorSourcelessFailureRetiredOnPin(t *testing.T) {
 }
 
 func TestMirrorObsoleteSourceFailureIgnored(t *testing.T) {
-	data := []byte("moving target")
+	data, realData := []byte("moving target"), []byte("moving target, moved") // distinct content: the real commit's task must not follow the held synthetic download
 	commitB := strings.Repeat("bb", 20)
 	synthetic, real := newPlainUpstream(), newPlainUpstream()
 	synthetic.commit, real.commit = "", commitB
 	synthetic.set("/org/repo/resolve/main/f.bin", data)
-	real.set("/org/repo/resolve/main/f.bin", data)
+	real.set("/org/repo/resolve/main/f.bin", realData)
 	var moved atomic.Bool
 	hold, started := make(chan struct{}), make(chan struct{})
 	var startOnce, release sync.Once
@@ -2183,6 +2178,8 @@ func TestMirrorDirectPseudoRecoveryRetiresSourceFailure(t *testing.T) {
 		t.Errorf("source failure retained after the recovery: %+v", retained)
 	}
 	m.dropEntry(key, ready)
+	// New upstream content of the same length: bytes still in storage would be published without the corrupt download.
+	upstream.set("/org/repo/resolve/main/f.bin", []byte("checksum altered"))
 	corrupt.Store(true)
 	if _, err := ingestWait(t, m, "org/repo", key.rev, "f.bin"); err == nil {
 		t.Fatal("corrupt ingest after the recovery succeeded")
@@ -2257,8 +2254,8 @@ func TestMirrorOverlappingProbeKeepsIngestFailure(t *testing.T) {
 	}
 }
 
-// loadBranch remembers absent and rejected pointers, not filesystem faults.
-func TestMirrorLoadBranchRemembersMisses(t *testing.T) {
+// loadBranch caches only the pointers it read: absent, rejected and faulted reads leave nothing behind and are retried on the next call.
+func TestMirrorLoadBranchRereadsMisses(t *testing.T) {
 	m, _ := newTestMirror(t, "http://example.invalid", t.TempDir(), t.TempDir())
 	commit := strings.Repeat("ab", 20)
 	valid := []byte(`{"commit":"` + commit + `","checked_at":"2026-01-01T00:00:00Z"}`)
@@ -2279,9 +2276,12 @@ func TestMirrorLoadBranchRemembersMisses(t *testing.T) {
 		if b := m.loadBranch("org/repo", tc.rev); b != nil {
 			t.Fatalf("%s pointer loaded as %+v", tc.name, b)
 		}
+		if b, ok := m.branches[revKey{repo: "org/repo", rev: tc.rev}]; ok {
+			t.Fatalf("%s pointer cached as %+v", tc.name, b)
+		}
 		writeRaw(t, p, valid)
-		if b := m.loadBranch("org/repo", tc.rev); b != nil {
-			t.Fatalf("%s pointer reread after the miss: %+v", tc.name, b)
+		if b := m.loadBranch("org/repo", tc.rev); b == nil || b.Commit != commit {
+			t.Fatalf("%s pointer not reread after the miss: %+v", tc.name, b)
 		}
 	}
 
@@ -2298,6 +2298,173 @@ func TestMirrorLoadBranchRemembersMisses(t *testing.T) {
 	writeRaw(t, p, valid)
 	if b := m.loadBranch("org/repo", "faulty"); b == nil || b.Commit != commit {
 		t.Fatalf("pointer not loaded after the fault cleared: %+v", b)
+	}
+}
+
+// Failures are process-local records, so a 404 scan must not grow m.entries
+// without bound: past the cap the least recently requested failures are
+// dropped, reading a failure counts as a request, and a success retires its
+// failure from the LRU.
+func TestFailedEntriesLRU(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = strings.Repeat("ab", 20)
+	srv := httptest.NewServer(upstream)
+	defer srv.Close()
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	m.failed.MaxEntries = 3
+	ctx := context.Background()
+	commit := upstream.commit // a 40-hex rev needs no branch pin, so each failure is recorded under the requested key itself
+	states := func() map[string]entryState {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		got := map[string]entryState{}
+		for k, e := range m.entries {
+			got[k.path] = e.State
+		}
+		return got
+	}
+
+	for _, p := range []string{"f1", "f2", "f3", "f4"} {
+		if _, err := ingestWait(t, m, "org/repo", commit, p); !errors.Is(err, ErrUpstreamNotFound) {
+			t.Fatalf("ingest %s err = %v, want ErrUpstreamNotFound", p, err)
+		}
+	}
+	want := map[string]entryState{"f2": stateFailed, "f3": stateFailed, "f4": stateFailed}
+	if got := states(); !maps.Equal(got, want) || m.failed.Len() != 3 {
+		t.Fatalf("entries after 4 failures = %v (lru %d), want %v (lru 3)", got, m.failed.Len(), want)
+	}
+
+	if _, err := m.Resolve(ctx, "org/repo", commit, "f2"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("resolve of f2 in backoff err = %v, want ErrUpstreamNotFound", err)
+	}
+	if _, err := ingestWait(t, m, "org/repo", commit, "f5"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("ingest f5 err = %v, want ErrUpstreamNotFound", err)
+	}
+	want = map[string]entryState{"f2": stateFailed, "f4": stateFailed, "f5": stateFailed}
+	if got := states(); !maps.Equal(got, want) || m.failed.Len() != 3 {
+		t.Fatalf("entries after rereading f2 = %v (lru %d), want %v (lru 3)", got, m.failed.Len(), want)
+	}
+
+	data := []byte("f2 content")
+	upstream.set("/org/repo/resolve/"+commit+"/f2", data)
+	clearBackoff(m, "/org/repo/resolve/"+commit+"/f2")
+	if entry, err := ingestWait(t, m, "org/repo", commit, "f2"); err != nil || entry.Size != int64(len(data)) {
+		t.Fatalf("ingest of f2 once upstream has it = %+v, %v; want a ready entry of %d bytes", entry, err, len(data))
+	}
+	want = map[string]entryState{"f2": stateReady, "f4": stateFailed, "f5": stateFailed}
+	if got := states(); !maps.Equal(got, want) || m.failed.Len() != 2 {
+		t.Fatalf("entries after f2 succeeded = %v (lru %d), want %v (lru 2)", got, m.failed.Len(), want)
+	}
+	if _, ok := m.failed.Get(resolveKey{repo: "org/repo", rev: commit, path: "f2"}); ok {
+		t.Fatal("ready f2 is still in the failure LRU")
+	}
+}
+
+// A failure under a pseudo commit is recorded under both its aliases, each
+// with its own LRU record, so evicting one alias drops exactly that key and
+// never strands a failed entry the LRU no longer tracks.
+func TestFailedEntriesTrackPseudoCommitAlias(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.commit = ""
+	data := []byte("alias content")
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/cdn/") {
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			_, _ = w.Write(bytes.Repeat([]byte("x"), len(data)))
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	ctx := context.Background()
+	src := resolveKey{repo: "org/repo", rev: "main", path: "f.bin"}
+	key := resolveKey{repo: "org/repo", rev: wantPseudo("org/repo", "main"), path: "f.bin"}
+	// tracked reports the failed entries and whether each has an LRU record.
+	tracked := func() (failed int, untracked []resolveKey) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for k, e := range m.entries {
+			if e.State != stateFailed {
+				continue
+			}
+			failed++
+			if _, ok := m.failed.Get(k); !ok {
+				untracked = append(untracked, k)
+			}
+		}
+		return failed, untracked
+	}
+
+	if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+		t.Fatalf("corrupt ingest err = %v, want the checksum failure", err)
+	}
+	m.mu.Lock()
+	bySrc, byKey := m.entries[src], m.entries[key]
+	m.mu.Unlock()
+	if bySrc == nil || bySrc != byKey || bySrc.State != stateFailed {
+		t.Fatalf("aliases hold %+v and %+v, want one shared failure", bySrc, byKey)
+	}
+	if failed, untracked := tracked(); failed != 2 || len(untracked) != 0 || m.failed.Len() != 2 {
+		t.Fatalf("failed entries %d (lru %d), untracked %v; want both aliases tracked", failed, m.failed.Len(), untracked)
+	}
+
+	// Touching the branch alias past a cap of one evicts the pseudo-commit alias alone.
+	m.failed.MaxEntries = 1
+	before := requests.Load()
+	if _, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+		t.Fatalf("branch alias inside the backoff: err = %v, want the recorded failure", err)
+	}
+	if got := requests.Load() - before; got != 0 {
+		t.Fatalf("branch alias made %d upstream requests inside its backoff, want 0", got)
+	}
+	m.mu.Lock()
+	bySrc, byKey = m.entries[src], m.entries[key]
+	m.mu.Unlock()
+	if bySrc == nil || byKey != nil {
+		t.Fatalf("after eviction the branch alias holds %+v and the pseudo-commit alias %+v; want only the branch alias", bySrc, byKey)
+	}
+	if failed, untracked := tracked(); failed != 1 || len(untracked) != 0 || m.failed.Len() != 1 {
+		t.Fatalf("failed entries %d (lru %d), untracked %v; want the branch alias alone", failed, m.failed.Len(), untracked)
+	}
+}
+
+// A miss leaves no state behind: a 404 branch gets no pointer and a 404
+// commit no manifest state, while a successful ingest keeps its pinned
+// commit loaded.
+func TestAbsentStateNotCached(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.set("/org/repo/resolve/main/f.bin", []byte("present"))
+	srv := httptest.NewServer(upstream)
+	defer srv.Close()
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	ctx := context.Background()
+	bogus := strings.Repeat("cd", 20)
+
+	if _, err := m.Resolve(ctx, "org/repo", "gone", "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("resolve at an absent branch err = %v, want ErrUpstreamNotFound", err)
+	}
+	if _, err := ingestWait(t, m, "org/repo", bogus, "f.bin"); !errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("ingest at an absent commit err = %v, want ErrUpstreamNotFound", err)
+	}
+	entry, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	if err != nil || entry.Commit != wantPseudo("org/repo", "main") {
+		t.Fatalf("ingest = %+v, %v; want a ready entry at the pseudo commit", entry, err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.branches[revKey{repo: "org/repo", rev: "gone"}]; ok {
+		t.Fatalf("absent branch cached as %+v", b)
+	}
+	if cs, ok := m.commits[revKey{repo: "org/repo", rev: bogus}]; ok {
+		t.Fatalf("absent commit cached as %+v", cs)
+	}
+	if cs := m.commits[revKey{repo: "org/repo", rev: entry.Commit}]; cs == nil || !cs.loaded || cs.files["f.bin"] == nil {
+		t.Fatalf("pinned commit state = %+v, want it loaded with f.bin", cs)
+	}
+	if m.branches[revKey{repo: "org/repo", rev: "main"}] == nil {
+		t.Fatal("pinned branch pointer not cached")
 	}
 }
 
@@ -2662,7 +2829,7 @@ func TestMirrorXetTransport(t *testing.T) {
 	}
 }
 
-// Every xet download on a mirror shares its chunk cache: two files fill it, and a third path holding the first file's bytes is served from the cached xorb without another xorb GET.
+// Every xet download on a mirror shares its chunk cache: two files fill it, and a third path holding the first file's bytes costs no xorb GET (its sha256 is already in storage, so it is published without a download).
 func TestMirrorXetDownloadsShareCache(t *testing.T) {
 	dataA, dataB := []byte("xet bytes shared through the mirror's chunk cache"), []byte("other xet bytes on the same mirror")
 	upA := newXetUpstream(t, "/org/a/resolve/main/f.bin", dataA, "cas-token-a")
@@ -2697,6 +2864,6 @@ func TestMirrorXetDownloadsShareCache(t *testing.T) {
 	}
 	ingest(upC, "/org/c/resolve/main/f.bin", dataA)
 	if n := rt.count("GET /v1/xorbs/"); n != 2 {
-		t.Fatalf("xorb GETs after downloading the first file's bytes again = %d, want 2 (served from the shared cache)", n)
+		t.Fatalf("xorb GETs after requesting the first file's bytes under another repo = %d, want 2 (published from storage, no download)", n)
 	}
 }

@@ -90,6 +90,7 @@ func main() {
 	}
 
 	var next http.Handler
+	var mir *mirror.Mirror
 
 	if *upstream != "" {
 		// Mirror mode: full-cache middle layer in front of the upstream hub.
@@ -98,7 +99,7 @@ func main() {
 		up := client.StaticUpstreamProvider(*upstream, *upstreamToken)
 		next = hf.NewUpstreamProxy(up)
 
-		mir, err := mirror.NewMirror(
+		mir, err = mirror.NewMirror(
 			mirror.WithStorage(stor),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
 		)
@@ -142,6 +143,7 @@ func main() {
 			})),
 			internalapi.WithGCGrace(1*time.Hour),
 			internalapi.WithGCAnchor(storage.AnchorBoth),
+			internalapi.WithMirror(mir),
 			internalapi.WithNext(next),
 		)
 		fmt.Println("Internal management endpoints enabled at /internal/")

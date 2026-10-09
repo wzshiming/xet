@@ -1706,6 +1706,58 @@ func TestMirrorBranchPinning(t *testing.T) {
 	}
 }
 
+// A branch that moves to a commit holding the same bytes is answered from the
+// stored content: the first request under the new commit already redirects
+// to the bridge, with no further upstream download.
+func TestResolveReusesStoredContentAcrossCommits(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstreamSrv := httptest.NewServer(upstream)
+	defer upstreamSrv.Close()
+
+	commit1, commit2 := strings.Repeat("11", 20), strings.Repeat("22", 20)
+	data := []byte("the same bytes at two commits")
+	upstream.commit = commit1
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	upstream.set("/org/repo/resolve/"+commit1+"/f.bin", data)
+	fx := newHubFixture(t, upstreamSrv.URL, t.TempDir(), t.TempDir(), mirror.WithRevalidateInterval(0))
+	resolveURL := fx.srv.URL + "/org/repo/resolve/main/f.bin"
+
+	resp, err := http.Get(resolveURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, data) {
+		t.Fatalf("first GET = %d, %d bytes, %v; want 200 and %d bytes", resp.StatusCode, len(body), err, len(data))
+	}
+	if got := waitReady(t, resolveURL).Header.Get("X-Repo-Commit"); got != commit1 {
+		t.Fatalf("X-Repo-Commit = %q, want %s", got, commit1)
+	}
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream data GETs = %d, want 1", got)
+	}
+
+	upstream.commit = commit2
+	upstream.set("/org/repo/resolve/"+commit2+"/f.bin", data)
+	resp, err = noRedirect().Get(resolveURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	sum := sha256.Sum256(data)
+	if loc := resp.Header.Get("Location"); resp.StatusCode != http.StatusFound || loc != fx.srv.URL+"/xet-bridge/"+hex.EncodeToString(sum[:]) {
+		t.Fatalf("first GET at the moved branch = %d, Location %q; want 302 to the bridge", resp.StatusCode, loc)
+	}
+	if got := resp.Header.Get("X-Repo-Commit"); got != commit2 {
+		t.Fatalf("X-Repo-Commit at the moved branch = %q, want %s", got, commit2)
+	}
+	if got := upstream.dataGETs.Load(); got != 1 {
+		t.Fatalf("upstream data GETs after the move = %d, want 1 (stored content must not be downloaded again)", got)
+	}
+}
+
 // Reproduction for: a client disconnects mid-download, then a new client
 // arrives. The new client must immediately receive the already-spooled bytes
 // (the ingest keeps running in the background) instead of starting from a
