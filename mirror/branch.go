@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -32,22 +30,18 @@ func (m *Mirror) branchStale(b *branchEntry) bool {
 	return time.Since(b.CheckedAt) >= m.revalidateInterval
 }
 
-// The caller holds m.mu; transient read faults remain retryable.
+// The caller holds m.mu; only pointers are cached, so misses and faults are re-read.
 func (m *Mirror) loadBranch(repo, rev string) *branchEntry {
-	name := repo + "\x00" + rev
-	if b, ok := m.branches[name]; ok {
+	name := revKey{repo: repo, rev: rev}
+	if b := m.branches[name]; b != nil {
 		return b
 	}
 	data, err := os.ReadFile(branchEntryPath(m.indexDir, repo, rev))
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			m.branches[name] = nil
-		}
 		return nil
 	}
 	var b branchEntry
 	if err := json.Unmarshal(data, &b); err != nil || !commitRevRe.MatchString(b.Commit) {
-		m.branches[name] = nil
 		return nil
 	}
 	m.branches[name] = &b
@@ -63,11 +57,12 @@ type branchProbe struct {
 
 // The caller holds m.mu; two nil results mean a probe is due.
 func (m *Mirror) branchState(key resolveKey) (*branchEntry, *fileEntry) {
-	b := m.loadBranch(key.repo, key.rev)
 	fe := m.entries[key]
 	if fe.inBackoff() {
+		m.touchFailed(key)
 		return nil, fe
 	}
+	b := m.loadBranch(key.repo, key.rev)
 	if b != nil && (!m.branchStale(b) || (fe == nil && time.Now().Before(b.nextRetry))) {
 		return b, nil
 	}
@@ -76,7 +71,7 @@ func (m *Mirror) branchState(key resolveKey) (*branchEntry, *fileEntry) {
 
 // The caller holds m.mu.
 func (m *Mirror) branchBackoff(key resolveKey) bool {
-	b := m.branches[key.repo+"\x00"+key.rev]
+	b := m.branches[key.revKey()]
 	return m.entries[key].inBackoff() || (b != nil && time.Now().Before(b.nextRetry))
 }
 
@@ -87,7 +82,7 @@ func authoritative(pr *probeResult) bool {
 
 // branchCommit resolves a branch rev to its pinned commit, probing origin with token when stale; only a 2xx probe pins.
 func (m *Mirror) branchCommit(origin, token string, key resolveKey) (string, *probeResult, *fileEntry) {
-	name := key.repo + "\x00" + key.rev
+	name := key.revKey()
 	m.mu.Lock()
 	b, fe := m.branchState(key)
 	m.mu.Unlock()
@@ -132,6 +127,7 @@ func (m *Mirror) branchCommit(origin, token string, key resolveKey) (string, *pr
 		m.mu.Lock()
 		if m.entries[key] == prev {
 			delete(m.entries, key)
+			m.forgetFailed(key)
 		}
 		m.branches[name] = nb
 		m.mu.Unlock()
@@ -155,7 +151,7 @@ func (m *Mirror) persistBranch(repo, rev string) error {
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
 	m.mu.Lock()
-	b := *m.branches[repo+"\x00"+rev]
+	b := *m.branches[revKey{repo: repo, rev: rev}]
 	m.mu.Unlock()
 	return writeJSON(branchEntryPath(m.indexDir, repo, rev), b)
 }

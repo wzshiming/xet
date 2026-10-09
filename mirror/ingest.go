@@ -3,7 +3,6 @@ package mirror
 import (
 	"context"
 	"errors"
-	"fmt"
 )
 
 // Entry describes a fully ingested file, exporting what the index persists.
@@ -110,15 +109,10 @@ func (m *Mirror) ingest(origin, token string, key resolveKey) (*Entry, error) {
 	}
 	if t != nil {
 		<-t.done
-		m.mu.Lock()
-		e = m.entries[key]
-		m.mu.Unlock()
-		if e == nil {
-			// Only possible when a concurrent revalidation found the fresh
-			// entry already stale; the same window Resolve reports as a
-			// drained stream.
-			return nil, fmt.Errorf("mirror: %q changed upstream during ingest", key)
+		if t.err != nil {
+			return nil, t.err
 		}
+		return exportEntry(key, t.entry), nil
 	}
 	if e.State == stateReady {
 		return exportEntry(key, e), nil

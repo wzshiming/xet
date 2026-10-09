@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/storage"
 )
 
@@ -22,6 +23,7 @@ type Handler struct {
 	gc         *storage.GC
 	gcGrace    time.Duration
 	gcAnchor   storage.SweepAnchor
+	mirror     *mirror.Mirror
 	root       *mux.Router
 	next       http.Handler
 }
@@ -57,6 +59,13 @@ func WithGCGrace(grace time.Duration) Option {
 func WithGCAnchor(anchor storage.SweepAnchor) Option {
 	return func(h *Handler) {
 		h.gcAnchor = anchor
+	}
+}
+
+// WithMirror adds the mirror's idle spools and dead index entries to the GC sweep; nil sweeps storage only.
+func WithMirror(m *mirror.Mirror) Option {
+	return func(h *Handler) {
+		h.mirror = m
 	}
 }
 
@@ -207,7 +216,12 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // until the response reports done=true; done and remaining_* describe that
 // pass only, and without max or budget one pass already sweeps everything.
 // dry_run reports a full stateless pass's mark-time upper bound (no
-// per-shard re-checks, no entry counts), ignoring max and budget.
+// per-shard re-checks, no entry counts), ignoring max and budget. The
+// response reports the storage pass under "storage" and, with a mirror, the
+// idle-spool pass the same grace and dry_run drive under "spools" and the
+// index pass under "index"; those two run once, on the step that finishes
+// the storage pass (done=true), so intermediate stepped responses carry
+// "storage" alone.
 func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
@@ -263,13 +277,14 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := h.gc.SweepStep(r.Context(), storage.SweepOptions{
+	opts := storage.SweepOptions{
 		Grace:      grace,
 		DryRun:     dryRun,
 		MaxDeletes: maxDeletes,
 		Budget:     budget,
 		Anchor:     anchor,
-	})
+	}
+	result, err := h.gc.SweepStep(r.Context(), opts)
 	if err != nil {
 		if errors.Is(err, storage.ErrGCBusy) {
 			http.Error(w, "GC already running", http.StatusConflict)
@@ -278,6 +293,28 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	resp := sweepResponse{Storage: result}
+	if h.mirror != nil && result.Done {
+		spools, err := h.mirror.SweepSpools(r.Context(), opts)
+		if err != nil {
+			http.Error(w, "Spool sweep failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp.Spools = &spools
+		index, err := h.mirror.SweepIndex(r.Context(), opts)
+		if err != nil {
+			http.Error(w, "Index sweep failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp.Index = &index
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// sweepResponse is the GC sweep report: the storage pass and, with a mirror, the spool and index passes.
+type sweepResponse struct {
+	Storage *storage.SweepResult     `json:"storage"`
+	Spools  *mirror.SpoolSweepResult `json:"spools,omitempty"`
+	Index   *mirror.IndexSweepResult `json:"index,omitempty"`
 }

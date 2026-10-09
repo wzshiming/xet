@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,13 +20,18 @@ import (
 // and concurrently tail-read by any number of stream readers. Readers block
 // at the current end until more bytes land or the writer finishes.
 //
-// The file name is <keyhash>-<etag>-<size>.spool, so the content identity is
-// part of the path itself: a later task that probes the same etag and size
-// computes the same name and resumes from the existing length, surviving task
-// failures and process restarts with no sidecar state. A changed etag or size
-// yields a different name, and stale siblings of the key are swept on open.
-// The file is only unlinked after a successful ingest, or via markRemove when
-// the bytes are known to be unusable.
+// The content identity is part of the path itself. An etag that is a content
+// hash names the file <originhash>-<hash>.spool, shared by every key of one
+// upstream origin with that content: a later task probing the same etag on
+// that origin under any key computes the same name and resumes from the
+// existing length, surviving task failures and process restarts with no
+// sidecar state, while another origin advertising the same etag gets its own
+// file. Other etags keep the key-prefixed <keyhash>-<etag>-<size>.spool,
+// where a changed etag or size yields a different name and stale siblings of
+// the key are swept on open; a task downloading beside the content's current
+// leader keeps that private name too, so the content spool has one writer.
+// The file is unlinked via markRemove once the ingest published its entry or
+// the bytes are known to be unusable; idle leftovers fall to SweepSpools.
 type spool struct {
 	f *os.File
 
@@ -47,6 +54,12 @@ func spoolKeyPrefix(key string) string {
 	return hex.EncodeToString(sum[:16]) + "-"
 }
 
+// spoolOriginPrefix hashes a different domain than spoolKeyPrefix, so a key's stale sweep never matches a content spool.
+func spoolOriginPrefix(origin string) string {
+	sum := sha256.Sum256([]byte("origin\x00" + origin))
+	return hex.EncodeToString(sum[:16]) + "-"
+}
+
 func spoolETagToken(etag string) string {
 	if etag == "" {
 		return "noetag"
@@ -58,9 +71,15 @@ func spoolETagToken(etag string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// spoolFileName builds the deterministic spool name for a resolve key and the
+// spoolFileName builds the deterministic spool name: the origin and the
+// content-hash etag for content spools, otherwise the resolve key with the
 // upstream validators known at probe time; size < 0 (unknown) becomes "u".
-func spoolFileName(key, etag string, size int64) string {
+// shared selects the content spool other tasks of the origin resume and
+// follow; a private spool belongs to its key alone.
+func spoolFileName(origin, key, etag string, size int64, shared bool) string {
+	if shared && hashETagRe.MatchString(etag) {
+		return spoolOriginPrefix(origin) + strings.ToLower(etag) + ".spool"
+	}
 	sizeTok := "u"
 	if size >= 0 {
 		sizeTok = strconv.FormatInt(size, 10)
@@ -84,12 +103,15 @@ func sweepStaleSpools(dir, key, keep string) {
 	}
 }
 
-// openSpool opens (or creates) the spool for key and the probed validators,
-// resuming existing partial bytes: the name already proves the etag and size
-// match. Without an etag there is no trustworthy identity, so the file is
-// truncated and starts fresh.
-func openSpool(dir, key, etag string, expectedSize int64) (*spool, error) {
-	name := spoolFileName(key, etag, expectedSize)
+// openSpool opens (or creates) the spool for key on origin and the probed
+// validators, resuming existing partial bytes: the name already proves the
+// origin and etag match, and a content spool longer than the expected size
+// cannot be this content. Without an etag there is no trustworthy identity,
+// so the file is truncated and starts fresh. shared opens the content spool
+// other tasks of the origin resume and follow; a private spool is the key's
+// alone.
+func openSpool(dir, origin, key, etag string, expectedSize int64, shared bool) (*spool, error) {
+	name := spoolFileName(origin, key, etag, expectedSize, shared)
 	sweepStaleSpools(dir, key, name)
 
 	f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_RDWR, 0644)
@@ -167,27 +189,19 @@ func (s *spool) finish(err error) {
 	}
 }
 
-// markRemove schedules the backing file for unlink once the spool retires
-// (after the ingest published the entry, or when the bytes are unusable).
+// markRemove unlinks the file now; the retry at retire time exists for Windows, which refuses to remove an open file.
 func (s *spool) markRemove() {
+	err := os.Remove(s.f.Name())
 	s.mu.Lock()
-	s.removable = true
-	retired := s.retired
+	s.removable = err != nil && !errors.Is(err, fs.ErrNotExist)
 	s.mu.Unlock()
-	if retired {
-		s.unlink()
-	}
 }
 
 func (s *spool) close(remove bool) {
 	_ = s.f.Close()
 	if remove {
-		s.unlink()
+		_ = os.Remove(s.f.Name())
 	}
-}
-
-func (s *spool) unlink() {
-	_ = os.Remove(s.f.Name())
 }
 
 // size returns the bytes written so far.

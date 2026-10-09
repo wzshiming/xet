@@ -14,7 +14,13 @@
 // read from the growing spool as bytes arrive. Abandoning a resolution never
 // cancels ingestion, and partial spool bytes survive task failures and
 // process restarts: the next task resumes from them when the upstream etag
-// still matches.
+// still matches. Downloads are shared by content within one upstream origin:
+// hub etags are content hashes, so a file requested under another path,
+// commit or repository of the same origin joins the download already running
+// for its etag and resumes the spool that origin and etag name, while another
+// origin advertising the same etag is never trusted with them. Content whose
+// sha256 local storage already holds is published without downloading at all,
+// whatever its origin: storage verified the digest when the file was stored.
 //
 // The package exposes no HTTP surface of its own. The downstream hub routes
 // (resolve, token, tree) are implemented by the server/hf package on top of
@@ -38,6 +44,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/internal/lru"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
 	"golang.org/x/sync/singleflight"
@@ -56,6 +63,7 @@ const (
 	failureBackoffCap  = 10 * time.Minute
 	maxFailureShift    = 6
 	defaultMaxIngests  = 16
+	maxFailedEntries   = 16384 // bounds the process-local failure records a 404 scan can accumulate
 )
 
 var (
@@ -90,6 +98,16 @@ func parseResolveKey(p string) (resolveKey, bool) {
 // URLs, spool names, and the persisted index.
 func (k resolveKey) String() string {
 	return "/" + k.repo + "/resolve/" + k.rev + "/" + k.path
+}
+
+// revKey identifies one (repo, rev) pair: a branch pointer or a commit manifest.
+type revKey struct {
+	repo string
+	rev  string
+}
+
+func (k resolveKey) revKey() revKey {
+	return revKey{repo: k.repo, rev: k.rev}
 }
 
 // upstreamOrigin validates raw as an absolute http(s) URL and returns it with its scheme://host origin.
@@ -141,12 +159,15 @@ type Mirror struct {
 	localAdapter *localCAS
 
 	mu        sync.Mutex
+	spoolMu   sync.Mutex // serializes spool opens against SweepSpools
 	persistMu sync.Mutex // orders index snapshots and writes
 	flight    singleflight.Group
 	entries   map[resolveKey]*fileEntry
-	branches  map[string]*branchEntry // repo NUL rev, loaded lazily from disk
-	commits   map[string]*commitState // repo NUL commit, loaded lazily from disk
+	branches  map[revKey]*branchEntry // branch rev -> pin, loaded lazily from disk
+	commits   map[revKey]*commitState // commit -> manifest state, loaded lazily from disk
 	tasks     map[resolveKey]*task
+	inflight  map[string]*task                // origin and content hash -> the task downloading it; later tasks for that content on that origin follow it
+	failed    lru.Cache[resolveKey, struct{}] // failed entries by recency; eviction drops them from entries
 }
 
 // Option configures the Mirror.
@@ -191,9 +212,17 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		revalidateInterval: 5 * time.Minute,
 		maxIngests:         defaultMaxIngests,
 		entries:            map[resolveKey]*fileEntry{},
-		branches:           map[string]*branchEntry{},
-		commits:            map[string]*commitState{},
+		branches:           map[revKey]*branchEntry{},
+		commits:            map[revKey]*commitState{},
 		tasks:              map[resolveKey]*task{},
+		inflight:           map[string]*task{},
+	}
+	m.failed.MaxEntries = maxFailedEntries
+	// Runs under m.mu: every touchFailed and forgetFailed caller holds it.
+	m.failed.OnEvicted = func(k resolveKey, _ struct{}) {
+		if e := m.entries[k]; e != nil && e.State == stateFailed {
+			delete(m.entries, k)
+		}
 	}
 	for _, opt := range opts {
 		opt(m)

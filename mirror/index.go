@@ -71,13 +71,12 @@ func commitPath(dir, repo, commit string) string {
 	return filepath.Join(repoDir(dir, repo), "commits", commit+".json")
 }
 
-// The caller holds m.mu; failed loads remain retryable.
+// The caller holds m.mu; only a manifest read from disk is kept in memory, so absent and unreadable ones stay retryable without pinning a state.
 func (m *Mirror) loadCommit(repo, commit string) *commitState {
-	name := repo + "\x00" + commit
+	name := revKey{repo: repo, rev: commit}
 	cs := m.commits[name]
 	if cs == nil {
 		cs = &commitState{}
-		m.commits[name] = cs
 	}
 	if cs.loaded {
 		return cs
@@ -93,6 +92,7 @@ func (m *Mirror) loadCommit(repo, commit string) *commitState {
 		return cs
 	}
 	cs.loaded = true
+	m.commits[name] = cs
 	if cs.source == "" {
 		cs.source = man.Source
 	}
@@ -108,13 +108,20 @@ func (m *Mirror) loadCommit(repo, commit string) *commitState {
 	return cs
 }
 
+// openCommit is loadCommit for writers: the state is kept in memory so what they add outlives the call. The caller holds m.mu.
+func (m *Mirror) openCommit(repo, commit string) *commitState {
+	cs := m.loadCommit(repo, commit)
+	m.commits[revKey{repo: repo, rev: commit}] = cs
+	return cs
+}
+
 // Source must reach disk before the branch pointer.
 func (m *Mirror) ensureSource(repo, commit, source string) {
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
 
 	m.mu.Lock()
-	cs := m.loadCommit(repo, commit)
+	cs := m.openCommit(repo, commit)
 	changed := cs.source == ""
 	if changed {
 		cs.source = source
@@ -134,27 +141,47 @@ func (m *Mirror) persistCommit(repo, commit string) error {
 
 func (m *Mirror) persistCommitLocked(repo, commit string) error {
 	m.mu.Lock()
+	cs, man, ok := m.snapshotCommit(repo, commit)
+	m.mu.Unlock()
+	if !ok {
+		return errManifestUnread
+	}
+	_, err := m.writeCommit(cs, man)
+	return err
+}
+
+// snapshotCommit copies the ready entries of a loaded commit into a manifest; ok is false when the manifest is unreadable. The caller holds m.mu.
+func (m *Mirror) snapshotCommit(repo, commit string) (*commitState, commitManifest, bool) {
 	cs := m.loadCommit(repo, commit)
 	if !cs.loaded {
-		m.mu.Unlock()
-		return errManifestUnread
+		return nil, commitManifest{}, false
 	}
 	man := commitManifest{Repo: repo, Commit: commit, Source: cs.source, Files: make(map[string]*fileEntry, len(cs.files))}
 	for path, e := range cs.files {
 		c := *e
 		man.Files[path] = &c
 	}
-	m.mu.Unlock()
+	return cs, man, true
+}
 
-	path := commitPath(m.indexDir, repo, commit)
+// writeCommit writes man, or removes the manifest when it is empty and sourceless, reporting whether it unlinked the file. The caller holds persistMu.
+func (m *Mirror) writeCommit(cs *commitState, man commitManifest) (bool, error) {
+	path := commitPath(m.indexDir, man.Repo, man.Commit)
 	if len(man.Files) == 0 && man.Source == "" {
 		err := os.Remove(path)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
 		}
-		return err
+		// Memory mirrors disk: a state still empty and sourceless goes with its manifest.
+		name := revKey{repo: man.Repo, rev: man.Commit}
+		m.mu.Lock()
+		if m.commits[name] == cs && len(cs.files) == 0 && cs.source == "" {
+			delete(m.commits, name)
+		}
+		m.mu.Unlock()
+		return err == nil, nil
 	}
-	return writeJSON(path, man)
+	return false, writeJSON(path, man)
 }
 
 // writeJSON replaces path atomically through a same-directory temp file.

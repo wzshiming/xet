@@ -460,9 +460,11 @@ func gcSweep(t *testing.T, baseURL, query string) storage.SweepResult {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("sweep status = %d", resp.StatusCode)
 	}
-	var res storage.SweepResult
+	var res struct {
+		Storage storage.SweepResult `json:"storage"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		t.Fatal(err)
 	}
-	return res
+	return res.Storage
 }

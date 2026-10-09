@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -163,6 +165,136 @@ func TestMirrorIdentityIgnoresOrigin(t *testing.T) {
 	if _, ok := upB.seenAuth.Load("Bearer tok-b"); ok || upB.dataGETs.Load() != 0 {
 		t.Fatal("upstream B was contacted for a path the mirror already holds")
 	}
+}
+
+// Content sharing stops at the upstream origin: a second origin advertising
+// the same content hash neither resumes the first origin's partial spool nor
+// joins its running download, whatever bytes the first origin served.
+func TestIngestSharingScopedByOrigin(t *testing.T) {
+	etag, commit := strings.Repeat("ab", 20), strings.Repeat("cd", 20)
+	const pathA, pathB = "/org/a/resolve/main/f.bin", "/org/b/resolve/main/g.bin"
+	data, lie := make([]byte, 64*1024), make([]byte, 64*1024)
+	for _, b := range [][]byte{data, lie} {
+		if _, err := rand.Read(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	// hub fronts up with the shared etag and the honest size, whatever its CDN serves, recording the Range header of each data GET.
+	hub := func(up *plainUpstream, ranges *[]string) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/cdn") {
+				if r.Method == http.MethodGet {
+					mu.Lock()
+					*ranges = append(*ranges, r.Header.Get("Range"))
+					mu.Unlock()
+				}
+				up.ServeHTTP(w, r)
+				return
+			}
+			if _, ok := up.get(r.URL.Path); !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("ETag", `"`+etag+`"`)
+			w.Header().Set("X-Linked-Size", fmt.Sprint(len(data)))
+			w.Header().Set("X-Repo-Commit", commit)
+			http.Redirect(w, r, "/cdn"+r.URL.Path, http.StatusFound)
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	ingest := func(m *testMirror, srv *httptest.Server, path string) *Ingestion {
+		t.Helper()
+		in, err := m.Mirror.Ingest(srv.URL+path, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return in
+	}
+
+	t.Run("partial spool", func(t *testing.T) {
+		var rangesB []string
+		upA, upB := newPlainUpstream(), newPlainUpstream()
+		upA.commit, upB.commit = commit, commit
+		upA.set(pathA, lie[:len(lie)-1]) // one byte short of the advertised size
+		upB.set(pathB, data)
+		srvA, srvB := hub(upA, new([]string)), hub(upB, &rangesB)
+		m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
+
+		inA := ingest(m, srvA, pathA)
+		awaitClosed(t, inA.Done(), "origin A ingest")
+		if _, err := inA.Entry(); err == nil || !strings.Contains(err.Error(), "size mismatch") {
+			t.Fatalf("origin A's short body: err = %v, want a size mismatch", err)
+		}
+		partial := filepath.Join(m.spoolDir, spoolFileName(srvA.URL, "/org/a/resolve/"+commit+"/f.bin", etag, int64(len(data)), true))
+		if fi, err := os.Stat(partial); err != nil || fi.Size() != int64(len(lie)-1) {
+			t.Fatalf("origin A's partial spool: %v, %v; want %d bytes kept", fi, err, len(lie)-1)
+		}
+
+		inB := ingest(m, srvB, pathB)
+		awaitClosed(t, inB.Done(), "origin B ingest")
+		entry, err := inB.Entry()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.SHA256 != hashHex(string(data)) {
+			t.Fatalf("origin B entry sha256 = %s, want %s: origin A's bytes leaked into it", entry.SHA256, hashHex(string(data)))
+		}
+		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+			t.Fatal("stored bytes differ from origin B's data")
+		}
+		mu.Lock()
+		got := slices.Clone(rangesB)
+		mu.Unlock()
+		if !slices.Equal(got, []string{""}) {
+			t.Fatalf("origin B data GET Range headers = %q, want one GET from offset 0", got)
+		}
+		if fi, err := os.Stat(partial); err != nil || fi.Size() != int64(len(lie)-1) {
+			t.Fatalf("origin A's partial spool after B's ingest: %v, %v; want it untouched", fi, err)
+		}
+		if files := spoolFiles(t, m.spoolDir); len(files) != 1 {
+			t.Fatalf("spool files = %v, want origin A's partial spool alone", files)
+		}
+	})
+
+	t.Run("in-flight leader", func(t *testing.T) {
+		upA, upB := newPlainUpstream(), newPlainUpstream()
+		upA.gate, upA.gateHit = make(chan struct{}), make(chan struct{})
+		upA.commit, upB.commit = commit, commit
+		upA.set(pathA, lie)
+		upB.set(pathB, data)
+		srvA, srvB := hub(upA, new([]string)), hub(upB, new([]string))
+		release := sync.OnceFunc(func() { close(upA.gate) })
+		t.Cleanup(release) // Close blocks on the gated handler
+		m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
+
+		inA := ingest(m, srvA, pathA)
+		awaitClosed(t, upA.gateHit, "origin A transfer")
+		inB := ingest(m, srvB, pathB)
+		awaitClosed(t, inB.Done(), "origin B ingest while origin A is gated")
+		entryB, err := inB.Entry()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entryB.SHA256 != hashHex(string(data)) || upB.dataGETs.Load() != 1 {
+			t.Fatalf("origin B entry sha256 = %s after %d data GETs, want %s after its own download", entryB.SHA256, upB.dataGETs.Load(), hashHex(string(data)))
+		}
+		release()
+		awaitClosed(t, inA.Done(), "origin A ingest")
+		entryA, err := inA.Entry()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entryA.SHA256 != hashHex(string(lie)) || entryA.FileHash == entryB.FileHash {
+			t.Fatalf("origin A entry = %+v, want its own bytes apart from origin B's %+v", entryA, entryB)
+		}
+		for _, want := range [][]byte{data, lie} {
+			if got := readStored(t, stor, hashHex(string(want))); !bytes.Equal(got, want) {
+				t.Fatal("stored bytes differ from the origin's data")
+			}
+		}
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
