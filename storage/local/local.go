@@ -440,7 +440,7 @@ func (fs *Storage) getShardBySHA256(digest [32]byte) (*shard.Shard, error) {
 		b, err := os.ReadFile(fs.objectPath("index/sha256", hex.EncodeToString(digest[:])))
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "", fmt.Errorf("SHA-256 not found")
+				return "", fmt.Errorf("sha256 %s: %w", hex.EncodeToString(digest[:]), iofs.ErrNotExist)
 			}
 			return "", fmt.Errorf("read SHA-256 index: %w", err)
 		}

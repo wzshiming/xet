@@ -9,16 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wzshiming/xet/mirror/spool"
 )
 
 func TestIngest(t *testing.T) {
@@ -87,12 +86,6 @@ func TestIngest(t *testing.T) {
 		}
 		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
 			t.Fatalf("stored bytes mismatch: got %d bytes, want %d", len(got), len(data))
-		}
-		if _, err := os.Stat(filepath.Join(cacheDir, "upload")); err != nil {
-			t.Fatalf("ingest did not stage under the mirror cache root: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(cacheDir, "upload", "chunks")); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("ingest touched the chunk location cache: %v", err)
 		}
 	})
 
@@ -196,8 +189,8 @@ func TestIngestInFlight(t *testing.T) {
 			if pinned == nil || res.Stream.t != pinned || tasks != 1 {
 				t.Fatalf("%s attached to task %p, pinned task %p, %d tasks; want one shared task", tc.rev, res.Stream.t, pinned, tasks)
 			}
-			if _, c, err := res.Stream.WaitMeta(ctx); err != nil || c != commit {
-				t.Fatalf("WaitMeta = %q, %v; want commit %s", c, err, commit)
+			if _, c := res.Stream.Meta(); c != commit {
+				t.Fatalf("Meta commit = %q; want %s", c, commit)
 			}
 			if got := upstream.dataGETs.Load(); got != 1 {
 				t.Fatalf("upstream GETs while gated = %d, want 1", got)
@@ -374,8 +367,8 @@ func TestMirrorIngestConcurrencyBound(t *testing.T) {
 	if err != nil || res.Stream == nil {
 		t.Fatalf("Resolve queued = %+v, %v; want the in-flight stream", res, err)
 	}
-	if _, commit, err := res.Stream.WaitMeta(ctx); err != nil || commit != up.commit {
-		t.Fatalf("queued WaitMeta = %q, %v; want commit %s", commit, err, up.commit)
+	if _, commit := res.Stream.Meta(); commit != up.commit {
+		t.Fatalf("queued Meta commit = %q; want %s", commit, up.commit)
 	}
 	if size, ok := res.Stream.WaitSize(ctx); !ok || size != int64(len(files[queued])) {
 		t.Fatalf("queued WaitSize = %d, %v; want %d, true", size, ok, len(files[queued]))
@@ -465,7 +458,7 @@ func TestMirrorIngestFailureReleasesSlot(t *testing.T) {
 	}
 	up.release(up.corrupt)
 	awaitClosed(t, bad.Done(), "bad ingest")
-	if _, err := bad.Entry(); !errors.Is(err, errSpoolCorrupt) {
+	if _, err := bad.Entry(); !errors.Is(err, spool.ErrCorrupt) {
 		t.Fatalf("bad ingest err = %v, want spool corrupt", err)
 	}
 
@@ -529,8 +522,8 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 		t.Fatalf("Resolve b.bin = %+v, %v; want an in-flight stream", b, err)
 	}
 	for name, st := range map[string]*Stream{"a.bin": a.Stream, "b.bin": b.Stream} {
-		if etag, commit, err := st.WaitMeta(ctx); err != nil || etag != hashHex(string(data)) || commit != upstream.commit {
-			t.Fatalf("%s WaitMeta = %q, %q, %v; want the shared etag at %s", name, etag, commit, err, upstream.commit)
+		if etag, commit := st.Meta(); etag != hashHex(string(data)) || commit != upstream.commit {
+			t.Fatalf("%s Meta = %q, %q; want the shared etag at %s", name, etag, commit, upstream.commit)
 		}
 		if size, ok := st.WaitSize(ctx); !ok || size != int64(len(data)) {
 			t.Fatalf("%s WaitSize = %d, %v; want %d, true", name, size, ok, len(data))
@@ -538,7 +531,7 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 	}
 
 	// The follower's first half arrives from the leader's spool while the upstream is still gated.
-	rc := b.Stream.NewReader(ctx, 0)
+	rc := b.Stream.NewReader(0)
 	if rc == nil {
 		t.Fatal("NewReader on the follower returned nil")
 	}
@@ -548,10 +541,10 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 		t.Fatalf("follower's first half while gated: %v", err)
 	}
 	m.mu.Lock()
-	inflight, tasks := len(m.inflight), len(m.tasks)
+	tasks := len(m.tasks)
 	m.mu.Unlock()
-	if inflight != 1 || tasks != 2 || a.Stream.t == b.Stream.t || a.Stream.t.spool != b.Stream.t.spool {
-		t.Fatalf("inflight %d, tasks %d, same task %v, shared spool %v; want 1, 2, false, true", inflight, tasks, a.Stream.t == b.Stream.t, a.Stream.t.spool == b.Stream.t.spool)
+	if tasks != 2 || a.Stream.t == b.Stream.t {
+		t.Fatalf("tasks %d, same task %v; want 2, false", tasks, a.Stream.t == b.Stream.t)
 	}
 	if got := upstream.dataGETs.Load(); got != 1 {
 		t.Fatalf("upstream GETs while gated = %d, want 1", got)
@@ -580,22 +573,15 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 	if got := upstream.dataGETs.Load(); got != 1 {
 		t.Fatalf("upstream GETs = %d, want 1 (the follower must share the download)", got)
 	}
-	// The leader leaves inflight after done closes, so give it a moment.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		m.mu.Lock()
-		inflight, tasks = len(m.inflight), len(m.tasks)
-		m.mu.Unlock()
-		if inflight == 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	m.mu.Lock()
+	tasks = len(m.tasks)
+	m.mu.Unlock()
+	if tasks != 0 {
+		t.Fatalf("tasks %d after both tasks finished; want 0", tasks)
 	}
-	if inflight != 0 || tasks != 0 {
-		t.Fatalf("inflight %d, tasks %d after both tasks finished; want 0, 0", inflight, tasks)
-	}
-	if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
-		t.Fatalf("spool files after the shared ingest = %v, want none", files)
+	// Both tasks released their hold, so the drained spool retired and takes no new readers.
+	if a.Stream.NewReader(0) != nil || b.Stream.NewReader(0) != nil {
+		t.Fatal("the shared spool still takes readers after both tasks finished")
 	}
 	if got := readStored(t, stor, ea.SHA256); !bytes.Equal(got, data) {
 		t.Fatal("stored bytes differ from upstream data")
@@ -641,9 +627,6 @@ func TestIngestSkipsDownloadWhenStored(t *testing.T) {
 			if got := upstream.dataGETs.Load(); got != 1 {
 				t.Fatalf("upstream GETs after the move = %d, want 1 (stored content must not be downloaded)", got)
 			}
-			if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
-				t.Fatalf("spool files after publishing stored content = %v, want none", files)
-			}
 
 			// Resolve under a cold key: the stored content is the answer at once.
 			upstream.commit = c3
@@ -664,9 +647,6 @@ func TestIngestSkipsDownloadWhenStored(t *testing.T) {
 			}
 			if got := upstream.dataGETs.Load(); got != 1 {
 				t.Fatalf("upstream GETs after three commits = %d, want 1", got)
-			}
-			if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
-				t.Fatalf("spool files after the cold resolve = %v, want none", files)
 			}
 			if got := readStored(t, stor, e1.SHA256); !bytes.Equal(got, data) {
 				t.Fatal("stored bytes differ from upstream data")
@@ -727,11 +707,8 @@ func TestIngestVerifiesUppercaseSHA256(t *testing.T) {
 		t.Fatalf("b.bin = %+v after %d data GETs, want %+v published from storage", held, upstream.dataGETs.Load(), entry)
 	}
 
-	if _, err := ingestWait(t, m, "org/repo", "main", "c.bin"); !errors.Is(err, errSpoolCorrupt) {
+	if _, err := ingestWait(t, m, "org/repo", "main", "c.bin"); !errors.Is(err, spool.ErrCorrupt) {
 		t.Fatalf("c.bin err = %v, want the bytes rejected against the uppercase digest", err)
-	}
-	if files := spoolFiles(t, m.spoolDir); len(files) != 0 {
-		t.Fatalf("spool files after the rejected download = %v, want none", files)
 	}
 }
 
@@ -766,7 +743,7 @@ func TestHeldEntryRejectsSizeDisagreement(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := upstream.dataGETs.Load()
-	if _, err := ingestWait(t, m, "org/repo", "main", "b.bin"); err == nil || !strings.Contains(err.Error(), "upstream size mismatch") {
+	if _, err := ingestWait(t, m, "org/repo", "main", "b.bin"); err == nil || !strings.Contains(err.Error(), "size mismatch") {
 		t.Fatalf("b.bin err = %v, want the download to fail on the advertised size", err)
 	}
 	if got := upstream.dataGETs.Load(); got != before+1 {

@@ -41,7 +41,7 @@ func (m *Mirror) loadBranch(repo, rev string) *branchEntry {
 		return nil
 	}
 	var b branchEntry
-	if err := json.Unmarshal(data, &b); err != nil || !commitRevRe.MatchString(b.Commit) {
+	if err := json.Unmarshal(data, &b); err != nil || !isCommit(b.Commit) {
 		return nil
 	}
 	m.branches[name] = &b

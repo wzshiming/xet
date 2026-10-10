@@ -12,15 +12,14 @@
 // The first resolution of a file starts the one background ingestion
 // download; concurrent resolutions (including the first) attach to it and
 // read from the growing spool as bytes arrive. Abandoning a resolution never
-// cancels ingestion, and partial spool bytes survive task failures and
-// process restarts: the next task resumes from them when the upstream etag
-// still matches. Downloads are shared by content within one upstream origin:
-// hub etags are content hashes, so a file requested under another path,
-// commit or repository of the same origin joins the download already running
-// for its etag and resumes the spool that origin and etag name, while another
-// origin advertising the same etag is never trusted with them. Content whose
-// sha256 local storage already holds is published without downloading at all,
-// whatever its origin: storage verified the digest when the file was stored.
+// cancels ingestion. The spool layer — downloads shared by content within
+// one upstream origin, partial bytes a crashed process spilled to disk
+// resumed on restart, verification and the ingest into storage — lives in
+// the mirror/spool package; this package keeps what is hub-specific: the
+// upstream probe, the fetch protocols, the index, branch pins and failure
+// backoff. Content whose sha256 local storage already holds is published
+// without downloading at all, whatever its origin: storage verified the
+// digest when the file was stored.
 //
 // The package exposes no HTTP surface of its own. The downstream hub routes
 // (resolve, token, tree) are implemented by the server/hf package on top of
@@ -30,13 +29,14 @@
 package mirror
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,17 +45,25 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/internal/lru"
+	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
 	"golang.org/x/sync/singleflight"
 )
 
-// resolveRe matches hub-style download paths. The prefix before /resolve/ is
-// treated as an opaque repo identity, so no platform-specific routing exists.
-var resolveRe = regexp.MustCompile(`^/(.+?)/resolve/([^/]+)/(.+)$`)
+// isHex reports whether s is exactly n hex digits.
+func isHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
 
-// commitRevRe matches revision strings that pin an immutable commit.
-var commitRevRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+// isCommit reports whether rev is a 40-hex commit id, the revision form that pins an immutable commit.
+func isCommit(rev string) bool {
+	return isHex(rev, 40)
+}
 
 const (
 	maxFetchAttempts   = 5
@@ -66,15 +74,10 @@ const (
 	maxFailedEntries   = 16384 // bounds the process-local failure records a 404 scan can accumulate
 )
 
-var (
-	// ErrUpstreamNotFound reports that the upstream hub has no file at the
-	// requested key. Errors returned by Resolve and Ingest match it with
-	// errors.Is.
-	ErrUpstreamNotFound = errors.New("upstream file not found")
-	// errSpoolCorrupt marks spooled bytes that failed verification; the spool
-	// must be discarded rather than kept for resume.
-	errSpoolCorrupt = errors.New("spool corrupt")
-)
+// ErrUpstreamNotFound reports that the upstream hub has no file at the
+// requested key. Errors returned by Resolve and Ingest match it with
+// errors.Is.
+var ErrUpstreamNotFound = errors.New("upstream file not found")
 
 // resolveKey identifies one (repo, rev, path) file and keys the in-memory
 // entry and task maps. Fields hold escaped URL path segments exactly as they
@@ -85,13 +88,23 @@ type resolveKey struct {
 	path string
 }
 
-// parseResolveKey splits a hub-style download path into its key.
+// parseResolveKey splits a hub-style download path, /<repo>/resolve/<rev>/<path>, into its key. The repo is the shortest prefix that leaves a rev and a path, so no platform-specific routing exists.
 func parseResolveKey(p string) (resolveKey, bool) {
-	seg := resolveRe.FindStringSubmatch(p)
-	if seg == nil {
+	const sep = "/resolve/"
+	if !strings.HasPrefix(p, "/") {
 		return resolveKey{}, false
 	}
-	return resolveKey{repo: seg[1], rev: seg[2], path: seg[3]}, true
+	for from := 2; from <= len(p); from++ {
+		i := strings.Index(p[from:], sep)
+		if i < 0 {
+			break
+		}
+		from += i
+		if rev, path, ok := strings.Cut(p[from+len(sep):], "/"); ok && rev != "" && path != "" {
+			return resolveKey{repo: p[1:from], rev: rev, path: path}, true
+		}
+	}
+	return resolveKey{}, false
 }
 
 // String renders the hub-style resolve path, the form used for upstream
@@ -145,28 +158,25 @@ type Mirror struct {
 	storage            storage.Storage
 	cacheDir           string
 	indexDir           string
-	spoolDir           string
 	revalidateInterval time.Duration
 	maxIngests         int
 	ingestSlots        chan struct{}
 	transport          http.RoundTripper
 
-	probeClient  *http.Client  // does not follow redirects; used for metadata probes
-	fetchClient  *http.Client  // follows redirects; body drops resume via httpseek
-	hubClient    *http.Client  // hub and CAS requests of the per-download hf clients; hf.NewClient adds the no-redirect and idle guards
-	cache        *client.Cache // chunk cache shared by the per-download xet clients
-	clientOpts   []client.Options
-	localAdapter *localCAS
+	probeClient *http.Client  // does not follow redirects; used for metadata probes
+	fetchClient *http.Client  // follows redirects; body drops resume via httpseek
+	hubClient   *http.Client  // hub and CAS requests of the per-download hf clients; hf.NewClient adds the no-redirect and idle guards
+	cache       *client.Cache // chunk cache shared by the per-download xet clients
+	clientOpts  []client.Options
+	spool       *spool.Spool // the downloads in flight and their spools; shares, verifies and ingests them into storage
 
 	mu        sync.Mutex
-	spoolMu   sync.Mutex // serializes spool opens against SweepSpools
 	persistMu sync.Mutex // orders index snapshots and writes
 	flight    singleflight.Group
 	entries   map[resolveKey]*fileEntry
 	branches  map[revKey]*branchEntry // branch rev -> pin, loaded lazily from disk
 	commits   map[revKey]*commitState // commit -> manifest state, loaded lazily from disk
 	tasks     map[resolveKey]*task
-	inflight  map[string]*task                // origin and content hash -> the task downloading it; later tasks for that content on that origin follow it
 	failed    lru.Cache[resolveKey, struct{}] // failed entries by recency; eviction drops them from entries
 }
 
@@ -178,9 +188,14 @@ func WithStorage(s storage.Storage) Option {
 	return func(m *Mirror) { m.storage = s }
 }
 
-// WithCacheDir stores indexes, spools, the chunk cache and upload staging under dir (index, spool, download, upload); defaults to ./xet-mirror.
+// WithCacheDir stores indexes, the chunk cache and, without WithSpool, the spools under dir (index, download, spool); defaults to ./xet-mirror.
 func WithCacheDir(dir string) Option {
 	return func(m *Mirror) { m.cacheDir = dir }
+}
+
+// WithSpool shares a Spool built elsewhere; by default the mirror builds its own under cacheDir/spool.
+func WithSpool(s *spool.Spool) Option {
+	return func(m *Mirror) { m.spool = s }
 }
 
 // WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache and upstream provider itself (WithCache in opts replaces the mirror's cache).
@@ -215,7 +230,6 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		branches:           map[revKey]*branchEntry{},
 		commits:            map[revKey]*commitState{},
 		tasks:              map[resolveKey]*task{},
-		inflight:           map[string]*task{},
 	}
 	m.failed.MaxEntries = maxFailedEntries
 	// Runs under m.mu: every touchFailed and forgetFailed caller holds it.
@@ -238,11 +252,8 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	m.ingestSlots = make(chan struct{}, m.maxIngests)
 
 	m.indexDir = filepath.Join(m.cacheDir, "index")
-	m.spoolDir = filepath.Join(m.cacheDir, "spool")
-	for _, dir := range []string{m.indexDir, m.spoolDir} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("mirror: create %s: %w", dir, err)
-		}
+	if err := os.MkdirAll(m.indexDir, 0755); err != nil {
+		return nil, fmt.Errorf("mirror: create %s: %w", m.indexDir, err)
 	}
 
 	if m.transport == nil {
@@ -268,7 +279,13 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	m.hubClient = &http.Client{Transport: m.transport}
 	m.cache = client.NewCache(m.cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)
 
-	m.localAdapter = &localCAS{storage: m.storage, namespace: "default"}
+	if m.spool == nil {
+		sp, err := spool.NewSpool(filepath.Join(m.cacheDir, "spool"), m.storage)
+		if err != nil {
+			return nil, fmt.Errorf("mirror: %w", err)
+		}
+		m.spool = sp
+	}
 
 	return m, nil
 }

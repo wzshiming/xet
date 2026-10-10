@@ -27,7 +27,7 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
 		}
-		return c.DownloadFile(ctx, f.Hash, t.spool)
+		return c.DownloadFile(ctx, f.Hash, t.item)
 	})
 }
 
@@ -54,7 +54,7 @@ func fetchWithRetries(ctx context.Context, operation string, fetch func() error)
 }
 
 func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) error {
-	offset := t.spool.size()
+	offset := t.item.Written()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.origin+src.String(), nil)
 	if err != nil {
 		return err
@@ -76,11 +76,11 @@ func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) er
 	switch {
 	case offset == 0 && resp.StatusCode == http.StatusOK:
 		if resp.ContentLength >= 0 {
-			t.setSize(resp.ContentLength)
+			t.item.SetSize(resp.ContentLength)
 		}
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
 		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
-			t.setSize(total)
+			t.item.SetSize(total)
 		}
 	case offset > 0 && resp.StatusCode == http.StatusOK:
 		// Upstream ignored the Range; skip what the spool already holds.
@@ -91,7 +91,7 @@ func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) er
 		return fmt.Errorf("upstream fetch status %d", resp.StatusCode)
 	}
 
-	_, err = io.Copy(t.spool, body)
+	_, err = io.Copy(t.item, body)
 	return err
 }
 

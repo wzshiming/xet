@@ -93,8 +93,8 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	if _, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex)); err == nil {
 		t.Fatal("sha256 reconstruction still resolves")
 	}
-	if _, err := st.GetFileHashBySHA256(ctx, "default", SHA256Digest(f.SHA256Hex)); err == nil {
-		t.Fatal("GetFileHashBySHA256 still resolves")
+	if _, err := st.GetFileHashBySHA256(ctx, "default", SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
+		t.Fatalf("GetFileHashBySHA256 after unlink = %v, want ErrNotExist", err)
 	}
 
 	// File-hash paths keep working; nothing else was touched.

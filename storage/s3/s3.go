@@ -881,7 +881,7 @@ func (ss *Storage) getShardBySHA256(ctx context.Context, digest [32]byte) (*shar
 		data, err := ss.getObject(ctx, ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 		if err != nil {
 			if isS3NotFound(err) {
-				return "", fmt.Errorf("SHA-256 not found")
+				return "", fmt.Errorf("sha256 %s: %w", hex.EncodeToString(digest[:]), iofs.ErrNotExist)
 			}
 			return "", fmt.Errorf("read SHA-256 index: %w", err)
 		}

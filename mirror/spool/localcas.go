@@ -1,4 +1,4 @@
-package mirror
+package spool
 
 import (
 	"context"
@@ -19,6 +19,11 @@ type localCAS struct {
 }
 
 var _ upload.ClientAdapter = (*localCAS)(nil)
+
+// newLocalCAS returns the upload target writing into namespace of st.
+func newLocalCAS(st storage.Storage, namespace string) *localCAS {
+	return &localCAS{storage: st, namespace: namespace}
+}
 
 func (l *localCAS) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
 	return l.storage.HasXorb(ctx, l.namespace, xorbHash)
