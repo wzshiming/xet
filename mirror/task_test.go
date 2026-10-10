@@ -486,9 +486,9 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 	}
 
 	// The follower's first half arrives from the leader's spool while the upstream is still gated.
-	rc := b.Stream.NewReader(0)
-	if rc == nil {
-		t.Fatal("NewReader on the follower returned nil")
+	rc, err := b.Stream.NewReader(0)
+	if err != nil {
+		t.Fatalf("NewReader on the follower: %v", err)
 	}
 	defer rc.Close()
 	half := make([]byte, len(data)/2)
@@ -535,8 +535,10 @@ func TestIngestSharesDownloadByETag(t *testing.T) {
 		t.Fatalf("tasks %d after both tasks finished; want 0", tasks)
 	}
 	// Both tasks released their hold, so the drained spool retired and takes no new readers.
-	if a.Stream.NewReader(0) != nil || b.Stream.NewReader(0) != nil {
-		t.Fatal("the shared spool still takes readers after both tasks finished")
+	for _, st := range []*Stream{a.Stream, b.Stream} {
+		if _, err := st.NewReader(0); err == nil {
+			t.Fatal("the shared spool still takes readers after both tasks finished")
+		}
 	}
 	if got := readStored(t, stor, ea.SHA256); !bytes.Equal(got, data) {
 		t.Fatal("stored bytes differ from upstream data")

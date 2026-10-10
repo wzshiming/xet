@@ -125,22 +125,22 @@ func (st *Stream) WaitSize(ctx context.Context) (size int64, ok bool) {
 	return st.t.item.Size(), true
 }
 
-// NewReader returns a reader over the file bytes starting at offset off,
-// tailing the growing spool until the ingest finishes. It returns nil only
+// NewReader returns a reader over the file bytes starting at offset,
+// tailing the growing spool until the ingest finishes. It returns an error
 // when the spool was already retired — the ingest finished and every reader
 // detached before this caller attached: Resolve again for the entry. Close
 // unblocks a waiting read, never the ingest.
-func (st *Stream) NewReader(off int64) io.ReadCloser {
-	return st.t.item.NewReader(off)
+func (st *Stream) NewReader(offset int) (io.ReadCloser, error) {
+	return st.t.item.NewReader(offset)
 }
 
-// NewSeekReader returns a ReadSeekCloser over the final size of the file,
-// fit for http.ServeContent: reads of regions not yet spooled block until
-// the data lands. It returns nil only when the spool was already retired —
-// the ingest finished and every reader detached before this caller attached:
-// Resolve again for the entry.
-func (st *Stream) NewSeekReader(size int64) io.ReadSeekCloser {
-	return st.t.item.NewSeekReader(size)
+// NewSeekReader returns a ReadSeekCloser over the final size of the file
+// positioned at offset, fit for http.ServeContent: reads of regions not yet
+// spooled block until the data lands. It returns an error when the spool was
+// already retired — the ingest finished and every reader detached before this
+// caller attached: Resolve again for the entry.
+func (st *Stream) NewSeekReader(offset, size int) (io.ReadSeekCloser, error) {
+	return st.t.item.NewSeekReader(offset, size)
 }
 
 // Done is closed once the ingest finished and released its spool — the entry

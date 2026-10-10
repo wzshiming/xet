@@ -274,8 +274,8 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		// Total size unknown until the ingest completes (xet upstream whose
 		// probe carried no size): ServeContent cannot handle that, so stream
 		// the whole body as it lands, ignoring Range.
-		rc := st.NewReader(0)
-		if rc == nil {
+		rc, err := st.NewReader(0)
+		if err != nil {
 			return false
 		}
 		defer func() {
@@ -286,8 +286,8 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		return true
 	}
 
-	rs := st.NewSeekReader(size)
-	if rs == nil {
+	rs, err := st.NewSeekReader(0, int(size))
+	if err != nil {
 		return false
 	}
 	defer func() {

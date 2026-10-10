@@ -127,22 +127,14 @@ func (it *Item) Written() int64 { return int64(it.f.swmr.Length()) }
 // path returns the spool file's path, present only after a spill or when adopted.
 func (it *Item) path() string { return it.f.path }
 
-// NewReader returns a tail-following reader of the spool from offset, nil once it retired; Close unblocks a waiting Read.
-func (it *Item) NewReader(offset int64) io.ReadCloser {
-	rc, err := it.f.swmr.NewReader(int(offset))
-	if err != nil {
-		return nil
-	}
-	return rc
+// NewReader returns a tail-following reader of the spool from offset, an error once it retired; Close unblocks a waiting Read.
+func (it *Item) NewReader(offset int) (io.ReadCloser, error) {
+	return it.f.swmr.NewReader(offset)
 }
 
-// NewSeekReader returns a blocking ReadSeekCloser over the spool's final size, for http.ServeContent while bytes still land, nil once it retired.
-func (it *Item) NewSeekReader(size int64) io.ReadSeekCloser {
-	rs, err := it.f.swmr.NewReadSeeker(0, int(size))
-	if err != nil {
-		return nil
-	}
-	return rs
+// NewSeekReader returns a blocking ReadSeekCloser over the spool's final size positioned at offset, for http.ServeContent while bytes still land, an error once it retired.
+func (it *Item) NewSeekReader(offset, size int) (io.ReadSeekCloser, error) {
+	return it.f.swmr.NewReadSeeker(offset, size)
 }
 
 // Size returns the flight's content length, -1 until known.
@@ -235,8 +227,8 @@ func (it *Item) Finish(ctx context.Context, err error) {
 			f.size.Store(size)
 			f.setSize(-1)                // definitive size stored above; size waiters need not wait for the ingest
 			_ = it.w.CloseWithError(nil) // readers drain to EOF while the ingest runs
-			if rs := it.NewSeekReader(size); rs == nil {
-				err = errors.New("spool: retired before ingest")
+			if rs, e := it.NewSeekReader(0, int(size)); e != nil {
+				err = e
 			} else {
 				res, err = ingest(ctx, s.st, rs, it.src.SHA256)
 				_ = rs.Close()

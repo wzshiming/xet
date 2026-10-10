@@ -206,9 +206,9 @@ func TestIngestFollowerRejectsSizeLearnedFromLeader(t *testing.T) {
 	if size, ok := c.Stream.WaitSize(ctx); !ok || size != int64(len(data)) {
 		t.Fatalf("honest follower WaitSize = %d, %v; want %d, true", size, ok, len(data))
 	}
-	rc := c.Stream.NewReader(0)
-	if rc == nil {
-		t.Fatal("honest follower NewReader returned nil")
+	rc, err := c.Stream.NewReader(0)
+	if err != nil {
+		t.Fatalf("honest follower NewReader: %v", err)
 	}
 	defer rc.Close()
 	half := make([]byte, len(data)/2)
