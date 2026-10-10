@@ -469,7 +469,7 @@ func TestQueryDedupShardsFetchesShardOnBatchHit(t *testing.T) {
 	if cached := cachedChunkEntries(cacheDir); len(cached) != len(cas.stored)-1 {
 		t.Fatalf("cached chunk locations = %v; want one per requested chunk", cached)
 	}
-	if got := c.cache.Upload.Lookup(t.Context(), c.dedupScope(srv.URL), []xet.ChunkHash{unrelated}); len(got) != 0 {
+	if got := c.cache.Upload.Lookup(t.Context(), srv.URL, []xet.ChunkHash{unrelated}); len(got) != 0 {
 		t.Fatalf("unrequested chunk cached: %v", got)
 	}
 }
@@ -900,34 +900,6 @@ func TestQueryDedupShardsIgnoresUnrequestedBatchResults(t *testing.T) {
 	for _, h := range unrequested {
 		if r, ok := results[h]; ok {
 			t.Fatalf("unrequested %s = %+v; want absent", h, r)
-		}
-	}
-}
-
-// The namespace is part of the cache scope: the same bytes uploaded under another namespace of one server are resolved by the server, not the cache.
-func TestUploadToOtherNamespaceIgnoresCache(t *testing.T) {
-	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv, count, reset := countingServer(t, server.NewHandler(server.WithStorage(stor)))
-	content := make([]byte, 1<<20)
-	rand.New(rand.NewSource(5)).Read(content)
-	shared := NewCache(t.TempDir(), 0, 0)
-	for _, tc := range []struct {
-		namespace string
-		wantDedup bool
-	}{{"default", true}, {"default", false}, {"other", true}} {
-		reset()
-		c, err := NewClient(WithCache(shared), WithNamespace(tc.namespace), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := c.UploadFile(t.Context(), bytes.NewReader(content)); err != nil {
-			t.Fatalf("upload to namespace %s: %v", tc.namespace, err)
-		}
-		if dedup := count("POST /v1/chunks", "GET /v1/chunks"); (dedup > 0) != tc.wantDedup {
-			t.Fatalf("upload to namespace %s made %d dedup queries; want some = %v", tc.namespace, dedup, tc.wantDedup)
 		}
 	}
 }

@@ -17,7 +17,6 @@ func NewCommand() *cobra.Command {
 		hfEndpoint  string
 		hfRepoType  string
 		hfRevision  string
-		namespace   string
 		concurrency int
 		cacheDir    string
 		resume      bool
@@ -47,7 +46,7 @@ func NewCommand() *cobra.Command {
 				Revision: hfRevision,
 			}
 
-			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(namespace, concurrency, cacheDir, os.Stderr)...))
+			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(concurrency, cacheDir, os.Stderr)...))
 			if err != nil {
 				return fmt.Errorf("create client: %w", err)
 			}
@@ -60,7 +59,6 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfEndpoint, "endpoint", common.DefaultHFEndpoint, "Hugging Face Hub endpoint override")
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, space, or kernel")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
-	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of xorb ranges to prefetch concurrently")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Cache root: <dir>/download holds the chunk cache, <dir>/upload holds upload staging and cached chunk locations (default: <os temp dir>/xet-cache)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")

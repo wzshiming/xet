@@ -48,9 +48,9 @@ func casCalls(t *testing.T, ctx context.Context, c *Client) map[string]casCall {
 		"DownloadFileV1":         {auth.Read, func() error { return file(c.DownloadFileV1) }},
 		"DownloadFileV2":         {auth.Read, func() error { return file(c.DownloadFileV2) }},
 		"DownloadFiles":          {auth.Read, func() error { _, _, err := c.DownloadFiles(ctx, []xet.FileHash{{}}); return err }},
-		"DownloadXorb":           {auth.Read, func() error { return closing(c.DownloadXorb(ctx, "default", xet.XorbHash{})) }},
+		"DownloadXorb":           {auth.Read, func() error { return closing(c.DownloadXorb(ctx, xet.XorbHash{})) }},
 		"FetchXorbRange": {auth.Read, func() error {
-			resp, err := c.FetchXorbRange(ctx, "default", xet.XorbHash{}, nil)
+			resp, err := c.FetchXorbRange(ctx, xet.XorbHash{}, nil)
 			if err == nil {
 				_ = resp.Body.Close()
 			}
@@ -351,7 +351,7 @@ func TestAuth401IsTerminal(t *testing.T) {
 			return err
 		},
 		"GET xorb": func(_ *testing.T, ctx context.Context, c *Client) error {
-			_, err := c.DownloadXorb(ctx, "default", xet.XorbHash{})
+			_, err := c.DownloadXorb(ctx, xet.XorbHash{})
 			return err
 		},
 		"POST xorb": func(_ *testing.T, ctx context.Context, c *Client) error {
@@ -411,11 +411,11 @@ func TestUpstreamProviderErrorsAreNotRetried(t *testing.T) {
 	calls := map[string]func(ctx context.Context, c *Client) error{
 		"HasXorb": func(ctx context.Context, c *Client) error { _, err := c.HasXorb(ctx, xet.XorbHash{}); return err },
 		"DownloadXorb": func(ctx context.Context, c *Client) error {
-			_, err := c.DownloadXorb(ctx, "default", xet.XorbHash{})
+			_, err := c.DownloadXorb(ctx, xet.XorbHash{})
 			return err
 		},
 		"FetchXorbRange": func(ctx context.Context, c *Client) error {
-			_, err := c.FetchXorbRange(ctx, "default", xet.XorbHash{}, nil)
+			_, err := c.FetchXorbRange(ctx, xet.XorbHash{}, nil)
 			return err
 		},
 		"UploadShardV2": func(ctx context.Context, c *Client) error {
@@ -574,7 +574,7 @@ func TestDownloadXorbResumeCarriesToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := c.DownloadXorb(t.Context(), "default", xet.XorbHash{})
+	r, err := c.DownloadXorb(t.Context(), xet.XorbHash{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,6 @@ func NewCommand() *cobra.Command {
 		hfEndpoint  string
 		hfRepoType  string
 		hfRevision  string
-		namespace   string
 		concurrency int
 		cacheDir    string
 	)
@@ -74,7 +73,7 @@ func NewCommand() *cobra.Command {
 
 			casToken := batchResult.Upload.Header["X-Xet-Access-Token"]
 
-			cli, err := client.NewClient(append(common.Options(namespace, concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(casURL, casToken)))...)
+			cli, err := client.NewClient(append(common.Options(concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(casURL, casToken)))...)
 			if err != nil {
 				return fmt.Errorf("upload failed: create client: %w", err)
 			}
@@ -104,7 +103,6 @@ func NewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&hfEndpoint, "endpoint", common.DefaultHFEndpoint, "Hugging Face Hub endpoint override")
 	cmd.Flags().StringVar(&hfRepoType, "repo-type", "model", "Hugging Face repo type: model, dataset, space, or kernel")
 	cmd.Flags().StringVar(&hfRevision, "revision", "main", "Hugging Face revision")
-	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of upload tasks to run concurrently")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Cache root: <dir>/download holds the chunk cache, <dir>/upload holds upload staging and cached chunk locations (default: <os temp dir>/xet-cache)")
 	return cmd
