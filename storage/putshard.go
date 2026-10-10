@@ -27,7 +27,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 			return digest, fileHash, err
 		}
 
-		offsets, err := xorbs.GetXorbChunkOffsets(ctx, "", entry.CASHash)
+		offsets, err := xorbs.GetXorbChunkOffsets(ctx, entry.CASHash)
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
@@ -35,7 +35,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
-		rc, err := xorbs.GetXorbRangeReadCloser(ctx, "", entry.CASHash, start, end)
+		rc, err := xorbs.GetXorbRangeReadCloser(ctx, entry.CASHash, start, end)
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("read xorb chunks: %w", err)
 		}
@@ -59,7 +59,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 
 // verifyCASBlock checks the declared chunk sequence against every chunk of the stored xorb.
 func verifyCASBlock(ctx context.Context, cb *shard.CASBlock, xorbs Storage) error {
-	rc, err := xorbs.GetXorbReadSeekCloser(ctx, "", cb.CASHash)
+	rc, err := xorbs.GetXorbReadSeekCloser(ctx, cb.CASHash)
 	if err != nil {
 		return fmt.Errorf("open xorb: %w", err)
 	}

@@ -47,7 +47,7 @@ func parseByteRange(header string, size int64) (start, end int64, ok bool) {
 // convention used by xet-core: ByteRangeStart is an offset into the
 // header-stripped stream, and range requests to the xorb download endpoint
 // are served from the same stripped stream (see handleDownloadXorb).
-func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV1, error) {
+func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV1, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -112,12 +112,12 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		// URL ranges are byte offsets within the compressed-data stream of the
 		// stored xorb (headers stripped).  Load the stored xorb and compute
 		// the accurate ranges from the actual compressed chunk sizes.
-		startByte, endByte, err := storage.GetXorbDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte, err := storage.GetXorbDataRange(ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}
 
-		xorbURL, err := storage.GetXorbURL(ctx, namespace, entry.CASHash)
+		xorbURL, err := storage.GetXorbURL(ctx, entry.CASHash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb URL: %w", err)
 		}

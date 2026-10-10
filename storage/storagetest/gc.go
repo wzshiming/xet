@@ -70,7 +70,7 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	f := PutFile(t, ctx, st, [][]byte{[]byte("unlink my sha256")})
 
 	// Warm the sha256 cache so the unlink must evict it.
-	rc, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex))
+	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,10 +90,10 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("sha256 entry after unlink = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex)); err == nil {
+	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
 		t.Fatal("sha256 reconstruction still resolves")
 	}
-	if _, err := st.GetFileHashBySHA256(ctx, "default", SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
+	if _, err := st.GetFileHashBySHA256(ctx, SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("GetFileHashBySHA256 after unlink = %v, want ErrNotExist", err)
 	}
 
@@ -104,7 +104,7 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard should survive UnlinkSHA256: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb removed by UnlinkSHA256")
 	}
 
@@ -145,10 +145,10 @@ func testSweepNeedsBothUnlinks(t *testing.T, b Backend) {
 		if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 			t.Fatalf("shard should survive: %v", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 			t.Fatal("xorb swept")
 		}
-		rc, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex))
+		rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
 		if err != nil {
 			t.Fatalf("GetReconstructedFile: %v", err)
 		}
@@ -177,7 +177,7 @@ func testSweepNeedsBothUnlinks(t *testing.T, b Backend) {
 		if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 			t.Fatalf("GetShard: %v", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 			t.Fatal("xorb swept")
 		}
 	})
@@ -208,7 +208,7 @@ func testSweepNeedsBothUnlinks(t *testing.T, b Backend) {
 		if _, err := st.GetShardByHash(ctx, f.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 			t.Fatalf("dead shard load = %v, want ErrNotExist", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); ok {
 			t.Fatal("xorb still stored")
 		}
 		if got, _ := st.GetChunkIndexEntry(ctx, f.ChunkHashes[0]); got != "" {
@@ -232,10 +232,10 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, fileA.FileHash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetShardByChunkHash(ctx, "default", fileA.ChunkHashes[1]); err != nil {
+	if _, err := st.GetShardByChunkHash(ctx, fileA.ChunkHashes[1]); err != nil {
 		t.Fatal(err)
 	}
-	rc, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(fileA.SHA256Hex))
+	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(fileA.SHA256Hex))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,18 +272,18 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, fileA.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("dead shard load = %v, want ErrNotExist", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", fileA.XorbHashes[1]); ok {
+	if ok, _ := st.HasXorb(ctx, fileA.XorbHashes[1]); ok {
 		t.Fatal("exclusive xorb of the dead shard still stored")
 	}
-	if ok, _ := st.HasXorb(ctx, "default", fileA.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, fileA.XorbHashes[0]); !ok {
 		t.Fatal("shared xorb was swept while file B references it")
 	}
 
 	// Stale caches must not resurrect swept state.
-	if _, err := st.GetShardByChunkHash(ctx, "default", fileA.ChunkHashes[1]); err == nil {
+	if _, err := st.GetShardByChunkHash(ctx, fileA.ChunkHashes[1]); err == nil {
 		t.Fatal("chunk lookup for the dead shard's exclusive chunk still resolves")
 	}
-	if _, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(fileA.SHA256Hex)); err == nil {
+	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(fileA.SHA256Hex)); err == nil {
 		t.Fatal("sha256 lookup for the swept file still resolves")
 	}
 
@@ -301,7 +301,7 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, fileB.FileHash); err != nil {
 		t.Fatalf("GetShard(fileB): %v", err)
 	}
-	rc, err = st.GetReconstructedFile(ctx, "default", SHA256Digest(fileB.SHA256Hex))
+	rc, err = st.GetReconstructedFile(ctx, SHA256Digest(fileB.SHA256Hex))
 	if err != nil {
 		t.Fatalf("GetReconstructedFile(fileB): %v", err)
 	}
@@ -340,7 +340,7 @@ func testSweepDryRunDeletesNothing(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard removed by dry run: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb removed by dry run")
 	}
 	if got, _ := st.GetChunkIndexEntry(ctx, f.ChunkHashes[0]); got != f.ShardHash {
@@ -401,7 +401,7 @@ func testSweepDryRunParity(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, doomed.FileHash); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("GetShard(doomed) = %v, want ErrNotExist", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", doomed.XorbHashes[0]); ok {
+	if ok, _ := st.HasXorb(ctx, doomed.XorbHashes[0]); ok {
 		t.Fatal("doomed xorb still stored")
 	}
 }
@@ -488,7 +488,7 @@ func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 		t.Fatalf("chunk entry owner = %q, want one of the two shards", owner)
 	}
 	// Warm the chunk cache so the delete must evict it.
-	if _, err := st.GetShardByChunkHash(ctx, "default", f1.ChunkHashes[0]); err != nil {
+	if _, err := st.GetShardByChunkHash(ctx, f1.ChunkHashes[0]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -507,7 +507,7 @@ func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 	if got, err := st.GetChunkIndexEntry(ctx, live.ChunkHashes[0]); err != nil || got != "" {
 		t.Fatalf("shared chunk entry = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetShardByChunkHash(ctx, "default", live.ChunkHashes[0]); err == nil {
+	if _, err := st.GetShardByChunkHash(ctx, live.ChunkHashes[0]); err == nil {
 		t.Fatal("shared chunk lookup still resolves after the entry delete")
 	}
 	// The dead shard's exclusive entry is gone; the live shard's own
@@ -521,7 +521,7 @@ func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 
 	// The live file itself is whole: file hash and SHA-256 resolve.
 	AssertFileIntact(t, ctx, st, live)
-	if ok, _ := st.HasXorb(ctx, "default", live.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, live.XorbHashes[0]); !ok {
 		t.Fatal("shared xorb was swept")
 	}
 }
@@ -617,7 +617,7 @@ func testSweepThenReuploadResurrects(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 		t.Fatalf("GetShard after re-upload: %v", err)
 	}
-	rc, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex))
+	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
 	if err != nil {
 		t.Fatalf("GetReconstructedFile after re-upload: %v", err)
 	}
@@ -703,7 +703,7 @@ func testSweepShieldsCommitDuringShardDeletePhase(t *testing.T, b Backend) {
 	if len(res.SweptXorbs) != 0 {
 		t.Fatalf("SweptXorbs = %v, want none", SweptHashes(res.SweptXorbs))
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f1.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f1.XorbHashes[0]); !ok {
 		t.Fatal("xorb shared with the late upload was swept")
 	}
 	AssertFileIntact(t, ctx, st, f2)
@@ -832,13 +832,13 @@ func testSweepStepRecommitBetweenSteps(t *testing.T, b Backend) {
 
 	// The re-linked file survives with its xorb; the other is gone.
 	AssertFileIntact(t, ctx, st, kept)
-	if ok, _ := st.HasXorb(ctx, "default", kept.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, kept.XorbHashes[0]); !ok {
 		t.Fatal("xorb of the re-uploaded file was swept")
 	}
 	if _, err := st.GetShardByHash(ctx, gone.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("dead shard load = %v, want ErrNotExist", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", gone.XorbHashes[0]); ok {
+	if ok, _ := st.HasXorb(ctx, gone.XorbHashes[0]); ok {
 		t.Fatal("dead file's xorb still stored")
 	}
 }
@@ -867,7 +867,7 @@ func testSweepStepDryRunIgnoresBounds(t *testing.T, b Backend) {
 		if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 			t.Fatalf("shard removed by dry step: %v", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 			t.Fatal("xorb removed by dry step")
 		}
 	}
@@ -909,7 +909,7 @@ func testSweepNeverTouchesShardCache(t *testing.T, b Backend) {
 		t.Fatalf("GetShardByHash called %d times during the sweep, want 0 (loads must bypass the cache)", hooked.cachedShardGets)
 	}
 	AssertFileIntact(t, ctx, st, fLive)
-	if ok, _ := st.HasXorb(ctx, "default", fGrace.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, fGrace.XorbHashes[0]); !ok {
 		t.Fatal("in-grace shard's xorb was swept")
 	}
 }
@@ -942,7 +942,7 @@ func testSweepReportsUnreadableDeadShard(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("unreadable shard object gone: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("unreadable shard's xorb was swept")
 	}
 	if got, err := st.GetChunkIndexEntry(ctx, f.ChunkHashes[0]); err != nil || got != f.ShardHash {
@@ -976,7 +976,7 @@ func testSweepUnreadableShardSuppressesXorbSweep(t *testing.T, b Backend) {
 	if len(res.SweptXorbs) != 0 || res.RemainingXorbs != 0 {
 		t.Fatalf("xorbs swept %v remaining %d, want none (xorb phase poisoned)", SweptHashes(res.SweptXorbs), res.RemainingXorbs)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", fDead.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, fDead.XorbHashes[0]); !ok {
 		t.Fatal("queued xorb swept despite an unreadable shard")
 	}
 	if _, err := st.GetShardByHash(ctx, fDead.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
@@ -1076,7 +1076,7 @@ func testSweepDeleteLoopAbortsOnRacingFileEntry(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard destroyed under the racing commit: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb destroyed under the racing commit")
 	}
 	assertChunkEntriesIntact(t, ctx, st, f, res)
@@ -1125,7 +1125,7 @@ func testSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard destroyed under the racing commit: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb destroyed under the racing commit")
 	}
 	assertChunkEntriesIntact(t, ctx, st, f, res)
@@ -1202,7 +1202,7 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, shardHash); err != nil {
 		t.Fatalf("shard destroyed under the racing commit: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", fullXorbs[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, fullXorbs[0]); !ok {
 		t.Fatal("xorb destroyed under the racing commit")
 	}
 }
@@ -1244,7 +1244,7 @@ func testSweepAnchorSHA256LFSLifecycle(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f1.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("dead shard load = %v, want ErrNotExist", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f1.XorbHashes[0]); ok {
+	if ok, _ := st.HasXorb(ctx, f1.XorbHashes[0]); ok {
 		t.Fatal("xorb still stored")
 	}
 
@@ -1355,7 +1355,7 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("sha256 entry after sweep = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex)); err == nil {
+	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
 		t.Fatal("sha256 lookup still resolves")
 	}
 }
@@ -1409,7 +1409,7 @@ func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("shared sha256 entry = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(live.SHA256Hex)); err == nil {
+	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(live.SHA256Hex)); err == nil {
 		t.Fatal("SHA-256 lookup still resolves after the entry delete")
 	}
 
@@ -1546,7 +1546,7 @@ func testSweepAnchorSHA256AbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 		if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 			t.Fatalf("shard destroyed under the racing commit: %v", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 			t.Fatal("xorb destroyed under the racing commit")
 		}
 		assertChunkEntriesIntact(t, ctx, st, f, res)
@@ -1666,7 +1666,7 @@ func testSweepStepUnreadableShardCannotLivelock(t *testing.T, b Backend) {
 	}
 	// The poisoned passes judge no xorb: the healthy shard's xorb
 	// stays until the corrupt object is repaired or removed.
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb swept despite the unreadable shard")
 	}
 	foundCorrupt := false
@@ -1750,14 +1750,14 @@ func testSweepStepSparedUnanchorableShardCannotLivelock(t *testing.T, b Backend)
 	if got, err := st.GetFileIndexEntry(ctx, sparedFile); err != nil || got != spared {
 		t.Fatalf("spared file entry = %q, %v; want %q", got, err, spared)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", sparedXorbs[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, sparedXorbs[0]); !ok {
 		t.Fatal("spared shard's xorb swept")
 	}
 	// The sha-dead shard and its xorb are gone.
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("dead shard load = %v, want ErrNotExist", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); ok {
 		t.Fatal("dead shard's xorb still stored")
 	}
 }
@@ -1794,7 +1794,7 @@ func testSweepStepExhaustedAtShardDrainSkipsXorbPhase(t *testing.T, b Backend) {
 	}
 	// The dead shard's xorb was never judged; a follow-up unbounded
 	// step finishes the job.
-	if ok, _ := st.HasXorb(ctx, "default", dead.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, dead.XorbHashes[0]); !ok {
 		t.Fatal("xorb swept by a step that skipped the xorb phase")
 	}
 	res, err = g.SweepStep(ctx, storage.SweepOptions{Grace: NoGrace})

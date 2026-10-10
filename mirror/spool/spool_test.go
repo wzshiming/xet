@@ -27,7 +27,7 @@ type xorbRejectingStorage struct {
 	storage.Storage
 }
 
-func (xorbRejectingStorage) PutXorb(context.Context, string, xet.XorbHash, io.Reader) (bool, error) {
+func (xorbRejectingStorage) PutXorb(context.Context, xet.XorbHash, io.Reader) (bool, error) {
 	return false, errors.New("xorb write refused")
 }
 
@@ -398,7 +398,7 @@ func TestIngest(t *testing.T) {
 	if res.SHA256 != digest || res.Size != int64(len(data)) || res.FileHash == "" {
 		t.Fatalf("Ingest result = %+v, want sha256 %s, size %d and a file hash", res, digest, len(data))
 	}
-	rc, err := st.GetReconstructedFile(ctx, "default", sum)
+	rc, err := st.GetReconstructedFile(ctx, sum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +473,7 @@ func TestSpoolWriter(t *testing.T) {
 	if res.SHA256 != digest || res.Size != int64(len(data)) || res.FileHash == "" {
 		t.Fatalf("Wait = %+v, want sha256 %s, size %d and a file hash", res, digest, len(data))
 	}
-	rc, err := st.GetReconstructedFile(ctx, "default", sum)
+	rc, err := st.GetReconstructedFile(ctx, sum)
 	if err != nil {
 		t.Fatal(err)
 	}

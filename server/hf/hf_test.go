@@ -592,11 +592,11 @@ type testCAS struct {
 }
 
 func (l testCAS) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
-	return l.storage.HasXorb(ctx, "default", xorbHash)
+	return l.storage.HasXorb(ctx, xorbHash)
 }
 
 func (l testCAS) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
-	wasInserted, err := l.storage.PutXorb(ctx, "default", xorbHash, reader)
+	wasInserted, err := l.storage.PutXorb(ctx, xorbHash, reader)
 	if err != nil {
 		return nil, err
 	}

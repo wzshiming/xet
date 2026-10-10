@@ -27,7 +27,7 @@ type shardV2TestStorage struct {
 	putErr      error
 }
 
-func (s *shardV2TestStorage) HasXorb(context.Context, string, xet.XorbHash) (bool, error) {
+func (s *shardV2TestStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) {
 	return true, nil
 }
 

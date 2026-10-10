@@ -122,7 +122,7 @@ func (m *Mirror) fileHashBySHA256(ctx context.Context, hexDigest string) (xet.Fi
 		return xet.FileHash{}, [sha256.Size]byte{}, false
 	}
 	digest := [sha256.Size]byte(raw)
-	fileHash, err := m.storage.GetFileHashBySHA256(ctx, "default", digest)
+	fileHash, err := m.storage.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		return xet.FileHash{}, digest, false
 	}

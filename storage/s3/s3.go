@@ -287,7 +287,7 @@ func (ss *Storage) putIndexObject(ctx context.Context, key string, value []byte)
 // PutXorb stores an xorb. The stream is validated while being spooled to a
 // temporary file, then uploaded with a known length so the SDK can sign and
 // retry the request.
-func (ss *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	key := ss.objectKey("xorbs", xorbHash.String())
 
 	if _, exists, err := ss.headObject(ctx, key); err != nil {
@@ -321,7 +321,7 @@ func (ss *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash,
 
 // GetXorbReadSeekCloser returns a ReadSeekCloser over the xorb object; reads
 // after a seek are served with S3 range requests.
-func (ss *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+func (ss *Storage) GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
 	key := ss.objectKey("xorbs", xorbHash.String())
 	size, exists, err := ss.headObject(ctx, key)
 	if err != nil {
@@ -334,7 +334,7 @@ func (ss *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash
 }
 
 // HasXorb checks whether an xorb exists.
-func (ss *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) (bool, error) {
+func (ss *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
 	_, exists, err := ss.headObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
 	if err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
@@ -345,9 +345,9 @@ func (ss *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash)
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
 // the xorb, from the in-memory cache, the xorb footer, or a full scan for
 // footer-less xorbs.
-func (ss *Storage) xorbChunkOffsets(ctx context.Context, namespace string, xorbHash xet.XorbHash) ([]uint64, error) {
+func (ss *Storage) xorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
 	return ss.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
-		f, err := ss.GetXorbReadSeekCloser(ctx, namespace, xorbHash)
+		f, err := ss.GetXorbReadSeekCloser(ctx, xorbHash)
 		if err != nil {
 			return nil, err
 		}
@@ -362,8 +362,8 @@ func (ss *Storage) xorbChunkOffsets(ctx context.Context, namespace string, xorbH
 
 // GetXorbDataRange returns the [start, end] byte range (inclusive) within
 // the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
-func (ss *Storage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := ss.xorbChunkOffsets(ctx, namespace, xorbHash)
+func (ss *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
+	offsets, err := ss.xorbChunkOffsets(ctx, xorbHash)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
@@ -372,8 +372,8 @@ func (ss *Storage) GetXorbDataRange(ctx context.Context, namespace string, xorbH
 
 // GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
 // the first read.
-func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, namespace string, xorbHash xet.XorbHash) ([]uint64, error) {
-	return ss.xorbChunkOffsets(ctx, namespace, xorbHash)
+func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+	return ss.xorbChunkOffsets(ctx, xorbHash)
 }
 
 // hasFile checks whether a file hash already has a shard mapping.
@@ -390,7 +390,7 @@ func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, er
 }
 
 // GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, _ string, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
 	return ss.getObjectRange(ctx, ss.objectKey("xorbs", xorbHash.String()), start, end)
 }
 
@@ -620,7 +620,7 @@ func (ss *Storage) WalkShards(ctx context.Context, fn func(shardHash string, siz
 }
 
 // WalkXorbs calls fn for every stored xorb object.
-func (ss *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (ss *Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	return ss.walkHashedObjects(ctx, "xorbs", fn)
 }
 
@@ -743,7 +743,7 @@ func (ss *Storage) DeleteShard(ctx context.Context, shardHash string) error {
 }
 
 // DeleteXorb removes a stored xorb object.
-func (ss *Storage) DeleteXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) error {
+func (ss *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
 	err := ss.deleteObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
 	ss.caches.Offsets.Remove(xorbHash)
 	if err != nil {
@@ -842,7 +842,7 @@ func (ss *Storage) getShardByFileHash(ctx context.Context, fileHash xet.FileHash
 }
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
-func (ss *Storage) GetShardByChunkHash(ctx context.Context, _ string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
+func (ss *Storage) GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error) {
 	shardHash, err := ss.caches.Chunks.GetOrLoad(chunkHash, func() (string, error) {
 		data, err := ss.getObject(ctx, ss.objectKey("index/chunks", chunkHash.String()))
 		if err != nil {
@@ -861,7 +861,7 @@ func (ss *Storage) GetShardByChunkHash(ctx context.Context, _ string, chunkHash 
 
 // GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded
 // at ingest, loading the owning shard and matching its file metadata.
-func (ss *Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
+func (ss *Storage) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.FileHash, error) {
 	sh, err := ss.getShardBySHA256(ctx, digest)
 	if err != nil {
 		return xet.FileHash{}, err
@@ -893,19 +893,19 @@ func (ss *Storage) getShardBySHA256(ctx context.Context, digest [32]byte) (*shar
 	return ss.getShardByHash(ctx, shardHash)
 }
 
-func (ss *Storage) GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error) {
+func (ss *Storage) GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error) {
 	sh, err := ss.getShardBySHA256(ctx, sha256)
 	if err != nil {
 		return nil, fmt.Errorf("get shard by sha256: %w", err)
 	}
-	return storage.NewReconstructedFile(ctx, ss, namespace, sh, sha256)
+	return storage.NewReconstructedFile(ctx, ss, sh, sha256)
 }
 
 // GetXorbURL generates a URL for accessing xorb data. By default it is a
 // presigned S3 GET URL so clients fetch xorb ranges straight from the object
 // store; with presigning disabled the URL routes through the CAS server's
 // xorb endpoint like the local backend.
-func (ss *Storage) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
+func (ss *Storage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error) {
 	if ss.presign {
 		req, err := ss.presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
 			Bucket: aws.String(ss.bucket),
@@ -918,9 +918,9 @@ func (ss *Storage) GetXorbURL(ctx context.Context, namespace string, xorbHash xe
 	}
 	if ss.baseURL == "" {
 		// If no base URL is configured, return a relative path
-		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String()), nil
+		return fmt.Sprintf("/v1/xorbs/default/%s", xorbHash.String()), nil
 	}
-	return fmt.Sprintf("%s/v1/xorbs/%s/%s", ss.baseURL, namespace, xorbHash.String()), nil
+	return fmt.Sprintf("%s/v1/xorbs/default/%s", ss.baseURL, xorbHash.String()), nil
 }
 
 // s3Opener adapts an S3 object to httpseek.Opener: each open is served with

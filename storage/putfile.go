@@ -23,10 +23,10 @@ type xorbReader struct {
 	buf      bytes.Buffer
 }
 
-// PutFile stores the file read from r under namespace: chunks already held by
-// a stored shard are reused, the new ones are packed into xorbs, and the shard
-// describing the file is committed. It returns the file's xet hash.
-func PutFile(ctx context.Context, stor Storage, namespace string, r io.ReadSeeker) (xet.FileHash, error) {
+// PutFile stores the file read from r: chunks already held by a stored shard
+// are reused, the new ones are packed into xorbs, and the shard describing the
+// file is committed. It returns the file's xet hash.
+func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, error) {
 	base, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return xet.FileHash{}, fmt.Errorf("locate file start: %w", err)
@@ -65,7 +65,7 @@ func PutFile(ctx context.Context, stor Storage, namespace string, r io.ReadSeeke
 		if _, ok := located[c.Hash]; ok || !shard.IsChunkGlobalDedupEligible(c.Hash, i == 0, 0) {
 			continue
 		}
-		sh, err := stor.GetShardByChunkHash(ctx, namespace, c.Hash)
+		sh, err := stor.GetShardByChunkHash(ctx, c.Hash)
 		if err != nil || sh == nil {
 			continue
 		}
@@ -98,7 +98,7 @@ func PutFile(ctx context.Context, stor Storage, namespace string, r io.ReadSeeke
 			x.offsets = append(x.offsets, offsets[fresh[k]])
 		}
 		xorbHash := xet.ComputeXorbHash(hashes, x.sizes)
-		if _, err := stor.PutXorb(ctx, namespace, xorbHash, x); err != nil {
+		if _, err := stor.PutXorb(ctx, xorbHash, x); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store xorb %s: %w", xorbHash.String(), err)
 		}
 		for j, k := range group {

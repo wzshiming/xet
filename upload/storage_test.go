@@ -21,11 +21,11 @@ import (
 type storageClient struct{ st storage.Storage }
 
 func (c storageClient) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
-	return c.st.HasXorb(ctx, "default", xorbHash)
+	return c.st.HasXorb(ctx, xorbHash)
 }
 
 func (c storageClient) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, r io.ReadSeeker) (*XorbUploadResponse, error) {
-	inserted, err := c.st.PutXorb(ctx, "default", xorbHash, r)
+	inserted, err := c.st.PutXorb(ctx, xorbHash, r)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +50,7 @@ func (c storageClient) QueryDedupShards(ctx context.Context, chunkHashes []xet.C
 		if _, ok := located[h]; ok {
 			continue
 		}
-		sh, err := c.st.GetShardByChunkHash(ctx, "default", h)
+		sh, err := c.st.GetShardByChunkHash(ctx, h)
 		if err != nil || sh == nil {
 			continue
 		}
@@ -72,12 +72,12 @@ type storeState struct {
 func snapshot(t *testing.T, ctx context.Context, st storage.Storage) storeState {
 	t.Helper()
 	s := storeState{xorbs: map[string][]byte{}, shards: map[string]bool{}, fileIndex: map[string]string{}}
-	err := st.WalkXorbs(ctx, "default", func(hash string, _ int64, _ time.Time) error {
+	err := st.WalkXorbs(ctx, func(hash string, _ int64, _ time.Time) error {
 		xorbHash, err := xet.ParseXorbHash(hash)
 		if err != nil {
 			return err
 		}
-		rc, err := st.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+		rc, err := st.GetXorbReadSeekCloser(ctx, xorbHash)
 		if err != nil {
 			return err
 		}
@@ -121,7 +121,7 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 		{"second", second, 2},
 		{"empty", nil, 2},
 	} {
-		want, err := storage.PutFile(ctx, native, "default", bytes.NewReader(file.data))
+		want, err := storage.PutFile(ctx, native, bytes.NewReader(file.data))
 		if err != nil {
 			t.Fatalf("%s: PutFile: %v", file.name, err)
 		}

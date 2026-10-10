@@ -224,7 +224,7 @@ func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 }
 
 // PutXorb stores an xorb
-func (fs *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+func (fs *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
 	// Check if xorb already exists. Dedup hits leave the stored object,
@@ -268,7 +268,7 @@ func (fs *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash,
 }
 
 // GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
-func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
 	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
 	f, err := os.Open(xorbPath)
@@ -283,7 +283,7 @@ func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash
 }
 
 // HasXorb checks whether an xorb exists.
-func (fs *Storage) HasXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) (bool, error) {
+func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
 	if _, ok := fs.xorbIndex.Get(xorbHash); ok {
 		return true, nil
 	}
@@ -404,7 +404,7 @@ func (r *lockedXorbRange) Close() error {
 }
 
 // GetXorbRangeReadCloser holds the cached handle lock until the returned reader closes.
-func (fs *Storage) GetXorbRangeReadCloser(_ context.Context, _ string, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+func (fs *Storage) GetXorbRangeReadCloser(_ context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
 	xf, err := fs.openXorb(xorbHash)
 	if err != nil {
 		return nil, err
@@ -420,7 +420,7 @@ func (fs *Storage) GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.
 
 // GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded
 // at ingest, loading the owning shard and matching its file metadata.
-func (fs *Storage) GetFileHashBySHA256(ctx context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
+func (fs *Storage) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xet.FileHash, error) {
 	sh, err := fs.getShardBySHA256(digest)
 	if err != nil {
 		return xet.FileHash{}, err
@@ -452,16 +452,16 @@ func (fs *Storage) getShardBySHA256(digest [32]byte) (*shard.Shard, error) {
 	return fs.getShardByHash(shardHash)
 }
 
-func (fs *Storage) GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error) {
+func (fs *Storage) GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error) {
 	sh, err := fs.getShardBySHA256(sha256)
 	if err != nil {
 		return nil, fmt.Errorf("get shard by sha256: %w", err)
 	}
-	return storage.NewReconstructedFile(ctx, fs, namespace, sh, sha256)
+	return storage.NewReconstructedFile(ctx, fs, sh, sha256)
 }
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
-func (fs *Storage) GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
+func (fs *Storage) GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error) {
 	shardHash, err := fs.caches.Chunks.GetOrLoad(chunkHash, func() (string, error) {
 		b, err := os.ReadFile(fs.objectPath("index/chunks", chunkHash.String()))
 		if err != nil {
@@ -565,7 +565,7 @@ func (fs *Storage) WalkShards(ctx context.Context, fn func(shardHash string, siz
 }
 
 // WalkXorbs calls fn for every stored xorb object.
-func (fs *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (fs *Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	return fs.walkHashedObjects(ctx, "xorbs", fn)
 }
 
@@ -652,7 +652,7 @@ func (fs *Storage) DeleteShard(ctx context.Context, shardHash string) error {
 }
 
 // DeleteXorb removes a stored xorb object.
-func (fs *Storage) DeleteXorb(ctx context.Context, _ string, xorbHash xet.XorbHash) error {
+func (fs *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
 	// Evict before removing: OnEvicted closes the cached handle once any
 	// in-flight read through it finishes, and Windows cannot delete a file
 	// that still has an open handle.
@@ -727,12 +727,12 @@ func (fs *Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string)
 }
 
 // GetXorbURL generates a URL for accessing xorb data
-func (fs *Storage) GetXorbURL(_ context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
+func (fs *Storage) GetXorbURL(_ context.Context, xorbHash xet.XorbHash) (string, error) {
 	if fs.baseURL == "" {
 		// If no base URL is configured, return a relative path
-		return fmt.Sprintf("/v1/xorbs/%s/%s", namespace, xorbHash.String()), nil
+		return fmt.Sprintf("/v1/xorbs/default/%s", xorbHash.String()), nil
 	}
-	return fmt.Sprintf("%s/v1/xorbs/%s/%s", fs.baseURL, namespace, xorbHash.String()), nil
+	return fmt.Sprintf("%s/v1/xorbs/default/%s", fs.baseURL, xorbHash.String()), nil
 }
 
 // GetXorbDataRange returns the [start, end] byte range (inclusive) within
@@ -742,7 +742,7 @@ func (fs *Storage) GetXorbURL(_ context.Context, namespace string, xorbHash xet.
 // compression type) when it downloads that byte range.
 // Ranges are computed from cached per-xorb chunk offsets, so the xorb file is
 // only read (footer or full scan) the first time it is seen.
-func (fs *Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
+func (fs *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
 	offsets, err := fs.xorbChunkOffsets(xorbHash)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
@@ -752,7 +752,7 @@ func (fs *Storage) GetXorbDataRange(ctx context.Context, _ string, xorbHash xet.
 
 // GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
 // the first read.
-func (fs *Storage) GetXorbChunkOffsets(_ context.Context, _ string, xorbHash xet.XorbHash) ([]uint64, error) {
+func (fs *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
 	return fs.xorbChunkOffsets(xorbHash)
 }
 

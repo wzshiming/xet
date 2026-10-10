@@ -165,7 +165,7 @@ func notFound(kind, name string) error {
 }
 
 // PutXorb validates the stream into a private copy; dedup hits leave the stored object untouched.
-func (s *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+func (s *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	if _, exists := s.get("xorbs", xorbHash.String()); exists {
 		return false, nil
 	}
@@ -177,12 +177,12 @@ func (s *Storage) PutXorb(ctx context.Context, _ string, xorbHash xet.XorbHash, 
 }
 
 // GetXorbURL routes through the CAS server's xorb endpoint, absolute when a base URL is set.
-func (s *Storage) GetXorbURL(_ context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
-	return fmt.Sprintf("%s/v1/xorbs/%s/%s", s.baseURL, namespace, xorbHash.String()), nil
+func (s *Storage) GetXorbURL(_ context.Context, xorbHash xet.XorbHash) (string, error) {
+	return fmt.Sprintf("%s/v1/xorbs/default/%s", s.baseURL, xorbHash.String()), nil
 }
 
 // GetXorbReadSeekCloser returns an independent reader over the stored xorb bytes.
-func (s *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+func (s *Storage) GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
 	obj, ok := s.get("xorbs", xorbHash.String())
 	if !ok {
 		return nil, notFound("xorb", xorbHash.String())
@@ -191,13 +191,13 @@ func (s *Storage) GetXorbReadSeekCloser(ctx context.Context, _ string, xorbHash 
 }
 
 // HasXorb checks whether an xorb exists.
-func (s *Storage) HasXorb(_ context.Context, _ string, xorbHash xet.XorbHash) (bool, error) {
+func (s *Storage) HasXorb(_ context.Context, xorbHash xet.XorbHash) (bool, error) {
 	_, ok := s.get("xorbs", xorbHash.String())
 	return ok, nil
 }
 
 // GetXorbChunkOffsets returns the xorb's cumulative packed chunk end-offsets.
-func (s *Storage) GetXorbChunkOffsets(_ context.Context, _ string, xorbHash xet.XorbHash) ([]uint64, error) {
+func (s *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
 	obj, ok := s.get("xorbs", xorbHash.String())
 	if !ok {
 		return nil, notFound("xorb", xorbHash.String())
@@ -210,8 +210,8 @@ func (s *Storage) GetXorbChunkOffsets(_ context.Context, _ string, xorbHash xet.
 }
 
 // GetXorbDataRange returns the inclusive [start, end] byte range of chunks [chunkStart, chunkEnd).
-func (s *Storage) GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := s.GetXorbChunkOffsets(ctx, namespace, xorbHash)
+func (s *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
+	offsets, err := s.GetXorbChunkOffsets(ctx, xorbHash)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
 	}
@@ -219,7 +219,7 @@ func (s *Storage) GetXorbDataRange(ctx context.Context, namespace string, xorbHa
 }
 
 // GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-func (s *Storage) GetXorbRangeReadCloser(_ context.Context, _ string, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+func (s *Storage) GetXorbRangeReadCloser(_ context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
 	obj, ok := s.get("xorbs", xorbHash.String())
 	if !ok {
 		return nil, notFound("xorb", xorbHash.String())
@@ -261,12 +261,12 @@ func (s *Storage) GetShard(_ context.Context, fileHash xet.FileHash) (*shard.Sha
 }
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication).
-func (s *Storage) GetShardByChunkHash(_ context.Context, _ string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
+func (s *Storage) GetShardByChunkHash(_ context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error) {
 	return s.shardByIndex("index/chunks", chunkHash.String())
 }
 
 // GetFileHashBySHA256 resolves a SHA-256 digest to the xet file hash recorded at ingest.
-func (s *Storage) GetFileHashBySHA256(_ context.Context, _ string, digest [32]byte) (xet.FileHash, error) {
+func (s *Storage) GetFileHashBySHA256(_ context.Context, digest [32]byte) (xet.FileHash, error) {
 	sh, err := s.shardByIndex("index/sha256", shard.NewSHA256Hash(digest).String())
 	if err != nil {
 		return xet.FileHash{}, err
@@ -279,12 +279,12 @@ func (s *Storage) GetFileHashBySHA256(_ context.Context, _ string, digest [32]by
 }
 
 // GetReconstructedFile returns a ReadSeekCloser for the file recorded under the SHA-256 digest.
-func (s *Storage) GetReconstructedFile(ctx context.Context, namespace string, digest [32]byte) (io.ReadSeekCloser, error) {
+func (s *Storage) GetReconstructedFile(ctx context.Context, digest [32]byte) (io.ReadSeekCloser, error) {
 	sh, err := s.shardByIndex("index/sha256", shard.NewSHA256Hash(digest).String())
 	if err != nil {
 		return nil, fmt.Errorf("get shard by sha256: %w", err)
 	}
-	return storage.NewReconstructedFile(ctx, s, namespace, sh, digest)
+	return storage.NewReconstructedFile(ctx, s, sh, digest)
 }
 
 // GetShardByHash loads a stored shard by the hash of its serialized bytes; the error wraps fs.ErrNotExist when absent.
@@ -303,7 +303,7 @@ func (s *Storage) WalkShards(ctx context.Context, fn func(shardHash string, size
 }
 
 // WalkXorbs calls fn for every stored xorb object.
-func (s *Storage) WalkXorbs(ctx context.Context, _ string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (s *Storage) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	return s.walkObjects(ctx, "xorbs", fn)
 }
 
@@ -338,7 +338,7 @@ func (s *Storage) DeleteShard(_ context.Context, shardHash string) error {
 }
 
 // DeleteXorb removes a stored xorb object.
-func (s *Storage) DeleteXorb(_ context.Context, _ string, xorbHash xet.XorbHash) error {
+func (s *Storage) DeleteXorb(_ context.Context, xorbHash xet.XorbHash) error {
 	s.delete("xorbs", xorbHash.String())
 	return nil
 }

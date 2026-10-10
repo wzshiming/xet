@@ -18,31 +18,32 @@ type Storage interface {
 	// Xorb objects: content-addressed chunk data under xorbs/.
 
 	// PutXorb stores an xorb by its hash
-	PutXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash, r io.Reader) (bool, error)
+	PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error)
 
 	// HasXorb checks whether an xorb exists.
-	HasXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) (bool, error)
+	HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error)
 
-	// GetXorbURL generates a URL for accessing xorb data
-	GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error)
+	// GetXorbURL generates a URL for accessing xorb data.
+	// A URL routed through the CAS carries xet-core's fixed /v1/xorbs/default/ prefix.
+	GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error)
 
 	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
-	GetXorbReadSeekCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
+	GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
 
 	// GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-	GetXorbRangeReadCloser(ctx context.Context, namespace string, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error)
+	GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error)
 
 	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
-	GetXorbDataRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
+	GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 
 	// GetXorbChunkOffsets returns cumulative packed chunk ends, wrapping fs.ErrNotExist when absent.
-	GetXorbChunkOffsets(ctx context.Context, namespace string, xorbHash xet.XorbHash) ([]uint64, error)
+	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)
 
 	// WalkXorbs calls fn for every stored xorb object.
-	WalkXorbs(ctx context.Context, namespace string, fn func(xorbHash string, size int64, modTime time.Time) error) error
+	WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error
 
 	// DeleteXorb removes a stored xorb object.
-	DeleteXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) error
+	DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error
 
 	// Shard objects: serialized shards under shards/, resolved through the indexes.
 
@@ -53,7 +54,7 @@ type Storage interface {
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)
 
 	// GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
-	GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.ChunkHash) (*shard.Shard, error)
+	GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error)
 
 	// GetShardByHash loads by serialized shard hash, wrapping fs.ErrNotExist when absent.
 	GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error)
@@ -70,10 +71,10 @@ type Storage interface {
 	// File lookups by content SHA-256 through index/sha256.
 
 	// GetReconstructedFile returns a ReadSeekCloser for a file reconstructed from a shard by its SHA-256 digest.
-	GetReconstructedFile(ctx context.Context, namespace string, sha256 [32]byte) (io.ReadSeekCloser, error)
+	GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error)
 
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest, wrapping fs.ErrNotExist when the digest is unknown.
-	GetFileHashBySHA256(ctx context.Context, namespace string, sha256 [32]byte) (xet.FileHash, error)
+	GetFileHashBySHA256(ctx context.Context, sha256 [32]byte) (xet.FileHash, error)
 
 	// GC index access: walks, cache-bypassing reads and deletes of index entries.
 

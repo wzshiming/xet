@@ -51,11 +51,11 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	})
 }
 
-func (h *hookedGCStore) WalkXorbs(ctx context.Context, namespace string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.Storage.WalkXorbs(ctx, namespace, func(xorbHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
 }
@@ -241,7 +241,7 @@ func TestSweepGraceShieldsDedupedXorbs(t *testing.T) {
 	if len(res.SweptXorbs) != 0 {
 		t.Fatalf("deduplicated xorb swept: %+v", res.SweptXorbs)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("shielded xorb removed")
 	}
 }
@@ -361,7 +361,7 @@ func TestSweepStepAbortsOnContextCancel(t *testing.T) {
 		if _, err := st.GetShardByHash(ctx, f.ShardHash); !errors.Is(err, iofs.ErrNotExist) {
 			t.Fatalf("shard load = %v, want ErrNotExist", err)
 		}
-		if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); ok {
+		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); ok {
 			t.Fatal("xorb still stored after both steps")
 		}
 	}
@@ -419,7 +419,7 @@ func TestSweepLoadContextErrorAborts(t *testing.T) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard gone after aborted sweep: %v", err)
 	}
-	if ok, _ := st.HasXorb(ctx, "default", f.XorbHashes[0]); !ok {
+	if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 		t.Fatal("xorb gone after aborted sweep")
 	}
 }

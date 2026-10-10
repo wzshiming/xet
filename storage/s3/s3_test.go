@@ -59,7 +59,7 @@ func newTestS3Storage(t *testing.T, opts ...Option) *Storage {
 
 // Offsets are cached per process, so a range read is where a xorb deleted elsewhere first goes missing.
 func TestS3StorageMissingXorbRangeIsNotExist(t *testing.T) {
-	if _, err := newTestS3Storage(t).GetXorbRangeReadCloser(context.Background(), "default", xet.XorbHash{1}, 0, 9); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := newTestS3Storage(t).GetXorbRangeReadCloser(context.Background(), xet.XorbHash{1}, 0, 9); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("GetXorbRangeReadCloser(missing) = %v, want fs.ErrNotExist", err)
 	}
 }
@@ -69,15 +69,15 @@ func TestS3StorageVanishedXorbReadIsNotExist(t *testing.T) {
 	ctx := context.Background()
 	ss := newTestS3Storage(t)
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("chunk"))
-	if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+	if _, err := ss.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 		t.Fatal(err)
 	}
-	rc, err := ss.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+	rc, err := ss.GetXorbReadSeekCloser(ctx, xorbHash)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	if err := ss.DeleteXorb(ctx, "default", xorbHash); err != nil {
+	if err := ss.DeleteXorb(ctx, xorbHash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := rc.Read(make([]byte, 1)); !errors.Is(err, fs.ErrNotExist) {
@@ -96,16 +96,16 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	}
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, chunks...)
 
-	if ok, err := ss.HasXorb(ctx, "default", xorbHash); err != nil || ok {
+	if ok, err := ss.HasXorb(ctx, xorbHash); err != nil || ok {
 		t.Fatalf("HasXorb() before put = %v, %v", ok, err)
 	}
-	if inserted, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil || !inserted {
+	if inserted, err := ss.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil || !inserted {
 		t.Fatalf("PutXorb() = %v, %v", inserted, err)
 	}
-	if inserted, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil || inserted {
+	if inserted, err := ss.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil || inserted {
 		t.Fatalf("PutXorb() repeat = %v, %v", inserted, err)
 	}
-	if ok, err := ss.HasXorb(ctx, "default", xorbHash); err != nil || !ok {
+	if ok, err := ss.HasXorb(ctx, xorbHash); err != nil || !ok {
 		t.Fatalf("HasXorb() after put = %v, %v", ok, err)
 	}
 
@@ -113,15 +113,15 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	bad := append([]byte(nil), encoded...)
 	bad[10] ^= 0xff
 	otherHash := xet.XorbHash{42}
-	if _, err := ss.PutXorb(ctx, "default", otherHash, bytes.NewReader(bad)); err == nil {
+	if _, err := ss.PutXorb(ctx, otherHash, bytes.NewReader(bad)); err == nil {
 		t.Fatal("PutXorb() accepted a corrupted xorb")
 	}
-	if ok, err := ss.HasXorb(ctx, "default", otherHash); err != nil || ok {
+	if ok, err := ss.HasXorb(ctx, otherHash); err != nil || ok {
 		t.Fatalf("HasXorb() after failed put = %v, %v", ok, err)
 	}
 
 	// Full sequential read.
-	rsc, err := ss.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+	rsc, err := ss.GetXorbReadSeekCloser(ctx, xorbHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ChunkDataRange(%d, %d): %v", start, end, err)
 			}
-			gotStart, gotEnd, err := ss.GetXorbDataRange(ctx, "default", xorbHash, start, end)
+			gotStart, gotEnd, err := ss.GetXorbDataRange(ctx, xorbHash, start, end)
 			if err != nil {
 				t.Fatalf("GetXorbDataRange(%d, %d): %v", start, end, err)
 			}
@@ -171,7 +171,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 		}
 	}
 
-	if _, err := ss.GetXorbReadSeekCloser(ctx, "default", xet.XorbHash{9}); err == nil {
+	if _, err := ss.GetXorbReadSeekCloser(ctx, xet.XorbHash{9}); err == nil {
 		t.Fatal("GetXorbReadSeekCloser() found a missing xorb")
 	}
 }
@@ -312,19 +312,19 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 		t.Fatal("loaded wrong shard")
 	}
 
-	byChunk, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(parts[0]))
+	byChunk, err := fresh.GetShardByChunkHash(ctx, xet.ComputeChunkHash(parts[0]))
 	if err != nil {
 		t.Fatalf("GetShardByChunkHash: %v", err)
 	}
 	if byChunk.Files[0].FileHash != fileHash {
 		t.Fatal("chunk index resolved wrong shard")
 	}
-	if _, err := fresh.GetShardByChunkHash(ctx, "default", xet.ChunkHash{99}); err == nil {
+	if _, err := fresh.GetShardByChunkHash(ctx, xet.ChunkHash{99}); err == nil {
 		t.Fatal("GetShardByChunkHash() found a missing chunk")
 	}
 
 	digest := sha256.Sum256(fileData)
-	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, "default", digest)
+	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		t.Fatalf("GetFileHashBySHA256: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 		t.Fatal("SHA-256 index resolved wrong file hash")
 	}
 
-	f, err := fresh.GetReconstructedFile(ctx, "default", digest)
+	f, err := fresh.GetReconstructedFile(ctx, digest)
 	if err != nil {
 		t.Fatalf("GetReconstructedFile: %v", err)
 	}
@@ -419,11 +419,11 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 	ss := newTestS3Storage(t)
 
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("presign me"))
-	if _, err := ss.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+	if _, err := ss.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 		t.Fatal(err)
 	}
 
-	u, err := ss.GetXorbURL(ctx, "default", xorbHash)
+	u, err := ss.GetXorbURL(ctx, xorbHash)
 	if err != nil {
 		t.Fatalf("GetXorbURL() error: %v", err)
 	}
@@ -456,13 +456,13 @@ func TestS3StorageGetXorbURL(t *testing.T) {
 
 	// Disabled presigning falls back to the server-served xorb path.
 	plain := newTestS3Storage(t, WithPresign(false))
-	if got, err := plain.GetXorbURL(ctx, "ns", xorbHash); err != nil || got != "/v1/xorbs/ns/"+xorbHash.String() {
+	if got, err := plain.GetXorbURL(ctx, xorbHash); err != nil || got != "/v1/xorbs/default/"+xorbHash.String() {
 		t.Fatalf("GetXorbURL() with presign disabled = %q, %v", got, err)
 	}
 
 	// A distinct presign endpoint moves only the URL host, not the API client.
 	public := newTestS3Storage(t, WithPresignEndpoint("http://public.example:9000"))
-	got, err := public.GetXorbURL(ctx, "default", xorbHash)
+	got, err := public.GetXorbURL(ctx, xorbHash)
 	if err != nil {
 		t.Fatalf("GetXorbURL() with presign endpoint error: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestS3StorageGetXorbURLPresignsWithCallerContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	var xorbHash xet.XorbHash
-	if _, err := ss.GetXorbURL(ctx, "default", xorbHash); err != nil {
+	if _, err := ss.GetXorbURL(ctx, xorbHash); err != nil {
 		t.Fatalf("GetXorbURL() error: %v", err)
 	}
 	if seen == nil || seen.Value(ctxKey{}) != "request" {
@@ -575,7 +575,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(parts[0])
-	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, "default", digest)
+	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		t.Fatalf("GetFileHashBySHA256 after retry: %v", err)
 	}
@@ -585,7 +585,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	if _, err := fresh.GetShard(ctx, fileHash); err != nil {
 		t.Fatalf("GetShard after retry: %v", err)
 	}
-	if _, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(parts[0])); err != nil {
+	if _, err := fresh.GetShardByChunkHash(ctx, xet.ComputeChunkHash(parts[0])); err != nil {
 		t.Fatalf("GetShardByChunkHash after retry: %v", err)
 	}
 }
@@ -602,7 +602,7 @@ func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
 	f1 := storagetest.PutFile(t, ctx, ss, [][]byte{shared, []byte("unique to file one")})
 
 	// Warm the chunk cache: the shared chunk resolves to f1's shard.
-	sh, err := ss.GetShardByChunkHash(ctx, "default", f1.ChunkHashes[0])
+	sh, err := ss.GetShardByChunkHash(ctx, f1.ChunkHashes[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
 	}
 
 	// A fresh resolution must follow the overwritten entry, not the cache.
-	sh, err = ss.GetShardByChunkHash(ctx, "default", f2.ChunkHashes[0])
+	sh, err = ss.GetShardByChunkHash(ctx, f2.ChunkHashes[0])
 	if err != nil {
 		t.Fatal(err)
 	}

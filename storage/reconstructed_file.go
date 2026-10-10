@@ -15,13 +15,12 @@ import (
 // implemented in terms of reconstruction entries, so http.ServeContent can
 // provide HEAD and byte-range responses without materializing the whole file.
 type reconstructedFile struct {
-	ctx       context.Context
-	storage   Storage
-	namespace string
-	entries   []shard.FileDataSequenceEntry
-	offsets   []int64
-	size      int64
-	position  int64
+	ctx      context.Context
+	storage  Storage
+	entries  []shard.FileDataSequenceEntry
+	offsets  []int64
+	size     int64
+	position int64
 
 	entryIndex int
 	xorb       io.ReadSeekCloser
@@ -45,7 +44,7 @@ func FindFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
 }
 
 // NewReconstructedFile exposes the file in sh whose recorded SHA-256 is digest.
-func NewReconstructedFile(ctx context.Context, stor Storage, namespace string, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
+func NewReconstructedFile(ctx context.Context, stor Storage, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
 	file := FindFileBySHA256(sh, digest)
 	if file == nil {
 		return nil, fmt.Errorf("SHA-256 is not present in shard")
@@ -54,7 +53,6 @@ func NewReconstructedFile(ctx context.Context, stor Storage, namespace string, s
 	r := &reconstructedFile{
 		ctx:        ctx,
 		storage:    stor,
-		namespace:  namespace,
 		entries:    file.Entries,
 		entryIndex: -1,
 	}
@@ -168,11 +166,11 @@ func (r *reconstructedFile) initOffsets() {
 func (r *reconstructedFile) openEntry(index int, skip int64) error {
 	r.closeEntry()
 	entry := r.entries[index]
-	f, err := r.storage.GetXorbReadSeekCloser(r.ctx, r.namespace, entry.CASHash)
+	f, err := r.storage.GetXorbReadSeekCloser(r.ctx, entry.CASHash)
 	if err != nil {
 		return err
 	}
-	start, end, err := r.storage.GetXorbDataRange(r.ctx, r.namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+	start, end, err := r.storage.GetXorbDataRange(r.ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 	if err != nil {
 		f.Close()
 		return err

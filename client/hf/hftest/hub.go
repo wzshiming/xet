@@ -357,7 +357,7 @@ func (h *Hub) lookup(r *http.Request, oid string) (xet.FileHash, bool) {
 	if err != nil || len(digest) != sha256.Size || h.opts.Storage == nil {
 		return xet.FileHash{}, false
 	}
-	hash, err := h.opts.Storage.GetFileHashBySHA256(r.Context(), "default", [sha256.Size]byte(digest))
+	hash, err := h.opts.Storage.GetFileHashBySHA256(r.Context(), [sha256.Size]byte(digest))
 	return hash, err == nil
 }
 
@@ -403,7 +403,7 @@ func (h *Hub) cdn(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	content, err := h.opts.Storage.GetReconstructedFile(r.Context(), "default", [sha256.Size]byte(digest))
+	content, err := h.opts.Storage.GetReconstructedFile(r.Context(), [sha256.Size]byte(digest))
 	if err != nil {
 		http.NotFound(w, r)
 		return
