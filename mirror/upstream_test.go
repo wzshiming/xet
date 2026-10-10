@@ -89,28 +89,28 @@ func TestMirrorXetUpstreamPerURL(t *testing.T) {
 	upB := newXetUpstream(t, "/org/b/resolve/main/f.bin", dataB, "cas-token-b")
 	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
 
-	inA, err := m.Mirror.Ingest(upA.hubURL+"/org/a/resolve/main/f.bin", "hub-token-a")
+	resA, err := m.Mirror.Resolve(context.Background(), upA.hubURL+"/org/a/resolve/main/f.bin", "hub-token-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	inB, err := m.Mirror.Ingest(upB.hubURL+"/org/b/resolve/main/f.bin", "hub-token-b")
+	resB, err := m.Mirror.Resolve(context.Background(), upB.hubURL+"/org/b/resolve/main/f.bin", "hub-token-b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, inA.Done(), "upstream A ingest")
-	awaitClosed(t, inB.Done(), "upstream B ingest")
+	awaitClosed(t, doneOf(resA), "upstream A ingest")
+	awaitClosed(t, doneOf(resB), "upstream B ingest")
 	for _, tc := range []struct {
 		name         string
-		in           *Ingestion
+		res          *Resolution
 		up           *xetUpstream
 		data         []byte
 		token, other string
 		hubToken     string
 	}{
-		{"A", inA, upA, dataA, "Bearer cas-token-a", "Bearer cas-token-b", "Bearer hub-token-a"},
-		{"B", inB, upB, dataB, "Bearer cas-token-b", "Bearer cas-token-a", "Bearer hub-token-b"},
+		{"A", resA, upA, dataA, "Bearer cas-token-a", "Bearer cas-token-b", "Bearer hub-token-a"},
+		{"B", resB, upB, dataB, "Bearer cas-token-b", "Bearer cas-token-a", "Bearer hub-token-b"},
 	} {
-		entry, err := tc.in.Entry()
+		entry, err := entryOf(tc.res)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -142,12 +142,12 @@ func TestMirrorIdentityIgnoresOrigin(t *testing.T) {
 	m, stor := newTestMirror(t, srvA.URL, t.TempDir(), t.TempDir())
 
 	for _, tc := range []struct{ url, token string }{{srvA.URL + path, "tok-a"}, {srvB.URL + path, "tok-b"}} {
-		in, err := m.Mirror.Ingest(tc.url, tc.token)
+		res, err := m.Mirror.Resolve(context.Background(), tc.url, tc.token)
 		if err != nil {
 			t.Fatal(err)
 		}
-		awaitClosed(t, in.Done(), tc.url)
-		entry, err := in.Entry()
+		awaitClosed(t, doneOf(res), tc.url)
+		entry, err := entryOf(res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -191,13 +191,13 @@ func TestIngestSharingScopedByOrigin(t *testing.T) {
 		t.Cleanup(srv.Close)
 		return srv
 	}
-	ingest := func(m *testMirror, srv *httptest.Server, path string) *Ingestion {
+	resolve := func(m *testMirror, srv *httptest.Server, path string) *Resolution {
 		t.Helper()
-		in, err := m.Mirror.Ingest(srv.URL+path, "")
+		res, err := m.Mirror.Resolve(context.Background(), srv.URL+path, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return in
+		return res
 	}
 
 	t.Run("in-flight leader", func(t *testing.T) {
@@ -211,11 +211,11 @@ func TestIngestSharingScopedByOrigin(t *testing.T) {
 		t.Cleanup(release) // Close blocks on the gated handler
 		m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
 
-		inA := ingest(m, srvA, pathA)
+		resA := resolve(m, srvA, pathA)
 		awaitClosed(t, upA.gateHit, "origin A transfer")
-		inB := ingest(m, srvB, pathB)
-		awaitClosed(t, inB.Done(), "origin B ingest while origin A is gated")
-		entryB, err := inB.Entry()
+		resB := resolve(m, srvB, pathB)
+		awaitClosed(t, doneOf(resB), "origin B ingest while origin A is gated")
+		entryB, err := entryOf(resB)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -223,8 +223,8 @@ func TestIngestSharingScopedByOrigin(t *testing.T) {
 			t.Fatalf("origin B entry sha256 = %s after %d data GETs, want %s after its own download", entryB.SHA256, upB.dataGETs.Load(), hashHex(string(data)))
 		}
 		release()
-		awaitClosed(t, inA.Done(), "origin A ingest")
-		entryA, err := inA.Entry()
+		awaitClosed(t, doneOf(resA), "origin A ingest")
+		entryA, err := entryOf(resA)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -356,9 +356,6 @@ func TestMirrorRejectsNonResolveURL(t *testing.T) {
 	for _, raw := range []string{srv.URL + "/org/repo/tree/main", srv.URL + "/org/repo/resolve/main/", "hub.example/org/repo/resolve/main/f.bin", "://x"} {
 		if _, err := m.Mirror.Resolve(ctx, raw, ""); err == nil {
 			t.Errorf("Resolve(%q) succeeded", raw)
-		}
-		if _, err := m.Mirror.Ingest(raw, ""); err == nil {
-			t.Errorf("Ingest(%q) succeeded", raw)
 		}
 	}
 	if _, err := m.FetchUpstream(ctx, "hub.example/api/models/org/repo", ""); err == nil {

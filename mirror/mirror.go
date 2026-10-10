@@ -75,8 +75,7 @@ const (
 )
 
 // ErrUpstreamNotFound reports that the upstream hub has no file at the
-// requested key. Errors returned by Resolve and Ingest match it with
-// errors.Is.
+// requested key. Errors returned by Resolve match it with errors.Is.
 var ErrUpstreamNotFound = errors.New("upstream file not found")
 
 // resolveKey identifies one (repo, rev, path) file and keys the in-memory

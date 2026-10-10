@@ -41,7 +41,7 @@ func TestIngestFollowerSharesFailure(t *testing.T) {
 	t.Cleanup(srv.Close)
 	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
 
-	a, err := m.Ingest("org/repo", "main", "a.bin")
+	a, err := m.Resolve(context.Background(), "org/repo", "main", "a.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,14 +58,14 @@ func TestIngestFollowerSharesFailure(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	b, err := m.Ingest("org/repo", "main", "b.bin")
+	b, err := m.Resolve(context.Background(), "org/repo", "main", "b.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, a.Done(), "leader ingest")
-	awaitClosed(t, b.Done(), "follower ingest")
-	_, errA := a.Entry()
-	_, errB := b.Entry()
+	awaitClosed(t, doneOf(a), "leader ingest")
+	awaitClosed(t, doneOf(b), "follower ingest")
+	_, errA := entryOf(a)
+	_, errB := entryOf(b)
 	if errA == nil || errB == nil || errA.Error() != errB.Error() {
 		t.Fatalf("leader err = %v, follower err = %v; want the follower to fail with the leader's error", errA, errB)
 	}
@@ -402,12 +402,7 @@ func TestMirrorFailedTaskDropsPartial(t *testing.T) {
 	// First ingest: the upstream serves one partial body then fails hard, so
 	// the task fails with partial progress, and each retry must have resumed
 	// from the previous offset.
-	in, err := m.Ingest("org/repo", "main", "flaky.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-in.Done()
-	if _, err := in.Entry(); err == nil {
+	if _, err := ingestWait(t, m, "org/repo", "main", "flaky.bin"); err == nil {
 		t.Fatal("ingest against a failing upstream unexpectedly succeeded")
 	}
 
@@ -426,12 +421,7 @@ func TestMirrorFailedTaskDropsPartial(t *testing.T) {
 	up.heal()
 	clearBackoff(m, resolvePath)
 	before := len(offsets)
-	in, err = m.Ingest("org/repo", "main", "flaky.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-in.Done()
-	entry, err := in.Entry()
+	entry, err := ingestWait(t, m, "org/repo", "main", "flaky.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,12 +494,7 @@ func TestMirrorStalePartialDiscarded(t *testing.T) {
 	const resolvePath = "/org/repo/resolve/main/stale.bin"
 	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), t.TempDir())
 
-	in, err := m.Ingest("org/repo", "main", "stale.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-in.Done()
-	if _, err := in.Entry(); err == nil {
+	if _, err := ingestWait(t, m, "org/repo", "main", "stale.bin"); err == nil {
 		t.Fatal("ingest against a failing upstream unexpectedly succeeded")
 	}
 	before := len(up.rangeOffsets())
@@ -527,12 +512,7 @@ func TestMirrorStalePartialDiscarded(t *testing.T) {
 	up.mu.Unlock()
 
 	clearBackoff(m, resolvePath)
-	in, err = m.Ingest("org/repo", "main", "stale.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-in.Done()
-	entry, err := in.Entry()
+	entry, err := ingestWait(t, m, "org/repo", "main", "stale.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,12 +542,12 @@ func TestMirrorStalledPlainFetchResumes(t *testing.T) {
 	// Shorten the upstream read-idle guard below the shared auth injector.
 	m.probeClient.Transport.(*authInjector).inner = client.NewIdleTimeoutTransport(http.DefaultTransport.(*http.Transport).Clone(), 200*time.Millisecond)
 
-	in, err := m.Ingest("org/repo", "main", "stall.bin")
+	res, err := m.Resolve(context.Background(), "org/repo", "main", "stall.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, in.Done(), "stalled ingest")
-	entry, err := in.Entry()
+	awaitClosed(t, doneOf(res), "stalled ingest")
+	entry, err := entryOf(res)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,12 +724,12 @@ func TestMirrorStalledXetFetchResumes(t *testing.T) {
 	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithClientOptions(client.WithIdleTimeout(200*time.Millisecond)))
 	t.Cleanup(func() { close(up.abort) }) // runs first: unblocks a still-stalled handler before servers close
 
-	in, err := m.Ingest("org/repo", "main", "stall.bin")
+	res, err := m.Resolve(context.Background(), "org/repo", "main", "stall.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, in.Done(), "stalled xet ingest")
-	entry, err := in.Entry()
+	awaitClosed(t, doneOf(res), "stalled xet ingest")
+	entry, err := entryOf(res)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -801,12 +781,12 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 	m, stor := newTestMirror(t, up.hubURL, t.TempDir(), cacheDir, WithClientOptions(client.WithIdleTimeout(200*time.Millisecond), client.WithCache(own)))
 	t.Cleanup(func() { close(up.abort) })
 
-	in, err := m.Ingest("org/repo", "main", "slow.bin")
+	res, err := m.Resolve(context.Background(), "org/repo", "main", "slow.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, in.Done(), "slow xet ingest")
-	entry, err := in.Entry()
+	awaitClosed(t, doneOf(res), "slow xet ingest")
+	entry, err := entryOf(res)
 	if err != nil {
 		t.Fatalf("continuously progressing transfer failed: %v", err)
 	}

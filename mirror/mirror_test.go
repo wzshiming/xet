@@ -48,13 +48,9 @@ func (m *testMirror) Resolve(ctx context.Context, repo, rev, path string) (*Reso
 	return m.Mirror.Resolve(ctx, resolveURL(m.upstream, repo, rev, path), m.token)
 }
 
-func (m *testMirror) Ingest(repo, rev, path string) (*Ingestion, error) {
-	return m.Mirror.Ingest(resolveURL(m.upstream, repo, rev, path), m.token)
-}
-
 // newTestMirror builds an engine over a file storage rooted at storageDir,
 // pointed at the given upstream. No HTTP surface is involved: tests drive the
-// engine through Ingest and Resolve.
+// engine through Resolve.
 func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, opts ...Option) (*testMirror, storage.Storage) {
 	t.Helper()
 
@@ -497,12 +493,7 @@ func TestMirrorIndexLayout(t *testing.T) {
 	cacheDir := t.TempDir()
 	m, _ := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
 
-	in, err := m.Ingest("Qwen/Qwen3-0.6B", "main", "f.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-in.Done()
-	entry, err := in.Entry()
+	entry, err := ingestWait(t, m, "Qwen/Qwen3-0.6B", "main", "f.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,14 +692,46 @@ func rawSource(t *testing.T, path string) string {
 	return src
 }
 
+// ingestWait resolves the file and waits for its ingest: the ready entry, or the terminal failure.
 func ingestWait(t *testing.T, m *testMirror, repo, rev, path string) (*Entry, error) {
 	t.Helper()
-	in, err := m.Ingest(repo, rev, path)
+	res, err := m.Resolve(context.Background(), repo, rev, path)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	<-in.Done()
-	return in.Entry()
+	return entryOf(res)
+}
+
+// entryOf waits for res's ingest, if any, and returns the ready entry or the terminal failure.
+func entryOf(res *Resolution) (*Entry, error) {
+	if res.Stream == nil {
+		return res.Entry, nil
+	}
+	<-res.Stream.Done()
+	tk := res.Stream.t
+	if tk.err != nil {
+		return nil, tk.err
+	}
+	return exportEntry(tk.key, tk.entry), nil
+}
+
+// doneOf returns a channel closed once res's ingest finished, already closed for a ready entry.
+func doneOf(res *Resolution) <-chan struct{} {
+	if res.Stream != nil {
+		return res.Stream.Done()
+	}
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: timed out", what)
+	}
 }
 
 // wantPseudo spells out the pseudo-commit scheme the index must keep using.
@@ -993,7 +1016,7 @@ func TestMirrorUnpinnableBranch(t *testing.T) {
 			t.Fatalf("%s: err = %v, want not-found %v", tc.path, err, tc.notFound)
 		}
 		if _, err := ingestWait(t, m, "org/repo", "main", tc.path); err == nil {
-			t.Fatalf("%s: Ingest succeeded against an unpinnable branch", tc.path)
+			t.Fatalf("%s: ingest succeeded against an unpinnable branch", tc.path)
 		}
 		if _, err := m.Resolve(ctx, "org/repo", "main", tc.path); err == nil {
 			t.Fatalf("%s: repeated Resolve succeeded", tc.path)
@@ -1119,7 +1142,7 @@ func TestMirrorConcurrentPublish(t *testing.T) {
 			m, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
 			var release sync.Once
 			t.Cleanup(func() { release.Do(func() { close(hold) }) })
-			slow, err := m.Ingest("org/repo", "main", "slow.bin")
+			slow, err := m.Resolve(context.Background(), "org/repo", "main", "slow.bin")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1129,8 +1152,7 @@ func TestMirrorConcurrentPublish(t *testing.T) {
 			ingestAll(m, "f")
 			check(n)
 			release.Do(func() { close(hold) })
-			<-slow.Done()
-			if _, err := slow.Entry(); err != nil {
+			if _, err := entryOf(slow); err != nil {
 				t.Fatal(err)
 			}
 			if man := readManifest(t, manifestPath); man.Files["slow.bin"] == nil || len(man.Files) != n+1 {
@@ -2044,7 +2066,7 @@ func TestMirrorObsoleteSourceFailureIgnored(t *testing.T) {
 	t.Cleanup(func() { release.Do(func() { close(hold) }) })
 	ctx := context.Background()
 
-	// Ingest would join the held flight by its original request key.
+	// The synthetic pin's ingest stays parked on the held download while main moves on.
 	first, err := m.Resolve(ctx, "org/repo", "main", "f.bin")
 	if err != nil || first.Stream == nil {
 		t.Fatalf("first resolve = %+v, %v; want an in-flight stream", first, err)
@@ -2484,12 +2506,12 @@ func TestMirrorRepoContainingResolve(t *testing.T) {
 	pseudo := wantPseudo("org", "x")
 
 	m, stor := newTestMirror(t, srv.URL, storageDir, cacheDir)
-	in, err := m.Mirror.Ingest(srv.URL+path, "")
+	res, err := m.Mirror.Resolve(context.Background(), srv.URL+path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, in.Done(), "ingest")
-	entry, err := in.Entry()
+	awaitClosed(t, doneOf(res), "ingest")
+	entry, err := entryOf(res)
 	if err != nil || entry.Commit != pseudo {
 		t.Fatalf("ingest = %+v, %v; want pseudo commit %s of (org, x)", entry, err, pseudo)
 	}
@@ -2504,7 +2526,7 @@ func TestMirrorRepoContainingResolve(t *testing.T) {
 	}
 
 	m2, _ := newTestMirror(t, srv.URL, storageDir, cacheDir)
-	res, err := m2.Mirror.Resolve(context.Background(), srv.URL+path, "")
+	res, err = m2.Mirror.Resolve(context.Background(), srv.URL+path, "")
 	if err != nil || res.Entry == nil || res.Entry.SHA256 != entry.SHA256 {
 		t.Fatalf("Resolve after restart = %+v, %v; want the cached entry", res, err)
 	}
@@ -2532,27 +2554,27 @@ func TestMirrorUpstreamPerURL(t *testing.T) {
 	t.Cleanup(srvB.Close)
 	m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
 
-	inA, err := m.Mirror.Ingest(srvA.URL+"/org/a/resolve/main/f.bin", "tok-a")
+	resA, err := m.Mirror.Resolve(context.Background(), srvA.URL+"/org/a/resolve/main/f.bin", "tok-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	inB, err := m.Mirror.Ingest(srvB.URL+"/datasets/org/b%20c/resolve/main/f.bin", "tok-b")
+	resB, err := m.Mirror.Resolve(context.Background(), srvB.URL+"/datasets/org/b%20c/resolve/main/f.bin", "tok-b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	awaitClosed(t, inA.Done(), "hub A ingest")
-	awaitClosed(t, inB.Done(), "hub B ingest")
+	awaitClosed(t, doneOf(resA), "hub A ingest")
+	awaitClosed(t, doneOf(resB), "hub B ingest")
 	for _, tc := range []struct {
 		name         string
-		in           *Ingestion
+		res          *Resolution
 		up           *plainUpstream
 		data         []byte
 		token, other string
 	}{
-		{"A", inA, upA, dataA, "Bearer tok-a", "Bearer tok-b"},
-		{"B", inB, upB, dataB, "Bearer tok-b", "Bearer tok-a"},
+		{"A", resA, upA, dataA, "Bearer tok-a", "Bearer tok-b"},
+		{"B", resB, upB, dataB, "Bearer tok-b", "Bearer tok-a"},
 	} {
-		entry, err := tc.in.Entry()
+		entry, err := entryOf(tc.res)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -2844,12 +2866,12 @@ func TestMirrorXetDownloadsShareCache(t *testing.T) {
 
 	ingest := func(up *xetUpstream, path string, data []byte) {
 		t.Helper()
-		in, err := m.Mirror.Ingest(up.hubURL+path, "")
+		res, err := m.Mirror.Resolve(context.Background(), up.hubURL+path, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		awaitClosed(t, in.Done(), path)
-		entry, err := in.Entry()
+		awaitClosed(t, doneOf(res), path)
+		entry, err := entryOf(res)
 		if err != nil {
 			t.Fatal(err)
 		}
