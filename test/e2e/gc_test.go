@@ -455,16 +455,20 @@ func gcListFiles(t *testing.T, baseURL string) []storage.FileListEntry {
 
 func gcSweep(t *testing.T, baseURL, query string) storage.SweepResult {
 	t.Helper()
-	resp := doRequest(t, http.MethodPost, baseURL+"/internal/gc/sweep"+query, nil)
+	resp := doRequest(t, http.MethodPost, baseURL+"/internal/gc"+query, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("sweep status = %d", resp.StatusCode)
 	}
 	var res struct {
 		Storage storage.SweepResult `json:"storage"`
+		Errors  []string            `json:"errors"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		t.Fatal(err)
+	}
+	if len(res.Errors) != 0 {
+		t.Fatalf("sweep errors = %v", res.Errors)
 	}
 	return res.Storage
 }
