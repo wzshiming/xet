@@ -41,7 +41,7 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 		t.Fatal(err)
 	}
 	xorbHash := encoder.SummoryHash()
-	if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+	if _, err := stor.PutXorb(ctx, xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
 		t.Fatal(err)
 	}
 	chunkHash := xet.ComputeChunkHash(content)
@@ -186,7 +186,7 @@ func TestInternalDeniedMutations(t *testing.T) {
 		if _, err := fs.GetShard(ctx, fileHash); err != nil {
 			t.Fatalf("file entry changed after denied mutation: %v", err)
 		}
-		if _, err := fs.GetFileHashBySHA256(ctx, "default", digest); err != nil {
+		if _, err := fs.GetFileHashBySHA256(ctx, digest); err != nil {
 			t.Fatalf("SHA256 entry changed after denied mutation: %v", err)
 		}
 	}

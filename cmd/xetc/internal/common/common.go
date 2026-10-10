@@ -33,11 +33,10 @@ func baseName(p string) string {
 	return p
 }
 
-// Options returns the client options every xetc transfer uses: namespace, concurrency, chunk cache and progress reporting to out.
-func Options(namespace string, concurrency int, cacheDir string, out io.Writer) []client.Options {
+// Options returns the client options every xetc transfer uses: concurrency, chunk cache and progress reporting to out.
+func Options(concurrency int, cacheDir string, out io.Writer) []client.Options {
 	progressSummary := newProgressSummary()
 	return []client.Options{
-		client.WithNamespace(namespace),
 		client.WithProgressFunc(func(name string, current, total int64) {
 			progressSummary.Update(baseName(name), current, total)
 			progressSummary.Output(out)
@@ -79,7 +78,7 @@ func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile s
 	if err != nil {
 		return fmt.Errorf("resolve download target: %w", err)
 	}
-	cli, err := hf.NewClient(repo, hf.WithToken(token), hf.WithClientOptions(Options("default", concurrency, cacheDir, out)...))
+	cli, err := hf.NewClient(repo, hf.WithToken(token), hf.WithClientOptions(Options(concurrency, cacheDir, out)...))
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}

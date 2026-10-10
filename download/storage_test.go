@@ -32,7 +32,7 @@ func (c storageClient) DownloadXorbWithURL(ctx context.Context, url string, head
 	if _, err := fmt.Sscanf(header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
 		return nil, fmt.Errorf("parse range %q: %w", header.Get("Range"), err)
 	}
-	return c.st.GetXorbRangeReadCloser(ctx, "default", xorbHash, start, end)
+	return c.st.GetXorbRangeReadCloser(ctx, xorbHash, start, end)
 }
 
 func (storageClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
@@ -46,10 +46,10 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 	_, _ = rand.NewChaCha8([32]byte{}).Read(random)
 	first := slices.Concat(random[:1<<20], random[:1<<19])
 	second := slices.Concat(first[:len(first)/2], random[1<<20:])
-	if _, err := storage.PutFile(ctx, st, "default", bytes.NewReader(first)); err != nil {
+	if _, err := storage.PutFile(ctx, st, bytes.NewReader(first)); err != nil {
 		t.Fatal(err)
 	}
-	fileHash, err := storage.PutFile(ctx, st, "default", bytes.NewReader(second))
+	fileHash, err := storage.PutFile(ctx, st, bytes.NewReader(second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 
 	readers := map[string]func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error){
 		"v1": func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error) {
-			resp, err := BuildReconstructionResponseV1(ctx, st, "default", sh, fileHash, rangeHeader)
+			resp, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, rangeHeader)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -85,7 +85,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 			return r, ExpectedLengthV1(resp), err
 		},
 		"v2": func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error) {
-			resp, err := BuildReconstructionResponseV2(ctx, st, "default", sh, fileHash, rangeHeader)
+			resp, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, rangeHeader)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -112,7 +112,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				rc, err := st.GetReconstructedFile(ctx, "default", sha256.Sum256(second))
+				rc, err := st.GetReconstructedFile(ctx, sha256.Sum256(second))
 				if err != nil {
 					t.Fatal(err)
 				}

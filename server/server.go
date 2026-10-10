@@ -76,19 +76,20 @@ func NewHandler(opts ...Option) *Handler {
 func (s *Handler) registerRoutes() {
 	// Defined in specification but not used by xet-core, so we can leave these commented out for now.
 	// s.root.HandleFunc("/api/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
-	// s.root.HandleFunc("/api/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	// s.root.HandleFunc("/api/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	// s.root.HandleFunc("/api/v1/xorbs/{prefix}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	// s.root.HandleFunc("/api/v1/chunks/{prefix}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	// s.root.HandleFunc("/api/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 
 	// Used by xet-core but not defined in specification.
 	s.root.HandleFunc("/v2/reconstructions/{file_hash}", s.handleGetReconstructionV2).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/reconstructions/{file_hash}", s.handleGetReconstruction).Methods(http.MethodGet)
 	s.root.HandleFunc("/reconstructions", s.handleBatchGetReconstruction).Methods(http.MethodGet)
-	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
-	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleHasXorb).Methods(http.MethodHead)
-	s.root.HandleFunc("/v1/xorbs/{namespace}/{xorb_hash}", s.handleDownloadXorb).Methods(http.MethodGet)
-	s.root.HandleFunc("/v1/chunks/{namespace}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
-	s.root.HandleFunc("/v1/chunks/{namespace}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
+	// {prefix} is xet-core's fixed default segment; handlers ignore it.
+	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleHasXorb).Methods(http.MethodHead)
+	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleDownloadXorb).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/chunks/{prefix}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
+	s.root.HandleFunc("/v1/chunks/{prefix}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 	s.root.HandleFunc("/v2/shards", s.handleUploadShardV2).Methods(http.MethodPost)
 	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
@@ -119,7 +120,7 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := s.storage.GetReconstructedFile(r.Context(), "default", digest)
+	content, err := s.storage.GetReconstructedFile(r.Context(), digest)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -132,14 +133,13 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, sh256Hash, time.Time{}, content)
 }
 
-// handleHasXorb handles HEAD /v1/xorbs/{namespace}/{xorb_hash}
+// handleHasXorb handles HEAD /v1/xorbs/{prefix}/{xorb_hash}
 func (s *Handler) handleHasXorb(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
 
 	vars := mux.Vars(r)
-	namespace := vars["namespace"]
 	xorbHashStr := vars["xorb_hash"]
 
 	xorbHash, err := xet.ParseXorbHash(xorbHashStr)
@@ -148,7 +148,7 @@ func (s *Handler) handleHasXorb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exists, err := s.storage.HasXorb(r.Context(), namespace, xorbHash)
+	exists, err := s.storage.HasXorb(r.Context(), xorbHash)
 	if err != nil {
 		http.Error(w, "Failed to check xorb", http.StatusInternalServerError)
 		return
@@ -213,8 +213,8 @@ type requestBaseStorage struct {
 	base string
 }
 
-func (s requestBaseStorage) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
-	u, err := s.StorageAdapter.GetXorbURL(ctx, namespace, xorbHash)
+func (s requestBaseStorage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error) {
+	u, err := s.StorageAdapter.GetXorbURL(ctx, xorbHash)
 	if err != nil {
 		return "", err
 	}
@@ -254,7 +254,7 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	}
 
 	// Build reconstruction response
-	response, err := download.BuildReconstructionResponseV1(r.Context(), s.reconstructionStorage(r), "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV1(r.Context(), s.reconstructionStorage(r), shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -307,7 +307,7 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 			// Skip files not found; caller can check which hashes are absent.
 			continue
 		}
-		single, err := download.BuildReconstructionResponseV1(r.Context(), recStorage, "default", sh, fileHash, "")
+		single, err := download.BuildReconstructionResponseV1(r.Context(), recStorage, sh, fileHash, "")
 		if err != nil {
 			continue
 		}
@@ -349,7 +349,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Build V2 reconstruction response
-	response, err := download.BuildReconstructionResponseV2(r.Context(), s.reconstructionStorage(r), "default", shard, fileHash, r.Header.Get("Range"))
+	response, err := download.BuildReconstructionResponseV2(r.Context(), s.reconstructionStorage(r), shard, fileHash, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -359,7 +359,7 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleUploadXorb handles POST /v1/xorbs/{namespace}/{xorb_hash}
+// handleUploadXorb handles POST /v1/xorbs/{prefix}/{xorb_hash}
 func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
@@ -372,7 +372,6 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
-	namespace := vars["namespace"]
 	xorbHashStr := vars["xorb_hash"]
 
 	// Parse xorb hash
@@ -387,7 +386,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	body = io.LimitReader(body, r.ContentLength)
 
 	// Store xorb directly. PutXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.PutXorb(r.Context(), namespace, xorbHash, body)
+	wasInserted, err := s.storage.PutXorb(r.Context(), xorbHash, body)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
@@ -402,12 +401,11 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// handleDownloadXorb handles GET /v1/xorbs/{namespace}/{xorb_hash}
+// handleDownloadXorb handles GET /v1/xorbs/{prefix}/{xorb_hash}
 func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	// Served without authorization: xet clients fetch the URLs from reconstruction responses without credentials.
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
-	namespace := vars["namespace"]
 	xorbHashStr := vars["xorb_hash"]
 
 	// Parse xorb hash
@@ -418,7 +416,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get xorb object
-	xorbReader, err := s.storage.GetXorbReadSeekCloser(r.Context(), namespace, xorbHash)
+	xorbReader, err := s.storage.GetXorbReadSeekCloser(r.Context(), xorbHash)
 	if err != nil {
 		http.Error(w, "Xorb not found", http.StatusNotFound)
 		return
@@ -491,7 +489,7 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 	}
 
 	for _, casBlock := range shardObj.CASInfos {
-		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
+		exists, err := s.storage.HasXorb(r.Context(), casBlock.CASHash)
 		if err != nil || !exists {
 			return false, http.StatusBadRequest, fmt.Errorf("invalid shard: referenced xorb not uploaded")
 		}
@@ -523,7 +521,7 @@ func (s *Handler) authorizeShardFiles(r *http.Request, sh *shard.Shard) error {
 	return nil
 }
 
-// handleQueryChunk handles GET /v1/chunks/{namespace}/{chunk_hash}
+// handleQueryChunk handles GET /v1/chunks/{prefix}/{chunk_hash}
 func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
@@ -531,7 +529,6 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 
 	// Extract parameters from path using mux
 	vars := mux.Vars(r)
-	namespace := vars["namespace"]
 	chunkHashStr := vars["chunk_hash"]
 
 	// Parse chunk hash
@@ -542,7 +539,7 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Query for chunk
-	shardObj, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
+	shardObj, err := s.storage.GetShardByChunkHash(r.Context(), chunkHash)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -567,14 +564,11 @@ func (s *Handler) handleQueryChunk(w http.ResponseWriter, r *http.Request) {
 // maxChunkQueryBodyBytes caps a batch query body; 1 MiB is roughly 15k chunk hashes.
 const maxChunkQueryBodyBytes = 1 << 20
 
-// handleQueryChunksBatch handles POST /v1/chunks/{namespace}:query.
+// handleQueryChunksBatch handles POST /v1/chunks/{prefix}:query.
 func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
-
-	vars := mux.Vars(r)
-	namespace := vars["namespace"]
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChunkQueryBodyBytes))
 	var tooLarge *http.MaxBytesError
@@ -598,7 +592,7 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
-		shardObj, err := s.storage.GetShardByChunkHash(r.Context(), namespace, chunkHash)
+		shardObj, err := s.storage.GetShardByChunkHash(r.Context(), chunkHash)
 		if err != nil || shardObj == nil {
 			results = append(results, res)
 			continue

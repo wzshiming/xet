@@ -158,7 +158,7 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(content)
-	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, "default", digest)
+	gotFileHash, err := fresh.GetFileHashBySHA256(ctx, digest)
 	if err != nil {
 		t.Fatalf("GetFileHashBySHA256 after retry: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	if _, err := fresh.GetShard(ctx, fileHash); err != nil {
 		t.Fatalf("GetShard after retry: %v", err)
 	}
-	if _, err := fresh.GetShardByChunkHash(ctx, "default", xet.ComputeChunkHash(content)); err != nil {
+	if _, err := fresh.GetShardByChunkHash(ctx, xet.ComputeChunkHash(content)); err != nil {
 		t.Fatalf("GetShardByChunkHash after retry: %v", err)
 	}
 }
@@ -270,7 +270,7 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				t.Fatal(err)
 			}
 			encoded, xorbHash := storagetest.EncodeXorb(t, format.withFooter, chunks...)
-			if _, err := fs.PutXorb(context.Background(), "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+			if _, err := fs.PutXorb(context.Background(), xorbHash, bytes.NewReader(encoded)); err != nil {
 				t.Fatal(err)
 			}
 
@@ -280,7 +280,7 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 					if err != nil {
 						t.Fatalf("ChunkDataRange(%d, %d): %v", start, end, err)
 					}
-					gotStart, gotEnd, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, start, end)
+					gotStart, gotEnd, err := fs.GetXorbDataRange(context.Background(), xorbHash, start, end)
 					if err != nil {
 						t.Fatalf("GetXorbDataRange(%d, %d): %v", start, end, err)
 					}
@@ -290,7 +290,7 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				}
 			}
 
-			if _, _, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, 0, numChunks+1); err == nil {
+			if _, _, err := fs.GetXorbDataRange(context.Background(), xorbHash, 0, numChunks+1); err == nil {
 				t.Fatal("GetXorbDataRange() accepted out-of-bounds chunk range")
 			}
 
@@ -298,7 +298,7 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 			if err := os.Remove(fs.objectPath("xorbs", xorbHash.String())); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err := fs.GetXorbDataRange(context.Background(), "default", xorbHash, 1, 2); err != nil {
+			if _, _, err := fs.GetXorbDataRange(context.Background(), xorbHash, 1, 2); err != nil {
 				t.Fatalf("GetXorbDataRange() after xorb removal: %v", err)
 			}
 		})
@@ -394,7 +394,7 @@ func (r *stepReader) Read(p []byte) (int, error) {
 func putXorbAsync(fs *Storage, xorbHash xet.XorbHash, r io.Reader) <-chan error {
 	done := make(chan error, 1)
 	go func() {
-		_, err := fs.PutXorb(context.Background(), "default", xorbHash, r)
+		_, err := fs.PutXorb(context.Background(), xorbHash, r)
 		done <- err
 	}()
 	return done

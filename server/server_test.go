@@ -48,7 +48,7 @@ func authorizerFixture(t *testing.T) (storage.Storage, xet.FileHash, xet.XorbHas
 	chunkHash := xet.ComputeChunkHash(data)
 	fileHash := xet.ComputeFileHash([]xet.ChunkHash{chunkHash}, []uint64{uint64(len(data))})
 	digest := sha256.Sum256(data)
-	if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+	if _, err := stor.PutXorb(ctx, xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
 		t.Fatal(err)
 	}
 	shardObj := shard.NewShard()
@@ -85,6 +85,29 @@ type recordingAuthorizer struct {
 func (authorizer *recordingAuthorizer) Authorize(r *http.Request, grant auth.Grant) error {
 	authorizer.calls = append(authorizer.calls, grant)
 	return authorizer.err
+}
+
+// The prefix segment is xet-core's fixed "default" (OpenAPI lists "default-merkledb" for chunks); the server accepts any value and ignores it.
+func TestXorbAndChunkRoutesIgnorePrefix(t *testing.T) {
+	stor, _, xorbHash, chunkHash, _, xorbBytes, _ := authorizerFixture(t)
+	handler := NewHandler(WithStorage(stor), WithAuthorizer(&recordingAuthorizer{}))
+	for _, test := range []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{"HEAD", "/v1/xorbs/default-merkledb/" + xorbHash.String(), nil},
+		{"GET", "/v1/xorbs/other/" + xorbHash.String(), nil},
+		{"POST", "/v1/xorbs/other/" + xorbHash.String(), xorbBytes},
+		{"GET", "/v1/chunks/default-merkledb/" + chunkHash.String(), nil},
+		{"POST", "/v1/chunks/other:query", fmt.Appendf(nil, `{"chunk_hashes":[%q]}`, chunkHash.String())},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(test.method, test.path, bytes.NewReader(test.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: status = %d: %s", test.method, test.path, rec.Code, rec.Body)
+		}
+	}
 }
 
 func TestRoutesConsultAuthorizer(t *testing.T) {
@@ -213,7 +236,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d: %s", rec.Code, rec.Body)
 		}
-		if exists, err := target.HasXorb(context.Background(), "default", xorbHash); err != nil || !exists {
+		if exists, err := target.HasXorb(context.Background(), xorbHash); err != nil || !exists {
 			t.Fatalf("uploaded xorb exists = %v, err = %v", exists, err)
 		}
 	})
@@ -246,7 +269,7 @@ func TestBoundTokensMatchRequestTarget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := target.PutXorb(context.Background(), "default", xorbHash, bytes.NewReader(xorbBytes)); err != nil {
+			if _, err := target.PutXorb(context.Background(), xorbHash, bytes.NewReader(xorbBytes)); err != nil {
 				t.Fatal(err)
 			}
 			shardObj := shard.NewShard()
@@ -321,7 +344,7 @@ func TestShardUploadHashMismatchIsNotRetryable(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(xorbBytes)); err != nil {
+				if _, err := stor.PutXorb(ctx, xorbHash, bytes.NewReader(xorbBytes)); err != nil {
 					t.Fatal(err)
 				}
 				shardObj := shard.NewShard()
@@ -418,7 +441,7 @@ type untouchedStorage struct {
 	t *testing.T
 }
 
-func (s *untouchedStorage) HasXorb(context.Context, string, xet.XorbHash) (bool, error) {
+func (s *untouchedStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) {
 	s.t.Error("HasXorb called for a rejected shard upload")
 	return false, errors.New("rejected upload")
 }
@@ -739,7 +762,7 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 			t.Fatal(err)
 		}
 		xorbHash := encoder.SummoryHash()
-		if _, err := stor.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+		if _, err := stor.PutXorb(ctx, xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
 			t.Fatal(err)
 		}
 		chunkHash := xet.ComputeChunkHash(part)
@@ -881,9 +904,9 @@ type chunkQueryTestStorage struct {
 	lookups int
 }
 
-func (s *chunkQueryTestStorage) GetShardByChunkHash(ctx context.Context, namespace string, chunkHash xet.ChunkHash) (*shard.Shard, error) {
+func (s *chunkQueryTestStorage) GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error) {
 	s.lookups++
-	return s.Storage.GetShardByChunkHash(ctx, namespace, chunkHash)
+	return s.Storage.GetShardByChunkHash(ctx, chunkHash)
 }
 
 func TestQueryChunksBatchBodyLimit(t *testing.T) {

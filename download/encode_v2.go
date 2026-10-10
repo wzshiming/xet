@@ -11,7 +11,7 @@ import (
 // BuildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
 // The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
 // into multi-range fetch entries for more efficient downloading.
-func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, namespace string, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV2, error) {
+func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV2, error) {
 	// Find the file block for this file hash
 	var fileBlock *shard.FileBlock
 	for i := range sh.Files {
@@ -80,7 +80,7 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		response.Terms = append(response.Terms, term)
 
 		// Calculate byte ranges for this term
-		startByte, endByte, err := storage.GetXorbDataRange(ctx, namespace, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		startByte, endByte, err := storage.GetXorbDataRange(ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}
@@ -101,7 +101,7 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 	// A more sophisticated implementation could group consecutive/nearby ranges
 	for xorbHashStr, ranges := range xorbFetchRanges {
 		xorbHash, _ := xet.ParseXorbHash(xorbHashStr)
-		xorbURL, err := storage.GetXorbURL(ctx, namespace, xorbHash)
+		xorbURL, err := storage.GetXorbURL(ctx, xorbHash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb URL: %w", err)
 		}

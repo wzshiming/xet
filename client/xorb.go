@@ -22,7 +22,7 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, c.namespace, xorbHash.String())
+	url := fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
@@ -69,7 +69,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, c.namespace, xorbHash.String())
+	url := fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String())
 
 	makeBody := func() (io.ReadCloser, error) {
 		if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
@@ -112,15 +112,15 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 
 // DownloadXorb fetches the raw xorb bytes for the given hash directly from
 // the bound CAS server. The caller must close the returned ReadCloser.
-func (c *Client) DownloadXorb(ctx context.Context, namespace string, xorbHash xet.XorbHash) (io.ReadCloser, error) {
+func (c *Client) DownloadXorb(ctx context.Context, xorbHash xet.XorbHash) (io.ReadCloser, error) {
 	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	return c.DownloadXorbWithURL(ctx, fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String()), nil)
+	return c.DownloadXorbWithURL(ctx, fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String()), nil)
 }
 
-// DownloadXorb downloads a xorb from a URL and returns a streaming Decoder.
+// DownloadXorbWithURL downloads a xorb from a URL and returns a streaming Decoder.
 // The caller must call Decoder.Close() when done to release the underlying HTTP connection.
 func (c *Client) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -172,7 +172,7 @@ func isExactWholeRangeResponse(req *http.Request, resp *http.Response) bool {
 	return resp.ContentLength == end-start+1
 }
 
-// DownloadXorbsMultipart sends one multi-range request and returns the multipart reader.
+// DownloadXorbsMultipartWithURL sends one multi-range request and returns the multipart reader.
 // Caller must close the returned closer.
 func (c *Client) DownloadXorbsMultipartWithURL(ctx context.Context, url string, header http.Header) (*multipart.Reader, io.Closer, error) {
 	if len(header) == 0 {
@@ -259,10 +259,10 @@ func (c *Client) FetchXorbRangeWithURL(ctx context.Context, rawURL string, heade
 
 // FetchXorbRange fetches a raw xorb byte range from the bound CAS server
 // endpoint. Useful as a fallback when no CDN URL is known for a given xorb hash.
-func (c *Client) FetchXorbRange(ctx context.Context, namespace string, xorbHash xet.XorbHash, header http.Header) (*http.Response, error) {
+func (c *Client) FetchXorbRange(ctx context.Context, xorbHash xet.XorbHash, header http.Header) (*http.Response, error) {
 	ctx, baseURL, err := c.casContext(ctx, auth.Read)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	return c.FetchXorbRangeWithURL(ctx, fmt.Sprintf("%s/v1/xorbs/%s/%s", baseURL, namespace, xorbHash.String()), header)
+	return c.FetchXorbRangeWithURL(ctx, fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String()), header)
 }

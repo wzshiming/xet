@@ -114,7 +114,7 @@ func (c *Client) newShardUploadRequest(ctx context.Context, version string, shar
 	}
 	req.ContentLength = int64(len(bodyBytes))
 	req.Header.Set("Content-Type", "application/octet-stream")
-	return req, c.dedupScope(baseURL), nil
+	return req, baseURL, nil
 }
 
 // uploadShardV2 performs a single /v2/shards upload attempt, caching the shard's chunk locations on success.
@@ -205,7 +205,7 @@ func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, c
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/v1/chunks/%s/%s", baseURL, c.namespace, chunkHash.String())
+	url := fmt.Sprintf("%s/v1/chunks/default/%s", baseURL, chunkHash.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -240,11 +240,6 @@ func (c *Client) QueryDedupShard(ctx context.Context, chunkHash xet.ChunkHash, c
 	return shardObj.ResolveChunks(append([]xet.ChunkHash{chunkHash}, candidates...)...), nil
 }
 
-// dedupScope names the CAS whose xorb locations the cache entries describe; the length prefix keeps a namespace with slashes from aliasing another base URL.
-func (c *Client) dedupScope(baseURL string) string {
-	return fmt.Sprintf("%d:%s/%s", len(baseURL), baseURL, c.namespace)
-}
-
 // QueryDedupShards resolves chunkHashes and candidates from the cached chunk locations first, then the batch endpoint (or per-chunk queries when it is unavailable), fetching hit shards while candidates around them are still unresolved; hashes the CAS does not store are absent from the result.
 func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHash, candidates ...xet.ChunkHash) (results map[xet.ChunkHash]shard.ChunkLocation, err error) {
 	if len(chunkHashes) == 0 {
@@ -257,8 +252,7 @@ func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHa
 
 	// Probes double as keyed-shard candidates so one fetched shard settles every probe it lists.
 	candidates = append(slices.Clone(chunkHashes), candidates...)
-	scope := c.dedupScope(baseURL)
-	local := c.cache.Upload.Lookup(ctx, scope, candidates)
+	local := c.cache.Upload.Lookup(ctx, baseURL, candidates)
 	results = make(map[xet.ChunkHash]shard.ChunkLocation, len(chunkHashes)+len(local))
 	maps.Copy(results, local)
 	remaining := make([]xet.ChunkHash, 0, len(chunkHashes))
@@ -284,7 +278,7 @@ func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHa
 			return nil, fmt.Errorf("marshal batch chunk query: %w", err)
 		}
 
-		url := fmt.Sprintf("%s/v1/chunks/%s:query", baseURL, c.namespace)
+		url := fmt.Sprintf("%s/v1/chunks/default:query", baseURL)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, fmt.Errorf("create batch request: %w", err)
@@ -344,7 +338,7 @@ func (c *Client) QueryDedupShards(ctx context.Context, chunkHashes []xet.ChunkHa
 			learned[h] = loc
 		}
 	}
-	_ = c.cache.Upload.Store(scope, learned)
+	_ = c.cache.Upload.Store(baseURL, learned)
 	return results, nil
 }
 

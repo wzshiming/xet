@@ -27,7 +27,6 @@ type Client struct {
 	provider      UpstreamProvider
 	httpClient    *http.Client
 	getHttpClient *http.Client
-	namespace     string
 	concurrency   int
 	retries       int
 	idleTimeout   time.Duration
@@ -41,13 +40,6 @@ type Options func(*Client)
 func WithHTTPClient(httpClient *http.Client) Options {
 	return func(c *Client) {
 		c.httpClient = httpClient
-	}
-}
-
-// WithNamespace sets the namespace for the client, which is used to scope resources on the server.
-func WithNamespace(namespace string) Options {
-	return func(c *Client) {
-		c.namespace = namespace
 	}
 }
 
@@ -104,7 +96,6 @@ func WithUpstreamProvider(provider UpstreamProvider) Options {
 func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
 		httpClient:  &http.Client{},
-		namespace:   "default",
 		concurrency: 4,
 		retries:     5,
 		idleTimeout: DefaultIdleTimeout,

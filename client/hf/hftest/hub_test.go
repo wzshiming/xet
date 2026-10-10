@@ -32,11 +32,11 @@ import (
 type storeCAS struct{ storage.Storage }
 
 func (s storeCAS) HasXorb(ctx context.Context, h xet.XorbHash) (bool, error) {
-	return s.Storage.HasXorb(ctx, "default", h)
+	return s.Storage.HasXorb(ctx, h)
 }
 
 func (s storeCAS) UploadXorb(ctx context.Context, h xet.XorbHash, r io.ReadSeeker) (*upload.XorbUploadResponse, error) {
-	inserted, err := s.Storage.PutXorb(ctx, "default", h, r)
+	inserted, err := s.Storage.PutXorb(ctx, h, r)
 	return &upload.XorbUploadResponse{WasInserted: inserted}, err
 }
 

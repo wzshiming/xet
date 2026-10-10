@@ -19,19 +19,19 @@ func testPutXorbRejectsWrongIdentity(t *testing.T, b Backend) {
 
 	for _, withFooter := range []bool{false, true} {
 		encoded, _ := EncodeXorb(t, withFooter, chunks...)
-		if _, err := st.PutXorb(ctx, "default", bogus, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "xorb hash mismatch") {
+		if _, err := st.PutXorb(ctx, bogus, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "xorb hash mismatch") {
 			t.Fatalf("PutXorb(bogus hash, footer=%v) error = %v, want xorb hash mismatch", withFooter, err)
 		}
-		if ok, err := st.HasXorb(ctx, "default", bogus); err != nil || ok {
+		if ok, err := st.HasXorb(ctx, bogus); err != nil || ok {
 			t.Fatalf("HasXorb(bogus, footer=%v) = %v, %v; want absent", withFooter, ok, err)
 		}
 	}
 
 	encoded, xorbHash := EncodeXorb(t, false, chunks...)
-	if inserted, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil || !inserted {
 		t.Fatalf("PutXorb(computed hash) = %v, %v; want inserted", inserted, err)
 	}
-	if ok, err := st.HasXorb(ctx, "default", xorbHash); err != nil || !ok {
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
 		t.Fatalf("HasXorb(computed hash) = %v, %v; want present", ok, err)
 	}
 }
@@ -54,15 +54,15 @@ func testPutXorbRejectsForgedChunkSizes(t *testing.T, b Backend) {
 	}
 	forged := xet.ComputeXorbHash(hashes, sizes)
 
-	if _, err := st.PutXorb(ctx, "default", forged, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "chunk size mismatch") {
+	if _, err := st.PutXorb(ctx, forged, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "chunk size mismatch") {
 		t.Fatalf("PutXorb(forged sizes) error = %v, want chunk size mismatch", err)
 	}
-	if ok, err := st.HasXorb(ctx, "default", forged); err != nil || ok {
+	if ok, err := st.HasXorb(ctx, forged); err != nil || ok {
 		t.Fatalf("HasXorb(forged) = %v, %v; want absent", ok, err)
 	}
 
 	honest, xorbHash := EncodeXorb(t, false, payloads...)
-	if inserted, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(honest)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(honest)); err != nil || !inserted {
 		t.Fatalf("PutXorb(honest) = %v, %v; want inserted", inserted, err)
 	}
 }

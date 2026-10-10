@@ -39,7 +39,7 @@ func storeFile(t *testing.T, ctx context.Context, st storage.Storage, data []byt
 	if _, err := r.Seek(int64(len(skipped)), io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	got, err := storage.PutFile(ctx, st, "default", r)
+	got, err := storage.PutFile(ctx, st, r)
 	if err != nil || got != want {
 		t.Fatalf("PutFile() = %s, %v; want %s", got.String(), err, want.String())
 	}
@@ -67,7 +67,7 @@ func assertNewChunks(t *testing.T, ctx context.Context, st storage.Storage, f Fi
 		for _, chunk := range cb.Chunks {
 			got = append(got, chunk.ChunkHash)
 		}
-		rc, err := st.GetXorbReadSeekCloser(ctx, "default", cb.CASHash)
+		rc, err := st.GetXorbReadSeekCloser(ctx, cb.CASHash)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +86,7 @@ func assertNewChunks(t *testing.T, ctx context.Context, st storage.Storage, f Fi
 func countXorbs(t *testing.T, ctx context.Context, st storage.Storage) int {
 	t.Helper()
 	n := 0
-	if err := st.WalkXorbs(ctx, "default", func(string, int64, time.Time) error {
+	if err := st.WalkXorbs(ctx, func(string, int64, time.Time) error {
 		n++
 		return nil
 	}); err != nil {
@@ -129,7 +129,7 @@ func testPutFileReusesStoredChunks(t *testing.T, b Backend) {
 func testPutFileEmpty(t *testing.T, b Backend) {
 	ctx := context.Background()
 	st := b.New(t)
-	fileHash, err := storage.PutFile(ctx, st, "default", bytes.NewReader(nil))
+	fileHash, err := storage.PutFile(ctx, st, bytes.NewReader(nil))
 	if err != nil || fileHash != (xet.FileHash{}) {
 		t.Fatalf("PutFile(empty) = %s, %v; want the zero hash", fileHash.String(), err)
 	}

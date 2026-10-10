@@ -19,7 +19,7 @@ import (
 func addXorbFile(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard, parts [][]byte) File {
 	t.Helper()
 	encoded, xorbHash := EncodeXorb(t, true, parts...)
-	if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 		t.Fatal(err)
 	}
 	f := File{Content: bytes.Join(parts, nil), XorbHashes: []xet.XorbHash{xorbHash}}
@@ -59,7 +59,7 @@ func assertFilesCommitted(t *testing.T, ctx context.Context, st storage.Storage,
 	t.Helper()
 	for _, f := range files {
 		AssertFileIntact(t, ctx, st, f)
-		if got, err := st.GetFileHashBySHA256(ctx, "default", SHA256Digest(f.SHA256Hex)); err != nil || got != f.FileHash {
+		if got, err := st.GetFileHashBySHA256(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.FileHash {
 			t.Fatalf("GetFileHashBySHA256(%s) = %s, %v; want %s", f.SHA256Hex, got.String(), err, f.FileHash.String())
 		}
 	}
@@ -218,7 +218,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 			}
 			assertFilesCommitted(t, ctx, st, f)
 			for _, chunkHash := range f.ChunkHashes {
-				if _, err := st.GetShardByChunkHash(ctx, "default", chunkHash); err != nil {
+				if _, err := st.GetShardByChunkHash(ctx, chunkHash); err != nil {
 					t.Fatalf("GetShardByChunkHash(%s) after honest retry: %v", chunkHash.String(), err)
 				}
 			}

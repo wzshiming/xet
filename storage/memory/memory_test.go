@@ -25,10 +25,10 @@ import (
 func TestGetXorbURLUsesBaseURL(t *testing.T) {
 	var xorbHash xet.XorbHash
 	want := "/v1/xorbs/default/" + xorbHash.String()
-	if got, err := NewStorage().GetXorbURL(context.Background(), "default", xorbHash); err != nil || got != want {
+	if got, err := NewStorage().GetXorbURL(context.Background(), xorbHash); err != nil || got != want {
 		t.Fatalf("GetXorbURL() = %q, %v; want %q", got, err, want)
 	}
-	if got, err := NewStorage(WithBaseURL("http://cas.test")).GetXorbURL(context.Background(), "default", xorbHash); err != nil || got != "http://cas.test"+want {
+	if got, err := NewStorage(WithBaseURL("http://cas.test")).GetXorbURL(context.Background(), xorbHash); err != nil || got != "http://cas.test"+want {
 		t.Fatalf("GetXorbURL() = %q, %v; want %q", got, err, "http://cas.test"+want)
 	}
 }
@@ -39,7 +39,7 @@ func TestPutXorbOwnsDataAndServesIndependentReaders(t *testing.T) {
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("owned chunk"))
 
 	input := slices.Clone(encoded)
-	if inserted, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(input)); err != nil || !inserted {
+	if inserted, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(input)); err != nil || !inserted {
 		t.Fatalf("PutXorb() = %v, %v", inserted, err)
 	}
 	// The caller reuses its buffer; the store must own its own copy.
@@ -47,11 +47,11 @@ func TestPutXorbOwnsDataAndServesIndependentReaders(t *testing.T) {
 		input[i] = 0
 	}
 
-	r1, err := st.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+	r1, err := st.GetXorbReadSeekCloser(ctx, xorbHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := st.GetXorbReadSeekCloser(ctx, "default", xorbHash)
+	r2, err := st.GetXorbReadSeekCloser(ctx, xorbHash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestXorbRangesMatchScanner(t *testing.T) {
 	st := NewStorage()
 	chunks := [][]byte{[]byte("first"), []byte("second chunk"), []byte("3")}
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, chunks...)
-	if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -82,16 +82,16 @@ func TestXorbRangesMatchScanner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start, end, err := st.GetXorbDataRange(ctx, "default", xorbHash, 1, 3)
+	start, end, err := st.GetXorbDataRange(ctx, xorbHash, 1, 3)
 	if err != nil || start != wantStart || end != wantEnd {
 		t.Fatalf("GetXorbDataRange() = [%d, %d], %v; want [%d, %d]", start, end, err, wantStart, wantEnd)
 	}
-	offsets, err := st.GetXorbChunkOffsets(ctx, "default", xorbHash)
+	offsets, err := st.GetXorbChunkOffsets(ctx, xorbHash)
 	if err != nil || len(offsets) != len(chunks) || int64(offsets[2]) != wantEnd+1 {
 		t.Fatalf("GetXorbChunkOffsets() = %v, %v; want %d chunks ending at %d", offsets, err, len(chunks), wantEnd+1)
 	}
 
-	rc, err := st.GetXorbRangeReadCloser(ctx, "default", xorbHash, start, end)
+	rc, err := st.GetXorbRangeReadCloser(ctx, xorbHash, start, end)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,11 +101,11 @@ func TestXorbRangesMatchScanner(t *testing.T) {
 		t.Fatalf("GetXorbRangeReadCloser() = %x, %v; want inclusive range %x", got, err, encoded[start:end+1])
 	}
 
-	if _, _, err := st.GetXorbDataRange(ctx, "default", xorbHash, 0, 4); err == nil {
+	if _, _, err := st.GetXorbDataRange(ctx, xorbHash, 0, 4); err == nil {
 		t.Fatal("GetXorbDataRange() accepted an out-of-bounds chunk range")
 	}
 	var missing xet.XorbHash
-	if _, _, err := st.GetXorbDataRange(ctx, "default", missing, 0, 1); !errors.Is(err, iofs.ErrNotExist) {
+	if _, _, err := st.GetXorbDataRange(ctx, missing, 0, 1); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("GetXorbDataRange(missing) = %v, want fs.ErrNotExist", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestWalksHonorCancellationAndCallbackErrors(t *testing.T) {
 	}
 
 	sentinel := errors.New("stop walking")
-	if err := st.WalkXorbs(ctx, "", func(string, int64, time.Time) error { return sentinel }); !errors.Is(err, sentinel) {
+	if err := st.WalkXorbs(ctx, func(string, int64, time.Time) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("WalkXorbs() = %v, want the callback error", err)
 	}
 	if err := st.WalkSHA256Index(ctx, func(string, string) error { return sentinel }); !errors.Is(err, sentinel) {
@@ -184,7 +184,7 @@ func TestConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range own {
 		wg.Go(func() {
-			if ok, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+			if ok, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 				t.Error(err)
 			} else if ok {
 				xorbInserts.Add(1)
@@ -197,7 +197,7 @@ func TestConcurrentAccess(t *testing.T) {
 			if ok, err := st.PutShard(ctx, own[i]); err != nil || !ok {
 				t.Errorf("PutShard(own %d) = %v, %v", i, ok, err)
 			}
-			rc, err := st.GetReconstructedFile(ctx, "default", sha256.Sum256(contents[i]))
+			rc, err := st.GetReconstructedFile(ctx, sha256.Sum256(contents[i]))
 			if err != nil {
 				t.Error(err)
 				return

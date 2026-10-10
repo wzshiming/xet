@@ -62,7 +62,7 @@ func AddFileBlock(t *testing.T, ctx context.Context, st storage.Storage, shardOb
 	var chunkSizes []uint64
 	for _, part := range parts {
 		encoded, xorbHash := EncodeXorb(t, true, part)
-		if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+		if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 			t.Fatal(err)
 		}
 		chunkHash := xet.ComputeChunkHash(part)
@@ -196,7 +196,7 @@ func AssertFileIntact(t *testing.T, ctx context.Context, st storage.Storage, f F
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 		t.Fatalf("GetShard: %v", err)
 	}
-	rc, err := st.GetReconstructedFile(ctx, "default", SHA256Digest(f.SHA256Hex))
+	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
 	if err != nil {
 		t.Fatalf("GetReconstructedFile: %v", err)
 	}
@@ -258,11 +258,11 @@ func (h *hookedGCStore) WalkShards(ctx context.Context, fn func(shardHash string
 	})
 }
 
-func (h *hookedGCStore) WalkXorbs(ctx context.Context, namespace string, fn func(xorbHash string, size int64, modTime time.Time) error) error {
+func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, size int64, modTime time.Time) error) error {
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.Storage.WalkXorbs(ctx, namespace, func(xorbHash string, size int64, modTime time.Time) error {
+	return h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
 }
@@ -333,7 +333,7 @@ func PutListedFile(t *testing.T, ctx context.Context, st storage.Storage, parts 
 	var storedSize uint64
 	for _, part := range parts {
 		encoded, xorbHash := EncodeXorb(t, true, part)
-		if _, err := st.PutXorb(ctx, "default", xorbHash, bytes.NewReader(encoded)); err != nil {
+		if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
 			t.Fatal(err)
 		}
 		chunkOnly, _ := EncodeXorb(t, false, part)
@@ -370,16 +370,16 @@ func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh 
 	if err != nil || len(shardHash) != 64 {
 		t.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
 	}
-	if ok, err := st.HasXorb(ctx, "default", xorbHash); err != nil || !ok {
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
 		t.Fatalf("HasXorb() = %v, %v", ok, err)
 	}
 	if _, err := st.GetShard(ctx, fileHash); err != nil {
 		t.Fatalf("GetShard(): %v", err)
 	}
-	if _, err := st.GetShardByChunkHash(ctx, "default", chunkHash); err != nil {
+	if _, err := st.GetShardByChunkHash(ctx, chunkHash); err != nil {
 		t.Fatalf("GetShardByChunkHash(): %v", err)
 	}
-	if got, err := st.GetFileHashBySHA256(ctx, "default", digest); err != nil || got != fileHash {
+	if got, err := st.GetFileHashBySHA256(ctx, digest); err != nil || got != fileHash {
 		t.Fatalf("GetFileHashBySHA256() = %s, %v", got, err)
 	}
 
@@ -406,7 +406,7 @@ func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh 
 			return nil
 		}
 	}
-	if err := st.WalkXorbs(ctx, "", collect("xorbs")); err != nil {
+	if err := st.WalkXorbs(ctx, collect("xorbs")); err != nil {
 		t.Fatalf("WalkXorbs(): %v", err)
 	}
 	if err := st.WalkShards(ctx, collect("shards")); err != nil {

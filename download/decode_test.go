@@ -427,31 +427,30 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 
 // recordingStorageAdapter captures what GetXorbURL receives.
 type recordingStorageAdapter struct {
-	ctx       context.Context
-	namespace string
+	ctx context.Context
 }
 
-func (r *recordingStorageAdapter) GetXorbURL(ctx context.Context, namespace string, xorbHash xet.XorbHash) (string, error) {
-	r.ctx, r.namespace = ctx, namespace
-	return "/v1/xorbs/" + namespace + "/" + xorbHash.String(), nil
+func (r *recordingStorageAdapter) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error) {
+	r.ctx = ctx
+	return "/v1/xorbs/default/" + xorbHash.String(), nil
 }
 
-func (r *recordingStorageAdapter) GetXorbDataRange(context.Context, string, xet.XorbHash, uint32, uint32) (int64, int64, error) {
+func (r *recordingStorageAdapter) GetXorbDataRange(context.Context, xet.XorbHash, uint32, uint32) (int64, int64, error) {
 	return 0, 0, nil
 }
 
-func TestBuildReconstructionForwardsContextAndNamespace(t *testing.T) {
+func TestBuildReconstructionForwardsContext(t *testing.T) {
 	type ctxKey struct{}
 	ctx := context.WithValue(context.Background(), ctxKey{}, "request")
 	var fileHash xet.FileHash
 	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash, Entries: []shard.FileDataSequenceEntry{{UnpackedSegBytes: 1, ChunkIndexEnd: 1}}}}}
 	build := map[string]func(StorageAdapter) error{
 		"v1": func(st StorageAdapter) error {
-			_, err := BuildReconstructionResponseV1(ctx, st, "tenant", sh, fileHash, "")
+			_, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, "")
 			return err
 		},
 		"v2": func(st StorageAdapter) error {
-			_, err := BuildReconstructionResponseV2(ctx, st, "tenant", sh, fileHash, "")
+			_, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, "")
 			return err
 		},
 	}
@@ -460,8 +459,8 @@ func TestBuildReconstructionForwardsContextAndNamespace(t *testing.T) {
 		if err := fn(st); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if st.ctx != ctx || st.namespace != "tenant" {
-			t.Fatalf("%s: GetXorbURL got ctx %v, namespace %q; want the caller's ctx and %q", name, st.ctx, st.namespace, "tenant")
+		if st.ctx != ctx {
+			t.Fatalf("%s: GetXorbURL got ctx %v; want the caller's ctx", name, st.ctx)
 		}
 	}
 }
@@ -496,14 +495,14 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 	}
 	build := map[string]func(sh *shard.Shard, header string) (result, error){
 		"v1": func(sh *shard.Shard, header string) (result, error) {
-			resp, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, "tenant", sh, fileHash, header)
+			resp, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, sh, fileHash, header)
 			if err != nil {
 				return result{}, err
 			}
 			return result{resp.Terms, resp.OffsetIntoFirstRange, ExpectedLengthV1(resp)}, nil
 		},
 		"v2": func(sh *shard.Shard, header string) (result, error) {
-			resp, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, "tenant", sh, fileHash, header)
+			resp, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, sh, fileHash, header)
 			if err != nil {
 				return result{}, err
 			}

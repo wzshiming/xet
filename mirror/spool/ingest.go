@@ -40,7 +40,7 @@ func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return Result{}, fmt.Errorf("rewind spool: %w", err)
 		}
-		fileHash, err := storage.PutFile(ctx, st, "default", r)
+		fileHash, err := storage.PutFile(ctx, st, r)
 		if err != nil {
 			return Result{}, fmt.Errorf("ingest into storage: %w", err)
 		}

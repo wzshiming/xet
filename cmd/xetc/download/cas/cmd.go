@@ -14,7 +14,6 @@ func NewCommand() *cobra.Command {
 	var (
 		baseURL     string
 		token       string
-		namespace   string
 		concurrency int
 		cacheDir    string
 		resume      bool
@@ -30,7 +29,7 @@ func NewCommand() *cobra.Command {
 				return fmt.Errorf("invalid file hash: %w", err)
 			}
 
-			cli, err := client.NewClient(append(common.Options(namespace, concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
+			cli, err := client.NewClient(append(common.Options(concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
 			if err != nil {
 				return fmt.Errorf("create client: %w", err)
 			}
@@ -40,7 +39,6 @@ func NewCommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&baseURL, "url", common.DefaultHFCASURL, "CAS server URL")
 	cmd.Flags().StringVar(&token, "token", "", "CAS token")
-	cmd.Flags().StringVar(&namespace, "namespace", "default", "Storage namespace")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of download tasks to run concurrently")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Cache root: <dir>/download holds the chunk cache, <dir>/upload holds upload staging and cached chunk locations (default: <os temp dir>/xet-cache)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")

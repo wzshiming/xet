@@ -171,7 +171,7 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		exists, err := s.storage.HasXorb(r.Context(), "default", casBlock.CASHash)
+		exists, err := s.storage.HasXorb(r.Context(), casBlock.CASHash)
 		if err != nil {
 			callbackMessage = "failed to check referenced xorb"
 			callbackRetryable = true

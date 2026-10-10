@@ -92,7 +92,7 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	cli, err := client.NewClient(append(Options("ns-a", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,8 +111,8 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(requests(), "/v1/xorbs/ns-a/") {
-		t.Fatalf("namespace not propagated, requests:\n%s", requests())
+	if !strings.Contains(requests(), "/v1/xorbs/default/") {
+		t.Fatalf("xorb requests did not use the default CAS prefix, requests:\n%s", requests())
 	}
 
 	for _, tc := range []struct {
@@ -131,7 +131,7 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 			}
 			before := requests()
 			var out bytes.Buffer
-			cli, err := client.NewClient(append(Options("ns-a", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+			cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +171,7 @@ func TestExecuteResolveDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	cli, err := client.NewClient(append(Options("default", 2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
 	if err != nil {
 		t.Fatal(err)
 	}

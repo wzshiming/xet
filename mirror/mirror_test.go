@@ -105,7 +105,7 @@ func readStored(t *testing.T, stor storage.Storage, shaHex string) []byte {
 	if err != nil || len(raw) != sha256.Size {
 		t.Fatalf("bad sha256 digest %q", shaHex)
 	}
-	content, err := stor.GetReconstructedFile(context.Background(), "default", [sha256.Size]byte(raw))
+	content, err := stor.GetReconstructedFile(context.Background(), [sha256.Size]byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
