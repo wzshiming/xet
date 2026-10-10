@@ -79,5 +79,7 @@ var cases = []struct {
 	{"TestPutShardRetryRepairsMissingFileEntry", testPutShardRetryRepairsMissingFileEntry},
 	{"TestPutXorbRejectsWrongIdentity", testPutXorbRejectsWrongIdentity},
 	{"TestPutXorbRejectsForgedChunkSizes", testPutXorbRejectsForgedChunkSizes},
+	{"TestPutFileReusesStoredChunks", testPutFileReusesStoredChunks},
+	{"TestPutFileEmpty", testPutFileEmpty},
 	{"TestUsageCountsObjectsByKind", testUsageCountsObjectsByKind},
 }
