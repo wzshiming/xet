@@ -14,106 +14,57 @@ import (
 	"github.com/wzshiming/xet/storage"
 )
 
-// SpoolSweepResult reports one SweepSpools pass; in a dry run the counts are what a real pass would remove.
-type SpoolSweepResult struct {
-	DryRun         bool  `json:"dry_run"`
-	SweptSpools    int   `json:"swept_spools"`
-	ReclaimedBytes int64 `json:"reclaimed_bytes"`
-}
-
-// SweepSpools removes spool files that no in-flight ingest holds and that
-// were last written before opts.Grace (zero: storage.DefaultSweepGrace;
-// negative: any age); opts.DryRun only reports. A spool that cannot be
-// unlinked is left, uncounted, for the next pass. Anchor, MaxDeletes and
-// Budget do not apply.
-func (m *Mirror) SweepSpools(ctx context.Context, opts storage.SweepOptions) (SpoolSweepResult, error) {
-	res := SpoolSweepResult{DryRun: opts.DryRun}
-	grace := opts.Grace
-	if grace == 0 {
-		grace = storage.DefaultSweepGrace
-	}
-	m.spoolMu.Lock()
-	defer m.spoolMu.Unlock()
-
-	// Spools of finished tasks stay deletable while readers drain them: their open descriptors outlive the unlink.
-	inUse := map[string]bool{}
-	m.mu.Lock()
-	for _, t := range m.tasks {
-		if t.spool != nil {
-			inUse[t.spool.f.Name()] = true
-		}
-	}
-	m.mu.Unlock()
-
-	ents, err := os.ReadDir(m.spoolDir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return res, nil
-	}
-	if err != nil {
-		return res, err
-	}
-	for _, ent := range ents {
-		if err := ctx.Err(); err != nil {
-			return res, err
-		}
-		p := filepath.Join(m.spoolDir, ent.Name())
-		if !ent.Type().IsRegular() || !strings.HasSuffix(ent.Name(), ".spool") || inUse[p] {
-			continue
-		}
-		info, err := ent.Info()
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return res, err
-		}
-		if grace > 0 && time.Since(info.ModTime()) < grace {
-			continue
-		}
-		// An open handle on Windows, or a permission denial, leaves the file for the next pass.
-		if !opts.DryRun && os.Remove(p) != nil {
-			continue
-		}
-		res.SweptSpools++
-		res.ReclaimedBytes += info.Size()
-	}
-	return res, nil
-}
-
-// IndexSweepResult reports one SweepIndex pass; in a dry run the counts are what a real pass would remove.
-type IndexSweepResult struct {
+// SweepResult reports one SweepIndex pass; in a dry run the counts are what a real pass would remove.
+type SweepResult struct {
 	DryRun           bool `json:"dry_run"`
 	DroppedEntries   int  `json:"dropped_entries"`
 	RemovedManifests int  `json:"removed_manifests"`
 	RemovedTempFiles int  `json:"removed_temp_files"`
 }
 
-// SweepIndex drops index entries whose file is gone from storage, removes
+// Sweep drops index entries whose file is gone from storage, removes
 // the manifests that leaves empty, and deletes the temp files interrupted
 // index writes left behind before opts.Grace (zero: storage.DefaultSweepGrace;
 // negative: any age); opts.DryRun only reports. Manifests no memory state
 // holds are judged against storage on disk and never loaded. Branch pointers
 // are never removed: a stale pin keeps serving while the upstream is down.
-func (m *Mirror) SweepIndex(ctx context.Context, opts storage.SweepOptions) (IndexSweepResult, error) {
-	res := IndexSweepResult{DryRun: opts.DryRun}
-	if err := ctx.Err(); err != nil {
-		return res, err
-	}
+func (m *Mirror) Sweep(ctx context.Context, opts storage.SweepOptions) (SweepResult, error) {
+	res := SweepResult{DryRun: opts.DryRun}
 	grace := opts.Grace
 	if grace == 0 {
 		grace = storage.DefaultSweepGrace
 	}
+	err := m.walkIndex(ctx, func(sub, p string, ent fs.DirEntry) error {
+		switch {
+		case strings.HasPrefix(ent.Name(), ".") && strings.HasSuffix(ent.Name(), ".tmp"):
+			removed, err := m.sweepTempFile(p, grace, opts.DryRun)
+			if err != nil {
+				return err
+			}
+			if removed {
+				res.RemovedTempFiles++
+			}
+		case sub == "commits" && strings.HasSuffix(ent.Name(), ".json"):
+			return m.sweepManifest(ctx, p, opts.DryRun, &res)
+		}
+		return nil
+	})
+	return res, err
+}
+
+// walkIndex calls fn for each regular file of a repo's commits or branches directory, named by that directory; a missing index holds none.
+func (m *Mirror) walkIndex(ctx context.Context, fn func(sub, path string, ent fs.DirEntry) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	repos, err := os.ReadDir(m.indexDir)
 	if errors.Is(err, fs.ErrNotExist) {
-		return res, nil
+		return nil
 	}
 	if err != nil {
-		return res, err
+		return err
 	}
 	for _, repo := range repos {
-		if err := ctx.Err(); err != nil {
-			return res, err
-		}
 		if !repo.IsDir() {
 			continue
 		}
@@ -124,32 +75,22 @@ func (m *Mirror) SweepIndex(ctx context.Context, opts storage.SweepOptions) (Ind
 				continue
 			}
 			if err != nil {
-				return res, err
+				return err
 			}
 			for _, ent := range ents {
 				if err := ctx.Err(); err != nil {
-					return res, err
+					return err
 				}
-				p := filepath.Join(dir, ent.Name())
-				switch {
-				case !ent.Type().IsRegular():
-				case strings.HasPrefix(ent.Name(), ".") && strings.HasSuffix(ent.Name(), ".tmp"):
-					removed, err := m.sweepTempFile(p, grace, opts.DryRun)
-					if err != nil {
-						return res, err
-					}
-					if removed {
-						res.RemovedTempFiles++
-					}
-				case sub == "commits" && strings.HasSuffix(ent.Name(), ".json"):
-					if err := m.sweepManifest(ctx, p, opts.DryRun, &res); err != nil {
-						return res, err
-					}
+				if !ent.Type().IsRegular() {
+					continue
+				}
+				if err := fn(sub, filepath.Join(dir, ent.Name()), ent); err != nil {
+					return err
 				}
 			}
 		}
 	}
-	return res, nil
+	return nil
 }
 
 // sweepTempFile removes (or, dry, reports) a temp file older than grace. Removal runs under persistMu, where every writeJSON runs: a temp file that exists then is a leftover, not a write in flight.
@@ -178,7 +119,7 @@ func (m *Mirror) sweepTempFile(p string, grace time.Duration, dryRun bool) (bool
 }
 
 // sweepManifest drops the dead entries of one manifest into res; GC does not judge corruption, so unparsable or misplaced manifests are left alone.
-func (m *Mirror) sweepManifest(ctx context.Context, p string, dryRun bool, res *IndexSweepResult) error {
+func (m *Mirror) sweepManifest(ctx context.Context, p string, dryRun bool, res *SweepResult) error {
 	data, err := os.ReadFile(p)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -187,7 +128,7 @@ func (m *Mirror) sweepManifest(ctx context.Context, p string, dryRun bool, res *
 		return err
 	}
 	var man commitManifest
-	if json.Unmarshal(data, &man) != nil || !commitRevRe.MatchString(man.Commit) || commitPath(m.indexDir, man.Repo, man.Commit) != p {
+	if json.Unmarshal(data, &man) != nil || !isCommit(man.Commit) || commitPath(m.indexDir, man.Repo, man.Commit) != p {
 		return nil
 	}
 	name := revKey{repo: man.Repo, rev: man.Commit}
@@ -282,7 +223,7 @@ func (m *Mirror) sweepManifest(ctx context.Context, p string, dryRun bool, res *
 }
 
 // sweepDiskManifest judges a manifest no memory state holds from its disk entries, loading nothing; a commit a writer opens meanwhile is left to the next pass, which judges it through memory.
-func (m *Mirror) sweepDiskManifest(ctx context.Context, p string, man commitManifest, dryRun bool, res *IndexSweepResult) error {
+func (m *Mirror) sweepDiskManifest(ctx context.Context, p string, man commitManifest, dryRun bool, res *SweepResult) error {
 	var dead []string
 	for path, e := range man.Files {
 		if err := ctx.Err(); err != nil {

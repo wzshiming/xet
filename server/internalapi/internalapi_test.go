@@ -21,6 +21,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
+	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
@@ -491,7 +492,11 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(WithStorage(fs), WithMirror(mir))
+	queue, err := spool.NewSpool(t.TempDir(), fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithMirror(mir), WithSpool(queue))
 	for i, content := range [][]byte{[]byte("stepped sweep one"), []byte("stepped sweep two")} {
 		fileHash := putTestFile(t, ctx, fs, content)
 		rec := httptest.NewRecorder()
@@ -525,8 +530,8 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 		sweptShards += len(result.SweptShards)
 		sweptXorbs += len(result.SweptXorbs)
 		if result.Done {
-			if !slices.Equal(keys, []string{"index", "spools", "storage"}) {
-				t.Fatalf("final step keys = %v, want the storage pass with both mirror passes", keys)
+			if !slices.Equal(keys, []string{"mirror", "spools", "storage"}) {
+				t.Fatalf("final step keys = %v, want the storage pass with the spool and mirror passes", keys)
 			}
 			break
 		}
@@ -551,8 +556,8 @@ func TestGCSweepEndpointStepped(t *testing.T) {
 	// Nothing is left for a full pass.
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
-	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"index", "spools", "storage"}) {
-		t.Fatalf("full pass keys = %v, want the storage pass with both mirror passes", keys)
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"mirror", "spools", "storage"}) {
+		t.Fatalf("full pass keys = %v, want the storage pass with the spool and mirror passes", keys)
 	}
 	result = decodeSweep(t, rec)
 	if len(result.SweptShards) != 0 || len(result.SweptXorbs) != 0 {
@@ -896,16 +901,16 @@ func sweepRequest(t *testing.T, handler *Handler, query string) sweepResponse {
 	return result
 }
 
-// TestGCSweepEndpointSpools: without a mirror the sweep report carries the
-// storage pass alone; with one, dry_run only reports (and says so), the
-// default grace removes only spools idle past it, and grace=0 removes every
-// idle spool.
+// TestGCSweepEndpointSpools: without a spool or mirror the sweep report
+// carries the storage pass alone; with them, dry_run only reports (and says
+// so), the default grace removes only spools idle past it, and grace=0
+// removes every idle spool.
 func TestGCSweepEndpointSpools(t *testing.T) {
 	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sweepRequest(t, NewHandler(WithStorage(fs)), "?grace=0"); got.Storage == nil || got.Spools != nil || got.Index != nil {
+	if got := sweepRequest(t, NewHandler(WithStorage(fs)), "?grace=0"); got.Storage == nil || got.Spools != nil || got.Mirror != nil {
 		t.Fatalf("sweep without a mirror = %+v, want a storage pass alone", got)
 	}
 	rec := httptest.NewRecorder()
@@ -915,15 +920,28 @@ func TestGCSweepEndpointSpools(t *testing.T) {
 	}
 
 	cacheDir := t.TempDir()
-	mir, err := mirror.NewMirror(mirror.WithStorage(fs), mirror.WithCacheDir(cacheDir))
+	queue, err := spool.NewSpool(filepath.Join(cacheDir, "spool"), fs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(WithStorage(fs), WithMirror(mir))
+	mir, err := mirror.NewMirror(mirror.WithStorage(fs), mirror.WithCacheDir(cacheDir), mirror.WithSpool(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(fs), WithMirror(mir), WithSpool(queue))
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc/sweep?grace=0", nil))
-	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"index", "spools", "storage"}) {
-		t.Fatalf("sweep keys with a mirror = %v, want storage, spools and index", keys)
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"mirror", "spools", "storage"}) {
+		t.Fatalf("sweep keys with a mirror = %v, want storage, spools and mirror", keys)
+	}
+	var raw struct {
+		Spools map[string]json.RawMessage `json:"spools"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if keys := slices.Sorted(maps.Keys(raw.Spools)); !slices.Equal(keys, []string{"dry_run", "reclaimed_bytes", "swept_spools"}) {
+		t.Fatalf("spools report keys = %v, want dry_run, reclaimed_bytes and swept_spools", keys)
 	}
 	stale := filepath.Join(cacheDir, "spool", "x.spool")
 	if err := os.WriteFile(stale, []byte("stale spool content"), 0o644); err != nil {
@@ -938,7 +956,7 @@ func TestGCSweepEndpointSpools(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := &mirror.SpoolSweepResult{DryRun: true, SweptSpools: 2, ReclaimedBytes: int64(len("stale spool content") + len("fresh"))}
+	want := &spool.SweepResult{DryRun: true, SweptSpools: 2, ReclaimedBytes: int64(len("stale spool content") + len("fresh"))}
 	if got := sweepRequest(t, handler, "?dry_run=true&grace=0"); got.Storage == nil || !got.Storage.DryRun || !reflect.DeepEqual(got.Spools, want) {
 		t.Fatalf("dry-run sweep storage = %+v, spools = %+v; want a dry-run storage pass and %+v", got.Storage, got.Spools, want)
 	}
@@ -948,7 +966,7 @@ func TestGCSweepEndpointSpools(t *testing.T) {
 		}
 	}
 
-	want = &mirror.SpoolSweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("stale spool content"))}
+	want = &spool.SweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("stale spool content"))}
 	if got := sweepRequest(t, handler, ""); !reflect.DeepEqual(got.Spools, want) {
 		t.Fatalf("default-grace spools = %+v, want %+v", got.Spools, want)
 	}
@@ -956,7 +974,7 @@ func TestGCSweepEndpointSpools(t *testing.T) {
 		t.Fatalf("default grace removed the fresh spool: %v", err)
 	}
 
-	want = &mirror.SpoolSweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("fresh"))}
+	want = &spool.SweepResult{SweptSpools: 1, ReclaimedBytes: int64(len("fresh"))}
 	if got := sweepRequest(t, handler, "?grace=0"); !reflect.DeepEqual(got.Spools, want) {
 		t.Fatalf("grace=0 spools = %+v, want %+v", got.Spools, want)
 	}
@@ -992,17 +1010,17 @@ func TestGCSweepEndpointIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := &mirror.IndexSweepResult{DryRun: true, DroppedEntries: 1, RemovedManifests: 1}
-	if got := sweepRequest(t, handler, "?dry_run=true&grace=0"); !reflect.DeepEqual(got.Index, want) {
-		t.Fatalf("dry-run index = %+v, want %+v", got.Index, want)
+	want := &mirror.SweepResult{DryRun: true, DroppedEntries: 1, RemovedManifests: 1}
+	if got := sweepRequest(t, handler, "?dry_run=true&grace=0"); !reflect.DeepEqual(got.Mirror, want) {
+		t.Fatalf("dry-run index = %+v, want %+v", got.Mirror, want)
 	}
 	if _, err := os.Stat(manifest); err != nil {
 		t.Fatalf("dry run removed the manifest: %v", err)
 	}
 
-	want = &mirror.IndexSweepResult{DroppedEntries: 1, RemovedManifests: 1}
-	if got := sweepRequest(t, handler, "?grace=0"); !reflect.DeepEqual(got.Index, want) {
-		t.Fatalf("grace=0 index = %+v, want %+v", got.Index, want)
+	want = &mirror.SweepResult{DroppedEntries: 1, RemovedManifests: 1}
+	if got := sweepRequest(t, handler, "?grace=0"); !reflect.DeepEqual(got.Mirror, want) {
+		t.Fatalf("grace=0 index = %+v, want %+v", got.Mirror, want)
 	}
 	if _, err := os.Stat(manifest); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("manifest after the sweep: %v, want removed", err)

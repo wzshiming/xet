@@ -37,13 +37,9 @@ type Resolution struct {
 // entries, and spools.
 //
 // The upstream probe runs before anything is returned: content local storage
-// already holds comes back as an Entry, and a probe failure as the error. A
-// returned Stream always has a spool to read; its readers are nil only in one
-// rare interleaving, when that spool was fully drained before the caller
-// attached, and resolving again then returns the published terminal entry.
-// ctx bounds only the resolution itself, including the wait for the probe
-// and task start that resolvers of one file share, never the background
-// ingest.
+// already holds comes back as an Entry, and a probe failure as the error. ctx
+// bounds only the resolution itself, including the wait for the probe and
+// task start that resolvers of one file share, never the background ingest.
 func (m *Mirror) Resolve(ctx context.Context, upstreamURL, token string) (*Resolution, error) {
 	origin, key, err := parseUpstreamURL(upstreamURL)
 	if err != nil {
@@ -70,11 +66,9 @@ type Stream struct {
 	t *task
 }
 
-// WaitMeta reports the upstream etag and the pinned commit. The probe ran
-// before the Stream was handed out, so it never blocks or fails; ctx is
-// accepted for callers written against the former asynchronous probe.
-func (st *Stream) WaitMeta(ctx context.Context) (etag, commit string, err error) {
-	return st.t.probe.etag, st.t.key.rev, nil
+// Meta reports the upstream etag and the pinned commit, both known before the Stream is handed out.
+func (st *Stream) Meta() (etag, commit string) {
+	return st.t.probe.etag, st.t.key.rev
 }
 
 // WaitSize blocks until the content length is known — some hubs carry no
@@ -85,45 +79,54 @@ func (st *Stream) WaitMeta(ctx context.Context) (etag, commit string, err error)
 // only when ctx was done first.
 func (st *Stream) WaitSize(ctx context.Context) (size int64, ok bool) {
 	select {
-	case <-st.t.sized:
+	case <-st.t.item.Sized():
 	case <-ctx.Done():
 		return -1, false
 	}
-	return st.t.size.Load(), true
+	return st.t.item.Size(), true
 }
 
 // NewReader returns a reader over the file bytes starting at offset off,
 // tailing the growing spool until the ingest finishes. It returns nil only
 // when the spool was already retired — the ingest finished and every reader
-// detached before this caller attached: Resolve again for the entry. ctx
-// interrupts blocked reads, never the ingest.
-func (st *Stream) NewReader(ctx context.Context, off int64) io.ReadCloser {
-	return st.t.spool.newReader(ctx, off)
+// detached before this caller attached: Resolve again for the entry. Close
+// unblocks a waiting read, never the ingest.
+func (st *Stream) NewReader(off int64) io.ReadCloser {
+	return st.t.item.NewReader(off)
 }
 
 // NewSeekReader returns a ReadSeekCloser over the final size of the file,
 // fit for http.ServeContent: reads of regions not yet spooled block until
 // the data lands. It returns nil only when the spool was already retired —
 // the ingest finished and every reader detached before this caller attached:
-// Resolve again for the entry. ctx interrupts blocked reads, never the
-// ingest.
-func (st *Stream) NewSeekReader(ctx context.Context, size int64) io.ReadSeekCloser {
-	return st.t.spool.newSeekReader(ctx, size)
+// Resolve again for the entry.
+func (st *Stream) NewSeekReader(size int64) io.ReadSeekCloser {
+	return st.t.item.NewSeekReader(size)
 }
 
 // LookupXetHash resolves an lfs sha256 oid to the local xet file hash
 // through the storage sha256 index; ok is false when the content is not held
 // locally. The server/hf package rewrites hub tree listings with it.
 func (m *Mirror) LookupXetHash(ctx context.Context, oid string) (string, bool) {
-	digest, err := hex.DecodeString(oid)
-	if err != nil || len(digest) != sha256.Size {
-		return "", false
-	}
-	fileHash, err := m.storage.GetFileHashBySHA256(ctx, "default", [32]byte(digest))
-	if err != nil {
+	fileHash, _, ok := m.fileHashBySHA256(ctx, oid)
+	if !ok {
 		return "", false
 	}
 	return fileHash.String(), true
+}
+
+// fileHashBySHA256 resolves a hex sha256 digest through the storage sha256 index; ok is false when it is malformed or the lookup fails.
+func (m *Mirror) fileHashBySHA256(ctx context.Context, hexDigest string) (xet.FileHash, [sha256.Size]byte, bool) {
+	raw, err := hex.DecodeString(hexDigest)
+	if err != nil || len(raw) != sha256.Size {
+		return xet.FileHash{}, [sha256.Size]byte{}, false
+	}
+	digest := [sha256.Size]byte(raw)
+	fileHash, err := m.storage.GetFileHashBySHA256(ctx, "default", digest)
+	if err != nil {
+		return xet.FileHash{}, digest, false
+	}
+	return fileHash, digest, true
 }
 
 // FetchUpstream GETs rawURL with token as the bearer credential for its origin, following redirects and resuming body reads; the caller owns the response body.

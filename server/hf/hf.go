@@ -251,14 +251,7 @@ func serveFetchError(w http.ResponseWriter, notFound bool, err error) {
 // block until the data lands. It reports false when the ingest finished and
 // the spool was already drained before this request could attach.
 func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mirror.Stream) bool {
-	etag, commit, err := st.WaitMeta(r.Context())
-	if err != nil {
-		if r.Context().Err() != nil {
-			return true
-		}
-		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
-		return true
-	}
+	etag, commit := st.Meta()
 
 	// The size may only be learned from the ingest download's first response
 	// headers (e.g. modelscope.cn sends none on HEAD); downstream hub clients
@@ -281,7 +274,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		// Total size unknown until the ingest completes (xet upstream whose
 		// probe carried no size): ServeContent cannot handle that, so stream
 		// the whole body as it lands, ignoring Range.
-		rc := st.NewReader(r.Context(), 0)
+		rc := st.NewReader(0)
 		if rc == nil {
 			return false
 		}
@@ -293,7 +286,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		return true
 	}
 
-	rs := st.NewSeekReader(r.Context(), size)
+	rs := st.NewSeekReader(size)
 	if rs == nil {
 		return false
 	}

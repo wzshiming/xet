@@ -26,80 +26,17 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 )
-
-func TestSpoolTailRead(t *testing.T) {
-	sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data := make([]byte, 64*1024)
-	if _, err := rand.Read(data); err != nil {
-		t.Fatal(err)
-	}
-
-	rc := sp.newReader(context.Background(), 0)
-	got := make(chan []byte, 1)
-	go func() {
-		b, _ := io.ReadAll(rc)
-		_ = rc.Close()
-		got <- b
-	}()
-
-	// Write in pieces so the reader has to wait repeatedly.
-	for i := 0; i < len(data); i += 8192 {
-		if _, err := sp.Write(data[i : i+8192]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	sp.finish(nil)
-
-	if b := <-got; !bytes.Equal(b, data) {
-		t.Fatalf("tail read mismatch: got %d bytes, want %d", len(b), len(data))
-	}
-
-	t.Run("canceled context unblocks reader", func(t *testing.T) {
-		sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer sp.finish(nil)
-		ctx, cancel := context.WithCancel(context.Background())
-		rc := sp.newReader(ctx, 0)
-		defer rc.Close()
-		errCh := make(chan error, 1)
-		go func() {
-			_, err := rc.Read(make([]byte, 1))
-			errCh <- err
-		}()
-		cancel()
-		if err := <-errCh; err != context.Canceled {
-			t.Fatalf("read err = %v, want context.Canceled", err)
-		}
-	})
-
-	t.Run("no readers after removal", func(t *testing.T) {
-		sp, err := openSpool(t.TempDir(), "https://hub.example", "k", "", -1, true)
-		if err != nil {
-			t.Fatal(err)
-		}
-		sp.finish(nil) // no refs: the file is removed immediately
-		if rc := sp.newReader(context.Background(), 0); rc != nil {
-			t.Fatal("expected nil reader after removal")
-		}
-		if rs := sp.newSeekReader(context.Background(), 0); rs != nil {
-			t.Fatal("expected nil seek reader after removal")
-		}
-	})
-}
 
 // testMirror addresses files by (repo, rev, path) on the fixture's upstream, sending token there, so tests read like the hub requests they stand for.
 type testMirror struct {
 	*Mirror
 	upstream string
 	token    string
+	spoolDir string // the mirror's spool directory under the cache dir
 }
 
 // resolveURL builds the hub download URL of a file on upstream.
@@ -157,7 +94,7 @@ func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, o
 			}
 		}
 	})
-	return &testMirror{Mirror: m, upstream: upstream}, stor
+	return &testMirror{Mirror: m, upstream: upstream, spoolDir: filepath.Join(cacheDir, "spool")}, stor
 }
 
 // readStored fetches the reconstructed bytes for a sha256 hex digest straight
@@ -178,6 +115,34 @@ func readStored(t *testing.T, stor storage.Storage, shaHex string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// seedStorage lands data in stor through a throwaway Spool, as the mirror's own ingests do, and returns its file hash.
+func seedStorage(t *testing.T, stor storage.Storage, data []byte) xet.FileHash {
+	t.Helper()
+	ctx := context.Background()
+	q, err := spool.NewSpool(t.TempDir(), stor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := q.Accept(ctx, spool.Source{Key: "/seed", Size: int64(len(data)), SHA256: hashHex(string(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Release()
+	if _, err := it.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	it.Finish(ctx, nil)
+	res, err := q.Wait(ctx, it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileHash, err := xet.ParseFileHash(res.FileHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fileHash
 }
 
 // plainUpstream is a hub without xet support: resolve requests redirect to a
@@ -205,8 +170,9 @@ func (u *plainUpstream) set(path string, data []byte) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.files[path] = data
-	if seg := resolveRe.FindStringSubmatch(path); seg != nil && commitRevRe.MatchString(u.commit) {
-		u.files["/"+seg[1]+"/resolve/"+u.commit+"/"+seg[3]] = data
+	if k, ok := parseResolveKey(path); ok && isCommit(u.commit) {
+		k.rev = u.commit
+		u.files[k.String()] = data
 	}
 }
 
@@ -316,15 +282,12 @@ func TestResolveStream(t *testing.T) {
 		t.Fatal("first resolve did not return an in-flight stream")
 	}
 
-	etag, commit, err := res.Stream.WaitMeta(ctx)
-	if err != nil {
-		t.Fatalf("WaitMeta: %v", err)
-	}
+	etag, commit := res.Stream.Meta()
 	if commit != upstream.commit {
 		t.Fatalf("commit = %q, want %s", commit, upstream.commit)
 	}
 	if etag == "" {
-		t.Fatal("empty etag from WaitMeta")
+		t.Fatal("empty etag from Meta")
 	}
 	size, ok := res.Stream.WaitSize(ctx)
 	if !ok || size != int64(len(data)) {
@@ -337,7 +300,7 @@ func TestResolveStream(t *testing.T) {
 		<-upstream.gateHit
 		close(upstream.gate)
 	}()
-	rc := res.Stream.NewReader(ctx, 0)
+	rc := res.Stream.NewReader(0)
 	if rc == nil {
 		t.Fatal("NewReader returned nil while the ingest is in flight")
 	}
@@ -388,6 +351,49 @@ func TestResolveStream(t *testing.T) {
 func hashHex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// The repo is the shortest prefix that leaves a rev and a path; a rev never spans a slash and both must be present.
+func TestParseResolveKey(t *testing.T) {
+	cases := []struct {
+		path string
+		want resolveKey
+		ok   bool
+	}{
+		{"/org/repo/resolve/main/model.bin", resolveKey{"org/repo", "main", "model.bin"}, true},
+		{"/datasets/org/repo/resolve/refs%2Fpr%2F1/dir/sub/f.txt", resolveKey{"datasets/org/repo", "refs%2Fpr%2F1", "dir/sub/f.txt"}, true},
+		{"/a/resolve/b/resolve/main/f", resolveKey{"a", "b", "resolve/main/f"}, true},
+		{"/a/resolve//resolve/main/f", resolveKey{"a/resolve/", "main", "f"}, true},
+		{"/resolve/main/f", resolveKey{}, false},
+		{"/a/resolve/main", resolveKey{}, false},
+		{"/a/resolve/main/", resolveKey{}, false},
+		{"/a/resolve//f", resolveKey{}, false},
+		{"a/resolve/main/f", resolveKey{}, false},
+		{"/", resolveKey{}, false},
+	}
+	for _, c := range cases {
+		got, ok := parseResolveKey(c.path)
+		if ok != c.ok || got != c.want {
+			t.Errorf("parseResolveKey(%q) = %+v, %v; want %+v, %v", c.path, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// A commit is 40 hex digits in either case; anything else names a branch.
+func TestIsCommit(t *testing.T) {
+	for rev, want := range map[string]bool{
+		strings.Repeat("ab", 20): true,
+		strings.Repeat("AB", 20): true,
+		strings.Repeat("ab", 19): false,
+		strings.Repeat("ab", 32): false,
+		strings.Repeat("g", 40):  false,
+		"main":                   false,
+		"":                       false,
+	} {
+		if got := isCommit(rev); got != want {
+			t.Errorf("isCommit(%q) = %v, want %v", rev, got, want)
+		}
+	}
 }
 
 func TestBranchEntryPath(t *testing.T) {
@@ -565,44 +571,18 @@ func TestMirrorUsage(t *testing.T) {
 	wantIndex := storage.ObjectUsage{Count: 3, Bytes: int64(len(manifestJSON) + len(pointerJSON) + len("partial"))}
 	writeRaw(t, filepath.Join(cacheDir, "download", "aa", "bb", "cc", "x.json"), []byte(`{}`))
 	writeRaw(t, filepath.Join(cacheDir, "upload", "y.spool"), []byte("not ours"))
+	writeRaw(t, filepath.Join(m.spoolDir, "z.spool"), []byte("the spool's"))
 	if runtime.GOOS != "windows" {
 		if err := os.Symlink(manifest, filepath.Join(filepath.Dir(pointer), "link.json")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got, err := m.Usage(ctx); err != nil || got != (Usage{Index: wantIndex}) {
-		t.Fatalf("usage with index files = %+v, %v; want %+v", got, err, Usage{Index: wantIndex})
-	}
-
-	sp, err := openSpool(m.spoolDir, "http://upstream.invalid", "/org/repo/resolve/main/f.bin", "etag1", 100, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sp.Write(make([]byte, 40)); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := m.Usage(ctx); err != nil || got.Spool != (storage.ObjectUsage{Count: 1, Bytes: 40}) {
-		t.Fatalf("usage with in-flight spool = %+v, %v; want spool count 1 bytes 40", got, err)
-	}
-	sp.finish(errors.New("interrupted"))
-	consumed, err := openSpool(m.spoolDir, "http://upstream.invalid", "/org/repo/resolve/main/g.bin", "etag2", 100, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := consumed.Write(make([]byte, 60)); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := m.Usage(ctx); err != nil || got.Spool != (storage.ObjectUsage{Count: 2, Bytes: 100}) {
-		t.Fatalf("usage with retained and in-flight spools = %+v, %v; want spool count 2 bytes 100", got, err)
-	}
-	consumed.markRemove()
-	consumed.finish(nil)
-	want := Usage{Index: wantIndex, Spool: storage.ObjectUsage{Count: 1, Bytes: 40}}
+	want := Usage{Index: wantIndex}
 	if got, err := m.Usage(ctx); err != nil || got != want {
-		t.Fatalf("usage after ingest consumed a spool = %+v, %v; want %+v", got, err, want)
+		t.Fatalf("usage with index files = %+v, %v; want %+v", got, err, want)
 	}
 
-	bare := &Mirror{indexDir: m.indexDir, spoolDir: m.spoolDir}
+	bare := &Mirror{indexDir: m.indexDir}
 	if got, err := bare.Usage(ctx); err != nil || got != want {
 		t.Fatalf("usage from directories only = %+v, %v; want %+v", got, err, want)
 	}
@@ -615,7 +595,7 @@ func TestMirrorUsage(t *testing.T) {
 
 	t.Run("missing dirs", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "never-created")
-		absent := &Mirror{indexDir: filepath.Join(root, "index"), spoolDir: filepath.Join(root, "spool")}
+		absent := &Mirror{indexDir: filepath.Join(root, "index")}
 		if got, err := absent.Usage(ctx); err != nil || got != (Usage{}) {
 			t.Fatalf("usage of missing dirs = %+v, %v; want zero", got, err)
 		}
@@ -637,7 +617,7 @@ func TestMirrorUsage(t *testing.T) {
 		}
 		file := filepath.Join(t.TempDir(), "file")
 		writeRaw(t, file, []byte("not a directory"))
-		broken := &Mirror{indexDir: filepath.Join(file, "index"), spoolDir: m.spoolDir}
+		broken := &Mirror{indexDir: filepath.Join(file, "index")}
 		if got, err := broken.Usage(ctx); !errors.Is(err, syscall.ENOTDIR) || got != (Usage{}) {
 			t.Fatalf("usage through a file = %+v, %v; want zero, ENOTDIR", got, err)
 		}
@@ -900,9 +880,6 @@ func TestMirrorSyntheticPin(t *testing.T) {
 			t.Fatal("other.bin was not fetched through the source branch")
 		}
 		release.Do(func() { close(hold) })
-		if _, _, err := res.Stream.WaitMeta(context.Background()); err != nil {
-			t.Fatal(err)
-		}
 	})
 
 	t.Run("concurrent source pin waits for persistence", func(t *testing.T) {
@@ -1829,6 +1806,33 @@ func TestMirrorIndexIgnoresLegacy(t *testing.T) {
 	})
 }
 
+// A hop that drops the connection is retried until the upstream answers; a status answer is a result, never retried (TestMirrorBranchProbeFailureAfterPin).
+func TestMirrorProbeRetriesDroppedHop(t *testing.T) {
+	upstream := newPlainUpstream()
+	data := []byte("probed after two dropped hops")
+	upstream.set("/org/repo/resolve/main/f.bin", data)
+	var drops atomic.Int64
+	drops.Store(2)
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == "/org/repo/resolve/main/f.bin" && drops.Add(-1) >= 0 {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+
+	pr, err := m.probe(context.Background(), srv.URL, resolveKey{repo: "org/repo", rev: "main", path: "f.bin"})
+	if err != nil || pr.status != http.StatusOK || pr.size != int64(len(data)) {
+		t.Fatalf("probe = %+v, %v; want a 200 of %d bytes after the dropped hops", pr, err, len(data))
+	}
+	if got := requests.Load(); got != 4 {
+		t.Fatalf("upstream requests = %d, want 4: two dropped hops, then the hub and CDN hops", got)
+	}
+}
+
 func TestMirrorBranchProbeFailureAfterPin(t *testing.T) {
 	commitB := strings.Repeat("bb", 20)
 	for _, synthetic := range []bool{false, true} {
@@ -2065,7 +2069,7 @@ func TestMirrorObsoleteSourceFailureIgnored(t *testing.T) {
 	}
 	before := requests.Load()
 	for range 3 {
-		if _, err := ingestWait(t, m, "org/repo", wantPseudo("org/repo", "main"), "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+		if _, err := ingestWait(t, m, "org/repo", wantPseudo("org/repo", "main"), "f.bin"); !errors.Is(err, spool.ErrCorrupt) {
 			t.Fatalf("obsolete commit retry = %v, want the retained ingest failure", err)
 		}
 	}
@@ -2396,7 +2400,7 @@ func TestFailedEntriesTrackPseudoCommitAlias(t *testing.T) {
 		return failed, untracked
 	}
 
-	if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+	if _, err := ingestWait(t, m, "org/repo", "main", "f.bin"); !errors.Is(err, spool.ErrCorrupt) {
 		t.Fatalf("corrupt ingest err = %v, want the checksum failure", err)
 	}
 	m.mu.Lock()
@@ -2412,7 +2416,7 @@ func TestFailedEntriesTrackPseudoCommitAlias(t *testing.T) {
 	// Touching the branch alias past a cap of one evicts the pseudo-commit alias alone.
 	m.failed.MaxEntries = 1
 	before := requests.Load()
-	if _, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); !errors.Is(err, errSpoolCorrupt) {
+	if _, err := m.Resolve(ctx, "org/repo", "main", "f.bin"); !errors.Is(err, spool.ErrCorrupt) {
 		t.Fatalf("branch alias inside the backoff: err = %v, want the recorded failure", err)
 	}
 	if got := requests.Load() - before; got != 0 {
@@ -2719,9 +2723,8 @@ func TestMirrorWithTransport(t *testing.T) {
 	if err != nil || res.Stream == nil {
 		t.Fatalf("Resolve = %+v, %v; want an in-flight stream", res, err)
 	}
-	etag, commit, err := res.Stream.WaitMeta(ctx)
-	if err != nil || etag != hashHex(string(data)) || commit != fake.commit {
-		t.Fatalf("WaitMeta = %q, %q, %v; want the transport's etag and commit", etag, commit, err)
+	if etag, commit := res.Stream.Meta(); etag != hashHex(string(data)) || commit != fake.commit {
+		t.Fatalf("Meta = %q, %q; want the transport's etag and commit", etag, commit)
 	}
 	if size, ok := res.Stream.WaitSize(ctx); !ok || size != int64(len(data)) {
 		t.Fatalf("WaitSize = %d, %v, want %d, true", size, ok, len(data))
@@ -2729,11 +2732,12 @@ func TestMirrorWithTransport(t *testing.T) {
 
 	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	rc := res.Stream.NewReader(readCtx, 0)
+	rc := res.Stream.NewReader(0)
 	if rc == nil {
 		t.Fatal("NewReader returned nil while the ingest is in flight")
 	}
 	defer rc.Close()
+	context.AfterFunc(readCtx, func() { _ = rc.Close() })
 	head := make([]byte, len(data)/2)
 	if _, err := io.ReadFull(rc, head); err != nil || !bytes.Equal(head, data[:len(head)]) {
 		t.Fatalf("first half before the gate opened: %v", err)

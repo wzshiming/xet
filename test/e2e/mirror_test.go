@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
+	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/storage/local"
@@ -32,9 +34,10 @@ import (
 // fakeHub is a configurable plain hub: resolve requests answer metadata
 // headers and redirect to a /cdn path that serves the bytes.
 type fakeHub struct {
-	mu    sync.Mutex
-	files map[string][]byte
-	api   map[string][]byte // raw JSON answered directly, e.g. hub token routes the mirror delegates upstream
+	mu     sync.Mutex
+	files  map[string][]byte
+	api    map[string][]byte // raw JSON answered directly, e.g. hub token routes the mirror delegates upstream
+	ranges []string          // Range header of each cdn GET, "" for a whole-file request
 
 	commit        string // "" omits X-Repo-Commit
 	etagOverride  string // "" uses the real sha256 of the data
@@ -74,6 +77,12 @@ func (u *fakeHub) etagFor(data []byte) string {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func (u *fakeHub) dataRanges() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.ranges)
 }
 
 func (u *fakeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +141,9 @@ func (u *fakeHub) serveData(w http.ResponseWriter, r *http.Request, path string)
 		return
 	}
 	u.dataGETs.Add(1)
+	u.mu.Lock()
+	u.ranges = append(u.ranges, r.Header.Get("Range"))
+	u.mu.Unlock()
 	if u.dropNextData.CompareAndSwap(true, false) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 		w.WriteHeader(http.StatusOK)
@@ -153,9 +165,7 @@ func (u *fakeHub) serveData(w http.ResponseWriter, r *http.Request, path string)
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(data))
 }
 
-// newMirrorServer wires the same composition as cmd/xetd: the CAS server
-// matches its routes first, serves the hub front end over the mirror engine,
-// and falls through to the upstream proxy.
+// newMirrorServer wires the same composition as cmd/xetd: the mirror spools through one spool under the storage dir, the CAS server's routes match first, then the hub front end over the mirror engine, falling through to the upstream proxy.
 func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opts ...mirror.Option) *httptest.Server {
 	t.Helper()
 	var inner atomic.Value
@@ -171,6 +181,10 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 	if err != nil {
 		t.Fatal(err)
 	}
+	queue, err := spool.NewSpool(filepath.Join(storageDir, "spool"), stor)
+	if err != nil {
+		t.Fatal(err)
+	}
 	issuer, err := auth.NewIssuer(nil, 15*time.Minute, time.Now)
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +194,7 @@ func newMirrorServer(t *testing.T, upstreamURL, storageDir, cacheDir string, opt
 		append([]mirror.Option{
 			mirror.WithStorage(stor),
 			mirror.WithCacheDir(cacheDir),
+			mirror.WithSpool(queue),
 		}, opts...)...,
 	)
 	if err != nil {
@@ -689,6 +704,107 @@ func TestMirrorResumeAfterUpstreamDrop(t *testing.T) {
 	}
 	if body := getBody(t, resolveURL); !bytes.Equal(body, data) {
 		t.Fatal("cached body mismatch after resumed ingest")
+	}
+}
+
+// TestMirrorResumeAcrossRestart: a server that dies mid-download leaves a
+// partial spool under the storage dir that nobody finished or swept; the
+// server restarted over the same storage and cache must resume the upstream
+// fetch from exactly those bytes, serve the whole file, and land it in storage.
+func TestMirrorResumeAcrossRestart(t *testing.T) {
+	hub := newFakeHub()
+	hub.gate = make(chan struct{})
+	hub.gateHit = make(chan struct{})
+	hubSrv := httptest.NewServer(hub)
+	t.Cleanup(hubSrv.Close)
+
+	data := deterministicData(128 * 1024)
+	const resolvePath = "/org/repo/resolve/main/restart.bin"
+	hub.set(resolvePath, data)
+
+	storageDir, cacheDir := t.TempDir(), t.TempDir()
+	var crashed *mirror.Mirror
+	srv := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir, func(m *mirror.Mirror) { crashed = m })
+	// Registered after srv: the parked download ingests once the gate opens and must finish before the servers and temp dirs go.
+	t.Cleanup(func() {
+		in, err := crashed.Ingest(hubSrv.URL+resolvePath, "") // joins the parked download while it still waits on the gate
+		close(hub.gate)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		select {
+		case <-in.Done():
+		case <-time.After(15 * time.Second):
+			t.Error("the abandoned server's download never finished")
+		}
+	})
+
+	head, err := noRedirectClient().Head(srv.URL + resolvePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Body.Close()
+	if head.StatusCode != http.StatusOK {
+		t.Fatalf("cold HEAD status = %d, want 200", head.StatusCode)
+	}
+	<-hub.gateHit // the upstream flushed half of the file and stalled
+	half := int64(len(data) / 2)
+	spoolDir := filepath.Join(storageDir, "spool")
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		spools, _ := filepath.Glob(filepath.Join(spoolDir, "*.spool"))
+		if len(spools) == 1 {
+			if st, err := os.Stat(spools[0]); err == nil && st.Size() == half {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spool files %v never held the %d flushed bytes", spools, half)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The crash: the first server is abandoned with its download parked on the stalled body.
+	srv2 := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // a refetch from zero would stall on the gate
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv2.URL+resolvePath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || !bytes.Equal(body, data) {
+		t.Fatalf("body through the restarted mirror: status %d, %d bytes, err %v; want 200 with the %d upstream bytes", resp.StatusCode, len(body), err, len(data))
+	}
+	waitMirrorReady(t, srv2.URL+resolvePath)
+
+	want := []string{"", fmt.Sprintf("bytes=%d-", half)}
+	if got := hub.dataRanges(); !slices.Equal(got, want) {
+		t.Fatalf("upstream data GET ranges = %q, want %q: one fetch resuming at the partial spool's length", got, want)
+	}
+	// The writer lets go of its spool just after publishing the entry the redirect reported.
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		spools, _ := filepath.Glob(filepath.Join(spoolDir, "*.spool"))
+		if len(spools) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spool files after the resumed ingest = %v, want none", spools)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if body := getBody(t, srv2.URL+resolvePath); !bytes.Equal(body, data) {
+		t.Fatal("stored body mismatch after the resumed ingest")
+	}
+	if got := hub.dataGETs.Load(); got != 2 {
+		t.Fatalf("upstream data GETs after ready = %d, want 2", got)
 	}
 }
 

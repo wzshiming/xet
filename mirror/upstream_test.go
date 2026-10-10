@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -21,7 +19,6 @@ import (
 
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/storage/local"
-	"github.com/wzshiming/xet/upload"
 )
 
 // xetUpstream is a hub+CAS pair serving one xet file: the hub mints casToken at the repository's read-token route and both record the Authorization headers they see.
@@ -55,11 +52,7 @@ func newXetUpstream(t *testing.T, resolvePath string, data []byte, casToken stri
 		t.Fatal(err)
 	}
 	cas = server.NewHandler(server.WithStorage(stor))
-	seed := &localCAS{storage: stor, namespace: "default"}
-	fileHash, err := upload.UploadFile(context.Background(), seed, bytes.NewReader(data), upload.WithEnableSHA256(true))
-	if err != nil {
-		t.Fatal(err)
-	}
+	fileHash := seedStorage(t, stor, data)
 	sum := sha256.Sum256(data)
 	u.sha256 = hex.EncodeToString(sum[:])
 
@@ -168,8 +161,8 @@ func TestMirrorIdentityIgnoresOrigin(t *testing.T) {
 }
 
 // Content sharing stops at the upstream origin: a second origin advertising
-// the same content hash neither resumes the first origin's partial spool nor
-// joins its running download, whatever bytes the first origin served.
+// the same content hash does not join the first origin's running download,
+// whatever bytes the first origin served.
 func TestIngestSharingScopedByOrigin(t *testing.T) {
 	etag, commit := strings.Repeat("ab", 20), strings.Repeat("cd", 20)
 	const pathA, pathB = "/org/a/resolve/main/f.bin", "/org/b/resolve/main/g.bin"
@@ -179,16 +172,10 @@ func TestIngestSharingScopedByOrigin(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var mu sync.Mutex
-	// hub fronts up with the shared etag and the honest size, whatever its CDN serves, recording the Range header of each data GET.
-	hub := func(up *plainUpstream, ranges *[]string) *httptest.Server {
+	// hub fronts up with the shared etag and the honest size, whatever its CDN serves.
+	hub := func(up *plainUpstream) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/cdn") {
-				if r.Method == http.MethodGet {
-					mu.Lock()
-					*ranges = append(*ranges, r.Header.Get("Range"))
-					mu.Unlock()
-				}
 				up.ServeHTTP(w, r)
 				return
 			}
@@ -213,58 +200,13 @@ func TestIngestSharingScopedByOrigin(t *testing.T) {
 		return in
 	}
 
-	t.Run("partial spool", func(t *testing.T) {
-		var rangesB []string
-		upA, upB := newPlainUpstream(), newPlainUpstream()
-		upA.commit, upB.commit = commit, commit
-		upA.set(pathA, lie[:len(lie)-1]) // one byte short of the advertised size
-		upB.set(pathB, data)
-		srvA, srvB := hub(upA, new([]string)), hub(upB, &rangesB)
-		m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())
-
-		inA := ingest(m, srvA, pathA)
-		awaitClosed(t, inA.Done(), "origin A ingest")
-		if _, err := inA.Entry(); err == nil || !strings.Contains(err.Error(), "size mismatch") {
-			t.Fatalf("origin A's short body: err = %v, want a size mismatch", err)
-		}
-		partial := filepath.Join(m.spoolDir, spoolFileName(srvA.URL, "/org/a/resolve/"+commit+"/f.bin", etag, int64(len(data)), true))
-		if fi, err := os.Stat(partial); err != nil || fi.Size() != int64(len(lie)-1) {
-			t.Fatalf("origin A's partial spool: %v, %v; want %d bytes kept", fi, err, len(lie)-1)
-		}
-
-		inB := ingest(m, srvB, pathB)
-		awaitClosed(t, inB.Done(), "origin B ingest")
-		entry, err := inB.Entry()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if entry.SHA256 != hashHex(string(data)) {
-			t.Fatalf("origin B entry sha256 = %s, want %s: origin A's bytes leaked into it", entry.SHA256, hashHex(string(data)))
-		}
-		if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
-			t.Fatal("stored bytes differ from origin B's data")
-		}
-		mu.Lock()
-		got := slices.Clone(rangesB)
-		mu.Unlock()
-		if !slices.Equal(got, []string{""}) {
-			t.Fatalf("origin B data GET Range headers = %q, want one GET from offset 0", got)
-		}
-		if fi, err := os.Stat(partial); err != nil || fi.Size() != int64(len(lie)-1) {
-			t.Fatalf("origin A's partial spool after B's ingest: %v, %v; want it untouched", fi, err)
-		}
-		if files := spoolFiles(t, m.spoolDir); len(files) != 1 {
-			t.Fatalf("spool files = %v, want origin A's partial spool alone", files)
-		}
-	})
-
 	t.Run("in-flight leader", func(t *testing.T) {
 		upA, upB := newPlainUpstream(), newPlainUpstream()
 		upA.gate, upA.gateHit = make(chan struct{}), make(chan struct{})
 		upA.commit, upB.commit = commit, commit
 		upA.set(pathA, lie)
 		upB.set(pathB, data)
-		srvA, srvB := hub(upA, new([]string)), hub(upB, new([]string))
+		srvA, srvB := hub(upA), hub(upB)
 		release := sync.OnceFunc(func() { close(upA.gate) })
 		t.Cleanup(release) // Close blocks on the gated handler
 		m, stor := newTestMirror(t, "http://unused.invalid", t.TempDir(), t.TempDir())

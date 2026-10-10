@@ -33,6 +33,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/wzshiming/httpseek v0.7.0 // indirect
+	github.com/wzshiming/ioswmr v0.3.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d // indirect
 	golang.org/x/sync v0.22.0 // indirect

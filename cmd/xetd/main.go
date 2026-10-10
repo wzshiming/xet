@@ -14,6 +14,7 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
+	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/server/internalapi"
@@ -75,6 +76,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	queue, err := spool.NewSpool(filepath.Join(*storageDir, "spool"), stor)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create spool: %v\n", err)
+		os.Exit(1)
+	}
+
 	issuer, err := auth.NewIssuer([]byte(*signingKey), 15*time.Minute, time.Now)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create token issuer: %v\n", err)
@@ -102,6 +109,7 @@ func main() {
 		mir, err = mirror.NewMirror(
 			mirror.WithStorage(stor),
 			mirror.WithCacheDir(filepath.Join(*storageDir, "mirror")),
+			mirror.WithSpool(queue),
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create mirror: %v\n", err)
@@ -144,6 +152,7 @@ func main() {
 			internalapi.WithGCGrace(1*time.Hour),
 			internalapi.WithGCAnchor(storage.AnchorBoth),
 			internalapi.WithMirror(mir),
+			internalapi.WithSpool(queue),
 			internalapi.WithNext(next),
 		)
 		fmt.Println("Internal management endpoints enabled at /internal/")
