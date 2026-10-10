@@ -23,6 +23,21 @@ type Resolution struct {
 	Stream *Stream
 }
 
+// Entry describes a fully ingested file, exporting what the index persists.
+type Entry struct {
+	// SHA256 is the hex digest of the file bytes, also the key of the plain
+	// download bridge (/xet-bridge/{sha256}).
+	SHA256 string
+	// FileHash is the xet file hash in local storage; empty for empty files.
+	FileHash string
+	// Size is the file length in bytes.
+	Size int64
+	// ETag is the upstream entity tag the cached bytes were validated against.
+	ETag string
+	// Commit is the upstream revision the file was resolved at.
+	Commit string
+}
+
 // Resolve resolves the file at upstreamURL, a hub download URL of the form
 // {origin}/{repo}/resolve/{rev}/{path}, through the shared acquire flow:
 // branch revisions are pinned to their upstream commit, entries and tasks are
@@ -33,8 +48,8 @@ type Resolution struct {
 // and token on it, and later resolvers of the same file join it. It returns
 // the ready entry, the stream of the in-flight ingest, or the terminal
 // ingest failure as an error (not-found matching ErrUpstreamNotFound). The
-// URL path is taken in its escaped form, so Resolve and Ingest share tasks,
-// entries, and spools.
+// URL path is taken in its escaped form, matching the HTTP route: tasks,
+// entries, and spools are keyed by it.
 //
 // The upstream probe runs before anything is returned: content local storage
 // already holds comes back as an Entry, and a probe failure as the error. ctx
@@ -56,6 +71,30 @@ func (m *Mirror) Resolve(ctx context.Context, upstreamURL, token string) (*Resol
 		return &Resolution{Entry: exportEntry(key, e)}, nil
 	}
 	return nil, entryErr(e)
+}
+
+// exportEntry copies the persisted fields of a ready entry into the exported
+// form.
+func exportEntry(key resolveKey, e *fileEntry) *Entry {
+	return &Entry{
+		SHA256:   e.SHA256,
+		FileHash: e.FileHash,
+		Size:     e.Size,
+		ETag:     e.ETag,
+		Commit:   key.rev,
+	}
+}
+
+// entryErr maps a failed entry to the error Resolve reports; not-found
+// failures match ErrUpstreamNotFound.
+func entryErr(e *fileEntry) error {
+	if e.lastErr != nil {
+		return e.lastErr
+	}
+	if e.notFound {
+		return ErrUpstreamNotFound
+	}
+	return errors.New("upstream fetch failed")
 }
 
 // Stream is the handle to one in-flight ingest. It never owns the ingest:
@@ -103,6 +142,11 @@ func (st *Stream) NewReader(off int64) io.ReadCloser {
 func (st *Stream) NewSeekReader(size int64) io.ReadSeekCloser {
 	return st.t.item.NewSeekReader(size)
 }
+
+// Done is closed once the ingest finished and released its spool — the entry
+// published and its manifest written (best effort), or the ingest failed;
+// Resolve again for the outcome.
+func (st *Stream) Done() <-chan struct{} { return st.t.done }
 
 // LookupXetHash resolves an lfs sha256 oid to the local xet file hash
 // through the storage sha256 index; ok is false when the content is not held

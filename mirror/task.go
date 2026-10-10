@@ -108,7 +108,7 @@ func (m *Mirror) startTask(ctx context.Context, key, src resolveKey, pre *probeR
 	}
 }
 
-// acquire is the shared resolution flow behind both Resolve and Ingest: it
+// acquire is the resolution flow behind Resolve: it
 // pins branch revisions to their upstream commit and returns what the request
 // attaches to — the in-flight task, or the terminal entry (ready,
 // revalidated on the usual cadence, or failed and still inside its retry

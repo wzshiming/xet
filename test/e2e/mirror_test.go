@@ -727,14 +727,17 @@ func TestMirrorResumeAcrossRestart(t *testing.T) {
 	srv := newMirrorServer(t, hubSrv.URL, storageDir, cacheDir, func(m *mirror.Mirror) { crashed = m })
 	// Registered after srv: the parked download ingests once the gate opens and must finish before the servers and temp dirs go.
 	t.Cleanup(func() {
-		in, err := crashed.Ingest(hubSrv.URL+resolvePath, "") // joins the parked download while it still waits on the gate
+		res, err := crashed.Resolve(context.Background(), hubSrv.URL+resolvePath, "") // joins the parked download while it still waits on the gate
 		close(hub.gate)
 		if err != nil {
 			t.Error(err)
 			return
 		}
+		if res.Stream == nil {
+			return
+		}
 		select {
-		case <-in.Done():
+		case <-res.Stream.Done():
 		case <-time.After(15 * time.Second):
 			t.Error("the abandoned server's download never finished")
 		}

@@ -20,7 +20,7 @@ import (
 	"github.com/wzshiming/xet/mirror/spool"
 )
 
-func TestIngest(t *testing.T) {
+func TestResolveToCompletion(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
 	defer upstreamSrv.Close()
@@ -35,24 +35,15 @@ func TestIngest(t *testing.T) {
 	cacheDir := t.TempDir()
 	m, stor := newTestMirror(t, upstreamSrv.URL, t.TempDir(), cacheDir)
 
-	t.Run("rejects invalid URLs", func(t *testing.T) {
-		if _, err := m.Mirror.Ingest(upstreamSrv.URL+"/org/repo/tree/main/model.bin", ""); err == nil {
-			t.Fatal("expected an error for a URL that is not a hub download URL")
-		}
-		if _, err := m.Ingest("org/repo", "main", ""); err == nil {
-			t.Fatal("expected an error for an empty path")
-		}
-	})
-
 	t.Run("resolves once done", func(t *testing.T) {
-		in, err := m.Ingest("org/repo", "main", "model.bin")
-		if err != nil {
-			t.Fatalf("Ingest: %v", err)
+		res, err := m.Resolve(context.Background(), "org/repo", "main", "model.bin")
+		if err != nil || res.Stream == nil {
+			t.Fatalf("Resolve = %+v, %v; want an in-flight stream", res, err)
 		}
-		<-in.Done()
-		entry, err := in.Entry()
+		<-res.Stream.Done()
+		entry, err := entryOf(res)
 		if err != nil {
-			t.Fatalf("Entry: %v", err)
+			t.Fatalf("ingest: %v", err)
 		}
 		sum := sha256.Sum256(data)
 		if entry.SHA256 != hex.EncodeToString(sum[:]) {
@@ -74,7 +65,7 @@ func TestIngest(t *testing.T) {
 
 		// Readiness must hold the moment Done closes: Resolve answers with
 		// the ready entry and storage serves the bytes.
-		res, err := m.Resolve(context.Background(), "org/repo", "main", "model.bin")
+		res, err = m.Resolve(context.Background(), "org/repo", "main", "model.bin")
 		if err != nil {
 			t.Fatalf("Resolve: %v", err)
 		}
@@ -91,14 +82,9 @@ func TestIngest(t *testing.T) {
 
 	t.Run("ready entry resolves without new downloads", func(t *testing.T) {
 		before := upstream.dataGETs.Load()
-		in, err := m.Ingest("org/repo", "main", "model.bin")
+		entry, err := ingestWait(t, m, "org/repo", "main", "model.bin")
 		if err != nil {
-			t.Fatalf("Ingest: %v", err)
-		}
-		<-in.Done()
-		entry, err := in.Entry()
-		if err != nil {
-			t.Fatalf("Entry: %v", err)
+			t.Fatalf("ingest: %v", err)
 		}
 		if entry.Size != int64(len(data)) {
 			t.Fatalf("Size = %d, want %d", entry.Size, len(data))
@@ -109,36 +95,17 @@ func TestIngest(t *testing.T) {
 	})
 
 	t.Run("not found matches ErrUpstreamNotFound", func(t *testing.T) {
-		in, err := m.Ingest("org/repo", "main", "missing.bin")
-		if err != nil {
-			t.Fatalf("Ingest: %v", err)
-		}
-		<-in.Done()
-		if _, err := in.Entry(); !errors.Is(err, ErrUpstreamNotFound) {
+		if _, err := ingestWait(t, m, "org/repo", "main", "missing.bin"); !errors.Is(err, ErrUpstreamNotFound) {
 			t.Fatalf("err = %v, want ErrUpstreamNotFound", err)
 		}
 		// The failure is cached with backoff and resolves without re-probing.
-		in, err = m.Ingest("org/repo", "main", "missing.bin")
-		if err != nil {
-			t.Fatalf("Ingest: %v", err)
-		}
-		<-in.Done()
-		if _, err := in.Entry(); !errors.Is(err, ErrUpstreamNotFound) {
+		if _, err := ingestWait(t, m, "org/repo", "main", "missing.bin"); !errors.Is(err, ErrUpstreamNotFound) {
 			t.Fatalf("cached err = %v, want ErrUpstreamNotFound", err)
 		}
 	})
 }
 
-func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("%s: timed out", what)
-	}
-}
-
-func TestIngestInFlight(t *testing.T) {
+func TestResolveInFlight(t *testing.T) {
 	commit := strings.Repeat("ab", 20)
 	for _, tc := range []struct{ name, rev string }{
 		{"same alias", "main"},
@@ -165,54 +132,46 @@ func TestIngestInFlight(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			in, err := m.Ingest("org/repo", "main", "model.bin")
-			if err != nil {
-				t.Fatalf("Ingest: %v", err)
+			first, err := m.Resolve(ctx, "org/repo", "main", "model.bin")
+			if err != nil || first.Stream == nil {
+				t.Fatalf("Resolve main = %+v, %v; want an in-flight stream", first, err)
 			}
 			awaitClosed(t, upstream.gateHit, "upstream transfer")
 			select {
-			case <-in.Done():
+			case <-first.Stream.Done():
 				t.Fatal("Done closed while the upstream transfer is still gated")
 			default:
 			}
-			if e, err := in.Entry(); e != nil || err != nil {
-				t.Fatalf("Entry before Done = %v, %v; want nil, nil", e, err)
-			}
 
-			res, err := m.Resolve(ctx, "org/repo", tc.rev, "model.bin")
-			if err != nil || res.Stream == nil {
-				t.Fatalf("Resolve %s = %+v, %v; want the in-flight stream", tc.rev, res, err)
+			joined, err := m.Resolve(ctx, "org/repo", tc.rev, "model.bin")
+			if err != nil || joined.Stream == nil {
+				t.Fatalf("Resolve %s = %+v, %v; want the in-flight stream", tc.rev, joined, err)
 			}
 			m.mu.Lock()
 			pinned, tasks := m.tasks[resolveKey{repo: "org/repo", rev: commit, path: "model.bin"}], len(m.tasks)
 			m.mu.Unlock()
-			if pinned == nil || res.Stream.t != pinned || tasks != 1 {
-				t.Fatalf("%s attached to task %p, pinned task %p, %d tasks; want one shared task", tc.rev, res.Stream.t, pinned, tasks)
+			if pinned == nil || joined.Stream.t != pinned || tasks != 1 {
+				t.Fatalf("%s attached to task %p, pinned task %p, %d tasks; want one shared task", tc.rev, joined.Stream.t, pinned, tasks)
 			}
-			if _, c := res.Stream.Meta(); c != commit {
+			if _, c := joined.Stream.Meta(); c != commit {
 				t.Fatalf("Meta commit = %q; want %s", c, commit)
 			}
 			if got := upstream.dataGETs.Load(); got != 1 {
 				t.Fatalf("upstream GETs while gated = %d, want 1", got)
 			}
-
-			joined, err := m.Ingest("org/repo", tc.rev, "model.bin")
-			if err != nil {
-				t.Fatalf("joining Ingest: %v", err)
-			}
 			select {
-			case <-joined.Done():
+			case <-joined.Stream.Done():
 				t.Fatal("joined Done closed while the upstream transfer is still gated")
 			default:
 			}
 
 			release.Do(func() { close(upstream.gate) })
 			sum := sha256.Sum256(data)
-			for name, h := range map[string]*Ingestion{"first": in, "joined": joined} {
-				awaitClosed(t, h.Done(), name+" Done")
-				entry, err := h.Entry()
+			for name, r := range map[string]*Resolution{"first": first, "joined": joined} {
+				awaitClosed(t, r.Stream.Done(), name+" Done")
+				entry, err := entryOf(r)
 				if err != nil {
-					t.Fatalf("%s Entry: %v", name, err)
+					t.Fatalf("%s ingest: %v", name, err)
 				}
 				if entry.Commit != commit || entry.SHA256 != hex.EncodeToString(sum[:]) || entry.Size != int64(len(data)) {
 					t.Fatalf("%s entry = %+v, want commit %s, sha256 %x, size %d", name, entry, commit, sum, len(data))
@@ -334,13 +293,13 @@ func TestMirrorIngestConcurrencyBound(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ingestions := map[string]*Ingestion{}
+	resolutions := map[string]*Resolution{}
 	for path := range files {
-		in, err := m.Ingest("org/repo", "main", strings.TrimPrefix(path, "/org/repo/resolve/main/"))
+		r, err := m.Resolve(ctx, "org/repo", "main", strings.TrimPrefix(path, "/org/repo/resolve/main/"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		ingestions[path] = in
+		resolutions[path] = r
 	}
 
 	running := map[string]bool{awaitStarted(t, up.started): true}
@@ -377,7 +336,7 @@ func TestMirrorIngestConcurrencyBound(t *testing.T) {
 	for path := range running {
 		first = path
 	}
-	joined, err := m.Ingest("org/repo", "main", strings.TrimPrefix(first, "/org/repo/resolve/main/"))
+	joined, err := m.Resolve(ctx, "org/repo", "main", strings.TrimPrefix(first, "/org/repo/resolve/main/"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,9 +353,9 @@ func TestMirrorIngestConcurrencyBound(t *testing.T) {
 	}
 	up.releaseAll()
 
-	for path, in := range ingestions {
-		awaitClosed(t, in.Done(), path)
-		entry, err := in.Entry()
+	for path, r := range resolutions {
+		awaitClosed(t, doneOf(r), path)
+		entry, err := entryOf(r)
 		if err != nil {
 			t.Fatalf("%s: %v", path, err)
 		}
@@ -404,8 +363,8 @@ func TestMirrorIngestConcurrencyBound(t *testing.T) {
 			t.Fatalf("%s: stored bytes mismatch", path)
 		}
 	}
-	awaitClosed(t, joined.Done(), "joined")
-	if _, err := joined.Entry(); err != nil {
+	awaitClosed(t, doneOf(joined), "joined")
+	if _, err := entryOf(joined); err != nil {
 		t.Fatal(err)
 	}
 	up.mu.Lock()
@@ -430,16 +389,12 @@ func TestMirrorIngestFailureReleasesSlot(t *testing.T) {
 	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), WithMaxConcurrentIngests(1))
 	t.Cleanup(up.releaseAll)
 
-	bad, err := m.Ingest("org/repo", "main", "bad.bin")
+	bad, err := m.Resolve(context.Background(), "org/repo", "main", "bad.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := awaitStarted(t, up.started); got != up.corrupt {
 		t.Fatalf("first transfer = %s, want %s", got, up.corrupt)
-	}
-	in, err := m.Ingest("org/repo", "main", "good.bin")
-	if err != nil {
-		t.Fatal(err)
 	}
 	// good.bin waits for the single slot; its size resolves meanwhile.
 	res, err := m.Resolve(context.Background(), "org/repo", "main", "good.bin")
@@ -457,8 +412,8 @@ func TestMirrorIngestFailureReleasesSlot(t *testing.T) {
 	default:
 	}
 	up.release(up.corrupt)
-	awaitClosed(t, bad.Done(), "bad ingest")
-	if _, err := bad.Entry(); !errors.Is(err, spool.ErrCorrupt) {
+	awaitClosed(t, doneOf(bad), "bad ingest")
+	if _, err := entryOf(bad); !errors.Is(err, spool.ErrCorrupt) {
 		t.Fatalf("bad ingest err = %v, want spool corrupt", err)
 	}
 
@@ -466,8 +421,8 @@ func TestMirrorIngestFailureReleasesSlot(t *testing.T) {
 		t.Fatalf("next transfer = %s, want good.bin", got)
 	}
 	up.releaseAll()
-	awaitClosed(t, in.Done(), "good ingest")
-	entry, err := in.Entry()
+	awaitClosed(t, doneOf(res), "good ingest")
+	entry, err := entryOf(res)
 	if err != nil {
 		t.Fatal(err)
 	}
