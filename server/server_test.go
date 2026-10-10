@@ -87,6 +87,29 @@ func (authorizer *recordingAuthorizer) Authorize(r *http.Request, grant auth.Gra
 	return authorizer.err
 }
 
+// The prefix segment is xet-core's fixed "default" (OpenAPI lists "default-merkledb" for chunks); the server accepts any value and ignores it.
+func TestXorbAndChunkRoutesIgnorePrefix(t *testing.T) {
+	stor, _, xorbHash, chunkHash, _, xorbBytes, _ := authorizerFixture(t)
+	handler := NewHandler(WithStorage(stor), WithAuthorizer(&recordingAuthorizer{}))
+	for _, test := range []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{"HEAD", "/v1/xorbs/default-merkledb/" + xorbHash.String(), nil},
+		{"GET", "/v1/xorbs/other/" + xorbHash.String(), nil},
+		{"POST", "/v1/xorbs/other/" + xorbHash.String(), xorbBytes},
+		{"GET", "/v1/chunks/default-merkledb/" + chunkHash.String(), nil},
+		{"POST", "/v1/chunks/other:query", fmt.Appendf(nil, `{"chunk_hashes":[%q]}`, chunkHash.String())},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(test.method, test.path, bytes.NewReader(test.body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s: status = %d: %s", test.method, test.path, rec.Code, rec.Body)
+		}
+	}
+}
+
 func TestRoutesConsultAuthorizer(t *testing.T) {
 	stor, fileHash, xorbHash, chunkHash, digest, xorbBytes, shardBytes := authorizerFixture(t)
 	unknown, err := xet.ParseFileHash(strings.Repeat("ab", 32))
