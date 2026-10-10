@@ -87,7 +87,10 @@ func TestSpoolTailRead(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer m.Writer().CloseWithError(nil)
-		rc := (&Item{f: &flight{swmr: m}}).NewReader(0)
+		rc, err := (&Item{f: &flight{swmr: m}}).NewReader(0)
+		if err != nil {
+			t.Fatal(err)
+		}
 		errCh := make(chan error, 1)
 		go func() {
 			_, err := rc.Read(make([]byte, 1))
@@ -106,11 +109,11 @@ func TestSpoolTailRead(t *testing.T) {
 		}
 		_ = m.Writer().CloseWithError(nil) // no refs: the file is removed immediately
 		it := &Item{f: &flight{swmr: m}}
-		if rc := it.NewReader(0); rc != nil {
-			t.Fatal("expected nil reader after removal")
+		if _, err := it.NewReader(0); !errors.Is(err, ioswmr.ErrClosedPipe) {
+			t.Fatalf("NewReader err = %v, want ioswmr.ErrClosedPipe", err)
 		}
-		if rs := it.NewSeekReader(0); rs != nil {
-			t.Fatal("expected nil seek reader after removal")
+		if _, err := it.NewSeekReader(0, 0); !errors.Is(err, ioswmr.ErrClosedPipe) {
+			t.Fatalf("NewSeekReader err = %v, want ioswmr.ErrClosedPipe", err)
 		}
 	})
 }
@@ -532,9 +535,9 @@ func TestSpoolFollower(t *testing.T) {
 		t.Fatalf("follower SetSize changed the flight size to %d", f.Size())
 	}
 
-	rc := f.NewReader(0)
-	if rc == nil {
-		t.Fatal("follower NewReader returned nil on a live spool")
+	rc, err := f.NewReader(0)
+	if err != nil {
+		t.Fatalf("follower NewReader on a live spool: %v", err)
 	}
 	tailed := make(chan []byte, 1)
 	go func() {
@@ -897,9 +900,9 @@ func TestSpoolFinish(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rc := it.NewReader(0)
-		if rc == nil {
-			t.Fatal("NewReader returned nil on a live spool")
+		rc, err := it.NewReader(0)
+		if err != nil {
+			t.Fatalf("NewReader on a live spool: %v", err)
 		}
 		if _, err := it.Write(data); err != nil {
 			t.Fatal(err)

@@ -296,9 +296,9 @@ func TestResolveStream(t *testing.T) {
 		<-upstream.gateHit
 		close(upstream.gate)
 	}()
-	rc := res.Stream.NewReader(0)
-	if rc == nil {
-		t.Fatal("NewReader returned nil while the ingest is in flight")
+	rc, err := res.Stream.NewReader(0)
+	if err != nil {
+		t.Fatalf("NewReader while the ingest is in flight: %v", err)
 	}
 	body, err := io.ReadAll(rc)
 	rc.Close()
@@ -2754,9 +2754,9 @@ func TestMirrorWithTransport(t *testing.T) {
 
 	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	rc := res.Stream.NewReader(0)
-	if rc == nil {
-		t.Fatal("NewReader returned nil while the ingest is in flight")
+	rc, err := res.Stream.NewReader(0)
+	if err != nil {
+		t.Fatalf("NewReader while the ingest is in flight: %v", err)
 	}
 	defer rc.Close()
 	context.AfterFunc(readCtx, func() { _ = rc.Close() })
