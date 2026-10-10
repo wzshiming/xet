@@ -1,8 +1,7 @@
 // Package spool handles the protocol-agnostic spooling of downloaded bytes on
 // the way into local storage: an append-only, tail-readable spool that buffers
-// in memory and spills to a file named by content identity, a storage-backed
-// upload target, and the verify-and-ingest step. Nothing here is specific to
-// any hub.
+// in memory and spills to a file named by content identity, and the
+// verify-and-ingest step into storage. Nothing here is specific to any hub.
 //
 // Spool is the ledger of the downloads in flight through one spool directory,
 // keyed by spool path. Accept hands a caller the writer of a new flight or a
@@ -35,7 +34,7 @@ import (
 // Spool is the ledger of downloads in flight through one spool directory, keyed by spool path; content spools are shared within an origin.
 type Spool struct {
 	dir     string
-	cas     *localCAS
+	st      storage.Storage
 	mu      sync.Mutex // flights
 	openMu  sync.Mutex // serializes spool open+register against Sweep
 	flights map[string]*flight
@@ -46,7 +45,7 @@ func NewSpool(dir string, st storage.Storage) (*Spool, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("spool: create %s: %w", dir, err)
 	}
-	return &Spool{dir: dir, cas: newLocalCAS(st, "default"), flights: map[string]*flight{}}, nil
+	return &Spool{dir: dir, st: st, flights: map[string]*flight{}}, nil
 }
 
 // Source is what a caller knows about the content it wants spooled.
@@ -239,7 +238,7 @@ func (it *Item) Finish(ctx context.Context, err error) {
 			if rs := it.NewSeekReader(size); rs == nil {
 				err = errors.New("spool: retired before ingest")
 			} else {
-				res, err = ingest(ctx, s.cas, rs, it.src.SHA256)
+				res, err = ingest(ctx, s.st, rs, it.src.SHA256)
 				_ = rs.Close()
 			}
 		}

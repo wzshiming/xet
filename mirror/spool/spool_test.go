@@ -380,9 +380,8 @@ func TestIngest(t *testing.T) {
 	digest := hex.EncodeToString(sum[:])
 
 	st := memory.NewStorage()
-	cas := newLocalCAS(st, "default")
 
-	if _, err := ingest(ctx, cas, f, strings.Repeat("00", 32)); !errors.Is(err, ErrCorrupt) {
+	if _, err := ingest(ctx, st, f, strings.Repeat("00", 32)); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Ingest with a wrong digest: %v, want ErrCorrupt", err)
 	}
 	if usage, err := st.Usage(ctx); err != nil || usage != (storage.Usage{}) {
@@ -392,7 +391,7 @@ func TestIngest(t *testing.T) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	res, err := ingest(ctx, cas, f, digest)
+	res, err := ingest(ctx, st, f, digest)
 	if err != nil {
 		t.Fatal(err)
 	}
