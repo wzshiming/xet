@@ -14,8 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/wzshiming/xet/storage"
 )
 
 // Sweep removes idle spools past the grace, never one a flight holds, and a dry run only counts.
@@ -62,16 +60,16 @@ func TestSpoolSweep(t *testing.T) {
 
 	all := []string{filepath.Base(stale), filepath.Base(fresh), filepath.Base(held.path())}
 	slices.Sort(all)
-	got, err := q.Sweep(ctx, storage.SweepOptions{Grace: -1, DryRun: true})
-	if err != nil || got != (SweepResult{DryRun: true, SweptSpools: 2, ReclaimedBytes: 100}) {
+	got, err := q.Sweep(ctx, SweepOptions{Grace: -1, DryRun: true})
+	if err != nil || got != (SweepResult{DryRun: true, SweptSpools: 2, ReclaimedBytes: 100, Done: true}) {
 		t.Fatalf("dry-run Sweep = %+v, %v; want a dry run of 2 spools, 100 bytes", got, err)
 	}
 	if files := spoolFiles(t, q.dir); !slices.Equal(files, all) {
 		t.Fatalf("spool files after dry run = %v, want %v", files, all)
 	}
 
-	got, err = q.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 40}) {
+	got, err = q.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 40, Done: true}) {
 		t.Fatalf("default-grace Sweep = %+v, %v; want 1 spool, 40 bytes", got, err)
 	}
 	want := []string{filepath.Base(fresh), filepath.Base(held.path())}
@@ -80,8 +78,8 @@ func TestSpoolSweep(t *testing.T) {
 		t.Fatalf("spool files after default-grace sweep = %v, want %v", files, want)
 	}
 
-	got, err = q.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 60}) {
+	got, err = q.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 60, Done: true}) {
 		t.Fatalf("no-grace Sweep = %+v, %v; want 1 spool, 60 bytes", got, err)
 	}
 	if files := spoolFiles(t, q.dir); !slices.Equal(files, []string{filepath.Base(held.path())}) {
@@ -105,7 +103,7 @@ func TestSpoolSweep(t *testing.T) {
 
 	t.Run("missing dir", func(t *testing.T) {
 		absent := &Spool{dir: filepath.Join(t.TempDir(), "absent")}
-		if got, err := absent.Sweep(ctx, storage.SweepOptions{Grace: -1}); err != nil || got != (SweepResult{}) {
+		if got, err := absent.Sweep(ctx, SweepOptions{Grace: -1}); err != nil || got != (SweepResult{Done: true}) {
 			t.Fatalf("Sweep of a missing dir = %+v, %v; want zero", got, err)
 		}
 	})
@@ -134,7 +132,7 @@ func TestSpoolSweepHoldsOpenMu(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := q.Sweep(ctx, storage.SweepOptions{})
+		res, err := q.Sweep(ctx, SweepOptions{})
 		done <- outcome{res, err}
 	}()
 	select {
@@ -149,7 +147,7 @@ func TestSpoolSweepHoldsOpenMu(t *testing.T) {
 	unlock()
 	select {
 	case o := <-done:
-		if o.err != nil || o.res != (SweepResult{SweptSpools: 1, ReclaimedBytes: 5}) {
+		if o.err != nil || o.res != (SweepResult{SweptSpools: 1, ReclaimedBytes: 5, Done: true}) {
 			t.Fatalf("Sweep after openMu was released = %+v, %v; want 1 spool, 5 bytes", o.res, o.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -180,12 +178,12 @@ func TestSpoolSweepSkipsUnremovable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(q.dir, 0o755) })
 
-	got, err := q.Sweep(ctx, storage.SweepOptions{DryRun: true})
-	if err != nil || got != (SweepResult{DryRun: true, SweptSpools: 1, ReclaimedBytes: 5}) {
+	got, err := q.Sweep(ctx, SweepOptions{DryRun: true})
+	if err != nil || got != (SweepResult{DryRun: true, SweptSpools: 1, ReclaimedBytes: 5, Done: true}) {
 		t.Fatalf("dry-run Sweep under a read-only spool dir = %+v, %v; want a dry run of 1 spool, 5 bytes", got, err)
 	}
-	got, err = q.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{}) {
+	got, err = q.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{Done: true}) {
 		t.Fatalf("Sweep under a read-only spool dir = %+v, %v; want nothing counted and no error", got, err)
 	}
 	if _, err := os.Stat(stale); err != nil {
@@ -195,11 +193,65 @@ func TestSpoolSweepSkipsUnremovable(t *testing.T) {
 	if err := os.Chmod(q.dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got, err = q.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 5}) {
+	got, err = q.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{SweptSpools: 1, ReclaimedBytes: 5, Done: true}) {
 		t.Fatalf("Sweep once the spool dir is writable = %+v, %v; want 1 spool, 5 bytes", got, err)
 	}
 	if _, err := os.Stat(stale); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("spool after the sweep: %v, want removed", err)
+	}
+}
+
+// A budget-bounded pass still unlinks one spool, so N stale spools drain in N passes; dry runs ignore the budget.
+func TestSpoolSweepBudget(t *testing.T) {
+	ctx := context.Background()
+	q, _ := newTestSpool(t)
+	old := time.Now().Add(-48 * time.Hour)
+	for i, name := range []string{"a.spool", "b.spool", "c.spool"} {
+		p := filepath.Join(q.dir, name)
+		if err := os.WriteFile(p, make([]byte, 10*(i+1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := q.Sweep(ctx, SweepOptions{Grace: -1, DryRun: true, Budget: time.Nanosecond})
+	if err != nil || got != (SweepResult{DryRun: true, SweptSpools: 3, ReclaimedBytes: 60, Done: true}) {
+		t.Fatalf("bounded dry-run Sweep = %+v, %v; want a finished dry run of 3 spools, 60 bytes", got, err)
+	}
+	if files := spoolFiles(t, q.dir); len(files) != 3 {
+		t.Fatalf("spool files after dry run = %v, want all 3", files)
+	}
+
+	var reclaimed int64
+	passes := 0
+	for {
+		if passes == 10 {
+			t.Fatal("bounded sweeps did not finish within 10 passes")
+		}
+		got, err := q.Sweep(ctx, SweepOptions{Grace: -1, Budget: time.Nanosecond})
+		passes++
+		if err != nil || got.SweptSpools != 1 {
+			t.Fatalf("bounded Sweep pass %d = %+v, %v; want exactly 1 spool", passes, got, err)
+		}
+		if want := 3 - passes; got.Done != (want == 0) || got.RemainingSpools != want {
+			t.Fatalf("bounded Sweep pass %d = %+v; want Done %v, RemainingSpools %d", passes, got, want == 0, want)
+		}
+		reclaimed += got.ReclaimedBytes
+		if got.Done {
+			break
+		}
+	}
+	if passes != 3 || reclaimed != 60 {
+		t.Fatalf("bounded sweeps = %d passes, %d bytes; want 3 passes, 60 bytes", passes, reclaimed)
+	}
+	if files := spoolFiles(t, q.dir); len(files) != 0 {
+		t.Fatalf("spool files after bounded sweeps = %v, want none", files)
+	}
+
+	if got, err := q.Sweep(ctx, SweepOptions{}); err != nil || got != (SweepResult{Done: true}) {
+		t.Fatalf("Sweep of a drained spool dir = %+v, %v; want a finished empty pass", got, err)
 	}
 }

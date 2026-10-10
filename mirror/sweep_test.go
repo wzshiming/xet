@@ -60,16 +60,16 @@ func TestSweepIndex(t *testing.T) {
 	}
 
 	killStored(t, stor, entries[0])
-	got, err := m.Sweep(ctx, storage.SweepOptions{DryRun: true})
-	if err != nil || got != (SweepResult{DryRun: true, DroppedEntries: 1}) {
+	got, err := m.Sweep(ctx, SweepOptions{DryRun: true})
+	if err != nil || got != (SweepResult{DryRun: true, DroppedEntries: 1, Done: true}) {
 		t.Fatalf("dry-run SweepIndex = %+v, %v; want a dry run of 1 dropped entry", got, err)
 	}
 	if got := files(); !slices.Equal(got, []string{"f1.bin", "f2.bin"}) || !has(key1) {
 		t.Fatalf("dry run changed the index: manifest files = %v, f1 in memory = %v", got, has(key1))
 	}
 
-	got, err = m.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{DroppedEntries: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{DroppedEntries: 1, Done: true}) {
 		t.Fatalf("SweepIndex = %+v, %v; want 1 dropped entry", got, err)
 	}
 	if got := files(); !slices.Equal(got, []string{"f2.bin"}) || has(key1) {
@@ -86,8 +86,8 @@ func TestSweepIndex(t *testing.T) {
 	writeRaw(t, freshTmp, []byte("{"))
 	garbage := filepath.Join(filepath.Dir(manifest), "garbage.json")
 	writeRaw(t, garbage, []byte("{"))
-	got, err = m.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{RemovedTempFiles: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{RemovedTempFiles: 1, Done: true}) {
 		t.Fatalf("default-grace SweepIndex = %+v, %v; want 1 temp file", got, err)
 	}
 	if _, err := os.Stat(oldTmp); !errors.Is(err, fs.ErrNotExist) {
@@ -96,8 +96,8 @@ func TestSweepIndex(t *testing.T) {
 	if _, err := os.Stat(freshTmp); err != nil {
 		t.Fatalf("fresh temp file removed inside the grace: %v", err)
 	}
-	got, err = m.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{RemovedTempFiles: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{RemovedTempFiles: 1, Done: true}) {
 		t.Fatalf("no-grace SweepIndex = %+v, %v; want 1 temp file", got, err)
 	}
 	if _, err := os.Stat(freshTmp); !errors.Is(err, fs.ErrNotExist) {
@@ -108,8 +108,8 @@ func TestSweepIndex(t *testing.T) {
 	}
 
 	killStored(t, stor, entries[1])
-	got, err = m.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{DroppedEntries: 1, RemovedManifests: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{DroppedEntries: 1, RemovedManifests: 1, Done: true}) {
 		t.Fatalf("SweepIndex with every file dead = %+v, %v; want 1 dropped entry and 1 removed manifest", got, err)
 	}
 	if _, err := os.Stat(manifest); !errors.Is(err, fs.ErrNotExist) {
@@ -136,7 +136,7 @@ func TestSweepIndex(t *testing.T) {
 
 	t.Run("missing dir", func(t *testing.T) {
 		absent := &Mirror{indexDir: filepath.Join(t.TempDir(), "absent")}
-		if got, err := absent.Sweep(ctx, storage.SweepOptions{Grace: -1}); err != nil || got != (SweepResult{}) {
+		if got, err := absent.Sweep(ctx, SweepOptions{Grace: -1}); err != nil || got != (SweepResult{Done: true}) {
 			t.Fatalf("SweepIndex of a missing dir = %+v, %v; want zero", got, err)
 		}
 	})
@@ -169,6 +169,65 @@ func killStored(t *testing.T, stor storage.Storage, e *Entry) {
 	}
 }
 
+// A spent budget ends the pass after the first swept unit, temp files first; dry runs ignore it,
+// and repeated passes drain the index.
+func TestSweepIndexBudget(t *testing.T) {
+	ctx := context.Background()
+	upstream := newPlainUpstream()
+	upstream.commit = strings.Repeat("ab", 20)
+	upstream.set("/org/repo/resolve/main/f1.bin", []byte("first file"))
+	srv := httptest.NewServer(upstream)
+	defer srv.Close()
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	entry, err := ingestWait(t, m, "org/repo", "main", "f1.bin")
+	if err != nil || entry.Commit != upstream.commit {
+		t.Fatalf("ingest = %+v, %v; want a ready entry at %s", entry, err, upstream.commit)
+	}
+	manifest := commitPath(m.indexDir, "org/repo", upstream.commit)
+	killStored(t, stor, entry)
+	oldTmp := filepath.Join(filepath.Dir(manifest), ".old.json.tmp")
+	writeRaw(t, oldTmp, []byte("{"))
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(oldTmp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(p string) bool {
+		_, err := os.Stat(p)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+
+	got, err := m.Sweep(ctx, SweepOptions{Grace: -1, DryRun: true, Budget: time.Nanosecond})
+	if err != nil || got != (SweepResult{DryRun: true, DroppedEntries: 1, RemovedManifests: 1, RemovedTempFiles: 1, Done: true}) {
+		t.Fatalf("budgeted dry run = %+v, %v; want a finished dry run of everything", got, err)
+	}
+	if !exists(oldTmp) || !exists(manifest) {
+		t.Fatalf("dry run changed the index: temp file %v, manifest %v", exists(oldTmp), exists(manifest))
+	}
+
+	opts := SweepOptions{Grace: -1, Budget: time.Nanosecond}
+	got, err = m.Sweep(ctx, opts)
+	if err != nil || got != (SweepResult{RemovedTempFiles: 1, RemainingManifests: 1}) {
+		t.Fatalf("first budgeted pass = %+v, %v; want the temp file and 1 manifest remaining", got, err)
+	}
+	if exists(oldTmp) || !exists(manifest) {
+		t.Fatalf("after the first pass: temp file %v, manifest %v; want only the manifest", exists(oldTmp), exists(manifest))
+	}
+	got, err = m.Sweep(ctx, opts)
+	if err != nil || got != (SweepResult{DroppedEntries: 1, RemovedManifests: 1, Done: true}) {
+		t.Fatalf("second budgeted pass = %+v, %v; want the manifest removed and done", got, err)
+	}
+	if exists(manifest) {
+		t.Fatal("manifest survived the second pass")
+	}
+	got, err = m.Sweep(ctx, opts)
+	if err != nil || got != (SweepResult{Done: true}) {
+		t.Fatalf("third budgeted pass = %+v, %v; want nothing counted and done", got, err)
+	}
+}
+
 // A temp file is only a leftover while no index write is in flight: the sweep waits for persistMu.
 func TestSweepIndexWaitsForWriter(t *testing.T) {
 	ctx := context.Background()
@@ -186,7 +245,7 @@ func TestSweepIndexWaitsForWriter(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
+		res, err := m.Sweep(ctx, SweepOptions{Grace: -1})
 		done <- outcome{res, err}
 	}()
 	select {
@@ -201,7 +260,7 @@ func TestSweepIndexWaitsForWriter(t *testing.T) {
 	unlock()
 	select {
 	case o := <-done:
-		if o.err != nil || o.res != (SweepResult{RemovedTempFiles: 1}) {
+		if o.err != nil || o.res != (SweepResult{RemovedTempFiles: 1, Done: true}) {
 			t.Fatalf("SweepIndex after the writer released = %+v, %v; want 1 temp file", o.res, o.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -241,7 +300,7 @@ func TestSweepIndexReportsPersistFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(commits, 0o755) })
-	got, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
+	got, err := m.Sweep(ctx, SweepOptions{Grace: -1})
 	if err == nil || got != (SweepResult{}) {
 		t.Fatalf("SweepIndex with an unwritable commits dir = %+v, %v; want zero counts and an error", got, err)
 	}
@@ -255,8 +314,8 @@ func TestSweepIndexReportsPersistFailure(t *testing.T) {
 	if err := os.Chmod(commits, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got, err = m.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{DroppedEntries: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{DroppedEntries: 1, Done: true}) {
 		t.Fatalf("SweepIndex once the dir is writable = %+v, %v; want the stale disk entry dropped", got, err)
 	}
 	if got := files(); !slices.Equal(got, []string{"f2.bin"}) {
@@ -298,7 +357,7 @@ func TestSweepIndexCountsWhatItWrites(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
+		res, err := m.Sweep(ctx, SweepOptions{Grace: -1})
 		done <- outcome{res, err}
 	}()
 	select {
@@ -322,7 +381,7 @@ func TestSweepIndexCountsWhatItWrites(t *testing.T) {
 	unlock()
 	select {
 	case o := <-done:
-		if o.err != nil || o.res != (SweepResult{DroppedEntries: 1}) {
+		if o.err != nil || o.res != (SweepResult{DroppedEntries: 1, Done: true}) {
 			t.Fatalf("SweepIndex with a file published meanwhile = %+v, %v; want 1 dropped entry and no removed manifest", o.res, o.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -384,7 +443,7 @@ func TestSweepIndexConcurrentPassesCountOnce(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
+		res, err := m.Sweep(ctx, SweepOptions{Grace: -1})
 		done <- outcome{res, err}
 	}()
 	select {
@@ -392,8 +451,8 @@ func TestSweepIndexConcurrentPassesCountOnce(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first sweep never checked the dead entry's liveness")
 	}
-	got, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{DroppedEntries: 1, RemovedManifests: 1}) {
+	got, err := m.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{DroppedEntries: 1, RemovedManifests: 1, Done: true}) {
 		t.Fatalf("second sweep = %+v, %v; want 1 dropped entry and 1 removed manifest", got, err)
 	}
 	if _, err := os.Stat(manifest); !errors.Is(err, fs.ErrNotExist) {
@@ -402,7 +461,7 @@ func TestSweepIndexConcurrentPassesCountOnce(t *testing.T) {
 	close(gated.release)
 	select {
 	case o := <-done:
-		if o.err != nil || o.res != (SweepResult{}) {
+		if o.err != nil || o.res != (SweepResult{Done: true}) {
 			t.Fatalf("first sweep after the manifest was removed under it = %+v, %v; want nothing counted", o.res, o.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -449,8 +508,8 @@ func TestSweepIndexLeavesNonResidentCommits(t *testing.T) {
 	if e, c := resident(); e != 0 || c != 0 {
 		t.Fatalf("restarted mirror holds %d entries and %d commits before any request", e, c)
 	}
-	got, err := m.Sweep(ctx, storage.SweepOptions{DryRun: true})
-	if err != nil || got != (SweepResult{DryRun: true, DroppedEntries: 2, RemovedManifests: 1}) {
+	got, err := m.Sweep(ctx, SweepOptions{DryRun: true})
+	if err != nil || got != (SweepResult{DryRun: true, DroppedEntries: 2, RemovedManifests: 1, Done: true}) {
 		t.Fatalf("dry-run SweepIndex = %+v, %v; want a dry run of 2 dropped entries and 1 removed manifest", got, err)
 	}
 	if e, c := resident(); e != 0 || c != 0 {
@@ -460,8 +519,8 @@ func TestSweepIndexLeavesNonResidentCommits(t *testing.T) {
 		t.Fatalf("dry run changed the manifest: files = %v", got)
 	}
 
-	got, err = m.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{DroppedEntries: 2, RemovedManifests: 1}) {
+	got, err = m.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{DroppedEntries: 2, RemovedManifests: 1, Done: true}) {
 		t.Fatalf("SweepIndex = %+v, %v; want 2 dropped entries and 1 removed manifest", got, err)
 	}
 	if e, c := resident(); e != 0 || c != 0 {
@@ -479,8 +538,8 @@ func TestSweepIndexLeavesNonResidentCommits(t *testing.T) {
 	if got := files(commits[2]); !slices.Equal(got, []string{"c1.bin"}) {
 		t.Fatalf("manifest of the live commit after the sweep = %v, want c1 alone", got)
 	}
-	got, err = m.Sweep(ctx, storage.SweepOptions{})
-	if err != nil || got != (SweepResult{}) {
+	got, err = m.Sweep(ctx, SweepOptions{})
+	if err != nil || got != (SweepResult{Done: true}) {
 		t.Fatalf("second SweepIndex = %+v, %v; want nothing counted", got, err)
 	}
 
@@ -530,7 +589,7 @@ func TestSweepIndexNonResidentYieldsToWriter(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
+		res, err := m.Sweep(ctx, SweepOptions{Grace: -1})
 		done <- outcome{res, err}
 	}()
 	select {
@@ -550,7 +609,7 @@ func TestSweepIndexNonResidentYieldsToWriter(t *testing.T) {
 	close(gated.release)
 	select {
 	case o := <-done:
-		if o.err != nil || o.res != (SweepResult{}) {
+		if o.err != nil || o.res != (SweepResult{Done: true}) {
 			t.Fatalf("SweepIndex over a commit opened meanwhile = %+v, %v; want nothing counted", o.res, o.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -560,8 +619,8 @@ func TestSweepIndexNonResidentYieldsToWriter(t *testing.T) {
 		t.Fatalf("manifest after the yielded sweep = %v, want f1 and g", got)
 	}
 
-	got, err := m.Sweep(ctx, storage.SweepOptions{Grace: -1})
-	if err != nil || got != (SweepResult{DroppedEntries: 1}) {
+	got, err := m.Sweep(ctx, SweepOptions{Grace: -1})
+	if err != nil || got != (SweepResult{DroppedEntries: 1, Done: true}) {
 		t.Fatalf("second SweepIndex = %+v, %v; want 1 dropped entry", got, err)
 	}
 	if got := files(); !slices.Equal(got, []string{"g.bin"}) {

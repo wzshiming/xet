@@ -106,7 +106,7 @@ func (h *Handler) registerRoutes() {
 	h.root.HandleFunc("/internal/files", h.handleListFiles).Methods(http.MethodGet)
 	h.root.HandleFunc("/internal/files/xet/{hash}", h.handleUnlinkFile).Methods(http.MethodDelete)
 	h.root.HandleFunc("/internal/files/sha256/{hash}", h.handleUnlinkSHA256).Methods(http.MethodDelete)
-	h.root.HandleFunc("/internal/gc/sweep", h.handleGCSweep).Methods(http.MethodPost)
+	h.root.HandleFunc("/internal/gc", h.handleGC).Methods(http.MethodPost)
 
 	h.root.NotFoundHandler = h.next
 }
@@ -211,7 +211,7 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGCSweep handles POST /internal/gc/sweep?dry_run=&grace=&max=&budget=&anchor=:
+// handleGC handles POST /internal/gc?dry_run=&grace=&max=&budget=&anchor=:
 // it removes (or, with dry_run, reports) shards and xorbs nothing keeps
 // alive under the chosen anchor: "both" (default; any file or non-zero
 // sha256 entry anchors — reclaiming takes the file and sha256 unlinks),
@@ -220,18 +220,27 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // stores managed exclusively by SHA-256, such as LFS backends). An omitted
 // anchor uses the server-configured default. An omitted grace uses the
 // server-configured window (the default when none was configured); an
-// explicit zero disables it; negative values are rejected. Every request
-// runs one independent bounded pass that re-marks from scratch — repeat
-// until the response reports done=true; done and remaining_* describe that
-// pass only, and without max or budget one pass already sweeps everything.
-// dry_run reports a full stateless pass's mark-time upper bound (no
-// per-shard re-checks, no entry counts), ignoring max and budget. The
-// response reports the storage pass under "storage" and, with a spool and
-// a mirror, the idle-spool pass the same grace and dry_run drive under
-// "spools" and the mirror's index pass under "mirror"; those two run once,
-// on the step that finishes the storage pass (done=true), so intermediate
-// stepped responses carry "storage" alone.
-func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
+// explicit zero disables it; negative values are rejected. The response
+// reports the storage pass under "storage" and, with a spool and a mirror,
+// the idle-spool pass the same grace and dry_run drive under "spools" and
+// the mirror's index pass under "mirror". Every request runs independent
+// bounded passes that re-mark from scratch: max bounds the storage pass
+// only, while budget is one wall-clock budget for the whole request, spent
+// storage → spool → mirror, each later pass getting what is left and being
+// skipped once the request has swept anything and nothing is left (a
+// request that swept nothing still hands the next pass a token budget, so
+// progress never stalls). The spool and mirror passes run only once the
+// storage pass has ended, done or failed, and each later pass only as the
+// budget allows, so stepped responses may carry "storage" alone, or
+// "storage" and "spools" without "mirror"; repeat until the top-level done
+// is true, and without max or budget one request already sweeps everything.
+// A failed pass appends "<name>: <message>" to "errors" and leaves done
+// false but does not stop the passes after it; the status stays 200 — only
+// a busy GC (409) or a bad parameter (400) fails the request. done and
+// remaining_* describe one request only. dry_run reports every pass's full
+// upper bound (for storage the mark-time bound: no per-shard re-checks, no
+// entry counts), ignoring max and budget.
+func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
 	}
@@ -286,6 +295,10 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var deadline time.Time
+	if budget > 0 && !dryRun {
+		deadline = time.Now().Add(budget)
+	}
 	opts := storage.SweepOptions{
 		Grace:      grace,
 		DryRun:     dryRun,
@@ -294,40 +307,71 @@ func (h *Handler) handleGCSweep(w http.ResponseWriter, r *http.Request) {
 		Anchor:     anchor,
 	}
 	result, err := h.gc.SweepStep(r.Context(), opts)
-	if err != nil {
-		if errors.Is(err, storage.ErrGCBusy) {
-			http.Error(w, "GC already running", http.StatusConflict)
-			return
-		}
-		http.Error(w, "Sweep failed: "+err.Error(), http.StatusInternalServerError)
+	if errors.Is(err, storage.ErrGCBusy) {
+		http.Error(w, "GC already running", http.StatusConflict)
 		return
 	}
-	resp := sweepResponse{Storage: result}
-	if result.Done {
-		if h.spool != nil {
-			spools, err := h.spool.Sweep(r.Context(), opts)
-			if err != nil {
-				http.Error(w, "Spool sweep failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			resp.Spools = &spools
+	var resp sweepResponse
+	swept, done := 0, true
+	if err != nil {
+		resp.Errors = append(resp.Errors, "storage: "+err.Error())
+		done = false
+	} else {
+		resp.Storage = result
+		swept = len(result.SweptShards) + len(result.SweptXorbs)
+		done = result.Done
+	}
+	// The later passes wait for the storage pass to finish, not for one that failed.
+	ended := err != nil || result.Done
+	// handDown returns the budget left for the next pass; false defers it
+	// because this request already swept something and spent its budget.
+	handDown := func() (time.Duration, bool) {
+		if deadline.IsZero() {
+			return 0, true
 		}
-		if h.mirror != nil {
-			mirror, err := h.mirror.Sweep(r.Context(), opts)
-			if err != nil {
-				http.Error(w, "Mirror sweep failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			resp.Mirror = &mirror
+		if left := time.Until(deadline); left > 0 {
+			return left, true
+		}
+		if swept > 0 {
+			return 0, false
+		}
+		return time.Nanosecond, true
+	}
+	if ended && h.spool != nil {
+		if b, ok := handDown(); !ok {
+			done = false
+		} else if spools, err := h.spool.Sweep(r.Context(), spool.SweepOptions{Grace: grace, DryRun: dryRun, Budget: b}); err != nil {
+			resp.Errors = append(resp.Errors, "spools: "+err.Error())
+			done = false
+		} else {
+			resp.Spools = &spools
+			swept += spools.SweptSpools
+			done = done && spools.Done
 		}
 	}
+	if ended && h.mirror != nil {
+		if b, ok := handDown(); !ok {
+			done = false
+		} else if index, err := h.mirror.Sweep(r.Context(), mirror.SweepOptions{Grace: grace, DryRun: dryRun, Budget: b}); err != nil {
+			resp.Errors = append(resp.Errors, "mirror: "+err.Error())
+			done = false
+		} else {
+			resp.Mirror = &index
+			done = done && index.Done
+		}
+	}
+	resp.Done = done
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// sweepResponse is the GC sweep report: the storage pass and, with a spool and a mirror, the spool and index passes.
+// sweepResponse is the GC sweep report: the storage pass and, with a spool and a mirror, the spool and index passes;
+// Errors lists the failed passes as "<name>: <message>" in pass order;
+// Done once every configured pass finished in this request.
 type sweepResponse struct {
-	Storage *storage.SweepResult `json:"storage"`
+	Done    bool                 `json:"done"`
+	Storage *storage.SweepResult `json:"storage,omitempty"`
 	Spools  *spool.SweepResult   `json:"spools,omitempty"`
 	Mirror  *mirror.SweepResult  `json:"mirror,omitempty"`
+	Errors  []string             `json:"errors,omitempty"`
 }
