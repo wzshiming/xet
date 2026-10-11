@@ -290,7 +290,7 @@ func TestAuthInternalToken(t *testing.T) {
 
 	routes := []struct{ method, url string }{
 		{http.MethodGet, srv.URL + "/internal/files"},
-		{http.MethodPost, srv.URL + "/internal/gc/sweep?dry_run=true"},
+		{http.MethodPost, srv.URL + "/internal/gc?dry_run=true"},
 		{http.MethodDelete, srv.URL + "/internal/files/xet/" + hashes[1].String()},
 		{http.MethodDelete, srv.URL + "/internal/files/sha256/" + hex.EncodeToString(digestB[:])},
 	}

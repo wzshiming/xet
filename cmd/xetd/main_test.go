@@ -120,7 +120,7 @@ func TestXetdInternalTokenIsolation(t *testing.T) {
 				{http.MethodGet, "/internal/files", http.StatusOK},
 				{http.MethodDelete, "/internal/files/xet/" + strings.Repeat("ab", 32), http.StatusNotFound},
 				{http.MethodDelete, "/internal/files/sha256/" + strings.Repeat("ab", 32), http.StatusNotFound},
-				{http.MethodPost, "/internal/gc/sweep?dry_run=true", http.StatusOK},
+				{http.MethodPost, "/internal/gc?dry_run=true", http.StatusOK},
 				{http.MethodGet, "/reconstructions", http.StatusOK},
 			} {
 				for _, token := range []string{"", "wrong-token", "signing-secret", readToken, writeToken, "internal-secret"} {
