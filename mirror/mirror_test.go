@@ -547,7 +547,7 @@ func TestMirrorUsage(t *testing.T) {
 	ctx := context.Background()
 	cacheDir := t.TempDir()
 	m, _ := newTestMirror(t, "http://upstream.invalid", t.TempDir(), cacheDir)
-	if got, err := m.Usage(ctx); err != nil || got != (Usage{}) {
+	if got, err := m.Usage(ctx); err != nil || got != (storage.ObjectUsage{}) {
 		t.Fatalf("usage of fresh mirror = %+v, %v; want zero", got, err)
 	}
 
@@ -559,7 +559,7 @@ func TestMirrorUsage(t *testing.T) {
 	writeRaw(t, manifest, manifestJSON)
 	writeRaw(t, pointer, pointerJSON)
 	writeRaw(t, manifest+".tmp", []byte("partial"))
-	wantIndex := storage.ObjectUsage{Count: 3, Bytes: int64(len(manifestJSON) + len(pointerJSON) + len("partial"))}
+	want := storage.ObjectUsage{Count: 3, Bytes: int64(len(manifestJSON) + len(pointerJSON) + len("partial"))}
 	writeRaw(t, filepath.Join(cacheDir, "download", "aa", "bb", "cc", "x.json"), []byte(`{}`))
 	writeRaw(t, filepath.Join(cacheDir, "upload", "y.spool"), []byte("not ours"))
 	writeRaw(t, filepath.Join(m.spoolDir, "z.spool"), []byte("the spool's"))
@@ -568,7 +568,6 @@ func TestMirrorUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := Usage{Index: wantIndex}
 	if got, err := m.Usage(ctx); err != nil || got != want {
 		t.Fatalf("usage with index files = %+v, %v; want %+v", got, err, want)
 	}
@@ -587,7 +586,7 @@ func TestMirrorUsage(t *testing.T) {
 	t.Run("missing dirs", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "never-created")
 		absent := &Mirror{indexDir: filepath.Join(root, "index")}
-		if got, err := absent.Usage(ctx); err != nil || got != (Usage{}) {
+		if got, err := absent.Usage(ctx); err != nil || got != (storage.ObjectUsage{}) {
 			t.Fatalf("usage of missing dirs = %+v, %v; want zero", got, err)
 		}
 		if _, err := os.Stat(root); !os.IsNotExist(err) {
@@ -596,7 +595,7 @@ func TestMirrorUsage(t *testing.T) {
 		canceled, cancel := context.WithCancel(ctx)
 		cancel()
 		for _, mir := range []*Mirror{absent, m.Mirror} {
-			if got, err := mir.Usage(canceled); !errors.Is(err, context.Canceled) || got != (Usage{}) {
+			if got, err := mir.Usage(canceled); !errors.Is(err, context.Canceled) || got != (storage.ObjectUsage{}) {
 				t.Fatalf("usage with canceled ctx = %+v, %v; want zero, context.Canceled", got, err)
 			}
 		}
@@ -609,7 +608,7 @@ func TestMirrorUsage(t *testing.T) {
 		file := filepath.Join(t.TempDir(), "file")
 		writeRaw(t, file, []byte("not a directory"))
 		broken := &Mirror{indexDir: filepath.Join(file, "index")}
-		if got, err := broken.Usage(ctx); !errors.Is(err, syscall.ENOTDIR) || got != (Usage{}) {
+		if got, err := broken.Usage(ctx); !errors.Is(err, syscall.ENOTDIR) || got != (storage.ObjectUsage{}) {
 			t.Fatalf("usage through a file = %+v, %v; want zero, ENOTDIR", got, err)
 		}
 	})
