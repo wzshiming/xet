@@ -24,14 +24,18 @@ type UpstreamProvider interface {
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	provider      UpstreamProvider
-	httpClient    *http.Client
-	getHttpClient *http.Client
-	concurrency   int
-	retries       int
-	idleTimeout   time.Duration
-	progressFunc  progress.ProgressFunc
-	cache         *Cache
+	provider          UpstreamProvider
+	httpClient        *http.Client
+	getHttpClient     *http.Client
+	concurrency       int
+	retries           int
+	idleTimeout       time.Duration
+	progressFunc      progress.ProgressFunc
+	shardProgressFunc progress.ProgressFunc
+	cache             *Cache
+
+	// detectedShardAPIVersion is the shard API auto uploads settled on (0 until probed, else 1 or 2); access it atomically.
+	detectedShardAPIVersion uint32
 }
 
 type Options func(*Client)
@@ -47,6 +51,13 @@ func WithHTTPClient(httpClient *http.Client) Options {
 func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
 	return func(c *Client) {
 		c.progressFunc = progressFunc
+	}
+}
+
+// WithShardProgressFunc sets a callback for V2 shard upload frames: ("validating", verified, total) or (commit stage, 0, 0).
+func WithShardProgressFunc(fn progress.ProgressFunc) Options {
+	return func(c *Client) {
+		c.shardProgressFunc = fn
 	}
 }
 
@@ -142,9 +153,10 @@ func (c *Client) Usage(ctx context.Context) (Usage, error) {
 }
 
 var (
-	errNotFound     = fmt.Errorf("404 not found")
-	errUnauthorized = errors.New("401 Unauthorized")
-	errForbidden    = errors.New("403 Forbidden")
+	errNotFound       = fmt.Errorf("404 not found")
+	errUnauthorized   = errors.New("401 Unauthorized")
+	errForbidden      = errors.New("403 Forbidden")
+	errNotImplemented = errors.New("501 Not Implemented")
 )
 
 func reqError(req *http.Request, resp *http.Response) error {
@@ -168,7 +180,7 @@ func reqError(req *http.Request, resp *http.Response) error {
 	return nil
 }
 
-// statusError is resp.Status as an error; a 401 also matches errUnauthorized and a 403 errForbidden so callers can keep them terminal.
+// statusError is resp.Status as an error; a 401 also matches errUnauthorized and a 403 errForbidden so callers can keep them terminal, a 501 errNotImplemented so shard uploads can fall back to V1.
 func statusError(resp *http.Response) error {
 	return statusCodeError{resp.StatusCode, resp.Status}
 }
@@ -186,6 +198,8 @@ func (e statusCodeError) Is(target error) bool {
 		return e.code == http.StatusUnauthorized
 	case errForbidden:
 		return e.code == http.StatusForbidden
+	case errNotImplemented:
+		return e.code == http.StatusNotImplemented
 	}
 	return false
 }

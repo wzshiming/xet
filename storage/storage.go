@@ -47,8 +47,12 @@ type Storage interface {
 
 	// Shard objects: serialized shards under shards/, resolved through the indexes.
 
-	// PutShard stores a shard, named by the SHA-256 of its stored bytes
-	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
+	// PutShardObject stores encoded as shards/<shardHash>, reporting false without writing when that object already exists.
+	PutShardObject(ctx context.Context, shardHash string, encoded []byte) (bool, error)
+
+	// PutIndexEntry records shardHash under kind/name, kind being index/chunks, index/sha256 or index/files.
+	// Whether an existing entry is kept (local, memory) or overwritten (s3) is the backend's choice; PutShard relies on neither.
+	PutIndexEntry(ctx context.Context, kind, name, shardHash string) error
 
 	// GetShard retrieves a shard by file hash
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)

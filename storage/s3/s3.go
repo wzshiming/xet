@@ -376,72 +376,34 @@ func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHas
 	return ss.xorbChunkOffsets(ctx, xorbHash)
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, error) {
-	if _, exists := ss.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
-	if err != nil {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return exists, nil
-}
-
 // GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
 func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
 	return ss.getObjectRange(ctx, ss.objectKey("xorbs", xorbHash.String()), start, end)
 }
 
-// PutShard stores a shard and its file/chunk/sha256 index objects.
-func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := ss.hasFile(ctx, fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, ss); err != nil {
-		return false, err
-	}
-
-	encoded, shardHash, err := storage.EncodeShard(s)
-	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-
+// PutShardObject uploads the encoded shard unless one of that name exists.
+func (ss *Storage) PutShardObject(ctx context.Context, shardHash string, encoded []byte) (bool, error) {
 	shardKey := ss.objectKey("shards", shardHash)
-	wasInserted := true
 	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
 		return false, fmt.Errorf("check shard object: %w", err)
 	} else if exists {
-		wasInserted = false
-	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded)); err != nil {
+		return false, nil
+	}
+	if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded)); err != nil {
 		return false, fmt.Errorf("upload shard: %w", err)
 	}
+	return true, nil
+}
 
-	// Nothing is cached here, but putIndexObject overwrites entries the caches
-	// may still hold, so each written key is evicted to keep warm reads from
-	// resolving a mapping the store no longer has.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(ctx context.Context, kind, name string, value []byte) error {
-		if err := ss.putIndexObject(ctx, ss.objectKey(kind, name), value); err != nil {
-			return err
-		}
-		ss.evictIndexEntry(kind, name)
-		return nil
-	})
-	return wasInserted, err
+// PutIndexEntry overwrites the entry. Nothing is cached here, but the caches
+// may still hold the overwritten mapping, so the key is evicted to keep warm
+// reads from resolving a mapping the store no longer has.
+func (ss *Storage) PutIndexEntry(ctx context.Context, kind, name, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey(kind, name), []byte(shardHash)); err != nil {
+		return err
+	}
+	ss.evictIndexEntry(kind, name)
+	return nil
 }
 
 // evictIndexEntry drops the cached mapping for an overwritten index object.

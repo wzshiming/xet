@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -65,6 +66,57 @@ func assertFilesCommitted(t *testing.T, ctx context.Context, st storage.Storage,
 	}
 }
 
+// addInterleavedFile stores xorbs A (3 chunks) and B (1 chunk) and appends to sh both CAS blocks and one file of terms A[0,2), B[0,1), A[2,3).
+func addInterleavedFile(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard) {
+	t.Helper()
+	a := [][]byte{[]byte("interleaved xorb A chunk 0"), []byte("interleaved xorb A chunk 1, longer"), []byte("interleaved xorb A chunk 2, longest of the three")}
+	b := []byte("interleaved xorb B chunk 0")
+	blocks := shard.NewShard()
+	addXorbFile(t, ctx, st, blocks, a)
+	addXorbFile(t, ctx, st, blocks, [][]byte{b})
+	sh.AddCASBlock(blocks.CASInfos[0])
+	sh.AddCASBlock(blocks.CASInfos[1])
+	var chunkHashes []xet.ChunkHash
+	var sizes []uint64
+	for _, part := range [][]byte{a[0], a[1], b, a[2]} {
+		chunkHashes = append(chunkHashes, xet.ComputeChunkHash(part))
+		sizes = append(sizes, uint64(len(part)))
+	}
+	xorbA, xorbB := blocks.CASInfos[0].CASHash, blocks.CASInfos[1].CASHash
+	sh.AddFile(shard.FileBlock{FileHash: xet.ComputeFileHash(chunkHashes, sizes), Entries: []shard.FileDataSequenceEntry{
+		{CASHash: xorbA, UnpackedSegBytes: uint32(len(a[0]) + len(a[1])), ChunkIndexEnd: 2},
+		{CASHash: xorbB, UnpackedSegBytes: uint32(len(b)), ChunkIndexEnd: 1},
+		{CASHash: xorbA, UnpackedSegBytes: uint32(len(a[2])), ChunkIndexStart: 2, ChunkIndexEnd: 3},
+	}})
+}
+
+// putShardEvent is a progress report or, with write set, a write of the shard object ("shards") or of an index entry (its kind).
+type putShardEvent struct {
+	phase       storage.PutShardPhase
+	done, total int
+	write       string
+}
+
+// putShardRecorder logs progress reports and, when PutShard commits through it, its writes in one sequence.
+type putShardRecorder struct {
+	storage.Storage
+	events []putShardEvent
+}
+
+func (r *putShardRecorder) progress(phase storage.PutShardPhase, done, total int) {
+	r.events = append(r.events, putShardEvent{phase: phase, done: done, total: total})
+}
+
+func (r *putShardRecorder) PutShardObject(ctx context.Context, shardHash string, encoded []byte) (bool, error) {
+	r.events = append(r.events, putShardEvent{write: "shards"})
+	return r.Storage.PutShardObject(ctx, shardHash, encoded)
+}
+
+func (r *putShardRecorder) PutIndexEntry(ctx context.Context, kind, name, shardHash string) error {
+	r.events = append(r.events, putShardEvent{write: kind})
+	return r.Storage.PutIndexEntry(ctx, kind, name, shardHash)
+}
+
 // One upload commits all its files in one shard; a file stored earlier must not hide the new ones.
 func testPutShardCommitsNewFilesBesideKnownFile(t *testing.T, b Backend) {
 	ctx := context.Background()
@@ -75,12 +127,12 @@ func testPutShardCommitsNewFilesBesideKnownFile(t *testing.T, b Backend) {
 	sh := shard.NewShard()
 	addFile(t, ctx, st, sh, partsA)
 	fileB := addFile(t, ctx, st, sh, [][]byte{[]byte("file B chunk one"), []byte("file B chunk two")})
-	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh, nil); err != nil || !inserted {
 		t.Fatalf("PutShard([A,B]) = %v, %v", inserted, err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
 
-	if inserted, err := st.PutShard(ctx, sh); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh, nil); err != nil || inserted {
 		t.Fatalf("repeated PutShard([A,B]) = %v, %v; want no-op", inserted, err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
@@ -93,7 +145,7 @@ func testPutShardRetryRepairsMissingFileEntry(t *testing.T, b Backend) {
 	sh := shard.NewShard()
 	a := addFile(t, ctx, st, sh, [][]byte{[]byte("file A of an interrupted upload")})
 	fileB := addFile(t, ctx, st, sh, [][]byte{[]byte("file B of an interrupted upload")})
-	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh, nil); err != nil || !inserted {
 		t.Fatalf("PutShard([A,B]) = %v, %v", inserted, err)
 	}
 	if _, err := storage.NewGC(st).Unlink(ctx, fileB.FileHash); err != nil {
@@ -103,7 +155,7 @@ func testPutShardRetryRepairsMissingFileEntry(t *testing.T, b Backend) {
 		t.Fatalf("GetFileIndexEntry(B) after unlink = %q, %v", got, err)
 	}
 
-	if _, err := st.PutShard(ctx, sh); err != nil {
+	if _, err := storage.PutShard(ctx, st, sh, nil); err != nil {
 		t.Fatalf("PutShard([A,B]) retry: %v", err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
@@ -134,7 +186,7 @@ func testPutShardVerifiesFileHash(t *testing.T, b Backend) {
 				digest[0] ^= 1
 				sh.Files[0].MetadataExt.SHA256Hash = shard.NewSHA256Hash(digest)
 			}
-			inserted, err := st.PutShard(ctx, sh)
+			inserted, err := storage.PutShard(ctx, st, sh, nil)
 			if test.wantErr != "" {
 				if inserted || !errors.Is(err, storage.ErrInvalidShard) || !strings.Contains(err.Error(), test.wantErr) {
 					t.Errorf("PutShard() = %v, %v, want %q", inserted, err, test.wantErr)
@@ -186,7 +238,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 				test.mutate(sh)
 			}
 
-			inserted, err := st.PutShard(ctx, sh)
+			inserted, err := storage.PutShard(ctx, st, sh, nil)
 			if test.wantErr == "" {
 				if err != nil || !inserted {
 					t.Fatalf("PutShard() = %v, %v", inserted, err)
@@ -213,7 +265,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 
 			honest := shard.NewShard()
 			addXorbFile(t, ctx, st, honest, parts)
-			if inserted, err := st.PutShard(ctx, honest); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, st, honest, nil); err != nil || !inserted {
 				t.Fatalf("honest PutShard() after rejection = %v, %v", inserted, err)
 			}
 			assertFilesCommitted(t, ctx, st, f)
@@ -223,5 +275,99 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 				}
 			}
 		})
+	}
+}
+
+func testPutShardReportsProgressPhases(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	sh := shard.NewShard()
+	addInterleavedFile(t, ctx, st, sh)
+	rec := &putShardRecorder{}
+	if inserted, err := storage.PutShard(ctx, st, sh, rec.progress); err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+	want := []putShardEvent{
+		{phase: storage.PutShardVerifying, done: 0, total: 5},
+		{phase: storage.PutShardVerifying, done: 1, total: 5},
+		{phase: storage.PutShardVerifying, done: 2, total: 5},
+		{phase: storage.PutShardVerifying, done: 3, total: 5},
+		{phase: storage.PutShardVerifying, done: 4, total: 5},
+		{phase: storage.PutShardVerifying, done: 5, total: 5},
+		{phase: storage.PutShardWriting},
+		{phase: storage.PutShardIndexing},
+	}
+	if !slices.Equal(rec.events, want) {
+		t.Fatalf("progress = %+v, want %+v", rec.events, want)
+	}
+}
+
+func testPutShardKnownShardReportsNoProgress(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	sh := shard.NewShard()
+	addInterleavedFile(t, ctx, st, sh)
+	if inserted, err := storage.PutShard(ctx, st, sh, nil); err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+	rec := &putShardRecorder{}
+	if inserted, err := storage.PutShard(ctx, st, sh, rec.progress); err != nil || inserted {
+		t.Fatalf("repeated PutShard() = %v, %v; want no-op", inserted, err)
+	}
+	if len(rec.events) != 0 {
+		t.Fatalf("repeated PutShard() reported %+v, want nothing", rec.events)
+	}
+}
+
+func testPutShardCommitsInPhaseOrder(t *testing.T, b Backend) {
+	ctx := context.Background()
+	rec := &putShardRecorder{Storage: b.New(t)}
+	sh := shard.NewShard()
+	addInterleavedFile(t, ctx, rec, sh)
+	if inserted, err := storage.PutShard(ctx, rec, sh, rec.progress); err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+
+	writing := slices.Index(rec.events, putShardEvent{phase: storage.PutShardWriting})
+	if writing < 0 || writing+1 == len(rec.events) || rec.events[writing+1] != (putShardEvent{write: "shards"}) {
+		t.Errorf("events = %+v, want the shard object written right after the Writing report", rec.events)
+	}
+	indexing := slices.Index(rec.events, putShardEvent{phase: storage.PutShardIndexing})
+	firstIndexWrite := slices.IndexFunc(rec.events, func(e putShardEvent) bool { return strings.HasPrefix(e.write, "index/") })
+	if indexing < 0 || firstIndexWrite < indexing {
+		t.Errorf("events = %+v, want the Indexing report before the first index write", rec.events)
+	}
+	var objectWrites int
+	var kinds []string
+	for _, e := range rec.events {
+		if e.write == "shards" {
+			objectWrites++
+		} else if e.write != "" {
+			kinds = append(kinds, e.write)
+		}
+	}
+	if objectWrites != 1 {
+		t.Errorf("PutShardObject called %d times, want 1", objectWrites)
+	}
+	if got, want := slices.Compact(kinds), []string{"index/chunks", "index/sha256", "index/files"}; !slices.Equal(got, want) {
+		t.Errorf("index writes by kind = %q, want %q", got, want)
+	}
+}
+
+func testPutShardStopsReportingOnInvalidShard(t *testing.T, b Backend) {
+	ctx := context.Background()
+	rec := &putShardRecorder{Storage: b.New(t)}
+	sh := shard.NewShard()
+	addInterleavedFile(t, ctx, rec, sh)
+	sh.CASInfos[1].Chunks[0].ChunkHash[0] ^= 1
+	if inserted, err := storage.PutShard(ctx, rec, sh, rec.progress); inserted || !errors.Is(err, storage.ErrInvalidShard) {
+		t.Fatalf("PutShard() = %v, %v; want %v", inserted, err, storage.ErrInvalidShard)
+	}
+	want := []putShardEvent{
+		{phase: storage.PutShardVerifying, done: 0, total: 5},
+		{phase: storage.PutShardVerifying, done: 1, total: 5},
+	}
+	if !slices.Equal(rec.events, want) {
+		t.Fatalf("events = %+v, want %+v and no writes", rec.events, want)
 	}
 }

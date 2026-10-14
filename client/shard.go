@@ -16,6 +16,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/progress"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/upload"
 )
@@ -39,6 +40,9 @@ type shardUploadEventV2 struct {
 	Type      string `json:"type"`
 	Message   string `json:"message,omitempty"`
 	Retryable bool   `json:"retryable,omitempty"`
+	Verified  uint64 `json:"verified"`
+	Total     uint64 `json:"total"`
+	Stage     string `json:"stage"`
 }
 
 // UploadShard uploads a serialized shard through the V1 API and caches its chunk locations for later dedup lookups.
@@ -133,7 +137,7 @@ func (c *Client) uploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upl
 		return nil, err
 	}
 
-	uploadResp, err := parseShardUploadNDJSON(resp.Body)
+	uploadResp, err := parseShardUploadNDJSON(resp.Body, c.shardProgressFunc)
 	if err != nil {
 		return nil, err
 	}
@@ -157,11 +161,11 @@ func (e *retryableShardUploadError) Error() string {
 const maxShardUploadEventSize = 1 << 20
 
 // parseShardUploadNDJSON reads the /v2/shards NDJSON response stream until a
-// terminal result or error frame. Progress frames ("validating", "committing",
-// "heartbeat", ...) and unknown frame types are non-terminal and skipped to
-// stay forward compatible. An error frame with retryable=true is reported as
+// terminal result or error frame. Validating and committing frames are passed
+// to progressFunc when non-nil; other non-terminal frames are skipped to stay
+// forward compatible. An error frame with retryable=true is reported as
 // *retryableShardUploadError so callers can retry the upload.
-func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
+func parseShardUploadNDJSON(r io.Reader, progressFunc progress.ProgressFunc) (*upload.ShardUploadResponse, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), maxShardUploadEventSize)
 	for scanner.Scan() {
@@ -174,6 +178,17 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 			return nil, fmt.Errorf("decode v2 shard upload event (line=%q): %w", line, err)
 		}
 		switch event.Type {
+		case "validating":
+			if progressFunc != nil {
+				progressFunc("validating", int64(event.Verified), int64(event.Total))
+			}
+		case "committing":
+			if event.Stage == "" {
+				event.Stage = "committing"
+			}
+			if progressFunc != nil {
+				progressFunc(event.Stage, 0, 0)
+			}
 		case "result":
 			return &upload.ShardUploadResponse{Result: 1}, nil
 		case "error":
@@ -185,7 +200,7 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 			}
 			return nil, fmt.Errorf("v2 shard upload failed: %s", event.Message)
 		default:
-			// Non-terminal progress frame; keep reading.
+			// Other non-terminal frame; keep reading.
 		}
 	}
 	if err := scanner.Err(); err != nil {

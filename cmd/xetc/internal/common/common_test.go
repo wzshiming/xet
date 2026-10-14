@@ -156,6 +156,53 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 	}
 }
 
+func TestExecuteUploadShowsShardStages(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	provider, _ := newTestServer(t)
+	input := filepath.Join(t.TempDir(), "input.bin")
+	if err := os.WriteFile(input, bytes.Repeat([]byte("xet shard stage characterization\n"), 64), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	uploadOutput := func() string {
+		var out bytes.Buffer
+		cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ExecuteUpload(context.Background(), input, cli, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+
+	got := uploadOutput()
+	rest := got
+	for _, line := range []string{"shard validating 0/2", "shard validating 2/2", "shard committing (uploading)", "shard committing (syncing)"} {
+		i := strings.Index(rest, line)
+		if i < 0 {
+			t.Fatalf("missing %q line (in stage order) in upload output %q", line, got)
+		}
+		rest = rest[i+len(line):]
+	}
+	if strings.Contains(got, "shard validating 0/0") {
+		t.Fatalf("unexpected %q line in upload output %q", "shard validating 0/0", got)
+	}
+	if !strings.Contains(got, "/s)") {
+		t.Fatalf("missing byte progress line in upload output %q", got)
+	}
+	_, hashLine, ok := strings.Cut(got, "Upload complete!\nFile hash: ")
+	if !ok {
+		t.Fatalf("unexpected upload output %q", got)
+	}
+	if _, err := xet.ParseFileHash(strings.TrimSuffix(hashLine, "\n")); err != nil {
+		t.Fatalf("upload output %q does not end with the file hash line: %v", got, err)
+	}
+
+	if again := uploadOutput(); strings.Contains(again, "shard committing") {
+		t.Fatalf("unexpected %q line in re-upload output %q; the server already stores the file", "shard committing", again)
+	}
+}
+
 // The resolve path downloads through the hub's xet links with the hub token, reporting the resolved hash.
 func TestExecuteResolveDownload(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())

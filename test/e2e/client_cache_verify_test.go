@@ -258,7 +258,7 @@ func newCountingCAS(t *testing.T) (*httptest.Server, *casCounters) {
 		case strings.HasPrefix(r.URL.Path, "/v1/xorbs/") && r.Method == http.MethodPost:
 			c.xorbPost.Add(1)
 			c.xorbBytes.Add(r.ContentLength)
-		case r.URL.Path == "/v1/shards" && r.Method == http.MethodPost:
+		case (r.URL.Path == "/v1/shards" || r.URL.Path == "/v2/shards") && r.Method == http.MethodPost:
 			c.shardPost.Add(1)
 		}
 		handler.ServeHTTP(w, r)

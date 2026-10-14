@@ -71,7 +71,7 @@ func authorizerFixture(t *testing.T) (storage.Storage, xet.FileHash, xet.XorbHas
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stor.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 	return stor, fileHash, xorbHash, chunkHash, digest, encoded.Bytes(), shardBytes
@@ -403,8 +403,8 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			probe := &shardV2TestStorage{Storage: target, putStarted: make(chan struct{}), putContinue: make(chan struct{})}
-			close(probe.putContinue)
+			probe := &shardV2TestStorage{Storage: target, gate: "GetFileIndexEntry", started: make(chan struct{}), release: make(chan struct{})}
+			probe.unblock()
 			authorizer := &recordingAuthorizer{err: auth.ErrForbidden}
 			body := &unreadBody{t: t}
 			request := httptest.NewRequest("POST", endpoint, body)
@@ -418,8 +418,8 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 				t.Fatalf("authorizations = %v", authorizer.calls)
 			}
 			select {
-			case <-probe.putStarted:
-				t.Fatal("PutShard called after authorization denied")
+			case <-probe.started:
+				t.Fatal("storage GetFileIndexEntry called after authorization denied")
 			default:
 			}
 			if _, err := target.GetShard(context.Background(), fileHash); err == nil {
@@ -446,9 +446,19 @@ func (s *untouchedStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) 
 	return false, errors.New("rejected upload")
 }
 
-func (s *untouchedStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
-	s.t.Error("PutShard called for a rejected shard upload")
+func (s *untouchedStorage) GetFileIndexEntry(context.Context, xet.FileHash) (string, error) {
+	s.t.Error("GetFileIndexEntry called for a rejected shard upload")
+	return "", errors.New("rejected upload")
+}
+
+func (s *untouchedStorage) PutShardObject(context.Context, string, []byte) (bool, error) {
+	s.t.Error("PutShardObject called for a rejected shard upload")
 	return false, errors.New("rejected upload")
+}
+
+func (s *untouchedStorage) PutIndexEntry(context.Context, string, string, string) error {
+	s.t.Error("PutIndexEntry called for a rejected shard upload")
+	return errors.New("rejected upload")
 }
 
 func TestShardUploadRejectsContentLengthBeforeBody(t *testing.T) {
@@ -778,7 +788,7 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 	}
 	fileBlock.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 	shardObj.AddFile(fileBlock)
-	if _, err := stor.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 

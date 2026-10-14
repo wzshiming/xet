@@ -12,8 +12,64 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
+// PutShardPhase is the commit stage a PutShardProgress report belongs to.
+type PutShardPhase uint8
+
+const (
+	PutShardVerifying PutShardPhase = iota + 1
+	PutShardWriting
+	PutShardIndexing
+)
+
+// PutShardProgress receives PutShard's progress: Verifying counts the CAS
+// blocks and file terms checked out of total, while Writing and Indexing
+// report (0, 0) once as they start.
+type PutShardProgress func(phase PutShardPhase, done, total int)
+
+// PutShard verifies s against the stored xorbs and commits it: the shard
+// object named by the SHA-256 of its encoding, then its chunk, SHA-256 and
+// file index entries. A shard whose every file is already indexed is a no-op.
+// It reports whether the shard object was newly written; progress may be nil.
+func PutShard(ctx context.Context, st Storage, s *shard.Shard, progress PutShardProgress) (bool, error) {
+	alreadyExists := len(s.Files) > 0
+	for _, file := range s.Files {
+		shardHash, err := st.GetFileIndexEntry(ctx, file.FileHash)
+		if err != nil {
+			return false, fmt.Errorf("check shard: %w", err)
+		}
+		if shardHash == "" {
+			alreadyExists = false
+			break
+		}
+	}
+	if alreadyExists {
+		return false, nil
+	}
+
+	if progress == nil {
+		progress = func(PutShardPhase, int, int) {}
+	}
+	if err := prepareShard(ctx, s, st, progress); err != nil {
+		return false, err
+	}
+
+	encoded, shardHash, err := EncodeShard(s)
+	if err != nil {
+		return false, fmt.Errorf("serialize shard: %w", err)
+	}
+
+	progress(PutShardWriting, 0, 0)
+	inserted, err := st.PutShardObject(ctx, shardHash, encoded)
+	if err != nil {
+		return false, err
+	}
+
+	progress(PutShardIndexing, 0, 0)
+	return inserted, putShardIndexes(ctx, st, s, shardHash)
+}
+
 // Empty files use zero digests instead of the SHA-256 of an empty stream.
-func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Storage) (digest [32]byte, fileHash xet.FileHash, err error) {
+func computeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Storage, termDone func()) (digest [32]byte, fileHash xet.FileHash, err error) {
 	if len(fileBlock.Entries) == 0 {
 		return digest, fileHash, nil
 	}
@@ -51,6 +107,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 		hashes, sizes := decoder.Chunks()
 		chunkHashes = append(chunkHashes, hashes...)
 		chunkSizes = append(chunkSizes, sizes...)
+		termDone()
 	}
 	copy(digest[:], h.Sum(nil))
 	fileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
@@ -92,17 +149,27 @@ func verifyCASBlock(ctx context.Context, cb *shard.CASBlock, xorbs Storage) erro
 	}
 }
 
-func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
+func prepareShard(ctx context.Context, s *shard.Shard, xorbs Storage, progress PutShardProgress) error {
 	if len(s.Files) == 0 {
 		return fmt.Errorf("shard has no file blocks")
+	}
+	done, total := 0, len(s.CASInfos)
+	for _, file := range s.Files {
+		total += len(file.Entries)
+	}
+	progress(PutShardVerifying, done, total)
+	verified := func() {
+		done++
+		progress(PutShardVerifying, done, total)
 	}
 	for i := range s.CASInfos {
 		if err := verifyCASBlock(ctx, &s.CASInfos[i], xorbs); err != nil {
 			return err
 		}
+		verified()
 	}
 	for i := range s.Files {
-		computed, fileHash, err := ComputeFileHashes(ctx, &s.Files[i], xorbs)
+		computed, fileHash, err := computeFileHashes(ctx, &s.Files[i], xorbs, verified)
 		if err != nil {
 			return fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
@@ -120,22 +187,21 @@ func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 }
 
 // File indexes commit last so partial writes remain retryable.
-func PutShardIndexes(ctx context.Context, s *shard.Shard, shardHash string, put func(ctx context.Context, kind, name string, value []byte) error) error {
-	value := []byte(shardHash)
+func putShardIndexes(ctx context.Context, st Storage, s *shard.Shard, shardHash string) error {
 	for _, casBlock := range s.CASInfos {
 		for _, chunk := range casBlock.Chunks {
-			if err := put(ctx, "index/chunks", chunk.ChunkHash.String(), value); err != nil {
+			if err := st.PutIndexEntry(ctx, "index/chunks", chunk.ChunkHash.String(), shardHash); err != nil {
 				return fmt.Errorf("write chunk index: %w", err)
 			}
 		}
 	}
 	for _, file := range s.Files {
-		if err := put(ctx, "index/sha256", file.MetadataExt.SHA256Hash.String(), value); err != nil {
+		if err := st.PutIndexEntry(ctx, "index/sha256", file.MetadataExt.SHA256Hash.String(), shardHash); err != nil {
 			return fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
-		if err := put(ctx, "index/files", file.FileHash.String(), value); err != nil {
+		if err := st.PutIndexEntry(ctx, "index/files", file.FileHash.String(), shardHash); err != nil {
 			return fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
