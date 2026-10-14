@@ -16,10 +16,11 @@ import (
 
 	"github.com/gorilla/handlers"
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/memory"
 )
 
+// shardV2TestStorage gates storage.PutShard at its first backend call and fails it there with putErr.
 type shardV2TestStorage struct {
 	storage.Storage
 	putStarted  chan struct{}
@@ -27,14 +28,25 @@ type shardV2TestStorage struct {
 	putErr      error
 }
 
-func (s *shardV2TestStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) {
-	return true, nil
-}
-
-func (s *shardV2TestStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
+func (s *shardV2TestStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
 	close(s.putStarted)
 	<-s.putContinue
-	return s.putErr == nil, s.putErr
+	if s.putErr != nil {
+		return "", s.putErr
+	}
+	return s.Storage.GetFileIndexEntry(ctx, fileHash)
+}
+
+// newShardV2TestStorage wraps a memory backend holding the xorb of
+// authorizerFixture's one-file shard, returned encoded for upload.
+func newShardV2TestStorage(t *testing.T) (*shardV2TestStorage, []byte) {
+	t.Helper()
+	_, _, xorbHash, _, _, xorbBytes, shardBytes := authorizerFixture(t)
+	backend := memory.NewStorage()
+	if _, err := backend.PutXorb(context.Background(), xorbHash, bytes.NewReader(xorbBytes)); err != nil {
+		t.Fatal(err)
+	}
+	return &shardV2TestStorage{Storage: backend, putStarted: make(chan struct{}), putContinue: make(chan struct{})}, shardBytes
 }
 
 type shardUploadWireEvent struct {
@@ -60,24 +72,11 @@ func readShardUploadWireEvent(t *testing.T, r *bufio.Reader) shardUploadWireEven
 }
 
 func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
-	shardObj := shard.NewShard()
-	shardObj.AddCASBlock(shard.CASBlock{})
-	encoded, err := shardObj.Encode(false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
+	stor, body := newShardV2TestStorage(t)
 	// Leave the final CAS-section bookend unsent. The first CAS block is
 	// complete, but Decode cannot finish until these last 48 bytes arrive.
 	partialSize := len(body) - 48
 
-	stor := &shardV2TestStorage{
-		putStarted:  make(chan struct{}),
-		putContinue: make(chan struct{}),
-	}
 	// Exercise the same logging wrapper used by cmd/xetd; ResponseController
 	// must unwrap it to enable full duplex on the underlying HTTP/1 writer.
 	httpSrv := httptest.NewServer(handlers.CombinedLoggingHandler(io.Discard, NewHandler(WithStorage(stor))))
@@ -161,14 +160,10 @@ func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 }
 
 func TestUploadShardStorageFailureRemainsRetryable(t *testing.T) {
-	_, _, _, _, _, _, body := authorizerFixture(t)
 	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
 		t.Run(endpoint, func(t *testing.T) {
-			stor := &shardV2TestStorage{
-				putStarted:  make(chan struct{}),
-				putContinue: make(chan struct{}),
-				putErr:      fmt.Errorf("backend unavailable"),
-			}
+			stor, body := newShardV2TestStorage(t)
+			stor.putErr = fmt.Errorf("backend unavailable")
 			close(stor.putContinue)
 			response := httptest.NewRecorder()
 			NewHandler(WithStorage(stor)).ServeHTTP(response, httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body)))

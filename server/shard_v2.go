@@ -208,7 +208,7 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 	if err := stream.committing("uploading"); err != nil {
 		return
 	}
-	if _, err := s.storage.PutShard(r.Context(), shardObj); err != nil {
+	if _, err := storage.PutShard(r.Context(), s.storage, shardObj, nil); err != nil {
 		if errors.Is(err, storage.ErrInvalidShard) {
 			finishWithError(err.Error(), false)
 		} else {

@@ -495,7 +495,7 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 		}
 	}
 
-	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
+	wasInserted, err := storage.PutShard(r.Context(), s.storage, shardObj, nil)
 	if err != nil {
 		if errors.Is(err, storage.ErrInvalidShard) {
 			return false, http.StatusBadRequest, err

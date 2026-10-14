@@ -33,7 +33,7 @@ func (c storageClient) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, r 
 }
 
 func (c storageClient) UploadShard(ctx context.Context, sh *shard.Shard) (*ShardUploadResponse, error) {
-	inserted, err := c.st.PutShard(ctx, sh)
+	inserted, err := storage.PutShard(ctx, c.st, sh, nil)
 	if err != nil {
 		return nil, err
 	}

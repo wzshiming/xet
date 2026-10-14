@@ -57,7 +57,7 @@ func putTestFile(t *testing.T, ctx context.Context, stor storage.Storage, conten
 			{CASHash: xorbHash, UnpackedSegBytes: uint32(len(content)), ChunkIndexEnd: 1},
 		},
 	})
-	if _, err := stor.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 	return fileHash
@@ -200,7 +200,7 @@ func TestBoundTokenCannotUnlinkEmptyFile(t *testing.T) {
 	}
 	empty := shard.NewShard()
 	empty.AddFile(shard.FileBlock{})
-	if _, err := stor.PutShard(ctx, empty); err != nil {
+	if _, err := storage.PutShard(ctx, stor, empty, nil); err != nil {
 		t.Fatal(err)
 	}
 	issuer, err := auth.NewIssuer(nil, 0, nil)

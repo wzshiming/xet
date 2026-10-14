@@ -24,6 +24,7 @@ import (
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -218,7 +219,7 @@ func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
 		s := shard.NewShard()
 		storagetest.AddFileBlock(t, ctx, ss, s, [][]byte{[]byte("identical content")})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
-		if inserted, err := ss.PutShard(ctx, s); err != nil || !inserted {
+		if inserted, err := storage.PutShard(ctx, ss, s, nil); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 
@@ -280,10 +281,10 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || inserted {
 		t.Fatalf("PutShard() repeat = %v, %v", inserted, err)
 	}
 
@@ -388,7 +389,7 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 			content := []byte("fan me out")
 			shardObj := shard.NewShard()
 			fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, [][]byte{content})
-			if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || !inserted {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
@@ -555,17 +556,17 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	fc.setFail(func(req *http.Request) bool {
 		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/index/sha256/")
 	})
-	if _, err := ss.PutShard(ctx, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj, nil); err == nil {
 		t.Fatal("PutShard() succeeded despite injected failure")
 	}
 
-	// The partial shard must not count as existing, in cache or in S3.
-	if exists, err := ss.hasFile(ctx, fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	// The partial shard must not count as existing.
+	if got, err := ss.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+		t.Fatalf("GetFileIndexEntry() after partial failure = %q, %v", got, err)
 	}
 
 	fc.setFail(nil)
-	if _, err := ss.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 

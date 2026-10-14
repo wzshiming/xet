@@ -1145,7 +1145,7 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 	shardObj := shard.NewShard()
 	emptyHash, _, _ := AddFileBlock(t, ctx, st, shardObj, nil)
 	fullHash, fullXorbs, _ := AddFileBlock(t, ctx, st, shardObj, [][]byte{content})
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 	var shardHash string
@@ -1257,7 +1257,7 @@ func testSweepAnchorSHA256LFSLifecycle(t *testing.T, b Backend) {
 		t.Fatalf("f2 sha256 entry = %q, %v; want %q", got, err, f2.ShardHash)
 	}
 
-	// hasFile self-heal: the file entry is gone, so PutShard treats
+	// Self-heal: the file entry is gone, so PutShard treats
 	// the content as absent and recommits it all.
 	if again := PutFile(t, ctx, st, parts1); again.ShardHash != f1.ShardHash {
 		t.Fatal("re-upload produced different hashes")
@@ -1364,7 +1364,7 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 // under two chunkings shares one sha256 entry, owned by whichever PutShard
 // the backend keeps (FileStorage the first, S3 the last). An AnchorFiles
 // sweep of the owner deletes the entry outright: SHA-256 lookup misses, and
-// re-uploading the live chunking cannot heal it (PutShard's hasFile gate
+// re-uploading the live chunking cannot heal it (PutShard's file-index gate
 // skips every index write), while the live file stays whole by file hash;
 // re-uploading the dead chunking rewrites the entry.
 func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
@@ -1413,7 +1413,7 @@ func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 		t.Fatal("SHA-256 lookup still resolves after the entry delete")
 	}
 
-	// The live chunking's re-upload is a no-op behind hasFile.
+	// The live chunking's re-upload is a no-op behind PutShard's file-index gate.
 	PutFile(t, ctx, st, liveParts)
 	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("sha256 entry after live re-upload = %q, %v; want still removed", got, err)
