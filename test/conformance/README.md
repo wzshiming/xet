@@ -3,7 +3,7 @@
 This module tests the Go implementation directly against the Rust reference
 implementation from [`huggingface/xet-core`](https://github.com/huggingface/xet-core).
 The Rust dependencies are pinned to commit
-`de71453d952bd8b806edaa997c72313051a49050`
+`4b485713577a8f25d015953046210dc3d5d25ea5` (v1.7.0)
 
 The test adapter builds `xet-core-reference` automatically with Cargo. It covers
 chunking and hashes, XORB interoperability, upload/download request behavior,

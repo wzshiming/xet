@@ -94,6 +94,8 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/shards", s.handleUploadShard).Methods(http.MethodPost)
 	s.root.HandleFunc("/xet-bridge/{sha256}", s.handleXetBridge).Methods(http.MethodGet, http.MethodHead)
+	// xet-core >= 1.7.0 posts one transfer summary here after each upload/download; validated per upstream openapi/cas.openapi.yaml, then discarded.
+	s.root.HandleFunc("/v1/telemetry", s.handleTelemetry).Methods(http.MethodPost)
 
 	s.root.NotFoundHandler = s.next
 }
@@ -612,4 +614,61 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchChunkDedupQueryResponse{Results: results})
+}
+
+// maxTelemetryBodyBytes is upstream's 1 MiB cap on a telemetry document; larger bodies get 413.
+const maxTelemetryBodyBytes = 1 << 20
+
+// handleTelemetry handles POST /v1/telemetry.
+func (s *Handler) handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Read}) {
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxTelemetryBodyBytes))
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err != nil || !validTelemetryEnvelope(body) {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// validTelemetryEnvelope reports whether body is the JSON object upstream's openapi/cas.openapi.yaml requires; metrics stay opaque.
+func validTelemetryEnvelope(body []byte) bool {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) != nil {
+		return false
+	}
+	_, snake := doc["user_agent"]
+	_, camel := doc["userAgent"]
+	if snake == camel {
+		return false
+	}
+	userAgent := "user_agent"
+	if camel {
+		userAgent = "userAgent"
+	}
+	// *string because JSON null unmarshals into a plain string without error.
+	str := func(key string) *string {
+		var s *string
+		if json.Unmarshal(doc[key], &s) != nil {
+			return nil
+		}
+		return s
+	}
+	ts := str("time")
+	if ts == nil || str("event") == nil || str("session_id") == nil || str(userAgent) == nil {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339, *ts); err != nil {
+		return false
+	}
+	var metrics map[string]json.RawMessage
+	return json.Unmarshal(doc["metrics"], &metrics) == nil && metrics != nil
 }
