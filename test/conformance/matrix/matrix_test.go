@@ -872,6 +872,7 @@ func compareUploadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustr
 		"POST:/v1/chunks/default:query": true,
 		"HEAD:/v1/xorbs/default/{hash}": true,
 		"POST:/v1/xorbs/default/{hash}": true,
+		telemetryReqType:                true,
 	})
 
 	// STRICT: Both must upload exactly one shard
@@ -927,6 +928,9 @@ const xorbDownloadReqType = "GET:/v1/xorbs/default/{hash}"
 // client may batch its range requests differently, so counts are not compared.
 const fetchTermReqType = "GET:/v1/fetch_term"
 
+// xet-core >= 1.7.0 posts a best-effort telemetry report after each transfer; the Go client does not, so it is not compared.
+const telemetryReqType = "POST:/v1/telemetry"
+
 // compareDownloadRequests compares HTTP requests from xet-core and native clients for downloads.
 func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustrefReqs, nativeReqs []RequestRecord, fileHash string) {
 	t.Helper()
@@ -977,6 +981,7 @@ func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rus
 		wantReconType:       true,
 		xorbDownloadReqType: true,
 		fetchTermReqType:    true,
+		telemetryReqType:    true,
 	})
 }
 
