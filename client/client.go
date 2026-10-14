@@ -24,14 +24,15 @@ type UpstreamProvider interface {
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	provider      UpstreamProvider
-	httpClient    *http.Client
-	getHttpClient *http.Client
-	concurrency   int
-	retries       int
-	idleTimeout   time.Duration
-	progressFunc  progress.ProgressFunc
-	cache         *Cache
+	provider          UpstreamProvider
+	httpClient        *http.Client
+	getHttpClient     *http.Client
+	concurrency       int
+	retries           int
+	idleTimeout       time.Duration
+	progressFunc      progress.ProgressFunc
+	shardProgressFunc progress.ProgressFunc
+	cache             *Cache
 }
 
 type Options func(*Client)
@@ -47,6 +48,13 @@ func WithHTTPClient(httpClient *http.Client) Options {
 func WithProgressFunc(progressFunc progress.ProgressFunc) Options {
 	return func(c *Client) {
 		c.progressFunc = progressFunc
+	}
+}
+
+// WithShardProgressFunc sets a callback for V2 shard upload frames: ("validating", verified, total) or (commit stage, 0, 0).
+func WithShardProgressFunc(fn progress.ProgressFunc) Options {
+	return func(c *Client) {
+		c.shardProgressFunc = fn
 	}
 }
 
