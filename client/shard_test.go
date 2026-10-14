@@ -206,6 +206,207 @@ func TestUploadShardV2HandlesTrailingFrameWithoutNewline(t *testing.T) {
 	}
 }
 
+type progressCall struct {
+	name           string
+	current, total int64
+}
+
+type progressRecorder struct {
+	mu    sync.Mutex
+	calls []progressCall
+}
+
+func (p *progressRecorder) record(name string, current, total int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, progressCall{name, current, total})
+}
+
+func (p *progressRecorder) get() []progressCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
+}
+
+// newStageProgressClient serves attempts[i] as the i-th /v2/shards response stream.
+func newStageProgressClient(t *testing.T, attempts ...[]string) (*Client, *progressRecorder) {
+	t.Helper()
+	var served atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for _, frame := range attempts[served.Add(1)-1] {
+			_, _ = io.WriteString(w, frame+"\n")
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	rec := &progressRecorder{}
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithRetries(len(attempts)-1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")), WithShardProgressFunc(rec.record))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return c, rec
+}
+
+func TestUploadShardV2ReportsStageProgress(t *testing.T) {
+	c, rec := newStageProgressClient(t, []string{
+		`{"type":"validating","verified":0,"total":0}`,
+		`{"type":"validating","verified":0,"total":3}`,
+		`{"type":"validating","verified":2,"total":3}`,
+		`{"type":"committing","stage":"uploading"}`,
+		`{"type":"committing","stage":"syncing"}`,
+		`{"type":"result"}`,
+	})
+	response, err := c.UploadShardV2(t.Context(), shard.NewShard())
+	if err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	if response.Result != 1 {
+		t.Fatalf("result: got %d want 1", response.Result)
+	}
+	want := []progressCall{{"validating", 0, 0}, {"validating", 0, 3}, {"validating", 2, 3}, {"uploading", 0, 0}, {"syncing", 0, 0}}
+	if got := rec.get(); !slices.Equal(got, want) {
+		t.Fatalf("stage progress: got %v want %v", got, want)
+	}
+}
+
+func TestUploadShardV2ReportsCommittingWithoutStage(t *testing.T) {
+	c, rec := newStageProgressClient(t, []string{`{"type":"committing"}`, `{"type":"result"}`})
+	if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	want := []progressCall{{"committing", 0, 0}}
+	if got := rec.get(); !slices.Equal(got, want) {
+		t.Fatalf("stage progress: got %v want %v", got, want)
+	}
+}
+
+func TestUploadShardV2ReportsRepeatedHeartbeatFrames(t *testing.T) {
+	c, rec := newStageProgressClient(t, []string{
+		`{"type":"validating","verified":1,"total":3}`,
+		`{"type":"validating","verified":1,"total":3}`,
+		`{"type":"committing","stage":"syncing"}`,
+		`{"type":"committing","stage":"syncing"}`,
+		`{"type":"result"}`,
+	})
+	if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	want := []progressCall{{"validating", 1, 3}, {"validating", 1, 3}, {"syncing", 0, 0}, {"syncing", 0, 0}}
+	if got := rec.get(); !slices.Equal(got, want) {
+		t.Fatalf("stage progress: got %v want %v", got, want)
+	}
+}
+
+// The leading validating frame keeps an unwired callback from passing.
+func TestUploadShardV2StageProgressIgnoresOtherFrames(t *testing.T) {
+	validating := `{"type":"validating","verified":0,"total":1}`
+	want := []progressCall{{"validating", 0, 1}}
+
+	t.Run("unknown and result", func(t *testing.T) {
+		c, rec := newStageProgressClient(t, []string{validating, `{"type":"unknown","verified":9,"total":9,"stage":"syncing"}`, `{"type":"result"}`})
+		if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err != nil {
+			t.Fatalf("UploadShardV2: %v", err)
+		}
+		if got := rec.get(); !slices.Equal(got, want) {
+			t.Fatalf("stage progress: got %v want %v", got, want)
+		}
+	})
+	t.Run("error", func(t *testing.T) {
+		c, rec := newStageProgressClient(t, []string{validating, `{"type":"error","message":"rejected","retryable":false}`})
+		if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err == nil || !strings.Contains(err.Error(), "rejected") {
+			t.Fatalf("expected terminal error, got %v", err)
+		}
+		if got := rec.get(); !slices.Equal(got, want) {
+			t.Fatalf("stage progress: got %v want %v", got, want)
+		}
+	})
+}
+
+func TestUploadShardV2StageProgressRestartsOnRetry(t *testing.T) {
+	c, rec := newStageProgressClient(t,
+		[]string{`{"type":"validating","verified":0,"total":1}`, `{"type":"error","message":"busy","retryable":true}`},
+		[]string{`{"type":"validating","verified":0,"total":1}`, `{"type":"result"}`},
+	)
+	response, err := c.UploadShardV2(t.Context(), shard.NewShard())
+	if err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	if response.Result != 1 {
+		t.Fatalf("result: got %d want 1", response.Result)
+	}
+	want := []progressCall{{"validating", 0, 1}, {"validating", 0, 1}}
+	if got := rec.get(); !slices.Equal(got, want) {
+		t.Fatalf("stage progress: got %v want %v", got, want)
+	}
+}
+
+func TestUploadShardV2StageProgressIndependentOfProgressFunc(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = io.WriteString(w, "{\"type\":\"validating\",\"verified\":0,\"total\":1}\n")
+		_, _ = io.WriteString(w, "{\"type\":\"result\"}\n")
+	}))
+	defer srv.Close()
+
+	stages, byteProgress := &progressRecorder{}, &progressRecorder{}
+	// WithProgressFunc goes last so an option sharing its field would divert the stage frames.
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")), WithShardProgressFunc(stages.record), WithProgressFunc(byteProgress.record))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	if got, want := stages.get(), []progressCall{{"validating", 0, 1}}; !slices.Equal(got, want) {
+		t.Fatalf("stage progress: got %v want %v", got, want)
+	}
+	if got := byteProgress.get(); len(got) != 0 {
+		t.Fatalf("byte progress: got %v want none", got)
+	}
+}
+
+// The trailing V2 upload keeps an unwired callback from passing.
+func TestUploadShardV1ReportsNoStageProgress(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/shards":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"result":1}`)
+		case "/v2/shards":
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = io.WriteString(w, "{\"type\":\"validating\",\"verified\":0,\"total\":1}\n")
+			_, _ = io.WriteString(w, "{\"type\":\"result\"}\n")
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	rec := &progressRecorder{}
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")), WithShardProgressFunc(rec.record))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	response, err := c.UploadShard(t.Context(), shard.NewShard())
+	if err != nil {
+		t.Fatalf("UploadShard: %v", err)
+	}
+	if response.Result != 1 {
+		t.Fatalf("result: got %d want 1", response.Result)
+	}
+	if got := rec.get(); len(got) != 0 {
+		t.Fatalf("stage progress after V1: got %v want none", got)
+	}
+	if _, err := c.UploadShardV2(t.Context(), shard.NewShard()); err != nil {
+		t.Fatalf("UploadShardV2: %v", err)
+	}
+	if got, want := rec.get(), []progressCall{{"validating", 0, 1}}; !slices.Equal(got, want) {
+		t.Fatalf("stage progress after V2: got %v want %v", got, want)
+	}
+}
+
 // buildDedupShardBytes serializes a single-xorb dedup shard whose stored
 // chunk hashes are given verbatim (pre-keyed by the caller when simulating a
 // keyed CAS response).
