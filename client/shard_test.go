@@ -886,7 +886,7 @@ func TestUploadTwiceSkipsDedupQueriesAndXorbUploads(t *testing.T) {
 	}
 
 	first := uploadOnce()
-	if xorbs, shards := count("POST /v1/xorbs/"), count("POST /v1/shards"); xorbs == 0 || shards != 1 {
+	if xorbs, shards := count("POST /v1/xorbs/"), count("POST /v1/shards", "POST /v2/shards"); xorbs == 0 || shards != 1 {
 		t.Fatalf("first upload: %d xorb uploads, %d shard uploads; want at least one and exactly one", xorbs, shards)
 	}
 	cached := cachedChunkEntries(cacheDir)
@@ -900,7 +900,7 @@ func TestUploadTwiceSkipsDedupQueriesAndXorbUploads(t *testing.T) {
 	if second := uploadOnce(); second != first {
 		t.Fatalf("second upload hash = %s, want %s", second, first)
 	}
-	dedup, xorbs, shards := count("GET /v1/chunks", "POST /v1/chunks"), count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("POST /v1/shards")
+	dedup, xorbs, shards := count("GET /v1/chunks", "POST /v1/chunks"), count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("POST /v1/shards", "POST /v2/shards")
 	if dedup != 0 || xorbs != 0 || shards != 1 {
 		t.Fatalf("second upload: %d dedup queries, %d xorb POST/HEAD, %d shard uploads; want 0, 0, 1", dedup, xorbs, shards)
 	}
@@ -936,7 +936,7 @@ func TestUploadSingleChunkTwiceSkipsDedupQueries(t *testing.T) {
 	}
 	reset()
 	upload()
-	dedup, xorbs, shards := count("GET /v1/chunks", "POST /v1/chunks"), count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("POST /v1/shards")
+	dedup, xorbs, shards := count("GET /v1/chunks", "POST /v1/chunks"), count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("POST /v1/shards", "POST /v2/shards")
 	if dedup != 0 || xorbs != 0 || shards != 1 {
 		t.Fatalf("second upload: %d dedup queries, %d xorb POST/HEAD, %d shard uploads; want 0, 0, 1", dedup, xorbs, shards)
 	}
@@ -975,7 +975,7 @@ func TestUploadToSecondEndpointIgnoresFirstEndpointsCache(t *testing.T) {
 		if _, err := c.UploadFile(ctx, bytes.NewReader(content)); err != nil {
 			t.Fatalf("upload to server %d: %v", i, err)
 		}
-		xorbs, shards := 0, requests[i]["POST /v1/shards"]
+		xorbs, shards := 0, requests[i]["POST /v1/shards"]+requests[i]["POST /v2/shards"]
 		for req, n := range requests[i] {
 			if strings.HasPrefix(req, "POST /v1/xorbs/") {
 				xorbs += n
@@ -1054,7 +1054,7 @@ func TestUploadWithCachedProbeFetchesShardForUncachedNeighbours(t *testing.T) {
 			upload(rootB, content[:1<<20])
 			reset()
 			upload(rootB, content)
-			if xorbs, gets, shards := count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("GET /v1/chunks/"), count("POST /v1/shards"); xorbs != 0 || gets < 1 || shards != 1 {
+			if xorbs, gets, shards := count("POST /v1/xorbs/", "HEAD /v1/xorbs/"), count("GET /v1/chunks/"), count("POST /v1/shards", "POST /v2/shards"); xorbs != 0 || gets < 1 || shards != 1 {
 				t.Fatalf("upload with a cached probe and uncached neighbours: %d xorb POST/HEAD, %d shard fetches, %d shard uploads; want 0, at least 1, 1", xorbs, gets, shards)
 			}
 		})
