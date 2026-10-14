@@ -135,6 +135,7 @@ func TestRoutesConsultAuthorizer(t *testing.T) {
 		{"write v1", "POST", "/v1/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
 		{"write legacy", "POST", "/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
 		{"write v2", "POST", "/v2/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
+		{"report telemetry", "POST", "/v1/telemetry", telemetryTestEnvelope(t, nil), []auth.Grant{{Permission: auth.Read}}},
 		{"download xorb", "GET", "/v1/xorbs/default/" + xorbHash.String(), nil, nil},
 		{"bridge get", "GET", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
 		{"bridge head", "HEAD", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
@@ -723,6 +724,7 @@ func TestRoutesAuthorizationParsingOrder(t *testing.T) {
 		{"POST", "/v1/shards", "", 403, 1},
 		{"POST", "/shards", "", 403, 1},
 		{"POST", "/v2/shards", "", 403, 1},
+		{"POST", "/v1/telemetry", "{", 403, 1},
 	} {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			calls := 0
@@ -965,5 +967,142 @@ func TestQueryChunksBatchDeniedBeforeBody(t *testing.T) {
 	}
 	if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Write}}) || probe.lookups != 0 {
 		t.Fatalf("authorizations = %v, lookups = %d", authorizer.calls, probe.lookups)
+	}
+}
+
+// telemetryTestEnvelope returns a valid POST /v1/telemetry body after mutate edits its top-level keys.
+func telemetryTestEnvelope(t *testing.T, mutate func(envelope map[string]any)) []byte {
+	t.Helper()
+	envelope := map[string]any{
+		"time":       "2026-07-28T12:00:00.000Z",
+		"event":      "download",
+		"session_id": "0190f6a2-5c3e-7b1d-9a4f-2e8c6d1b3a57",
+		"metrics":    map[string]any{"bytes": 1024},
+		"user_agent": "hf_xet/1.7.0",
+	}
+	if mutate != nil {
+		mutate(envelope)
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func TestTelemetryEnvelope(t *testing.T) {
+	valid := telemetryTestEnvelope(t, nil)
+	camelCase := telemetryTestEnvelope(t, func(envelope map[string]any) {
+		envelope["userAgent"] = envelope["user_agent"]
+		delete(envelope, "user_agent")
+	})
+	with := func(key string, value any) []byte {
+		return telemetryTestEnvelope(t, func(envelope map[string]any) { envelope[key] = value })
+	}
+	without := func(key string) []byte {
+		return telemetryTestEnvelope(t, func(envelope map[string]any) { delete(envelope, key) })
+	}
+	for _, test := range []struct {
+		name   string
+		body   []byte
+		status int
+	}{
+		{"valid", valid, http.StatusOK},
+		{"camelCase user agent", camelCase, http.StatusOK},
+		{"unknown key ignored", with("schema_version", 2), http.StatusOK},
+		{"metrics values unvalidated", with("metrics", map[string]any{"bytes": "many", "nested": []any{nil, true}}), http.StatusOK},
+		{"missing time", without("time"), http.StatusBadRequest},
+		{"missing event", without("event"), http.StatusBadRequest},
+		{"missing session_id", without("session_id"), http.StatusBadRequest},
+		{"missing metrics", without("metrics"), http.StatusBadRequest},
+		{"missing user agent", without("user_agent"), http.StatusBadRequest},
+		{"both user agents", with("userAgent", "hf_xet/1.7.0"), http.StatusBadRequest},
+		{"time not RFC3339", with("time", "2026-07-28 12:00:00"), http.StatusBadRequest},
+		{"event number", with("event", 1), http.StatusBadRequest},
+		{"session_id null", with("session_id", nil), http.StatusBadRequest},
+		{"user_agent number", with("user_agent", 1), http.StatusBadRequest},
+		{"metrics array", with("metrics", []any{}), http.StatusBadRequest},
+		{"metrics string", with("metrics", "bytes=1024"), http.StatusBadRequest},
+		{"metrics null", with("metrics", nil), http.StatusBadRequest},
+		{"top-level array", []byte("[" + string(valid) + "]"), http.StatusBadRequest},
+		{"top-level string", []byte(`"download"`), http.StatusBadRequest},
+		{"top-level null", []byte("null"), http.StatusBadRequest},
+		{"invalid JSON", []byte("{"), http.StatusBadRequest},
+		{"empty", nil, http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			NewHandler(WithAuthorizer(&recordingAuthorizer{})).ServeHTTP(rec, httptest.NewRequest("POST", "/v1/telemetry", bytes.NewReader(test.body)))
+			if rec.Code != test.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, test.status, rec.Body)
+			}
+			if test.status == http.StatusOK && rec.Body.Len() != 0 {
+				t.Fatalf("body = %q, want empty", rec.Body.String())
+			}
+		})
+	}
+	t.Run("no authorizer", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		NewHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/telemetry", bytes.NewReader(valid)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body)
+		}
+	})
+}
+
+func TestTelemetryBodyLimit(t *testing.T) {
+	const limit = 1 << 20
+	base := len(telemetryTestEnvelope(t, func(envelope map[string]any) { envelope["padding"] = "" }))
+	padded := func(size int) []byte {
+		return telemetryTestEnvelope(t, func(envelope map[string]any) { envelope["padding"] = strings.Repeat("x", size-base) })
+	}
+	exact, over := padded(limit), padded(limit+1)
+	for _, test := range []struct {
+		name          string
+		body          []byte
+		unknownLength bool
+		status        int
+	}{
+		{"exact limit", exact, false, http.StatusOK},
+		{"exact limit unknown length", exact, true, http.StatusOK},
+		{"one over limit", over, false, http.StatusRequestEntityTooLarge},
+		{"one over limit unknown length", over, true, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest("POST", "/v1/telemetry", bytes.NewReader(test.body))
+			if test.unknownLength {
+				request.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+			NewHandler().ServeHTTP(rec, request)
+			if rec.Code != test.status {
+				t.Fatalf("status = %d, want %d for a %d-byte body: %.80s", rec.Code, test.status, len(test.body), rec.Body)
+			}
+		})
+	}
+}
+
+func TestTelemetryDeniedBeforeBody(t *testing.T) {
+	for _, test := range []struct {
+		err       error
+		status    int
+		challenge string
+	}{
+		{auth.ErrUnauthenticated, http.StatusUnauthorized, "Bearer"},
+		{auth.ErrForbidden, http.StatusForbidden, ""},
+	} {
+		t.Run(test.err.Error(), func(t *testing.T) {
+			authorizer := &recordingAuthorizer{err: test.err}
+			request := httptest.NewRequest("POST", "/v1/telemetry", &unreadBody{t: t})
+			request.ContentLength = 16 << 20
+			rec := httptest.NewRecorder()
+			NewHandler(WithAuthorizer(authorizer)).ServeHTTP(rec, request)
+			if rec.Code != test.status || rec.Header().Get("WWW-Authenticate") != test.challenge {
+				t.Fatalf("response = %d %v, want %d with challenge %q", rec.Code, rec.Header(), test.status, test.challenge)
+			}
+			if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Read}}) {
+				t.Fatalf("authorizations = %v, want one untargeted read", authorizer.calls)
+			}
+		})
 	}
 }
