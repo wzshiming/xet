@@ -403,8 +403,8 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			probe := &shardV2TestStorage{Storage: target, putStarted: make(chan struct{}), putContinue: make(chan struct{})}
-			close(probe.putContinue)
+			probe := &shardV2TestStorage{Storage: target, gate: "GetFileIndexEntry", started: make(chan struct{}), release: make(chan struct{})}
+			probe.unblock()
 			authorizer := &recordingAuthorizer{err: auth.ErrForbidden}
 			body := &unreadBody{t: t}
 			request := httptest.NewRequest("POST", endpoint, body)
@@ -418,8 +418,8 @@ func TestShardAuthorizationDeniedBeforeBody(t *testing.T) {
 				t.Fatalf("authorizations = %v", authorizer.calls)
 			}
 			select {
-			case <-probe.putStarted:
-				t.Fatal("PutShard called after authorization denied")
+			case <-probe.started:
+				t.Fatal("storage GetFileIndexEntry called after authorization denied")
 			default:
 			}
 			if _, err := target.GetShard(context.Background(), fileHash); err == nil {

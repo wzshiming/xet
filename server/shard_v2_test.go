@@ -10,43 +10,105 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gorilla/handlers"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/memory"
+	"github.com/wzshiming/xet/storage/storagetest"
 )
 
-// shardV2TestStorage gates storage.PutShard at its first backend call and fails it there with putErr.
+// shardV2TestStorage holds the first call to its gate method until unblock,
+// then fails that call with gateErr when set.
 type shardV2TestStorage struct {
 	storage.Storage
-	putStarted  chan struct{}
-	putContinue chan struct{}
-	putErr      error
+	gate    string
+	gateErr error
+	held    atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+// hold gives up after five seconds so a failed test cannot hang the handler.
+func (s *shardV2TestStorage) hold(method string) error {
+	if method != s.gate || !s.held.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(s.started)
+	select {
+	case <-s.release:
+		return s.gateErr
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("%s gate was never released", method)
+	}
+}
+
+func (s *shardV2TestStorage) unblock() {
+	select {
+	case <-s.release:
+	default:
+		close(s.release)
+	}
 }
 
 func (s *shardV2TestStorage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
-	close(s.putStarted)
-	<-s.putContinue
-	if s.putErr != nil {
-		return "", s.putErr
+	if err := s.hold("GetFileIndexEntry"); err != nil {
+		return "", err
 	}
 	return s.Storage.GetFileIndexEntry(ctx, fileHash)
 }
 
-// newShardV2TestStorage wraps a memory backend holding the xorb of
-// authorizerFixture's one-file shard, returned encoded for upload.
-func newShardV2TestStorage(t *testing.T) (*shardV2TestStorage, []byte) {
+func (s *shardV2TestStorage) GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+	if err := s.hold("GetXorbRangeReadCloser"); err != nil {
+		return nil, err
+	}
+	return s.Storage.GetXorbRangeReadCloser(ctx, xorbHash, start, end)
+}
+
+func (s *shardV2TestStorage) PutShardObject(ctx context.Context, shardHash string, encoded []byte) (bool, error) {
+	if err := s.hold("PutShardObject"); err != nil {
+		return false, err
+	}
+	return s.Storage.PutShardObject(ctx, shardHash, encoded)
+}
+
+func (s *shardV2TestStorage) PutIndexEntry(ctx context.Context, kind, name, shardHash string) error {
+	if err := s.hold("PutIndexEntry"); err != nil {
+		return err
+	}
+	return s.Storage.PutIndexEntry(ctx, kind, name, shardHash)
+}
+
+// newShardV2TestStorage gates a memory backend holding one single-chunk xorb
+// per term and returns the encoded shard of one file made of those terms.
+func newShardV2TestStorage(t *testing.T, gate string, terms int) (*shardV2TestStorage, []byte) {
 	t.Helper()
-	_, _, xorbHash, _, _, xorbBytes, shardBytes := authorizerFixture(t)
 	backend := memory.NewStorage()
-	if _, err := backend.PutXorb(context.Background(), xorbHash, bytes.NewReader(xorbBytes)); err != nil {
+	parts := make([][]byte, terms)
+	for i := range parts {
+		parts[i] = fmt.Appendf(nil, "shard upload term %d", i)
+	}
+	shardObj := shard.NewShard()
+	storagetest.AddFileBlock(t, context.Background(), backend, shardObj, parts)
+	// AddFileBlock leaves NumBytesInCAS zero, which the handler's Validate rejects.
+	for i := range shardObj.CASInfos {
+		shardObj.CASInfos[i].NumBytesInCAS = shardObj.CASInfos[i].Chunks[0].UnpackedSegBytes
+	}
+	encoded, err := shardObj.Encode(false)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return &shardV2TestStorage{Storage: backend, putStarted: make(chan struct{}), putContinue: make(chan struct{})}, shardBytes
+	body, err := io.ReadAll(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &shardV2TestStorage{Storage: backend, gate: gate, started: make(chan struct{}), release: make(chan struct{})}, body
 }
 
 type shardUploadWireEvent struct {
@@ -71,9 +133,28 @@ func readShardUploadWireEvent(t *testing.T, r *bufio.Reader) shardUploadWireEven
 	return event
 }
 
+// readShardUploadWireEvents reads n events, or all of them when n < 0, stopping early where the stream ends.
+func readShardUploadWireEvents(t *testing.T, r *bufio.Reader, n int) []shardUploadWireEvent {
+	t.Helper()
+	var events []shardUploadWireEvent
+	for ; n != 0; n-- {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			break
+		}
+		var event shardUploadWireEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("decode shard upload event %q after %+v: %v", line, events, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
 func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
-	stor, body := newShardV2TestStorage(t)
-	// Leave the final CAS-section bookend unsent. The first CAS block is
+	stor, body := newShardV2TestStorage(t, "GetFileIndexEntry", 2)
+	stor.unblock()
+	// Leave the final CAS-section bookend unsent. Both CAS blocks are
 	// complete, but Decode cannot finish until these last 48 bytes arrive.
 	partialSize := len(body) - 48
 
@@ -81,13 +162,6 @@ func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 	// must unwrap it to enable full duplex on the underlying HTTP/1 writer.
 	httpSrv := httptest.NewServer(handlers.CombinedLoggingHandler(io.Discard, NewHandler(WithStorage(stor))))
 	defer httpSrv.Close()
-	defer func() {
-		select {
-		case <-stor.putContinue:
-		default:
-			close(stor.putContinue)
-		}
-	}()
 
 	conn, err := net.Dial("tcp", httpSrv.Listener.Addr().String())
 	if err != nil {
@@ -121,50 +195,102 @@ func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 	}
 
 	events := bufio.NewReader(resp.Body)
-	for i, want := range []shardUploadWireEvent{
+	if got, want := readShardUploadWireEvents(t, events, 3), []shardUploadWireEvent{
 		{Type: "validating", Verified: 0, Total: 0},
-		{Type: "validating", Verified: 0, Total: 1},
-		{Type: "validating", Verified: 1, Total: 1},
-	} {
-		if got := readShardUploadWireEvent(t, events); got != want {
-			t.Fatalf("event %d before request completed = %+v, want %+v", i, got, want)
-		}
+		{Type: "validating", Verified: 0, Total: 3},
+		{Type: "validating", Verified: 0, Total: 4},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("events before request completed = %+v, want %+v", got, want)
 	}
 	select {
-	case <-stor.putStarted:
-		t.Fatal("PutShard started before the complete request body arrived")
+	case <-stor.started:
+		t.Fatal("GetFileIndexEntry called before the complete request body arrived")
 	default:
 	}
 
 	if _, err := conn.Write(body[partialSize:]); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := readShardUploadWireEvent(t, events), (shardUploadWireEvent{Type: "committing", Stage: "uploading"}); got != want {
-		t.Fatalf("commit event = %+v, want %+v", got, want)
-	}
-	select {
-	case <-stor.putStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("PutShard did not start")
-	}
-	close(stor.putContinue)
-
-	for i, want := range []shardUploadWireEvent{
+	if got, want := readShardUploadWireEvents(t, events, -1), []shardUploadWireEvent{
+		{Type: "validating", Verified: 0, Total: 4},
+		{Type: "validating", Verified: 1, Total: 4},
+		{Type: "validating", Verified: 2, Total: 4},
+		{Type: "validating", Verified: 3, Total: 4},
+		{Type: "validating", Verified: 4, Total: 4},
+		{Type: "committing", Stage: "uploading"},
 		{Type: "committing", Stage: "syncing"},
 		{Type: "result"},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("events after request completed = %+v, want %+v", got, want)
+	}
+}
+
+func TestUploadShardV2FlushesProgressBeforeStorageCalls(t *testing.T) {
+	stream := []shardUploadWireEvent{
+		{Type: "validating", Verified: 0, Total: 0},
+		{Type: "validating", Verified: 0, Total: 2},
+		{Type: "validating", Verified: 0, Total: 2},
+		{Type: "validating", Verified: 1, Total: 2},
+		{Type: "validating", Verified: 2, Total: 2},
+		{Type: "committing", Stage: "uploading"},
+		{Type: "committing", Stage: "syncing"},
+		{Type: "result"},
+	}
+	for _, test := range []struct {
+		gate    string
+		flushed int
+	}{
+		{"GetXorbRangeReadCloser", 4},
+		{"PutShardObject", 6},
+		{"PutIndexEntry", 7},
 	} {
-		if got := readShardUploadWireEvent(t, events); got != want {
-			t.Fatalf("terminal event %d = %+v, want %+v", i, got, want)
-		}
+		t.Run(test.gate, func(t *testing.T) {
+			stor, body := newShardV2TestStorage(t, test.gate, 1)
+			srv := httptest.NewServer(NewHandler(WithStorage(stor)))
+			defer srv.Close()
+			defer stor.unblock()
+
+			resp, err := srv.Client().Post(srv.URL+"/v2/shards", "application/octet-stream", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			events := bufio.NewReader(resp.Body)
+			select {
+			case <-stor.started:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s was not called", test.gate)
+			}
+			if got, want := readShardUploadWireEvents(t, events, test.flushed), stream[:test.flushed]; !slices.Equal(got, want) {
+				t.Fatalf("events while %s is held = %+v, want %+v", test.gate, got, want)
+			}
+			stor.unblock()
+			if got, want := readShardUploadWireEvents(t, events, -1), stream[test.flushed:]; !slices.Equal(got, want) {
+				t.Fatalf("events after %s = %+v, want %+v", test.gate, got, want)
+			}
+		})
+	}
+}
+
+func TestUploadShardV2ReportsStoredShardWithoutCommitting(t *testing.T) {
+	stor, _, _, _, _, _, body := authorizerFixture(t)
+	rec := httptest.NewRecorder()
+	NewHandler(WithStorage(stor)).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v2/shards", bytes.NewReader(body)))
+	if got, want := readShardUploadWireEvents(t, bufio.NewReader(rec.Body), -1), []shardUploadWireEvent{
+		{Type: "validating", Verified: 0, Total: 0},
+		{Type: "validating", Verified: 0, Total: 2},
+		{Type: "result"},
+	}; !slices.Equal(got, want) {
+		t.Fatalf("events = %+v, want %+v", got, want)
 	}
 }
 
 func TestUploadShardStorageFailureRemainsRetryable(t *testing.T) {
 	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
 		t.Run(endpoint, func(t *testing.T) {
-			stor, body := newShardV2TestStorage(t)
-			stor.putErr = fmt.Errorf("backend unavailable")
-			close(stor.putContinue)
+			stor, body := newShardV2TestStorage(t, "GetFileIndexEntry", 1)
+			stor.gateErr = fmt.Errorf("backend unavailable")
+			stor.unblock()
 			response := httptest.NewRecorder()
 			NewHandler(WithStorage(stor)).ServeHTTP(response, httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body)))
 			if endpoint != "/v2/shards" {
