@@ -24,8 +24,7 @@ import (
 	"github.com/wzshiming/xet/storage/storagetest"
 )
 
-// shardV2TestStorage holds the first call to its gate method until unblock,
-// then fails that call with gateErr when set.
+// shardV2TestStorage holds the first call to its gate method until unblock.
 type shardV2TestStorage struct {
 	storage.Storage
 	gate    string
@@ -85,8 +84,7 @@ func (s *shardV2TestStorage) PutIndexEntry(ctx context.Context, kind, name, shar
 	return s.Storage.PutIndexEntry(ctx, kind, name, shardHash)
 }
 
-// newShardV2TestStorage gates a memory backend holding one single-chunk xorb
-// per term and returns the encoded shard of one file made of those terms.
+// newShardV2TestStorage stores one single-chunk xorb per term of the returned one-file shard.
 func newShardV2TestStorage(t *testing.T, gate string, terms int) (*shardV2TestStorage, []byte) {
 	t.Helper()
 	backend := memory.NewStorage()
@@ -154,12 +152,10 @@ func readShardUploadWireEvents(t *testing.T, r *bufio.Reader, n int) []shardUplo
 func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 	stor, body := newShardV2TestStorage(t, "GetFileIndexEntry", 2)
 	stor.unblock()
-	// Leave the final CAS-section bookend unsent. Both CAS blocks are
-	// complete, but Decode cannot finish until these last 48 bytes arrive.
+	// Withhold the 48-byte CAS-section bookend so both CAS blocks arrive but Decode cannot finish.
 	partialSize := len(body) - 48
 
-	// Exercise the same logging wrapper used by cmd/xetd; ResponseController
-	// must unwrap it to enable full duplex on the underlying HTTP/1 writer.
+	// Wrap as cmd/xetd does: ResponseController must unwrap the logging writer for HTTP/1 full duplex.
 	httpSrv := httptest.NewServer(handlers.CombinedLoggingHandler(io.Discard, NewHandler(WithStorage(stor))))
 	defer httpSrv.Close()
 

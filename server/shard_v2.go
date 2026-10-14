@@ -128,9 +128,7 @@ func (s *shardUploadStream) startHeartbeat(interval time.Duration) func() {
 	}
 }
 
-// handleUploadShardV2 handles POST /v2/shards as a full-duplex NDJSON stream:
-// a validating frame per CAS block as the body is decoded, then the
-// verification and commit progress of storage.PutShard, then result or error.
+// handleUploadShardV2 handles POST /v2/shards as a full-duplex NDJSON progress stream.
 func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
