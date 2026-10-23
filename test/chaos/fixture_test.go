@@ -667,6 +667,9 @@ func (fx *fixture) cachedErr(ctx context.Context, f *blob, cacheDir string) erro
 	if err := diffBytes(got, f.data); err != nil {
 		return fmt.Errorf("%s from cache %s: %w", f.name, cacheDir, err)
 	}
+	if err := fx.fp.waitErr(func(_ []record, inflight int) bool { return inflight == 0 }); err != nil {
+		return fmt.Errorf("%s from cache %s: %w", f.name, cacheDir, err)
+	}
 	if gets := filter(fx.fp.records(), record.xorbGet); len(gets) != 0 {
 		return fmt.Errorf("%s from cache %s: %d xorb GETs: %+v", f.name, cacheDir, len(gets), gets)
 	}

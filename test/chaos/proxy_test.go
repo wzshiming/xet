@@ -130,6 +130,8 @@ func (p *faultProxy) Addr() string { return p.srv.Listener.Addr().String() }
 func (p *faultProxy) Close() {
 	p.closeOnce.Do(func() {
 		close(p.stop)
+		// Handlers reading a stalled request body only return once its connection is gone.
+		p.srv.CloseClientConnections()
 		p.srv.Close()
 		p.transport.CloseIdleConnections()
 	})
@@ -168,6 +170,13 @@ func (p *faultProxy) snapshotLocked() []record {
 // wait blocks until pred holds for the current log and in-flight count.
 func (p *faultProxy) wait(t *testing.T, pred func(recs []record, inflight int) bool) {
 	t.Helper()
+	if err := p.waitErr(pred); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitErr blocks until pred holds for the current log and in-flight count, or reports the state after waitTimeout.
+func (p *faultProxy) waitErr(pred func(recs []record, inflight int) bool) error {
 	deadline := time.Now().Add(waitTimeout)
 	timer := time.AfterFunc(waitTimeout, func() {
 		p.mu.Lock()
@@ -179,10 +188,11 @@ func (p *faultProxy) wait(t *testing.T, pred func(recs []record, inflight int) b
 	defer p.mu.Unlock()
 	for !pred(p.snapshotLocked(), p.inflight) {
 		if !time.Now().Before(deadline) {
-			t.Fatalf("proxy: waited %v with %d requests in flight and %d recorded", waitTimeout, p.inflight, len(p.log))
+			return fmt.Errorf("proxy: waited %v with %d requests in flight and %d recorded", waitTimeout, p.inflight, len(p.log))
 		}
 		p.cond.Wait()
 	}
+	return nil
 }
 
 // settle waits for every handler to finish and returns the phase's records.
@@ -361,20 +371,25 @@ func (p *faultProxy) relayPrefix(w http.ResponseWriter, r *http.Request, body io
 
 // begin records the request, picks its fault, and returns the backend base URL.
 func (p *faultProxy) begin(r *http.Request) (*record, fault, string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	key := r.Method + " " + r.URL.Path + " " + r.Header.Get("Range")
+	p.mu.Lock()
 	rec := &record{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Range: r.Header.Get("Range"), Seq: p.seq[key], Start: time.Now()}
 	p.seq[key]++
+	p.inflight++
+	rule, target := p.rule, p.target
+	p.cond.Broadcast()
+	p.mu.Unlock()
+	// The rule runs unlocked, so it may read records(), which hold the earlier requests.
 	var f fault
-	if p.rule != nil {
-		f = p.rule(*rec)
+	if rule != nil {
+		f = rule(*rec)
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	rec.Fault = f.kind
 	p.log = append(p.log, rec)
-	p.inflight++
 	p.cond.Broadcast()
-	return rec, f, p.target
+	return rec, f, target
 }
 
 func (p *faultProxy) finish(rec *record) {
