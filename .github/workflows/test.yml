@@ -59,3 +59,20 @@ jobs:
     - name: Run conformance tests
       working-directory: test/conformance
       run: go test ./...
+
+  chaos:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Run chaos tests
+      run: go test -race -count=2 -timeout 15m ./test/chaos/
