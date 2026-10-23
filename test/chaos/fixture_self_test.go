@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -30,6 +31,7 @@ func TestFixtureSeeded(t *testing.T) {
 	t.Run("accounting", func(t *testing.T) { selfAccounting(t, ctx, fx) })
 	t.Run("uploadOracles", func(t *testing.T) { selfUploadOracles(t, ctx, fx) })
 	t.Run("workerLeaks", func(t *testing.T) { selfWorkerLeaks(t, ctx, fx) })
+	t.Run("heal", func(t *testing.T) { selfHeal(t, ctx, fx) })
 }
 
 // TestFixtureKnownGap pins knownGap skipping unless XET_CHAOS_KNOWN_GAPS=1.
@@ -299,8 +301,8 @@ func selfCacheOracle(t *testing.T, ctx context.Context, fx *fixture) {
 	cacheDir := t.TempDir()
 	fx.mustDownload(t, ctx, fx.newClient(t, cacheDir), apiV1, fx.small)
 
-	if err := fx.cachedErr(ctx, fx.small, t.TempDir()); err == nil {
-		t.Fatal("cachedErr returned nil for an empty cacheDir")
+	if err := fx.cachedErr(ctx, fx.small, t.TempDir()); err == nil || (!strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "xorb GET")) {
+		t.Fatalf("cachedErr for an empty cacheDir: %v; want an error naming the denied xorb GETs or their 403", err)
 	}
 	fx.assertCached(t, ctx, fx.small, cacheDir)
 	// assertCached disarms the proxy, so a cold cache may fetch xorbs again.
@@ -413,11 +415,16 @@ func selfWorkerLeaks(t *testing.T, ctx context.Context, fx *fixture) {
 	before = snapshotWorkers()
 	stalled, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	downloader := make(chan string, 1)
 	done := make(chan error, 1)
-	go func() { done <- fx.download(stalled, stalledClient, apiV1, fx.small, out) }()
+	go func() {
+		downloader <- selfGoroutineID()
+		done <- fx.download(stalled, stalledClient, apiV1, fx.small, out)
+	}()
 	selfAwaitXorbGet(t, fx, done)
-	if leaked := leakedWorkers(before); len(leaked) == 0 {
-		t.Error("leakedWorkers found nothing while a download waits on a stalled xorb GET")
+	leaked := leakedWorkers(before)
+	if own := <-downloader; !slices.ContainsFunc(leaked, func(stack string) bool { return goroutineID(stack) != own }) {
+		t.Errorf("leakedWorkers found %d stacks while a download waits on a stalled xorb GET, none beyond the downloading goroutine %s:\n%s", len(leaked), own, strings.Join(leaked, "\n\n"))
 	}
 	cancel()
 	select {
@@ -429,6 +436,26 @@ func selfWorkerLeaks(t *testing.T, ctx context.Context, fx *fixture) {
 		t.Fatalf("download still running %v after cancel", waitTimeout)
 	}
 	fx.noLeakedWorkers(t, before)
+}
+
+// selfHeal pins heal clearing the TCP impairments, completing f on cacheDir, returning only that completion's xorb GETs and leaving the cache warm.
+func selfHeal(t *testing.T, ctx context.Context, fx *fixture) {
+	fx.fp.arm(nil)
+	fx.tcp.cutAfter(toClient, 4096, cutRst)
+	t.Cleanup(fx.tcp.clear)
+	cuts := fx.tcp.cuts()
+	cacheDir := t.TempDir()
+	gets := fx.heal(t, ctx, fx.file1, cacheDir)
+	if fired := fx.tcp.cuts() - cuts; fired != 0 {
+		t.Errorf("the armed cut fired %d times during heal; want heal to clear it first", fired)
+	}
+	if err := accountingErr(gets, fx.file1, 0); len(gets) == 0 || err != nil {
+		t.Errorf("heal of a cold cache returned %d xorb GETs %+v, accounting %v; want file1's xorb fetched", len(gets), gets, err)
+	}
+	fx.assertCached(t, ctx, fx.file1, cacheDir)
+	if again := fx.heal(t, ctx, fx.file1, cacheDir); len(again) != 0 {
+		t.Errorf("heal of the warm cache returned %d xorb GETs %+v; want none", len(again), again)
+	}
 }
 
 // selfLCG recomputes the contract's pseudoRandom: s = s*1664525 + 1013904223 from seed, then byte(s>>24), per byte.
@@ -512,6 +539,12 @@ func selfGapRun(t *testing.T, name string) (*testing.T, bool) {
 		reached = true
 	})
 	return sub, reached
+}
+
+// selfGoroutineID returns the id of the calling goroutine.
+func selfGoroutineID() string {
+	buf := make([]byte, 64)
+	return goroutineID(string(buf[:runtime.Stack(buf, false)]))
 }
 
 // selfAwaitXorbGet waits for fx's fault proxy to record a xorb GET, failing t if the download reporting on done ends first.

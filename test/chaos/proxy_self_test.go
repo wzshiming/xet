@@ -6,12 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -30,6 +32,12 @@ type selfRead struct {
 	at   time.Time
 }
 
+// selfResponse is how a request made in a goroutine ended; status 0 means no response arrived.
+type selfResponse struct {
+	status int
+	err    error
+}
+
 // TestSelfPassThrough pins arm(nil) as the pass-through phase.
 func TestSelfPassThrough(t *testing.T) {
 	t.Parallel()
@@ -39,6 +47,111 @@ func TestSelfPassThrough(t *testing.T) {
 	p.setTarget(srv.URL)
 	p.arm(nil)
 	selfOK(t, p.URL()+"/x")
+}
+
+// TestSelfSeq pins Seq counting the phase's earlier requests with the same method, path and Range, and arm restarting it.
+func TestSelfSeq(t *testing.T) {
+	t.Parallel()
+	srv, _ := selfBlob(t, selfData(64))
+	p := newFaultProxy()
+	t.Cleanup(p.Close)
+	p.setTarget(srv.URL)
+	firstOnly := func(r record) fault {
+		if r.Seq == 0 {
+			return fault{kind: injectStatus, status: http.StatusServiceUnavailable}
+		}
+		return fault{}
+	}
+	for phase := range 2 {
+		p.arm(firstOnly)
+		var statuses []int
+		for _, rng := range []string{"", "", "bytes=0-9"} {
+			resp, _, _ := selfGet(t, p.URL()+"/blob", rng)
+			statuses = append(statuses, resp.StatusCode)
+		}
+		if want := []int{http.StatusServiceUnavailable, http.StatusOK, http.StatusServiceUnavailable}; !slices.Equal(statuses, want) {
+			t.Fatalf("phase %d: statuses %v for two whole GETs then a ranged one; want %v from a rule failing Seq 0", phase, statuses, want)
+		}
+		var seqs []int
+		for _, rec := range p.settle(t) {
+			seqs = append(seqs, rec.Seq)
+		}
+		if want := []int{0, 1, 0}; !slices.Equal(seqs, want) {
+			t.Fatalf("phase %d: record Seq %v, want %v", phase, seqs, want)
+		}
+	}
+}
+
+// TestSelfRuleRecords pins a rule reading records() without deadlocking and seeing the phase's earlier requests.
+func TestSelfRuleRecords(t *testing.T) {
+	t.Parallel()
+	srv, _ := selfBlob(t, []byte("ok"))
+	p := newFaultProxy()
+	t.Cleanup(p.Close)
+	p.setTarget(srv.URL)
+	var mu sync.Mutex
+	var seen []int
+	p.arm(func(record) fault {
+		n := len(p.records())
+		mu.Lock()
+		seen = append(seen, n)
+		mu.Unlock()
+		return fault{}
+	})
+	for range 2 {
+		selfOK(t, p.URL()+"/")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []int{0, 1}; !slices.Equal(seen, want) {
+		t.Fatalf("the rule saw %v records, want %v: the phase's earlier requests", seen, want)
+	}
+}
+
+// TestSelfCloseMidRequestBody pins Close returning within 1s while a client stalls mid-request-body under every fault that reads the body.
+func TestSelfCloseMidRequestBody(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		f    fault
+	}{
+		{"injectStatus", fault{kind: injectStatus, status: http.StatusServiceUnavailable}},
+		{"injectBody", fault{kind: injectBody, status: http.StatusOK, contentType: "text/plain", body: []byte("ok")}},
+		{"stallHeaders", fault{kind: stallHeaders}},
+		{"passThrough", fault{kind: passThrough}},
+		{"cutRequestBody", fault{kind: cutRequestBody, prefix: 5000}},
+		{"stallRequestBody", fault{kind: stallRequestBody, prefix: 5000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv, _ := selfSink(t)
+			p := newFaultProxy()
+			var once sync.Once
+			t.Cleanup(func() { once.Do(p.Close) })
+			p.setTarget(srv.URL)
+			p.arm(func(record) fault { return tc.f })
+			c := selfDial(t, p.Addr())
+			if _, err := io.WriteString(c, selfPostHead(p.Addr(), 1<<20)+string(selfData(1000))); err != nil {
+				t.Fatal(err)
+			}
+			p.wait(t, func(recs []record, _ int) bool { return len(recs) == 1 && recs[0].ReqBytes == 1000 })
+			start := time.Now()
+			closed := make(chan struct{}, 1)
+			go func() {
+				once.Do(p.Close)
+				closed <- struct{}{}
+			}()
+			// Cleanup closes c before p, so a Close stuck on the client fails the test instead of hanging it.
+			selfRecv(t, closed, "Close to return while the client stalls mid-body")
+			if d := time.Since(start); d > time.Second {
+				t.Fatalf("Close took %v while the client stalls mid-body, want under 1s", d)
+			}
+			selfDeadline(t, c, time.Second)
+			if _, err := io.ReadAll(c); errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatal("client connection still open 1s after Close")
+			}
+		})
+	}
 }
 
 // TestSelfFaultKinds pins each response fault kind against a 64 KiB backend body.
@@ -138,9 +251,9 @@ func TestSelfFaultKinds(t *testing.T) {
 		t.Parallel()
 		p, hits := selfBlobFault(t, blob, fault{kind: injectStatus, status: http.StatusServiceUnavailable})
 		resp, _, _ := selfGet(t, p.URL()+"/blob", "")
-		p.settle(t)
-		if resp.StatusCode != http.StatusServiceUnavailable || len(hits) != 0 {
-			t.Fatalf("status %d after %d backend calls; want 503 without calling the backend", resp.StatusCode, len(hits))
+		rec := selfOnly(t, p)
+		if resp.StatusCode != http.StatusServiceUnavailable || len(hits) != 0 || rec.Status != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, record Status %d after %d backend calls; want 503 recorded without calling the backend", resp.StatusCode, rec.Status, len(hits))
 		}
 	})
 	t.Run("shiftRange", func(t *testing.T) {
@@ -221,11 +334,17 @@ func TestSelfRequestBody(t *testing.T) {
 		t.Parallel()
 		srv, _ := selfSink(t)
 		p := selfFault(t, srv.URL, fault{kind: stallHeaders})
-		if status, _, err := selfRequest(selfCtx(t, 300*time.Millisecond), http.MethodPost, p.URL()+"/upload", payload); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("status %d, err %v; want no response within the 300ms client deadline", status, err)
+		ctx, cancel := context.WithCancel(selfCtx(t, waitTimeout))
+		defer cancel()
+		done := selfRequestAsync(ctx, http.MethodPost, p.URL()+"/upload", payload)
+		p.wait(t, func(recs []record, _ int) bool { return len(recs) == 1 && recs[0].ReqBytes == 1<<20 })
+		selfNoResponse(t, done, 300*time.Millisecond)
+		cancel()
+		if r := selfRecv(t, done, "the upload to end"); !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("status %d, err %v after the client left; want context.Canceled", r.status, r.err)
 		}
-		if rec := selfOnly(t, p); rec.ReqBytes != 1<<20 {
-			t.Fatalf("record ReqBytes %d, want %d", rec.ReqBytes, 1<<20)
+		if rec := selfOnly(t, p); rec.Status != 0 {
+			t.Fatalf("record Status %d, want 0 while the headers are withheld", rec.Status)
 		}
 	})
 }
@@ -284,20 +403,25 @@ func TestSelfStallRequestBody(t *testing.T) {
 		return srv, prefix, next
 	}
 
-	t.Run("clientDeadline", func(t *testing.T) {
+	t.Run("clientLeaves", func(t *testing.T) {
 		t.Parallel()
 		srv, prefix, next := backend(t)
 		p := selfFault(t, srv.URL, stall)
-		ctx := selfCtx(t, 300*time.Millisecond)
-		deadline, _ := ctx.Deadline()
-		if status, _, err := selfRequest(ctx, http.MethodPost, p.URL()+"/upload", payload); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("status %d, err %v; want no response within the 300ms client deadline", status, err)
-		}
+		ctx, cancel := context.WithCancel(selfCtx(t, waitTimeout))
+		defer cancel()
+		done := selfRequestAsync(ctx, http.MethodPost, p.URL()+"/upload", payload)
+		p.wait(t, func(recs []record, _ int) bool { return len(recs) == 1 && recs[0].ReqBytes == 1000 })
 		if r := selfRecv(t, prefix, "the backend prefix"); r.err != nil || !bytes.Equal(r.data, payload[:1000]) {
 			t.Fatalf("backend prefix read err %v; want the first 1000 bytes", r.err)
 		}
-		if r := selfRecv(t, next, "the backend's next Read"); r.at.Before(deadline) || r.err == nil {
-			t.Fatalf("backend's next Read returned %d bytes, err %v, %v after the client deadline; want an error no earlier", len(r.data), r.err, r.at.Sub(deadline))
+		selfNoResponse(t, done, 300*time.Millisecond)
+		left := time.Now()
+		cancel()
+		if r := selfRecv(t, done, "the upload to end"); !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("status %d, err %v after the client left; want context.Canceled", r.status, r.err)
+		}
+		if r := selfRecv(t, next, "the backend's next Read"); r.at.Before(left) || r.err == nil {
+			t.Fatalf("backend's next Read returned %d bytes, err %v, %v after the client left; want an error no earlier", len(r.data), r.err, r.at.Sub(left))
 		}
 	})
 	t.Run("proxyClose", func(t *testing.T) {
@@ -332,7 +456,7 @@ func TestSelfStallRequestBody(t *testing.T) {
 	})
 }
 
-// TestSelfFullDuplex pins the proxy relaying a response while the request body is still streaming.
+// TestSelfFullDuplex pins the proxy relaying and flushing a response while the request body is still streaming.
 func TestSelfFullDuplex(t *testing.T) {
 	t.Parallel()
 	payload := selfData(512 << 10)
@@ -347,9 +471,26 @@ func TestSelfFullDuplex(t *testing.T) {
 		_, _ = io.WriteString(w, "second\n")
 	})
 	p := selfFault(t, srv.URL, fault{kind: passThrough})
-	status, got, err := selfRequest(selfCtx(t, waitTimeout), http.MethodPost, p.URL()+"/upload", payload)
-	if status != http.StatusOK || err != nil || string(got) != "first\nsecond\n" {
-		t.Fatalf("status %d, body %q, err %v; want 200 with both lines", status, got, err)
+	c := selfDial(t, p.Addr())
+	half := len(payload) / 2
+	if _, err := io.WriteString(c, selfPostHead(p.Addr(), len(payload))+string(payload[:half])); err != nil {
+		t.Fatal(err)
+	}
+	selfDeadline(t, c, 2*time.Second)
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("response head with half the body sent: %v; want it within 2s while the body still streams", err)
+	}
+	line := make([]byte, len("first\n"))
+	if _, err := io.ReadFull(resp.Body, line); resp.StatusCode != http.StatusOK || err != nil || string(line) != "first\n" {
+		t.Fatalf("status %d, first read %q, err %v with half the body sent; want 200 and %q", resp.StatusCode, line, err, "first\n")
+	}
+	if _, err := c.Write(payload[half:]); err != nil {
+		t.Fatal(err)
+	}
+	selfDeadline(t, c, waitTimeout)
+	if rest, err := io.ReadAll(resp.Body); err != nil || string(rest) != "second\n" {
+		t.Fatalf("rest of the body %q, err %v; want %q", rest, err, "second\n")
 	}
 	if r := selfRecv(t, reads, "the backend read"); r.err != nil || !bytes.Equal(r.data, payload) {
 		t.Fatalf("backend read %d bytes, err %v; want all %d", len(r.data), r.err, len(payload))
@@ -507,7 +648,7 @@ func TestSelfTCPBlackhole(t *testing.T) {
 	}
 }
 
-// TestSelfTCPRefuse pins refuse resetting accepted connections and clear restoring service.
+// TestSelfTCPRefuse pins refuse resetting accepted connections and clear restoring unimpaired service.
 func TestSelfTCPRefuse(t *testing.T) {
 	t.Parallel()
 	web, _ := selfBlob(t, []byte("ok"))
@@ -529,6 +670,8 @@ func TestSelfTCPRefuse(t *testing.T) {
 		t.Parallel()
 		p := newTCPProxy(t, addr)
 		p.refuse(-1)
+		p.delay(toClient, time.Second, 0)
+		p.cutAfter(toClient, 1, cutRst)
 		for i := range 2 {
 			if status, _, err := selfRequest(selfCtx(t, waitTimeout), http.MethodGet, p.URL()+"/", nil); !selfConnErr(err) {
 				t.Fatalf("GET %d: status %d, err %v; want a *url.Error from the refused connection", i+1, status, err)
@@ -536,7 +679,13 @@ func TestSelfTCPRefuse(t *testing.T) {
 		}
 		selfPoll(t, "refused() == 2", func() bool { return p.refused() == 2 })
 		p.clear()
-		selfOK(t, p.URL()+"/")
+		start := time.Now()
+		if status, got, err := selfRequest(selfCtx(t, waitTimeout), http.MethodGet, p.URL()+"/", nil); status != http.StatusOK || err != nil || string(got) != "ok" {
+			t.Fatalf("GET after clear: status %d, body %q, err %v; want 200 ok over a connection the cleared cut leaves intact", status, got, err)
+		}
+		if d := time.Since(start); d >= time.Second {
+			t.Fatalf("GET after clear took %v, want under the cleared 1s delay", d)
+		}
 	})
 }
 
@@ -750,6 +899,31 @@ func selfRequest(ctx context.Context, method, u string, body []byte) (int, []byt
 	defer resp.Body.Close()
 	got, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, got, err
+}
+
+// selfRequestAsync runs selfRequest in a goroutine and reports how it ended on the returned channel.
+func selfRequestAsync(ctx context.Context, method, u string, body []byte) chan selfResponse {
+	done := make(chan selfResponse, 1)
+	go func() {
+		status, _, err := selfRequest(ctx, method, u, body)
+		done <- selfResponse{status: status, err: err}
+	}()
+	return done
+}
+
+// selfNoResponse fails t if the request reporting on done ends within d.
+func selfNoResponse(t *testing.T, done <-chan selfResponse, d time.Duration) {
+	t.Helper()
+	select {
+	case r := <-done:
+		t.Fatalf("status %d, err %v; want no response within %v", r.status, r.err, d)
+	case <-time.After(d):
+	}
+}
+
+// selfPostHead is the head of a POST /upload to addr declaring a body of n bytes.
+func selfPostHead(addr string, n int) string {
+	return fmt.Sprintf("POST /upload HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n", addr, n)
 }
 
 // selfOK fails t unless GET u answers 200 "ok".
