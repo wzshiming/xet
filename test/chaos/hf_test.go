@@ -22,6 +22,7 @@ const (
 	hubReadToken  = "/xet-read-token/"
 	hubWriteToken = "/xet-write-token/"
 	hubStall      = 300 * time.Millisecond // the ctx of a call the hub stalls
+	hubOverlap    = 100 * time.Millisecond // how long a trickled token answer must still be streaming after every download sharing it began
 )
 
 // TestHubToken pins the hub client's CAS read token: fetched once, cached, renewed inside its margin, and failing bounded under faults on its endpoint.
@@ -99,20 +100,38 @@ func TestHubToken(t *testing.T) {
 		}
 	})
 	t.Run("singleFlight", func(t *testing.T) {
-		hubArm(t, fx, readToken(-1, fault{kind: trickle, piece: 16, gap: 20 * time.Millisecond}), nil)
+		// 8 bytes every 30 ms keep the ~90-byte token answer streaming for about 300 ms.
+		hubArm(t, fx, readToken(-1, fault{kind: trickle, piece: 8, gap: 30 * time.Millisecond}), nil)
 		hc := fx.newHFClient(t, t.TempDir())
 		outs := []*output{newOutput(t, nil), newOutput(t, nil), newOutput(t, nil), newOutput(t, nil)}
-		errs := make(chan error, len(outs))
+		type attempt struct {
+			began time.Time
+			err   error
+		}
+		attempts := make(chan attempt, len(outs))
 		for _, out := range outs {
-			go func() { errs <- hubDL(ctx, fx, hc, out) }()
+			go func() {
+				began := time.Now()
+				attempts <- attempt{began, hubDL(ctx, fx, hc, out)}
+			}()
 		}
+		var began []time.Time
 		for range outs {
-			if err := <-errs; err != nil {
-				t.Errorf("concurrent download: %v", err)
+			a := <-attempts
+			if a.err != nil {
+				t.Errorf("concurrent download: %v", a.err)
 			}
+			began = append(began, a.began)
 		}
-		if n := fetches(t); n != 1 {
-			t.Errorf("%d read-token fetches for %d concurrent downloads; want 1 they all share", n, len(outs))
+		tokens := hubRecs(t, fx.hubProxy, http.MethodGet, hubReadToken)
+		if len(tokens) != 1 {
+			t.Fatalf("read-token fetches %+v for %d concurrent downloads; want 1 they all share", tokens, len(outs))
+		}
+		// Every download began while the one token answer still had most of its trickle to stream, so three of them waited on that fetch.
+		for i, at := range began {
+			if lead := tokens[0].End.Sub(at); lead < hubOverlap {
+				t.Errorf("download %d began %v before the token answer ended; want at least %v", i, lead, hubOverlap)
+			}
 		}
 		if recon := filter(fx.fp.settle(t), record.reconstruction); len(recon) != len(outs) {
 			t.Errorf("%d reconstruction requests; want %d, one per download", len(recon), len(outs))

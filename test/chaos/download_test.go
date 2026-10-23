@@ -23,6 +23,9 @@ const (
 	dlCancelBound  = 2 * time.Second    // how long an abandoned download may take to return
 	dlGenerous     = 5 * time.Second    // how long an impaired download that must still finish may take
 
+	// dlOverlap is how long a trickled range must still be streaming once a second client holds the layout naming it.
+	dlOverlap = 100 * time.Millisecond
+
 	// dlBodyRace names the data race an abandoned body read trips under -race.
 	dlBodyRace = "abandoning a stalled body races httpseek: download/prefetcher.go:252 closes the body from context.AfterFunc while runJob's decoder reads it, and OpenSeeker (openseek.go:104, :341) is not safe for concurrent use"
 )
@@ -450,7 +453,8 @@ func TestDLAbandon(t *testing.T) {
 	t.Run("SharedCache", func(t *testing.T) {
 		r := dlStart(t, fx, fx.small)
 		follower := fx.newClient(t, r.cacheDir)
-		fx.fp.arm(dlWhen(record.xorbGet, fault{kind: trickle, piece: 64 << 10, gap: 20 * time.Millisecond}))
+		// 64 KiB every 40 ms keeps each ~512 KiB range streaming for over 300 ms past its first piece.
+		fx.fp.arm(dlWhen(record.xorbGet, fault{kind: trickle, piece: 64 << 10, gap: 40 * time.Millisecond}))
 		outLeader, outFollower := newOutput(t, nil), newOutput(t, nil)
 		leaderDone, followerDone := make(chan error, 1), make(chan error, 1)
 		go func() { leaderDone <- fx.download(r.ctx, r.c, apiV2, fx.file2, outLeader) }()
@@ -467,7 +471,15 @@ func TestDLAbandon(t *testing.T) {
 		}
 		requireBytes(t, outLeader, fx.file2.data)
 		requireBytes(t, outFollower, fx.file2.data)
-		dlGets(t, fx, 2)
+		shared := filter(dlGets(t, fx, 2), big.match)
+		recon := filter(fx.fp.records(), record.reconstruction)
+		if len(shared) != 1 || len(recon) != 2 {
+			t.Fatalf("GETs for %s = %+v and reconstruction queries = %+v, want the range fetched once and one query per client", big.rangeHeader(), shared, recon)
+		}
+		// The follower held its layout while the leader's GET still had most of its trickle to stream, so it waited on the entry instead of fetching.
+		if lead := shared[0].End.Sub(recon[1].End); lead < dlOverlap {
+			t.Fatalf("the follower's query was answered %v before the shared GET ended, want at least %v", lead, dlOverlap)
+		}
 		r.cached(t, fx)
 	})
 }
@@ -702,7 +714,7 @@ func TestDLKnownGaps(t *testing.T) {
 	})
 
 	t.Run("ReconBody", func(t *testing.T) {
-		const gap = "a reconstruction body fault is terminal: client/reconstruction.go:46 decodes doWithNetworkRetry's answer once, with no retry of the query"
+		const gap = "a reconstruction body fault is terminal: client/reconstruction.go:46 (V1) and :91 (V2) decode doWithNetworkRetry's answer once, with no retry of the query"
 		for _, tc := range []struct {
 			kind faultKind
 			api  apiVersion
@@ -782,8 +794,10 @@ func TestDLKnownGaps(t *testing.T) {
 		corrupt[100] ^= 0xff
 		out := &dlReadableOutput{output: newOutput(t, corrupt)}
 		knownGap(t, "a resumed download never verifies the file hash: client/download.go:147 verifies only when resumeOffset == 0 (design TBD: the client would have to read the seeded prefix back)")
-		if err := r.c.DownloadFile(r.ctx, fx.file2.hash, out); err == nil {
-			t.Fatal("resuming onto a corrupt prefix succeeded, want a hash mismatch")
+		// A full download reports download/download.go fileVerifier's "file hash mismatch"; a resumed one must too.
+		err := r.c.DownloadFile(r.ctx, fx.file2.hash, out)
+		if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+			t.Fatalf("resuming onto a corrupt prefix returned %v, want the file hash mismatch reported", err)
 		}
 	})
 }
