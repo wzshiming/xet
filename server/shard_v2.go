@@ -128,10 +128,7 @@ func (s *shardUploadStream) startHeartbeat(interval time.Duration) func() {
 	}
 }
 
-// handleUploadShardV2 handles POST /v2/shards as a full-duplex NDJSON stream.
-// Progress starts before the request body has finished arriving, CAS references
-// are validated as their blocks are decoded, and every post-stream failure is
-// reported by a terminal error frame.
+// handleUploadShardV2 handles POST /v2/shards as a full-duplex NDJSON progress stream.
 func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
@@ -162,12 +159,18 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 
 	body := io.LimitReader(r.Body, r.ContentLength)
 	shardObj := shard.NewShard()
-	var verified, total uint64
+	var casSeen, fileTerms uint64
 	var callbackMessage string
 	var callbackRetryable bool
 	if err := shardObj.DecodeWithCASBlockCallback(body, false, func(casBlock shard.CASBlock) error {
-		total++
-		if err := stream.validating(verified, total); err != nil {
+		// The file section precedes the CAS section, so shardObj.Files is complete here.
+		if casSeen == 0 {
+			for _, file := range shardObj.Files {
+				fileTerms += uint64(len(file.Entries))
+			}
+		}
+		casSeen++
+		if err := stream.validating(0, casSeen+fileTerms); err != nil {
 			return err
 		}
 
@@ -180,11 +183,6 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 		if !exists {
 			callbackMessage = "invalid shard: referenced xorb not uploaded"
 			return errors.New(callbackMessage)
-		}
-
-		verified++
-		if err := stream.validating(verified, total); err != nil {
-			return err
 		}
 		return nil
 	}); err != nil {
@@ -205,18 +203,23 @@ func (s *Handler) handleUploadShardV2(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := stream.committing("uploading"); err != nil {
-		return
+	// Send errors are ignored: a departed client cancels PutShard through r.Context().
+	progress := func(phase storage.PutShardPhase, done, total int) {
+		switch phase {
+		case storage.PutShardVerifying:
+			_ = stream.validating(uint64(done), uint64(total))
+		case storage.PutShardWriting:
+			_ = stream.committing("uploading")
+		case storage.PutShardIndexing:
+			_ = stream.committing("syncing")
+		}
 	}
-	if _, err := s.storage.PutShard(r.Context(), shardObj); err != nil {
+	if _, err := storage.PutShard(r.Context(), s.storage, shardObj, progress); err != nil {
 		if errors.Is(err, storage.ErrInvalidShard) {
 			finishWithError(err.Error(), false)
 		} else {
 			finishWithError("failed to store shard", true)
 		}
-		return
-	}
-	if err := stream.committing("syncing"); err != nil {
 		return
 	}
 

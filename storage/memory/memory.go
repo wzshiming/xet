@@ -227,32 +227,15 @@ func (s *Storage) GetXorbRangeReadCloser(_ context.Context, xorbHash xet.XorbHas
 	return io.NopCloser(io.NewSectionReader(bytes.NewReader(obj.data), start, end-start+1)), nil
 }
 
-// PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
-func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(sh.Files) > 0
-	for _, file := range sh.Files {
-		if s.indexEntry("index/files", file.FileHash.String()) == "" {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil
-	}
-	if err := storage.PrepareShard(ctx, sh, s); err != nil {
-		return false, err
-	}
-	encoded, shardHash, err := storage.EncodeShard(sh)
-	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-	inserted := s.put("shards", shardHash, encoded, false)
-	err = storage.PutShardIndexes(ctx, sh, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		s.put(kind, name, value, false)
-		return nil
-	})
-	return inserted, err
+// PutShardObject stores the encoded shard unless one of that name exists.
+func (s *Storage) PutShardObject(_ context.Context, shardHash string, encoded []byte) (bool, error) {
+	return s.put("shards", shardHash, encoded, false), nil
+}
+
+// PutIndexEntry keeps an existing entry's first writer, like the file backend.
+func (s *Storage) PutIndexEntry(_ context.Context, kind, name, shardHash string) error {
+	s.put(kind, name, []byte(shardHash), false)
+	return nil
 }
 
 // GetShard retrieves a shard by file hash.

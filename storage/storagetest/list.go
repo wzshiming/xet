@@ -34,7 +34,7 @@ func testListFilesGroupsBySHA256(t *testing.T, b Backend) {
 	emptyHash := xet.FileHash{}
 	emptyShard := shard.NewShard()
 	emptyShard.AddFile(shard.FileBlock{FileHash: emptyHash})
-	if _, err := st.PutShard(ctx, emptyShard); err != nil {
+	if _, err := storage.PutShard(ctx, st, emptyShard, nil); err != nil {
 		t.Fatalf("PutShard(empty file): %v", err)
 	}
 
@@ -140,7 +140,7 @@ func testListFilesComputesUniqueAndShared(t *testing.T, b Backend) {
 	if len(shardAB.CASInfos) != 1 {
 		t.Fatalf("test setup: %d CAS blocks left, want only partB's", len(shardAB.CASInfos))
 	}
-	if _, err := st.PutShard(ctx, shardAB); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardAB, nil); err != nil {
 		t.Fatalf("PutShard: %v", err)
 	}
 

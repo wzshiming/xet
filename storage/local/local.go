@@ -110,21 +110,6 @@ func (fs *Storage) objectPath(kind, name string) string {
 	return filepath.Join(fs.basePath, filepath.FromSlash(storage.ObjectKey(kind, name)))
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (fs *Storage) hasFile(fileHash xet.FileHash) (bool, error) {
-	if _, exists := fs.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	filePath := fs.objectPath("index/files", fileHash.String())
-	if _, err := os.Stat(filePath); err == nil {
-		return true, nil
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return false, nil
-}
-
 // getShard resolves a file hash through index/files/<file-hash>, whose contents
 // are the hash of the serialized shard stored at shards/<shard-hash>.
 func (fs *Storage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
@@ -301,51 +286,25 @@ func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 	return false, fmt.Errorf("check xorb file: %w", err)
 }
 
-// PutShard stores a shard
-func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := fs.hasFile(fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, fs); err != nil {
-		return false, err
-	}
-
-	encoded, shardHash, err := storage.EncodeShard(s)
-	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
-	}
-
+// PutShardObject writes the encoded shard unless one of that name exists.
+func (fs *Storage) PutShardObject(_ context.Context, shardHash string, encoded []byte) (bool, error) {
 	shardPath := fs.objectPath("shards", shardHash)
-	wasInserted := true
 	if _, err := os.Stat(shardPath); err == nil {
-		wasInserted = false
+		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("check shard file: %w", err)
-	} else if err := overwriteIndexFile(shardPath, encoded); err != nil {
+	}
+	if err := overwriteIndexFile(shardPath, encoded); err != nil {
 		return false, fmt.Errorf("write shard file: %w", err)
 	}
+	return true, nil
+}
 
-	// Nothing is cached here; the read path populates the caches from the
-	// stored objects, so a warm process serves exactly what a restarted one
-	// would.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		return writeIndexFile(fs.objectPath(kind, name), value)
-	})
-	return wasInserted, err
+// PutIndexEntry keeps an entry already present. Nothing is cached here; the
+// read path populates the caches from the stored objects, so a warm process
+// serves exactly what a restarted one would.
+func (fs *Storage) PutIndexEntry(_ context.Context, kind, name, shardHash string) error {
+	return writeIndexFile(fs.objectPath(kind, name), []byte(shardHash))
 }
 
 // openXorb returns a cached read handle for the given xorb, opening it on

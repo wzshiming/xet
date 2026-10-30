@@ -604,7 +604,7 @@ func (l testCAS) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 }
 
 func (l testCAS) UploadShard(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	wasInserted, err := l.storage.PutShard(ctx, shardObj)
+	wasInserted, err := storage.PutShard(ctx, l.storage, shardObj, nil)
 	if err != nil {
 		return nil, err
 	}

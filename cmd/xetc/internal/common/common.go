@@ -41,6 +41,9 @@ func Options(concurrency int, cacheDir string, out io.Writer) []client.Options {
 			progressSummary.Update(baseName(name), current, total)
 			progressSummary.Output(out)
 		}),
+		client.WithShardProgressFunc(func(name string, current, total int64) {
+			progressSummary.OutputStage(out, name, current, total)
+		}),
 		client.WithConcurrency(concurrency),
 		client.WithCache(client.NewCache(cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)),
 	}
@@ -139,6 +142,12 @@ type progressSummary struct {
 
 	previousCurrent int64
 	latestUpdate    time.Time
+
+	width int // length of the last printed line, byte or stage
+
+	stageName   string
+	stage       progressItem
+	stageUpdate time.Time
 }
 
 func newProgressSummary() *progressSummary {
@@ -181,9 +190,43 @@ func (s *progressSummary) Output(out io.Writer) {
 
 	rate := formatTransferRate(bytesSinceLast * int64(time.Second) / int64(elapsed))
 
-	if _, err := fmt.Fprintf(out, "%s/%s (%s)\r", formatByteSize(current), formatByteSize(total), rate); err != nil {
+	line := fmt.Sprintf("%s/%s (%s)", formatByteSize(current), formatByteSize(total), rate)
+	s.width = len(line)
+	if _, err := fmt.Fprintf(out, "%s\r", line); err != nil {
 		return
 	}
+}
+
+// OutputStage prints a client.WithShardProgressFunc frame over the progress line.
+func (s *progressSummary) OutputStage(out io.Writer, name string, current, total int64) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+
+	// The server opens every stream with validating (0,0).
+	if name == "validating" && total == 0 {
+		return
+	}
+	// Heartbeats and phase seams repeat the last frame.
+	item := progressItem{current: current, total: total}
+	if name == s.stageName && item == s.stage {
+		return
+	}
+	now := time.Now()
+	if name == s.stageName && total == s.stage.total && current != total && now.Sub(s.stageUpdate) < time.Second {
+		return
+	}
+	s.stageName, s.stage, s.stageUpdate = name, item, now
+
+	line := fmt.Sprintf("shard committing (%s)", name)
+	if name == "validating" {
+		line = fmt.Sprintf("shard validating %d/%d", current, total)
+	}
+	// Blank out the tail of a longer previous line.
+	if pad := s.width - len(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	s.width = len(line)
+	_, _ = fmt.Fprintf(out, "%s\r", line)
 }
 
 func formatTransferRate(bytesPerSecond int64) string {

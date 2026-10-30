@@ -19,6 +19,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -41,7 +42,7 @@ func TestShardNameIsDeterministicContentHash(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inserted, err := st.PutShard(context.Background(), newIdenticalShard(st, creationTime)); err != nil || !inserted {
+		if inserted, err := storage.PutShard(context.Background(), st, newIdenticalShard(st, creationTime), nil); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 		entries, err := fanoutEntries(filepath.Join(basePath, "shards"))
@@ -136,19 +137,19 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.PutShard(ctx, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj, nil); err == nil {
 		t.Fatal("PutShard() succeeded despite blocked sha256 index")
 	}
 
 	// The partial shard must not count as existing.
-	if exists, err := fs.hasFile(fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	if got, err := fs.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+		t.Fatalf("GetFileIndexEntry() after partial failure = %q, %v", got, err)
 	}
 
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj, nil); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 
@@ -208,7 +209,7 @@ func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
 	content := []byte("fan me out")
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, fs, shardObj, [][]byte{content})
-	if inserted, err := fs.PutShard(ctx, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, fs, shardObj, nil); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
 
