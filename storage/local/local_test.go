@@ -12,6 +12,7 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -245,7 +246,7 @@ func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
 	}
 }
 
-func TestGetXorbDataRangeFromOffsets(t *testing.T) {
+func TestXorbChunkOffsetsRanges(t *testing.T) {
 	chunks := [][]byte{
 		bytes.Repeat([]byte{1}, 1000),
 		[]byte("second chunk"),
@@ -274,15 +275,22 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			offsets, err := fs.GetXorbChunkOffsets(context.Background(), xorbHash)
+			if err != nil {
+				t.Fatalf("GetXorbChunkOffsets: %v", err)
+			}
+			if len(offsets) != int(numChunks) {
+				t.Fatalf("GetXorbChunkOffsets returned %d offsets for %d chunks", len(offsets), numChunks)
+			}
 			for start := range numChunks {
 				for end := start + 1; end <= numChunks; end++ {
 					wantStart, wantEnd, err := xorb.ChunkDataRange(bytes.NewReader(reference), start, end)
 					if err != nil {
 						t.Fatalf("ChunkDataRange(%d, %d): %v", start, end, err)
 					}
-					gotStart, gotEnd, err := fs.GetXorbDataRange(context.Background(), xorbHash, start, end)
+					gotStart, gotEnd, err := xorb.ChunkDataRangeFromOffsets(offsets, start, end)
 					if err != nil {
-						t.Fatalf("GetXorbDataRange(%d, %d): %v", start, end, err)
+						t.Fatalf("ChunkDataRangeFromOffsets(%d, %d): %v", start, end, err)
 					}
 					if gotStart != wantStart || gotEnd != wantEnd {
 						t.Fatalf("range [%d, %d) = [%d, %d], want [%d, %d]", start, end, gotStart, gotEnd, wantStart, wantEnd)
@@ -290,16 +298,12 @@ func TestGetXorbDataRangeFromOffsets(t *testing.T) {
 				}
 			}
 
-			if _, _, err := fs.GetXorbDataRange(context.Background(), xorbHash, 0, numChunks+1); err == nil {
-				t.Fatal("GetXorbDataRange() accepted out-of-bounds chunk range")
-			}
-
-			// Cached offsets keep serving ranges without touching the xorb file.
+			// Cached offsets keep serving without touching the xorb file.
 			if err := os.Remove(fs.objectPath("xorbs", xorbHash.String())); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, err := fs.GetXorbDataRange(context.Background(), xorbHash, 1, 2); err != nil {
-				t.Fatalf("GetXorbDataRange() after xorb removal: %v", err)
+			if cached, err := fs.GetXorbChunkOffsets(context.Background(), xorbHash); err != nil || !slices.Equal(cached, offsets) {
+				t.Fatalf("GetXorbChunkOffsets after xorb removal = %v, %v; want %v, nil", cached, err, offsets)
 			}
 		})
 	}

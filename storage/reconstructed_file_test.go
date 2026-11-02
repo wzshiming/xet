@@ -33,8 +33,8 @@ var mixedChunkSizes = []int{1, xet.MaxChunkSize, 3, 4 << 10, 2, 64<<10 + 1, 1000
 var noneClass, lz4Class = benchClasses[0], benchClasses[1]
 
 var (
-	errInjected = errors.New("injected range failure")
-	errReleased = errors.New("blocked range released at test end")
+	errInjected = errors.New("injected read failure")
+	errReleased = errors.New("blocked read released at test end")
 	missingXorb = xet.XorbHash{0xde, 0xad} // held by no store
 )
 
@@ -171,19 +171,22 @@ func framesOf(t *testing.T, st storage.Storage, h xet.XorbHash) []frame {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := st.GetXorbRangeReadCloser(t.Context(), h, 0, int64(offsets[len(offsets)-1])-1)
+	rs, err := st.GetXorbReadSeekCloser(t.Context(), h)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := io.ReadAll(rc)
-	rc.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer rs.Close()
 	frames := make([]frame, len(offsets))
 	var start int64
+	var buf [xorb.ChunkHeaderSize]byte
 	for i, end := range offsets {
-		hdr, err := xorb.ParseChunkHeader(data[start:])
+		if _, err := rs.Seek(start, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(rs, buf[:]); err != nil {
+			t.Fatalf("xorb %s chunk %d header: %v", h.String(), i, err)
+		}
+		hdr, err := xorb.ParseChunkHeader(buf[:])
 		if err != nil {
 			t.Fatalf("xorb %s chunk %d: %v", h.String(), i, err)
 		}
@@ -199,32 +202,31 @@ func termRange(frames []frame, e shard.FileDataSequenceEntry) (start, end int64)
 }
 
 // countingStore records the xorb reads a reconstructed file makes; fault,
-// when set before the file opens, may wrap each range it serves.
+// when set before the file opens, may wrap each seeker it serves.
 type countingStore struct {
 	storage.Storage
-	fault func(ctx context.Context, r rangeRead, rd io.Reader) io.Reader
+	fault func(ctx context.Context, r seekRead, rs io.ReadSeeker) io.ReadSeeker
 
 	mu      sync.Mutex
 	calls   map[xet.XorbHash]int // xorb reads of any kind
-	seekers int                  // GetXorbReadSeekCloser calls
 	offsets map[xet.XorbHash]int // GetXorbChunkOffsets calls
-	ranges  []*rangeRead
-	open    int // range readers not yet closed
+	seekers []*seekRead
+	open    int // seekers not yet closed
 	maxOpen int
 	ctxs    []context.Context // what each xorb read was given
 }
 
-// rangeRead is one GetXorbRangeReadCloser call and what its reader served.
-type rangeRead struct {
-	hash       xet.XorbHash
-	nth        int // 1 for the first range of hash
-	start, end int64
-	read       int64
-	closes     int
+// seekRead is one GetXorbReadSeekCloser call and what its seeker served.
+type seekRead struct {
+	hash   xet.XorbHash
+	nth    int   // 1 for the first seeker of hash
+	start  int64 // xorb offset its first Read began at, -1 before one
+	read   int64
+	closes int
 }
 
-func (r rangeRead) String() string {
-	return fmt.Sprintf("%.8s#%d[%d,%d] read %d closed %d", r.hash.String(), r.nth, r.start, r.end, r.read, r.closes)
+func (r seekRead) String() string {
+	return fmt.Sprintf("%.8s#%d@%d read %d closed %d", r.hash.String(), r.nth, r.start, r.read, r.closes)
 }
 
 func newCountingStore(st storage.Storage) *countingStore {
@@ -240,15 +242,26 @@ func (s *countingStore) note(ctx context.Context, h xet.XorbHash) {
 
 func (s *countingStore) GetXorbReadSeekCloser(ctx context.Context, h xet.XorbHash) (io.ReadSeekCloser, error) {
 	s.note(ctx, h)
+	rsc, err := s.Storage.GetXorbReadSeekCloser(ctx, h)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
-	s.seekers++
+	r := &seekRead{hash: h, nth: 1, start: -1}
+	for _, prev := range s.seekers {
+		if prev.hash == h {
+			r.nth++
+		}
+	}
+	s.seekers = append(s.seekers, r)
+	s.open++
+	s.maxOpen = max(s.maxOpen, s.open)
 	s.mu.Unlock()
-	return s.Storage.GetXorbReadSeekCloser(ctx, h)
-}
-
-func (s *countingStore) GetXorbDataRange(ctx context.Context, h xet.XorbHash, chunkStart, chunkEnd uint32) (int64, int64, error) {
-	s.note(ctx, h)
-	return s.Storage.GetXorbDataRange(ctx, h, chunkStart, chunkEnd)
+	var rs io.ReadSeeker = rsc
+	if s.fault != nil {
+		rs = s.fault(ctx, *r, rsc)
+	}
+	return &countedSeeker{s: s, rec: r, rs: rs, c: rsc}, nil
 }
 
 func (s *countingStore) GetXorbChunkOffsets(ctx context.Context, h xet.XorbHash) ([]uint64, error) {
@@ -257,30 +270,6 @@ func (s *countingStore) GetXorbChunkOffsets(ctx context.Context, h xet.XorbHash)
 	s.offsets[h]++
 	s.mu.Unlock()
 	return s.Storage.GetXorbChunkOffsets(ctx, h)
-}
-
-func (s *countingStore) GetXorbRangeReadCloser(ctx context.Context, h xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	s.note(ctx, h)
-	rc, err := s.Storage.GetXorbRangeReadCloser(ctx, h, start, end)
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	r := &rangeRead{hash: h, nth: 1, start: start, end: end}
-	for _, prev := range s.ranges {
-		if prev.hash == h {
-			r.nth++
-		}
-	}
-	s.ranges = append(s.ranges, r)
-	s.open++
-	s.maxOpen = max(s.maxOpen, s.open)
-	s.mu.Unlock()
-	var rd io.Reader = rc
-	if s.fault != nil {
-		rd = s.fault(ctx, *r, rc)
-	}
-	return &countedRange{s: s, rec: r, r: rd, c: rc}, nil
 }
 
 func (s *countingStore) total() int {
@@ -299,19 +288,19 @@ func (s *countingStore) readsOf(h xet.XorbHash) int {
 	return s.calls[h]
 }
 
-func (s *countingStore) rangeReads() []rangeRead {
+func (s *countingStore) seekReads() []seekRead {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]rangeRead, len(s.ranges))
-	for i, r := range s.ranges {
+	out := make([]seekRead, len(s.seekers))
+	for i, r := range s.seekers {
 		out[i] = *r
 	}
 	return out
 }
 
-func (s *countingStore) rangesOf(h xet.XorbHash) int {
+func (s *countingStore) seekersOf(h xet.XorbHash) int {
 	n := 0
-	for _, r := range s.rangeReads() {
+	for _, r := range s.seekReads() {
 		if r.hash == h {
 			n++
 		}
@@ -319,32 +308,45 @@ func (s *countingStore) rangesOf(h xet.XorbHash) int {
 	return n
 }
 
-// rangeBytes is how many bytes the range readers have served.
-func (s *countingStore) rangeBytes() int64 {
+// seekBytes is how many bytes the seekers have served.
+func (s *countingStore) seekBytes() int64 {
 	var n int64
-	for _, r := range s.rangeReads() {
+	for _, r := range s.seekReads() {
 		n += r.read
 	}
 	return n
 }
 
-// countedRange is a range reader whose reads and closes its store records.
-type countedRange struct {
+// countedSeeker is a seeker whose reads and closes its store records.
+type countedSeeker struct {
 	s   *countingStore
-	rec *rangeRead
-	r   io.Reader
+	rec *seekRead
+	rs  io.ReadSeeker
 	c   io.Closer
+	pos int64
 }
 
-func (r *countedRange) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
+func (r *countedSeeker) Seek(offset int64, whence int) (int64, error) {
+	pos, err := r.rs.Seek(offset, whence)
+	if err == nil {
+		r.pos = pos
+	}
+	return pos, err
+}
+
+func (r *countedSeeker) Read(p []byte) (int, error) {
+	n, err := r.rs.Read(p)
 	r.s.mu.Lock()
+	if r.rec.start < 0 {
+		r.rec.start = r.pos
+	}
 	r.rec.read += int64(n)
 	r.s.mu.Unlock()
+	r.pos += int64(n)
 	return n, err
 }
 
-func (r *countedRange) Close() error {
+func (r *countedSeeker) Close() error {
 	r.s.mu.Lock()
 	r.rec.closes++
 	if r.rec.closes == 1 {
@@ -354,11 +356,11 @@ func (r *countedRange) Close() error {
 	return r.c.Close()
 }
 
-// faultyRange serves r, at xorb offset off, with the byte at a non-zero flip
+// faultySeeker serves rs, at xorb offset off, with the byte at a non-zero flip
 // inverted; at a non-zero stop it fails with err or, without one, signals
 // blocked and waits for ctx or release.
-type faultyRange struct {
-	r          io.Reader
+type faultySeeker struct {
+	rs         io.ReadSeeker
 	off        int64
 	flip, stop int64
 	err        error
@@ -367,7 +369,15 @@ type faultyRange struct {
 	blocked    chan struct{}
 }
 
-func (f *faultyRange) Read(p []byte) (int, error) {
+func (f *faultySeeker) Seek(offset int64, whence int) (int64, error) {
+	off, err := f.rs.Seek(offset, whence)
+	if err == nil {
+		f.off = off
+	}
+	return off, err
+}
+
+func (f *faultySeeker) Read(p []byte) (int, error) {
 	if f.stop != 0 {
 		if f.off >= f.stop {
 			if f.err != nil {
@@ -386,7 +396,7 @@ func (f *faultyRange) Read(p []byte) (int, error) {
 		}
 		p = p[:min(int64(len(p)), f.stop-f.off)]
 	}
-	n, err := f.r.Read(p)
+	n, err := f.rs.Read(p)
 	if f.flip != 0 && f.flip >= f.off && f.flip < f.off+int64(n) {
 		p[f.flip-f.off] ^= 0xff
 	}
@@ -394,24 +404,24 @@ func (f *faultyRange) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// inject has dec serve ranges of xorb h through f, or only the first with first set.
-func inject(dec *countingStore, h xet.XorbHash, first bool, f faultyRange) {
-	dec.fault = func(ctx context.Context, r rangeRead, rd io.Reader) io.Reader {
+// inject has dec serve seekers of xorb h through f, or only the first with first set.
+func inject(dec *countingStore, h xet.XorbHash, first bool, f faultySeeker) {
+	dec.fault = func(ctx context.Context, r seekRead, rs io.ReadSeeker) io.ReadSeeker {
 		if r.hash != h || (first && r.nth > 1) {
-			return rd
+			return rs
 		}
 		g := f
-		g.r, g.ctx, g.off = rd, ctx, r.start
+		g.rs, g.ctx = rs, ctx
 		return &g
 	}
 }
 
-// stuckRange serves r only once release closes, as a backend read deaf to
-// cancellation would: its first Read signals blocked, then waits, signalling
-// cancelled should ctx end first; released, it fails with a non-nil err or
-// serves r.
-type stuckRange struct {
-	r                  io.Reader
+// stuckSeeker serves its ReadSeeker only once release closes, as a backend
+// read deaf to cancellation would: its first Read signals blocked, then waits,
+// signalling cancelled should ctx end first; released, it fails with a non-nil
+// err or serves the ReadSeeker.
+type stuckSeeker struct {
+	io.ReadSeeker
 	ctx                context.Context
 	err                error
 	blocked, cancelled chan<- struct{}
@@ -419,7 +429,7 @@ type stuckRange struct {
 	waited             bool
 }
 
-func (s *stuckRange) Read(p []byte) (int, error) {
+func (s *stuckSeeker) Read(p []byte) (int, error) {
 	if !s.waited {
 		s.waited = true
 		s.blocked <- struct{}{}
@@ -433,7 +443,7 @@ func (s *stuckRange) Read(p []byte) (int, error) {
 	if s.err != nil {
 		return 0, s.err
 	}
-	return s.r.Read(p)
+	return s.ReadSeeker.Read(p)
 }
 
 // openFile opens f over st and closes it when the test ends.
@@ -520,7 +530,7 @@ func closeWithin(t *testing.T, rc io.Closer, d time.Duration) {
 	within(t, d, "Close", func() { rc.Close() })
 }
 
-// blockAfterFirstChunk returns a store whose first range of f's first xorb
+// blockAfterFirstChunk returns a store whose first seeker of f's first xorb
 // serves chunk 0, then blocks until the context it was given ends; blocked
 // receives once a Read waits there.
 func blockAfterFirstChunk(t *testing.T, st storage.Storage, f storedFile) (*countingStore, <-chan struct{}) {
@@ -528,11 +538,11 @@ func blockAfterFirstChunk(t *testing.T, st storage.Storage, f storedFile) (*coun
 	h := f.XorbHashes[0]
 	blocked := make(chan struct{}, 1)
 	dec := newCountingStore(st)
-	inject(dec, h, true, faultyRange{stop: framesOf(t, st, h)[0].end, release: t.Context().Done(), blocked: blocked})
+	inject(dec, h, true, faultySeeker{stop: framesOf(t, st, h)[0].end, release: t.Context().Done(), blocked: blocked})
 	return dec, blocked
 }
 
-// readFirstChunk reads f's first size bytes, then waits for the blocked range.
+// readFirstChunk reads f's first size bytes, then waits for the blocked seeker.
 func readFirstChunk(t *testing.T, rc io.Reader, f storedFile, size int, blocked <-chan struct{}) {
 	t.Helper()
 	got := make([]byte, size)
@@ -544,7 +554,7 @@ func readFirstChunk(t *testing.T, rc io.Reader, f storedFile, size int, blocked 
 	select {
 	case <-blocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("no Read ever waited on the term's GetXorbRangeReadCloser")
+		t.Fatal("no Read ever waited on the term's seeker")
 	}
 }
 
@@ -656,7 +666,7 @@ func TestReconstructedFileSeekBackInsideChunkRereadsWithoutIO(t *testing.T) {
 }
 
 // A Seek one byte past the decoded chunk's end is a Seek away: the next Read
-// serves the bytes there through one new range read.
+// serves the bytes there through one new seeker.
 func TestReconstructedFileSeekPastChunkEndOpensNewRange(t *testing.T) {
 	st := newLocal(t)
 	f := putXorbs(t, st, xorbsOf(lz4Class, 1, mixedChunkSizes))
@@ -670,7 +680,7 @@ func TestReconstructedFileSeekPastChunkEndOpensNewRange(t *testing.T) {
 	if _, err := io.ReadFull(rc, make([]byte, 100)); err != nil {
 		t.Fatal(err)
 	}
-	opened := len(dec.rangeReads())
+	opened := len(dec.seekReads())
 	if got, err := rc.Seek(past, io.SeekStart); err != nil || got != past {
 		t.Fatalf("Seek(%d) = %d, %v", past, got, err)
 	}
@@ -678,12 +688,12 @@ func TestReconstructedFileSeekPastChunkEndOpensNewRange(t *testing.T) {
 	if _, err := io.ReadFull(rc, got); err != nil || !bytes.Equal(got, f.Content[past:past+100]) {
 		t.Fatalf("read after Seek(%d) = %v; want the file's bytes [%d, %d)", past, err, past, past+100)
 	}
-	if n := len(dec.rangeReads()) - opened; n != 1 {
-		t.Fatalf("Read after a Seek one past the decoded chunk opened %d ranges, want 1", n)
+	if n := len(dec.seekReads()) - opened; n != 1 {
+		t.Fatalf("Read after a Seek one past the decoded chunk opened %d seekers, want 1", n)
 	}
 }
 
-// A Seek to a term's first byte resumes from that term's range alone: the
+// A Seek to a term's first byte resumes from that term's seeker alone: the
 // term ending there is not opened again.
 func TestReconstructedFileSeekToTermStartOpensOnlyThatTerm(t *testing.T) {
 	st := newLocal(t)
@@ -697,12 +707,12 @@ func TestReconstructedFileSeekToTermStartOpensOnlyThatTerm(t *testing.T) {
 	if got, err := rc.Seek(pos, io.SeekStart); err != nil || got != pos {
 		t.Fatalf("Seek(%d) = %d, %v", pos, got, err)
 	}
-	opened := len(dec.rangeReads())
+	opened := len(dec.seekReads())
 	if got, err := io.ReadAll(rc); err != nil || !bytes.Equal(got, f.Content[pos:]) {
 		t.Fatalf("read after Seek(%d) = %d bytes, %v; want the %d after it", pos, len(got), err, int64(len(f.Content))-pos)
 	}
-	if next := dec.rangeReads()[opened:]; len(next) != 1 || next[0].hash != f.XorbHashes[1] {
-		t.Fatalf("ranges after Seek(%d) = %v; want only the second term's", pos, next)
+	if next := dec.seekReads()[opened:]; len(next) != 1 || next[0].hash != f.XorbHashes[1] {
+		t.Fatalf("seekers after Seek(%d) = %v; want only the second term's", pos, next)
 	}
 }
 
@@ -811,10 +821,10 @@ func TestReconstructedFileSkipsZeroLengthTerms(t *testing.T) {
 	}
 }
 
-// Each non-empty term is one GetXorbRangeReadCloser of exactly its chunks,
-// read through and closed once before the next opens, beside at most one
-// GetXorbChunkOffsets and no GetXorbReadSeekCloser, whether the file is read
-// to EOF or, as http.ServeContent sends it, copied to exactly its size.
+// Each non-empty term is one GetXorbReadSeekCloser, read from its chunks'
+// first byte through their last and closed once before the next opens, beside
+// at most one GetXorbChunkOffsets, whether the file is read to EOF or, as
+// http.ServeContent sends it, copied to exactly its size.
 func TestReconstructedFileOneRangeReadPerTerm(t *testing.T) {
 	files := []struct {
 		name string
@@ -858,7 +868,7 @@ func TestReconstructedFileOneRangeReadPerTerm(t *testing.T) {
 					if err := rc.Close(); err != nil {
 						t.Fatalf("Close = %v", err)
 					}
-					var want []rangeRead
+					var want []seekRead
 					terms := map[xet.XorbHash]int{}
 					for _, e := range f.entries() {
 						if e.UnpackedSegBytes == 0 {
@@ -866,10 +876,10 @@ func TestReconstructedFileOneRangeReadPerTerm(t *testing.T) {
 						}
 						terms[e.CASHash]++
 						start, end := termRange(framesOf(t, st, e.CASHash), e)
-						want = append(want, rangeRead{hash: e.CASHash, nth: terms[e.CASHash], start: start, end: end, read: end - start + 1, closes: 1})
+						want = append(want, seekRead{hash: e.CASHash, nth: terms[e.CASHash], start: start, read: end - start + 1, closes: 1})
 					}
-					if got := dec.rangeReads(); !slices.Equal(got, want) {
-						t.Errorf("range reads = %v; want one per non-empty term, read through and closed once: %v", got, want)
+					if got := dec.seekReads(); !slices.Equal(got, want) {
+						t.Errorf("seekers = %v; want one per non-empty term, read from its first byte through its last and closed once: %v", got, want)
 					}
 					dec.mu.Lock()
 					defer dec.mu.Unlock()
@@ -878,15 +888,47 @@ func TestReconstructedFileOneRangeReadPerTerm(t *testing.T) {
 							t.Errorf("GetXorbChunkOffsets(%.8s) called %d times for %d terms, want at most one per term", h.String(), n, terms[h])
 						}
 					}
-					if dec.seekers != 0 {
-						t.Errorf("GetXorbReadSeekCloser called %d times, want never", dec.seekers)
-					}
 					if dec.maxOpen > 1 {
-						t.Errorf("%d range readers open at once, want one at a time", dec.maxOpen)
+						t.Errorf("%d seekers open at once, want one at a time", dec.maxOpen)
 					}
 				})
 			}
 		}
+	}
+}
+
+// PrepareShard reads through one seeker per CAS block and one per term, and
+// closes each once.
+func TestPrepareShardOpensOneSeekerPerCASBlockAndTerm(t *testing.T) {
+	for _, file := range []struct {
+		name string
+		put  func(t *testing.T, st storage.Storage) storedFile
+	}{
+		{"whole xorbs", func(t *testing.T, st storage.Storage) storedFile {
+			return putXorbs(t, st, xorbsOf(lz4Class, 3, mixedChunkSizes))
+		}},
+		{"sub-range terms", func(t *testing.T, st storage.Storage) storedFile {
+			return putSubRangeFile(t, st, xorbsOf(lz4Class, 2, mixedChunkSizes))
+		}},
+	} {
+		t.Run(file.name, func(t *testing.T) {
+			st := newLocal(t)
+			f := file.put(t, st)
+			dec := newCountingStore(st)
+			if err := storage.PrepareShard(t.Context(), f.sh, dec); err != nil {
+				t.Fatalf("PrepareShard: %v", err)
+			}
+			blocks, terms := len(f.sh.CASInfos), len(f.entries())
+			got := dec.seekReads()
+			if len(got) != blocks+terms {
+				t.Errorf("PrepareShard opened seekers %v; want %d, one per CAS block (%d) and per term (%d)", got, blocks+terms, blocks, terms)
+			}
+			for _, r := range got {
+				if r.closes != 1 {
+					t.Errorf("seeker %v closed %d times, want once", r, r.closes)
+				}
+			}
+		})
 	}
 }
 
@@ -904,20 +946,20 @@ func TestReconstructedFileFaultFailsAtChunk(t *testing.T) {
 	before := f.termStart(1) + k*size
 	for _, fault := range []struct {
 		name string
-		f    faultyRange
+		f    faultySeeker
 	}{
-		{"flipped body byte", faultyRange{flip: (fk.start + xorb.ChunkHeaderSize + fk.end) / 2}},
-		{"header size off its frame", faultyRange{flip: fk.start + 1}},
-		{"range fails mid-frame", faultyRange{stop: fk.start + xorb.ChunkHeaderSize + 5, err: errInjected}},
-		{"range truncated at chunk boundary", faultyRange{stop: fk.start, err: io.EOF}},
+		{"flipped body byte", faultySeeker{flip: (fk.start + xorb.ChunkHeaderSize + fk.end) / 2}},
+		{"header size off its frame", faultySeeker{flip: fk.start + 1}},
+		{"seeker fails mid-frame", faultySeeker{stop: fk.start + xorb.ChunkHeaderSize + 5, err: errInjected}},
+		{"seeker truncated at chunk boundary", faultySeeker{stop: fk.start, err: io.EOF}},
 	} {
 		t.Run(fault.name, func(t *testing.T) {
 			dec := newCountingStore(st)
 			inject(dec, h, false, fault.f)
 			rc := openFile(t, t.Context(), dec, f)
 			got, err := io.ReadAll(rc)
-			if dec.rangesOf(h) == 0 {
-				t.Fatal("no GetXorbRangeReadCloser of the second term, so the fault was never injected")
+			if dec.seekersOf(h) == 0 {
+				t.Fatal("no seeker of the second term, so the fault was never injected")
 			}
 			checkFailedRead(t, rc, f.Content, got, err)
 			if int64(len(got)) != before {
@@ -1139,11 +1181,11 @@ func TestReconstructedFileSeekAwayClearsError(t *testing.T) {
 	f := putXorbs(t, st, xorbsOf(lz4Class, 1, slices.Repeat([]int{16 << 10}, 8)))
 	h := f.XorbHashes[0]
 	dec := newCountingStore(st)
-	inject(dec, h, true, faultyRange{stop: framesOf(t, st, h)[2].start + 5, err: errInjected})
+	inject(dec, h, true, faultySeeker{stop: framesOf(t, st, h)[2].start + 5, err: errInjected})
 	rc := openFile(t, t.Context(), dec, f)
 	got, err := io.ReadAll(rc)
-	if dec.rangesOf(h) == 0 {
-		t.Fatal("no GetXorbRangeReadCloser, so the fault was never injected")
+	if dec.seekersOf(h) == 0 {
+		t.Fatal("no GetXorbReadSeekCloser, so the fault was never injected")
 	}
 	checkFailedRead(t, rc, f.Content, got, err)
 	if pos, serr := rc.Seek(0, io.SeekCurrent); serr != nil || pos != int64(len(got)) {
@@ -1232,8 +1274,8 @@ func TestReconstructedFileParentCancelStopsPipeline(t *testing.T) {
 	settleGoroutines(t, baseline)
 }
 
-// Close cancels the context it gave storage: it returns promptly with a range
-// read in flight, closes that range once, and leaves nothing running.
+// Close cancels the context it gave storage: it returns promptly with a term's
+// seeker read in flight, closes that seeker once, and leaves nothing running.
 func TestReconstructedFileCloseCancelsInFlightRangeRead(t *testing.T) {
 	const size = 4 << 10
 	st := newLocal(t)
@@ -1249,17 +1291,17 @@ func TestReconstructedFileCloseCancelsInFlightRangeRead(t *testing.T) {
 			t.Errorf("xorb read %d was given a context Close left live, want a child of the reader's that Close cancels", i)
 		}
 	}
-	for _, r := range dec.ranges {
+	for _, r := range dec.seekers {
 		if r.closes != 1 {
-			t.Errorf("range %v closed %d times, want once", r, r.closes)
+			t.Errorf("seeker %v closed %d times, want once", r, r.closes)
 		}
 	}
 	dec.mu.Unlock()
 	settleGoroutines(t, baseline)
 }
 
-// closeRacesBlockedRead Reads f over st until its first range, a stuckRange
-// failing with fail, blocks; Closes; releases the range once Close has
+// closeRacesBlockedRead Reads f over st until its first seeker, a stuckSeeker
+// failing with fail, blocks; Closes; releases the seeker once Close has
 // cancelled it; then checks the Read, Close and a fresh reader's bytes.
 func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail error) {
 	t.Helper()
@@ -1268,11 +1310,11 @@ func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail 
 	unstick := sync.OnceFunc(func() { close(release) })
 	defer unstick()
 	dec := newCountingStore(st)
-	dec.fault = func(ctx context.Context, r rangeRead, rd io.Reader) io.Reader {
+	dec.fault = func(ctx context.Context, r seekRead, rs io.ReadSeeker) io.ReadSeeker {
 		if r.nth > 1 {
-			return rd
+			return rs
 		}
-		return &stuckRange{r: rd, ctx: ctx, err: fail, blocked: blocked, cancelled: cancelled, release: release}
+		return &stuckSeeker{ReadSeeker: rs, ctx: ctx, err: fail, blocked: blocked, cancelled: cancelled, release: release}
 	}
 	rc, err := storage.NewReconstructedFile(t.Context(), dec, f.sh, f.digest)
 	if err != nil {
@@ -1290,7 +1332,7 @@ func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail 
 	select {
 	case <-blocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("no Read ever waited on the stuck GetXorbRangeReadCloser")
+		t.Fatal("no Read ever waited on the stuck seeker")
 	}
 
 	closed := make(chan error, 1)
@@ -1333,7 +1375,7 @@ func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail 
 	}
 }
 
-// Close racing a Read that waits on a range read deaf to cancellation, which
+// Close racing a Read that waits on a seeker read deaf to cancellation, which
 // then fails or serves its chunk, returns nil within 1s, ends the Read in
 // fs.ErrClosed after only the file's bytes, and reenters no pool buffer twice;
 // under -race it also pins Read and Close as serialized.
@@ -1344,8 +1386,8 @@ func TestReconstructedFileCloseRacesBlockedRead(t *testing.T) {
 		name string
 		fail error
 	}{
-		{"range fails once released", errInjected},
-		{"range serves its chunk once released", nil},
+		{"seeker fails once released", errInjected},
+		{"seeker serves its chunk once released", nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			for range 200 {
@@ -1356,7 +1398,7 @@ func TestReconstructedFileCloseRacesBlockedRead(t *testing.T) {
 }
 
 // Close while a Read waits in the final chunk's drain, on a last term declared
-// short by its last chunk whose range read blocks there, returns nil within
+// short by its last chunk whose seeker read blocks there, returns nil within
 // 1s and ends that Read in fs.ErrClosed without the withheld chunk; under
 // -race it also pins Read and Close as serialized.
 func TestReconstructedFileCloseInterruptsFinalChunkDrain(t *testing.T) {
@@ -1366,7 +1408,7 @@ func TestReconstructedFileCloseInterruptsFinalChunkDrain(t *testing.T) {
 	frames := framesOf(t, st, h)
 	blocked := make(chan struct{}, 1)
 	dec := newCountingStore(st)
-	inject(dec, h, true, faultyRange{stop: frames[len(frames)-1].start, release: t.Context().Done(), blocked: blocked})
+	inject(dec, h, true, faultySeeker{stop: frames[len(frames)-1].start, release: t.Context().Done(), blocked: blocked})
 	rc := openFile(t, t.Context(), dec, f)
 	size := f.termStart(len(f.entries()))
 	if _, err := io.ReadFull(rc, make([]byte, size-final)); err != nil {
@@ -1375,7 +1417,7 @@ func TestReconstructedFileCloseInterruptsFinalChunkDrain(t *testing.T) {
 	select {
 	case <-blocked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("no range read ever waited on the chunk past the last term's declared size")
+		t.Fatal("no seeker read ever waited on the chunk past the last term's declared size")
 	}
 
 	type result struct {
@@ -1408,8 +1450,8 @@ func TestReconstructedFileCloseInterruptsFinalChunkDrain(t *testing.T) {
 }
 
 // A Seek out of the decoded chunk stops the pipeline before it returns: every
-// range closed once, no goroutine left; the next Read resumes from a range of
-// the target's term.
+// seeker closed once, no goroutine left; the next Read resumes from one seeker
+// of the target's term, read through its end.
 func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 	const size = 4 << 10
 	st := newLocal(t)
@@ -1420,8 +1462,8 @@ func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 	if _, err := io.ReadFull(rc, make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if dec.rangesOf(f.XorbHashes[0]) == 0 {
-		t.Fatal("the first Read opened no GetXorbRangeReadCloser of the first term")
+	if dec.seekersOf(f.XorbHashes[0]) == 0 {
+		t.Fatal("the first Read opened no seeker of the first term")
 	}
 	pos := f.termStart(1) + size + 7 // in chunk 1 of the second term
 	var at int64
@@ -1430,10 +1472,10 @@ func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 	if err != nil || at != pos {
 		t.Fatalf("Seek(%d) = %d, %v", pos, at, err)
 	}
-	opened := dec.rangeReads()
+	opened := dec.seekReads()
 	for _, r := range opened {
 		if r.closes != 1 {
-			t.Errorf("range %v closed %d times when Seek returned, want once", r, r.closes)
+			t.Errorf("seeker %v closed %d times when Seek returned, want once", r, r.closes)
 		}
 	}
 	settleGoroutines(t, baseline)
@@ -1441,11 +1483,14 @@ func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 	if _, err := io.ReadFull(rc, got); err != nil || !bytes.Equal(got, f.Content[pos:pos+100]) {
 		t.Fatalf("read after Seek(%d) = %v; want the file's bytes there", pos, err)
 	}
+	if rest, err := io.ReadAll(rc); err != nil || !bytes.Equal(rest, f.Content[pos+100:]) {
+		t.Fatalf("read to EOF after Seek(%d) = %d bytes, %v; want the %d after its first 100", pos, len(rest), err, int64(len(f.Content))-pos-100)
+	}
 	frames := framesOf(t, st, f.XorbHashes[1])
 	_, termEnd := termRange(frames, f.entries()[1])
-	next := dec.rangeReads()[len(opened):]
-	if len(next) == 0 || next[0].hash != f.XorbHashes[1] || next[0].start > frames[1].start || next[0].end != termEnd {
-		t.Fatalf("ranges after the Seek = %v; want first the second term's from at most chunk 1 to its end %d", next, termEnd)
+	next := dec.seekReads()[len(opened):]
+	if len(next) != 1 || next[0].hash != f.XorbHashes[1] || next[0].start > frames[1].start || next[0].start+next[0].read != termEnd+1 {
+		t.Fatalf("seekers after the Seek = %v; want one of the second term's, read from at most chunk 1 through its end %d", next, termEnd)
 	}
 }
 
@@ -1453,8 +1498,8 @@ func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 func TestReconstructedFileReadAheadFillsWindow(t *testing.T) {
 	dec, rc, frames := stalledReader(t)
 	want := frames[8-1].end
-	if !eventually(func() bool { return dec.rangeBytes() >= want }) {
-		t.Fatalf("stalled reader fetched %d bytes, want read-ahead through the window's %d frames, %d bytes", dec.rangeBytes(), 8, want)
+	if !eventually(func() bool { return dec.seekBytes() >= want }) {
+		t.Fatalf("stalled reader fetched %d bytes, want read-ahead through the window's %d frames, %d bytes", dec.seekBytes(), 8, want)
 	}
 	closeWithin(t, rc, time.Second)
 }
@@ -1464,10 +1509,10 @@ func TestReconstructedFileReadAheadFillsWindow(t *testing.T) {
 func TestReconstructedFileStalledReaderStaysBounded(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	dec, rc, frames := stalledReader(t)
-	if full := frames[8-1].end; !eventually(func() bool { return dec.rangeBytes() >= full }) {
-		t.Fatalf("stalled reader fetched %d bytes, never filling its window of %d frames, %d bytes", dec.rangeBytes(), 8, full)
+	if full := frames[8-1].end; !eventually(func() bool { return dec.seekBytes() >= full }) {
+		t.Fatalf("stalled reader fetched %d bytes, never filling its window of %d frames, %d bytes", dec.seekBytes(), 8, full)
 	}
-	if got, limit := dec.rangeBytes(), frames[8+1].end; got > limit {
+	if got, limit := dec.seekBytes(), frames[8+1].end; got > limit {
 		t.Errorf("stalled reader fetched %d of %d bytes, want at most 8+2 frames, %d bytes", got, frames[len(frames)-1].end, limit)
 	}
 	workers := min(runtime.GOMAXPROCS(0), 4)

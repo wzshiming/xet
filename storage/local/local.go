@@ -1,6 +1,7 @@
 // Package local implements storage.Storage on a filesystem below the base
 // directory given to NewStorage. Objects and index entries land through a
 // temp file plus rename, and an index entry already present is kept.
+// Xorbs are read from an LRU of read-only memory mappings.
 package local
 
 import (
@@ -13,11 +14,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/internal/lru"
+	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -25,42 +25,11 @@ import (
 
 // Storage implements storage.Storage on the local filesystem.
 type Storage struct {
-	basePath    string
-	baseURL     string
-	caches      *storage.IndexCaches
-	xorbIndex   *lru.Cache[xet.XorbHash, *xorbFile] // bounded xorb handle cache
-	xorbHandles atomic.Int64                        // open xorb files, cached or held by readers
-}
-
-// xorbFile is a shared xorb handle read only through positional reads, so
-// any number of readers use it at once. The cache and every reader or
-// offsets load each hold a reference; the last release closes the file.
-type xorbFile struct {
-	f       *os.File
-	refs    atomic.Int64
-	handles *atomic.Int64 // the owning Storage's xorbHandles
-}
-
-// acquire takes a reference, reporting false once the last one is gone and
-// the file closed.
-func (xf *xorbFile) acquire() bool {
-	for {
-		n := xf.refs.Load()
-		if n == 0 {
-			return false
-		}
-		if xf.refs.CompareAndSwap(n, n+1) {
-			return true
-		}
-	}
-}
-
-// release drops a reference; the last one closes the file.
-func (xf *xorbFile) release() {
-	if xf.refs.Add(-1) == 0 {
-		_ = xf.f.Close()
-		xf.handles.Add(-1)
-	}
+	basePath      string
+	baseURL       string
+	caches        *storage.IndexCaches
+	xorbCacheSize int
+	xorbCache     *xorbmap.Cache // bounded xorb mapping cache
 }
 
 const defaultXorbCacheSize = 512
@@ -79,34 +48,30 @@ func WithBaseURL(baseURL string) Option {
 	}
 }
 
-// WithXorbCacheSize sets how many xorb file handles stay cached for reuse.
-// Open xorb files are bounded by the cached handles plus the evicted ones
-// that in-flight readers still hold. Values less than one leave the handle
-// cache unbounded.
+// WithXorbCacheSize sets how many xorb mappings stay cached; evicted ones live until their readers close; values below one leave it unbounded.
 func WithXorbCacheSize(size int) Option {
 	return func(fs *Storage) {
-		fs.xorbIndex = lru.New[xet.XorbHash, *xorbFile](size)
+		fs.xorbCacheSize = size
 	}
 }
 
 // NewStorage creates a new filesystem-based storage
 func NewStorage(opts ...Option) (*Storage, error) {
 	fs := &Storage{
-		basePath:  "./xet",
-		baseURL:   "",
-		caches:    storage.NewIndexCaches(),
-		xorbIndex: lru.New[xet.XorbHash, *xorbFile](defaultXorbCacheSize),
+		basePath:      "./xet",
+		baseURL:       "",
+		caches:        storage.NewIndexCaches(),
+		xorbCacheSize: defaultXorbCacheSize,
 	}
 
 	for _, opt := range opts {
 		opt(fs)
 	}
 
-	// Eviction drops only the cache's reference, so it never waits for
-	// readers; the last of them to release the handle closes the file.
-	fs.xorbIndex.OnEvicted = func(_ xet.XorbHash, xf *xorbFile) {
-		xf.release()
-	}
+	// Built after the options so size and base path are final.
+	fs.xorbCache = xorbmap.New(fs.xorbCacheSize, func(h xet.XorbHash) (*os.File, error) {
+		return os.Open(fs.objectPath("xorbs", h.String()))
+	}, nil)
 
 	// Create directories
 	dirs := []string{
@@ -288,24 +253,18 @@ func (fs *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Read
 	return true, nil
 }
 
-// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
+// GetXorbReadSeekCloser returns a seekable reader over the xorb's cached mapping, holding it until Close.
 func (fs *Storage) GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
-	xorbPath := fs.objectPath("xorbs", xorbHash.String())
-
-	f, err := os.Open(xorbPath)
+	m, err := fs.xorbCache.Acquire(xorbHash)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
-		}
-		return nil, fmt.Errorf("open xorb file: %w", err)
+		return nil, err
 	}
-
-	return f, nil
+	return m.Reader(), nil
 }
 
 // HasXorb checks whether an xorb exists.
 func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
-	if _, ok := fs.xorbIndex.Get(xorbHash); ok {
+	if fs.xorbCache.Has(xorbHash) {
 		return true, nil
 	}
 
@@ -369,91 +328,23 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 	return wasInserted, err
 }
 
-// openXorb returns a referenced read handle for the given xorb, opening it on
-// first use; the caller releases it when done. Handles are retained in the
-// store-wide LRU cache, which holds a reference of its own, so the number of
-// open files stays bounded and handles are shared across readers.
-func (fs *Storage) openXorb(casHash xet.XorbHash) (*xorbFile, error) {
-	for {
-		var opened bool
-		var openErr error
-		xf, ok := fs.xorbIndex.GetOrNew(casHash, func() (*xorbFile, bool) {
-			f, err := os.Open(fs.objectPath("xorbs", casHash.String()))
-			if err != nil {
-				openErr = fmt.Errorf("open xorb %s: %w", casHash.String(), err)
-				return nil, false
-			}
-			fs.xorbHandles.Add(1)
-			xf := &xorbFile{f: f, handles: &fs.xorbHandles}
-			xf.refs.Store(2) // the cache's and the caller's
-			opened = true
-			return xf, true
-		})
-		if !ok {
-			return nil, openErr
-		}
-		// A hit that eviction closed before acquire has left the cache; retry.
-		if opened || xf.acquire() {
-			return xf, nil
-		}
-	}
-}
-
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
 // the xorb, from the in-memory cache, the xorb footer, or a full header scan
 // for footer-less xorbs. Once cached, chunk ranges are computed without
 // touching the xorb file.
 func (fs *Storage) xorbChunkOffsets(xorbHash xet.XorbHash) ([]uint64, error) {
 	return fs.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
-		xf, err := fs.openXorb(xorbHash)
+		m, err := fs.xorbCache.Acquire(xorbHash)
 		if err != nil {
 			return nil, err
 		}
-		defer xf.release()
-		info, err := xf.f.Stat()
-		if err != nil {
-			return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
-		}
-		offsets, err := storage.ReadXorbChunkOffsets(io.NewSectionReader(xf.f, 0, info.Size()))
+		defer m.Release()
+		offsets, err := storage.ReadXorbChunkOffsets(m.Reader())
 		if err != nil {
 			return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
 		}
 		return offsets, nil
 	})
-}
-
-// xorbRange reads a byte range of a shared xorb handle, one positional read
-// per Read, holding a reference until Close.
-type xorbRange struct {
-	xf      atomic.Pointer[xorbFile] // nil once closed
-	section *io.SectionReader
-}
-
-func (r *xorbRange) Read(p []byte) (int, error) {
-	if r.xf.Load() == nil {
-		return 0, iofs.ErrClosed
-	}
-	return r.section.Read(p)
-}
-
-func (r *xorbRange) Close() error {
-	if xf := r.xf.Swap(nil); xf != nil {
-		xf.release()
-	}
-	return nil
-}
-
-// GetXorbRangeReadCloser reads through the shared cached handle while holding
-// a reference rather than a lock, so readers of one xorb never wait on each
-// other and eviction never waits on them.
-func (fs *Storage) GetXorbRangeReadCloser(_ context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	xf, err := fs.openXorb(xorbHash)
-	if err != nil {
-		return nil, err
-	}
-	r := &xorbRange{section: io.NewSectionReader(xf.f, start, end-start+1)}
-	r.xf.Store(xf)
-	return r, nil
 }
 
 // GetShard retrieves a shard by file hash
@@ -696,11 +587,8 @@ func (fs *Storage) DeleteShard(ctx context.Context, shardHash string) error {
 
 // DeleteXorb removes a stored xorb object.
 func (fs *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
-	// Evict before removing: dropping the cache's reference closes the handle
-	// unless readers still hold it, and eviction never waits for them. Unix
-	// keeps the unlinked file readable until they close; Windows cannot
-	// delete a file with an open handle, so there the remove fails meanwhile.
-	fs.xorbIndex.Remove(xorbHash)
+	// Evict first: Windows cannot delete a file with a mapped view, so there the remove fails until readers close.
+	fs.xorbCache.Remove(xorbHash)
 	fs.caches.Offsets.Remove(xorbHash)
 	err := os.Remove(fs.objectPath("xorbs", xorbHash.String()))
 	if err != nil && !os.IsNotExist(err) {
@@ -777,21 +665,6 @@ func (fs *Storage) GetXorbURL(_ context.Context, xorbHash xet.XorbHash) (string,
 		return fmt.Sprintf("/v1/xorbs/default/%s", xorbHash.String()), nil
 	}
 	return fmt.Sprintf("%s/v1/xorbs/default/%s", fs.baseURL, xorbHash.String()), nil
-}
-
-// GetXorbDataRange returns the [start, end] byte range (inclusive) within
-// the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
-// The returned range includes the 8-byte chunk header for each chunk, so that
-// xet-core can parse the header (version, compressed/uncompressed size,
-// compression type) when it downloads that byte range.
-// Ranges are computed from cached per-xorb chunk offsets, so the xorb file is
-// only read (footer or full scan) the first time it is seen.
-func (fs *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := fs.xorbChunkOffsets(xorbHash)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
-	}
-	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
 }
 
 // GetXorbChunkOffsets returns the xorb's chunk offset table; cached after

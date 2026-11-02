@@ -35,7 +35,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("locate xorb chunks: %w", err)
 		}
-		rc, err := xorbs.GetXorbRangeReadCloser(ctx, entry.CASHash, start, end)
+		rc, err := openXorbRange(ctx, xorbs, entry.CASHash, start, end)
 		if err != nil {
 			return digest, fileHash, fmt.Errorf("read xorb chunks: %w", err)
 		}

@@ -435,8 +435,9 @@ func (r *recordingStorageAdapter) GetXorbURL(ctx context.Context, xorbHash xet.X
 	return "/v1/xorbs/default/" + xorbHash.String(), nil
 }
 
-func (r *recordingStorageAdapter) GetXorbDataRange(context.Context, xet.XorbHash, uint32, uint32) (int64, int64, error) {
-	return 0, 0, nil
+// GetXorbChunkOffsets gives every xorb three chunks, enough for the terms these tests build.
+func (r *recordingStorageAdapter) GetXorbChunkOffsets(context.Context, xet.XorbHash) ([]uint64, error) {
+	return []uint64{1, 2, 3}, nil
 }
 
 func TestBuildReconstructionForwardsContext(t *testing.T) {

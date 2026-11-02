@@ -1,6 +1,7 @@
 // Package s3 implements storage.Storage over an S3-compatible object store
 // with the local backend's layout under an optional key prefix. Index entries
 // are overwritten on every write and xorb download URLs are presigned by default.
+// Xorbs are read from mapped whole-object local copies in a bounded cache.
 package s3
 
 import (
@@ -13,7 +14,9 @@ import (
 	iofs "io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,8 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/wzshiming/httpseek"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
@@ -32,6 +35,8 @@ import (
 // defaultPresignExpiry keeps presigned xorb URLs valid long enough for
 // clients to work through a large reconstruction term by term.
 const defaultPresignExpiry = time.Hour
+
+const defaultXorbCacheSize = 512
 
 // Storage implements storage.Storage backed by an S3-compatible object store.
 // It uses the same object layout as the local backend (xorbs/, shards/,
@@ -49,6 +54,14 @@ type Storage struct {
 	presignEndpoint string
 
 	caches *storage.IndexCaches
+
+	cacheDir      string
+	xorbCacheSize int
+	xorbCache     *xorbmap.Cache
+
+	// xorbLive counts live mappings per hash so an old mapping's release never removes a refilled copy.
+	xorbFiles sync.Mutex
+	xorbLive  map[xet.XorbHash]int
 
 	// endpoint, region and pathStyle configure the lazily created client
 	// when one is not injected directly.
@@ -142,6 +155,22 @@ func WithPresignEndpoint(endpoint string) Option {
 	}
 }
 
+// WithCacheDir sets the directory for local xorb copies (default xet-s3-xorbs under os.TempDir());
+// NewStorage empties its xorbs/ subtree, so use one Storage per directory.
+func WithCacheDir(dir string) Option {
+	return func(ss *Storage) {
+		ss.cacheDir = dir
+	}
+}
+
+// WithXorbCacheSize keeps at most n xorbs downloaded and mapped (default 512; unbounded when n < 1);
+// evicted copies stay on disk until their readers close.
+func WithXorbCacheSize(n int) Option {
+	return func(ss *Storage) {
+		ss.xorbCacheSize = n
+	}
+}
+
 // NewStorage creates an S3-backed storage. Credentials are resolved
 // through the standard AWS configuration chain (environment variables,
 // shared config, IAM roles) unless a client is injected with WithS3Client.
@@ -150,6 +179,8 @@ func NewStorage(ctx context.Context, opts ...Option) (*Storage, error) {
 		presign:       true,
 		presignExpiry: defaultPresignExpiry,
 		caches:        storage.NewIndexCaches(),
+		xorbCacheSize: defaultXorbCacheSize,
+		xorbLive:      make(map[xet.XorbHash]int),
 	}
 
 	for _, opt := range opts {
@@ -159,6 +190,19 @@ func NewStorage(ctx context.Context, opts ...Option) (*Storage, error) {
 	if ss.bucket == "" {
 		return nil, fmt.Errorf("s3 storage requires a bucket")
 	}
+
+	if ss.cacheDir == "" {
+		ss.cacheDir = filepath.Join(os.TempDir(), "xet-s3-xorbs")
+	}
+	// Copies left by an earlier process are unknown to this cache and would never be removed.
+	xorbDir := filepath.Join(ss.cacheDir, "xorbs")
+	if err := os.RemoveAll(xorbDir); err != nil {
+		return nil, fmt.Errorf("clear xorb cache: %w", err)
+	}
+	if err := os.MkdirAll(xorbDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create xorb cache: %w", err)
+	}
+	ss.xorbCache = xorbmap.New(ss.xorbCacheSize, ss.downloadXorb, ss.removeXorbFile)
 
 	if ss.client == nil {
 		var cfgOpts []func(*config.LoadOptions) error
@@ -252,22 +296,6 @@ func (ss *Storage) getObjectReader(ctx context.Context, key string) (io.ReadClos
 	return out.Body, nil
 }
 
-// getObjectRange returns the [start, end] byte range (inclusive) of an object.
-func (ss *Storage) getObjectRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
-	out, err := ss.client.GetObject(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(ss.bucket),
-		Key:    aws.String(key),
-		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
-	})
-	if err != nil {
-		if isS3NotFound(err) {
-			return nil, fmt.Errorf("object %s: %w", key, iofs.ErrNotExist)
-		}
-		return nil, err
-	}
-	return out.Body, nil
-}
-
 func (ss *Storage) putObject(ctx context.Context, key string, body io.ReadSeeker) error {
 	_, err := ss.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket: aws.String(ss.bucket),
@@ -319,22 +347,21 @@ func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Read
 	return true, nil
 }
 
-// GetXorbReadSeekCloser returns a ReadSeekCloser over the xorb object; reads
-// after a seek are served with S3 range requests.
+// GetXorbReadSeekCloser reads the xorb's mapped local copy, held until Close;
+// a miss downloads the whole object once, ignoring ctx.
 func (ss *Storage) GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
-	key := ss.objectKey("xorbs", xorbHash.String())
-	size, exists, err := ss.headObject(ctx, key)
+	m, err := ss.xorbCache.Acquire(xorbHash)
 	if err != nil {
-		return nil, fmt.Errorf("check xorb object: %w", err)
+		return nil, fmt.Errorf("get xorb: %w", err)
 	}
-	if !exists {
-		return nil, fmt.Errorf("xorb %s: %w", xorbHash.String(), iofs.ErrNotExist)
-	}
-	return httpseek.NewOpenSeeker(&s3Opener{ctx: ctx, storage: ss, key: key, size: size}), nil
+	return m.Reader(), nil
 }
 
-// HasXorb checks whether an xorb exists.
+// HasXorb checks whether an xorb exists; a cached copy answers without a request.
 func (ss *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
+	if ss.xorbCache.Has(xorbHash) {
+		return true, nil
+	}
 	_, exists, err := ss.headObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
 	if err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
@@ -345,14 +372,14 @@ func (ss *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
 // the xorb, from the in-memory cache, the xorb footer, or a full scan for
 // footer-less xorbs.
-func (ss *Storage) xorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+func (ss *Storage) xorbChunkOffsets(xorbHash xet.XorbHash) ([]uint64, error) {
 	return ss.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
-		f, err := ss.GetXorbReadSeekCloser(ctx, xorbHash)
+		m, err := ss.xorbCache.Acquire(xorbHash)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get xorb: %w", err)
 		}
-		defer f.Close()
-		offsets, err := storage.ReadXorbChunkOffsets(f)
+		defer m.Release()
+		offsets, err := storage.ReadXorbChunkOffsets(bytes.NewReader(m.Bytes()))
 		if err != nil {
 			return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
 		}
@@ -360,20 +387,10 @@ func (ss *Storage) xorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) 
 	})
 }
 
-// GetXorbDataRange returns the [start, end] byte range (inclusive) within
-// the stored xorb binary for the given chunk range [chunkStart, chunkEnd).
-func (ss *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := ss.xorbChunkOffsets(ctx, xorbHash)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
-	}
-	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
-}
-
 // GetXorbChunkOffsets returns the xorb's chunk offset table; cached after
 // the first read.
 func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
-	return ss.xorbChunkOffsets(ctx, xorbHash)
+	return ss.xorbChunkOffsets(xorbHash)
 }
 
 // hasFile checks whether a file hash already has a shard mapping.
@@ -387,11 +404,6 @@ func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, er
 		return false, fmt.Errorf("check file index: %w", err)
 	}
 	return exists, nil
-}
-
-// GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-func (ss *Storage) GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	return ss.getObjectRange(ctx, ss.objectKey("xorbs", xorbHash.String()), start, end)
 }
 
 // PutShard stores a shard and its file/chunk/sha256 index objects.
@@ -742,9 +754,10 @@ func (ss *Storage) DeleteShard(ctx context.Context, shardHash string) error {
 	return nil
 }
 
-// DeleteXorb removes a stored xorb object.
+// DeleteXorb removes a stored xorb object; readers already open keep their copy until Close.
 func (ss *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
 	err := ss.deleteObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
+	ss.xorbCache.Remove(xorbHash)
 	ss.caches.Offsets.Remove(xorbHash)
 	if err != nil {
 		return fmt.Errorf("delete xorb: %w", err)
@@ -921,57 +934,6 @@ func (ss *Storage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (strin
 		return fmt.Sprintf("/v1/xorbs/default/%s", xorbHash.String()), nil
 	}
 	return fmt.Sprintf("%s/v1/xorbs/default/%s", ss.baseURL, xorbHash.String()), nil
-}
-
-// s3Opener adapts an S3 object to httpseek.Opener: each open is served with
-// an S3 range GET, and the ETag reported on every open lets the OpenSeeker
-// detect content changes across reopens.
-type s3Opener struct {
-	ctx     context.Context
-	storage *Storage
-	key     string
-	size    int64 // total object size from the open-time HEAD probe
-}
-
-var _ httpseek.Opener = (*s3Opener)(nil)
-
-func (o *s3Opener) OpenRange(_ string, start, end int64) (httpseek.OpenResult, error) {
-	if start < 0 {
-		// Suffix of length end, resolved against the known size.
-		start = max(o.size-end, 0)
-		end = o.size - 1
-	}
-	res := httpseek.OpenResult{Start: start, End: end, Size: o.size}
-
-	in := &awss3.GetObjectInput{
-		Bucket: aws.String(o.storage.bucket),
-		Key:    aws.String(o.key),
-	}
-	switch {
-	case end >= 0:
-		in.Range = aws.String(fmt.Sprintf("bytes=%d-%d", start, end))
-	case start > 0:
-		in.Range = aws.String(fmt.Sprintf("bytes=%d-", start))
-	}
-	out, err := o.storage.client.GetObject(o.ctx, in)
-	if err != nil {
-		var respErr *awshttp.ResponseError
-		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
-			return res, httpseek.ErrRangeNotSatisfiable
-		}
-		if isS3NotFound(err) {
-			return res, fmt.Errorf("object %s: %w", o.key, iofs.ErrNotExist)
-		}
-		return res, err
-	}
-	res.Body = out.Body
-	res.Validator = aws.ToString(out.ETag)
-	return res, nil
-}
-
-// Size reports the size learned by the HEAD probe at construction time.
-func (o *s3Opener) Size(string) (httpseek.SizeResult, error) {
-	return httpseek.SizeResult{Size: o.size}, nil
 }
 
 var _ storage.Storage = (*Storage)(nil)

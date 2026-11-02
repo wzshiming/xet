@@ -365,6 +365,7 @@ func newGofakeS3Storage(t *testing.T) storage.Storage {
 		s3.WithPrefix("xet-data"),
 		s3.WithEndpoint(s3Server.URL),
 		s3.WithPathStyle(true),
+		s3.WithCacheDir(t.TempDir()),
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -48,6 +48,7 @@ func newTestS3Storage(t *testing.T, opts ...Option) *Storage {
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
 	ss, err := NewStorage(context.Background(), append([]Option{
+		WithCacheDir(t.TempDir()),
 		WithS3Client(client),
 		WithBucket("test-bucket"),
 	}, opts...)...)
@@ -57,15 +58,7 @@ func newTestS3Storage(t *testing.T, opts ...Option) *Storage {
 	return ss
 }
 
-// Offsets are cached per process, so a range read is where a xorb deleted elsewhere first goes missing.
-func TestS3StorageMissingXorbRangeIsNotExist(t *testing.T) {
-	if _, err := newTestS3Storage(t).GetXorbRangeReadCloser(context.Background(), xet.XorbHash{1}, 0, 9); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("GetXorbRangeReadCloser(missing) = %v, want fs.ErrNotExist", err)
-	}
-}
-
-// The whole-xorb reader opens lazily, so a xorb deleted after its HEAD goes missing at the first read.
-func TestS3StorageVanishedXorbReadIsNotExist(t *testing.T) {
+func TestS3StorageDeleteXorbWhileReaderOpen(t *testing.T) {
 	ctx := context.Background()
 	ss := newTestS3Storage(t)
 	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("chunk"))
@@ -80,8 +73,22 @@ func TestS3StorageVanishedXorbReadIsNotExist(t *testing.T) {
 	if err := ss.DeleteXorb(ctx, xorbHash); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rc.Read(make([]byte, 1)); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Read after the object vanished = %v, want fs.ErrNotExist", err)
+	got, err := io.ReadAll(rc)
+	if err != nil || !bytes.Equal(got, encoded) {
+		t.Fatalf("reader opened before DeleteXorb read %d bytes, %v; want the %d stored bytes", len(got), err, len(encoded))
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc, err := ss.GetXorbReadSeekCloser(ctx, xorbHash); !errors.Is(err, fs.ErrNotExist) {
+		if err == nil {
+			rc.Close()
+		}
+		t.Fatalf("GetXorbReadSeekCloser after DeleteXorb error = %v, want fs.ErrNotExist", err)
+	}
+	if ok, err := ss.HasXorb(ctx, xorbHash); err != nil || ok {
+		t.Fatalf("HasXorb after DeleteXorb = %v, %v; want false, nil", ok, err)
 	}
 }
 
@@ -154,6 +161,10 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 
 	// Chunk ranges must match those scanned from the raw chunk data.
 	reference, _ := storagetest.EncodeXorb(t, false, chunks...)
+	offsets, err := ss.GetXorbChunkOffsets(ctx, xorbHash)
+	if err != nil {
+		t.Fatalf("GetXorbChunkOffsets: %v", err)
+	}
 	numChunks := uint32(len(chunks))
 	for start := range numChunks {
 		for end := start + 1; end <= numChunks; end++ {
@@ -161,9 +172,9 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ChunkDataRange(%d, %d): %v", start, end, err)
 			}
-			gotStart, gotEnd, err := ss.GetXorbDataRange(ctx, xorbHash, start, end)
+			gotStart, gotEnd, err := xorb.ChunkDataRangeFromOffsets(offsets, start, end)
 			if err != nil {
-				t.Fatalf("GetXorbDataRange(%d, %d): %v", start, end, err)
+				t.Fatalf("ChunkDataRangeFromOffsets(%d, %d): %v", start, end, err)
 			}
 			if gotStart != wantStart || gotEnd != wantEnd {
 				t.Fatalf("range [%d, %d) = [%d, %d], want [%d, %d]", start, end, gotStart, gotEnd, wantStart, wantEnd)
@@ -171,8 +182,8 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 		}
 	}
 
-	if _, err := ss.GetXorbReadSeekCloser(ctx, xet.XorbHash{9}); err == nil {
-		t.Fatal("GetXorbReadSeekCloser() found a missing xorb")
+	if _, err := ss.GetXorbReadSeekCloser(ctx, xet.XorbHash{9}); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("GetXorbReadSeekCloser(missing xorb) error = %v, want fs.ErrNotExist", err)
 	}
 }
 
@@ -296,6 +307,7 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	// A fresh storage over the same bucket must resolve everything without
 	// any in-memory state.
 	fresh, err := NewStorage(ctx,
+		WithCacheDir(t.TempDir()),
 		WithS3Client(ss.client),
 		WithBucket(ss.bucket),
 		WithPrefix(ss.prefix),
@@ -392,7 +404,7 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
-			fresh, err := NewStorage(ctx, WithS3Client(ss.client), WithBucket(ss.bucket), WithPrefix(prefix))
+			fresh, err := NewStorage(ctx, WithCacheDir(t.TempDir()), WithS3Client(ss.client), WithBucket(ss.bucket), WithPrefix(prefix))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -482,7 +494,7 @@ func TestS3StorageGetXorbURLPresignsWithCallerContext(t *testing.T) {
 			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
 		}),
 	})
-	ss, err := NewStorage(context.Background(), WithS3Client(client), WithBucket("test-bucket"))
+	ss, err := NewStorage(context.Background(), WithCacheDir(t.TempDir()), WithS3Client(client), WithBucket("test-bucket"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +553,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	ss, err := NewStorage(ctx, WithS3Client(client), WithBucket("test-bucket"))
+	ss, err := NewStorage(ctx, WithCacheDir(t.TempDir()), WithS3Client(client), WithBucket("test-bucket"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +582,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	// A fresh storage must resolve every index written by the retry.
-	fresh, err := NewStorage(ctx, WithS3Client(client), WithBucket("test-bucket"))
+	fresh, err := NewStorage(ctx, WithCacheDir(t.TempDir()), WithS3Client(client), WithBucket("test-bucket"))
 	if err != nil {
 		t.Fatal(err)
 	}
