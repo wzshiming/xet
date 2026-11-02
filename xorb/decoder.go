@@ -43,7 +43,7 @@ func (d *Decoder) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	var headerBuf [8]byte
+	var headerBuf [ChunkHeaderSize]byte
 	_, err := io.ReadFull(d.r, headerBuf[:])
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		if d.withFooter {
@@ -81,52 +81,41 @@ func (d *Decoder) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Parse chunk header (8 bytes):
-	//   [0]    version
-	//   [1-3]  compressed size (little-endian, 3 bytes)
-	//   [4]    compression type
-	//   [5-7]  uncompressed size (little-endian, 3 bytes)
-	if headerBuf[0] != 0 {
-		d.err = fmt.Errorf("unsupported chunk version: %d", headerBuf[0])
+	header, err := ParseChunkHeader(headerBuf[:])
+	if err != nil {
+		d.err = err
 		return 0, d.err
 	}
-	compressedSize := uint32(headerBuf[1]) | uint32(headerBuf[2])<<8 | uint32(headerBuf[3])<<16
-	ct := compressionType(headerBuf[4])
-	uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
-	if compressedSize > uint32(len(p)) {
-		d.err = fmt.Errorf("input buffer too small for compressed chunk: need %d bytes, have %d", compressedSize, len(p))
-		return 0, d.err
-	}
-	if uncompressedSize > xet.MaxChunkSize {
-		d.err = fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
+	if header.CompressedSize > uint32(len(p)) {
+		d.err = fmt.Errorf("input buffer too small for compressed chunk: need %d bytes, have %d", header.CompressedSize, len(p))
 		return 0, d.err
 	}
 	if len(d.chunkHashes) >= xet.MaxChunksPerXorb {
 		d.err = fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
 		return 0, d.err
 	}
-	if d.rawSize > xet.MaxXorbSize || uint64(uncompressedSize) > xet.MaxXorbSize-d.rawSize {
+	if d.rawSize > xet.MaxXorbSize || uint64(header.UncompressedSize) > xet.MaxXorbSize-d.rawSize {
 		d.err = fmt.Errorf("raw payload size exceeds maximum %d", xet.MaxXorbSize)
 		return 0, d.err
 	}
 
-	if _, err := io.ReadFull(d.r, p[:compressedSize]); err != nil {
+	body := p[:header.CompressedSize]
+	if _, err := io.ReadFull(d.r, body); err != nil {
 		d.err = fmt.Errorf("failed to read chunk data: %w", err)
 		return 0, d.err
 	}
 
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
-	uncompressed, err := decompressChunk(tmp[:0], p[:compressedSize], ct, int(uncompressedSize))
+	uncompressed, err := DecodeChunk(tmp[:], header, body)
 	if err != nil {
 		d.err = fmt.Errorf("decompress chunk: %w", err)
 		return 0, d.err
 	}
 
-	h := xet.ComputeChunkHash(uncompressed)
-	d.chunkHashes = append(d.chunkHashes, h)
-	d.chunkSizes = append(d.chunkSizes, uint64(uncompressedSize))
-	d.rawSize += uint64(uncompressedSize)
+	d.chunkHashes = append(d.chunkHashes, xet.ComputeChunkHash(uncompressed))
+	d.chunkSizes = append(d.chunkSizes, uint64(header.UncompressedSize))
+	d.rawSize += uint64(header.UncompressedSize)
 
 	if len(uncompressed) > len(p) {
 		d.err = fmt.Errorf("output buffer too small: need %d bytes", len(uncompressed))

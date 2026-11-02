@@ -4,31 +4,31 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
+	"sync"
 
-	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/internal/pool"
 	"github.com/wzshiming/xet/shard"
-	"github.com/wzshiming/xet/xorb"
 )
 
-// reconstructedFile exposes a shard file as an io.ReadSeekCloser. Seeking is
-// implemented in terms of reconstruction entries, so http.ServeContent can
-// provide HEAD and byte-range responses without materializing the whole file.
+// reconstructedFile exposes a shard file as an io.ReadSeekCloser. Its bytes
+// come from a decode pipeline started by the first Read that needs them, so
+// http.ServeContent answers HEAD and range requests without extra I/O.
+// Calls are serialized; Close fails a Read or Seek still waiting with fs.ErrClosed.
 type reconstructedFile struct {
 	ctx      context.Context
+	life     context.Context // child of ctx every pipeline derives from
+	cancel   context.CancelFunc
 	storage  Storage
 	entries  []shard.FileDataSequenceEntry
-	offsets  []int64
 	size     int64
+	mu       sync.Mutex // held through each Read, Seek and Close
 	position int64
+	closed   bool
+	err      error // sticky until a Seek away
 
-	entryIndex int
-	xorb       io.ReadSeekCloser
-	decoder    *xorb.Decoder
-	chunkBuf   *[xet.MaxChunkSize + 8]byte
-	chunk      []byte
-	chunkPos   int
-	closed     bool
+	pipe     *pipeline
+	cur      *frame // delivered chunk holding position; nil without pipe
+	chunkOff int64  // file offset of cur.data[0]
 }
 
 // FindFileBySHA256 returns the shard file whose recorded SHA-256 matches
@@ -50,180 +50,172 @@ func NewReconstructedFile(ctx context.Context, stor Storage, sh *shard.Shard, di
 		return nil, fmt.Errorf("SHA-256 is not present in shard")
 	}
 
-	r := &reconstructedFile{
-		ctx:        ctx,
-		storage:    stor,
-		entries:    file.Entries,
-		entryIndex: -1,
+	f := &reconstructedFile{
+		ctx:     ctx,
+		storage: stor,
+		entries: file.Entries,
 	}
-	for i := range r.entries {
-		r.size += int64(r.entries[i].UnpackedSegBytes)
+	f.life, f.cancel = context.WithCancel(ctx)
+	for i := range f.entries {
+		f.size += int64(f.entries[i].UnpackedSegBytes)
 	}
-	return r, nil
+	return f, nil
 }
 
-func (r *reconstructedFile) Read(p []byte) (int, error) {
-	if r.closed {
-		return 0, fmt.Errorf("read reconstructed file: closed")
+func (f *reconstructedFile) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed || f.closing() {
+		return 0, fmt.Errorf("read reconstructed file: %w", fs.ErrClosed)
 	}
-	if err := r.ctx.Err(); err != nil {
+	if err := f.ctx.Err(); err != nil {
+		f.stop()
 		return 0, err
 	}
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if r.position >= r.size {
+	if f.err != nil {
+		return 0, f.err
+	}
+	if f.position >= f.size {
 		return 0, io.EOF
 	}
 
 	n := 0
-	for n < len(p) && r.position < r.size {
-		idx := r.entryAt(r.position)
-		if r.entryIndex != idx {
-			if err := r.openEntry(idx, r.position-r.offsets[idx]); err != nil {
-				return n, err
+	for n < len(p) && f.position < f.size {
+		if f.cur == nil || f.position == f.chunkOff+int64(len(f.cur.data)) {
+			if err := f.advance(); err != nil {
+				return n, f.fail(err)
 			}
-		}
-		if r.chunkPos == len(r.chunk) {
-			if err := r.decodeChunk(); err != nil {
-				if err == io.EOF && r.position == r.offsets[idx+1] {
-					r.closeEntry()
-					continue
+			// Withhold the final chunk until the fetcher has checked the last term's size.
+			if f.chunkOff+int64(len(f.cur.data)) >= f.size {
+				if err := f.pipe.drain(f.life); err != nil {
+					err = f.fail(err)
+					if n == 0 {
+						return 0, err
+					}
+					return n, nil // the sticky error ends the next Read
 				}
-				return n, err
 			}
 		}
-		copied := copy(p[n:], r.chunk[r.chunkPos:])
-		r.chunkPos += copied
-		r.position += int64(copied)
+		copied := copy(p[n:], f.cur.data[f.position-f.chunkOff:])
+		f.position += int64(copied)
 		n += copied
-	}
-	if n == 0 && r.position >= r.size {
-		return 0, io.EOF
 	}
 	return n, nil
 }
 
-func (r *reconstructedFile) Seek(offset int64, whence int) (int64, error) {
+func (f *reconstructedFile) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed || f.closing() {
+		return 0, fmt.Errorf("seek reconstructed file: %w", fs.ErrClosed)
+	}
 	var next int64
 	switch whence {
 	case io.SeekStart:
 		next = offset
 	case io.SeekCurrent:
-		next = r.position + offset
+		next = f.position + offset
 	case io.SeekEnd:
-		next = r.size + offset
+		next = f.size + offset
 	default:
 		return 0, fmt.Errorf("invalid seek whence %d", whence)
 	}
 	if next < 0 {
 		return 0, fmt.Errorf("negative seek position %d", next)
 	}
-	if next == r.position {
+	if next == f.position {
 		return next, nil
 	}
-	// Reposition within the buffered chunk to avoid reopening the entry.
-	if r.chunk != nil {
-		if pos := int64(r.chunkPos) + next - r.position; pos >= 0 && pos <= int64(len(r.chunk)) {
-			r.chunkPos = int(pos)
-			r.position = next
-			return next, nil
-		}
+	// Outside the delivered chunk, the next Read restarts the pipeline.
+	if f.cur == nil || next < f.chunkOff || next > f.chunkOff+int64(len(f.cur.data)) {
+		f.stop()
+		f.err = nil
 	}
-	r.closeEntry()
-	r.position = next
+	f.position = next
 	return next, nil
 }
 
-func (r *reconstructedFile) Close() error {
-	if r.closed {
-		return nil
-	}
-	r.closed = true
-	return r.closeEntry()
-}
-
-func (r *reconstructedFile) entryAt(position int64) int {
-	r.initOffsets()
-	for i := range r.entries {
-		if position < r.offsets[i+1] {
-			return i
-		}
-	}
-	return len(r.entries)
-}
-
-func (r *reconstructedFile) initOffsets() {
-	if r.offsets != nil {
-		return
-	}
-	r.offsets = make([]int64, len(r.entries)+1)
-	for i := range r.entries {
-		r.offsets[i+1] = r.offsets[i] + int64(r.entries[i].UnpackedSegBytes)
-	}
-}
-
-func (r *reconstructedFile) openEntry(index int, skip int64) error {
-	r.closeEntry()
-	entry := r.entries[index]
-	f, err := r.storage.GetXorbReadSeekCloser(r.ctx, entry.CASHash)
-	if err != nil {
-		return err
-	}
-	start, end, err := r.storage.GetXorbDataRange(r.ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
-	if err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		f.Close()
-		return err
-	}
-	r.xorb = f
-	r.decoder = xorb.NewDecoder(io.LimitReader(f, end-start+1), false)
-	r.entryIndex = index
-	for skip > 0 {
-		if err := r.decodeChunk(); err != nil {
-			return err
-		}
-		remaining := int64(len(r.chunk) - r.chunkPos)
-		if skip < remaining {
-			r.chunkPos += int(skip)
-			break
-		}
-		skip -= remaining
-		r.chunkPos = len(r.chunk)
+func (f *reconstructedFile) Close() error {
+	// Cancel before locking: a Read waiting on the pipeline wakes and lets go of mu.
+	f.cancel()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.closed {
+		f.closed = true
+		f.stop()
 	}
 	return nil
 }
 
-func (r *reconstructedFile) decodeChunk() error {
-	if r.chunkBuf == nil {
-		r.chunkBuf = pool.GetChunkBuf()
+// closing reports whether Close has cancelled life while ctx is live.
+func (f *reconstructedFile) closing() bool {
+	return f.life.Err() != nil && f.ctx.Err() == nil
+}
+
+// advance makes cur the next delivered chunk holding position, starting the
+// pipeline at the term holding position when none runs.
+func (f *reconstructedFile) advance() error {
+	if f.cur != nil {
+		f.chunkOff += int64(len(f.cur.data))
+		f.pipe.release(f.cur)
+		f.cur = nil
 	}
-	buf := r.chunkBuf[:xet.MaxChunkSize]
-	n, err := r.decoder.Read(buf)
-	if n != 0 {
-		r.chunk = buf[:n]
-		r.chunkPos = 0
+	if f.pipe == nil {
+		var term int
+		term, f.chunkOff = f.termAt(f.position)
+		f.pipe = startPipeline(f.life, f.storage, f.entries[term:])
+	}
+	for {
+		fr, err := f.pipe.next(f.life)
+		if err != nil {
+			return err
+		}
+		// A restarted pipeline begins at its term's first chunk: discard up to position.
+		if end := f.chunkOff + int64(len(fr.data)); f.position >= end {
+			f.chunkOff = end
+			f.pipe.release(fr)
+			continue
+		}
+		f.cur = fr
 		return nil
 	}
+}
+
+// termAt returns the index and file offset of the term holding position,
+// which is never an empty term.
+func (f *reconstructedFile) termAt(position int64) (int, int64) {
+	var off int64
+	for i := range f.entries {
+		end := off + int64(f.entries[i].UnpackedSegBytes)
+		if position < end {
+			return i, off
+		}
+		off = end
+	}
+	return len(f.entries), off
+}
+
+// fail stops the pipeline and makes err sticky.
+func (f *reconstructedFile) fail(err error) error {
+	// A Close or a cancelled parent surfaces as itself, not as the storage error it caused.
+	if f.closing() {
+		err = fmt.Errorf("read reconstructed file: %w", fs.ErrClosed)
+	} else if ctxErr := f.ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	f.stop()
+	f.err = err
 	return err
 }
 
-func (r *reconstructedFile) closeEntry() error {
-	r.decoder = nil
-	if r.chunkBuf != nil {
-		pool.PutChunkBuf(r.chunkBuf)
-		r.chunkBuf = nil
+// stop tears the pipeline down, returning every buffer it held.
+func (f *reconstructedFile) stop() {
+	if f.pipe == nil {
+		return
 	}
-	r.chunk = nil
-	r.chunkPos = 0
-	r.entryIndex = -1
-	if r.xorb == nil {
-		return nil
-	}
-	err := r.xorb.Close()
-	r.xorb = nil
-	return err
+	f.pipe.stop()
+	f.pipe, f.cur = nil, nil
 }

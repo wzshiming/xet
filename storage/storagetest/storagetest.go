@@ -77,6 +77,7 @@ var cases = []struct {
 	{"TestPutShardVerifiesCASChunks", testPutShardVerifiesCASChunks},
 	{"TestPutShardCommitsNewFilesBesideKnownFile", testPutShardCommitsNewFilesBesideKnownFile},
 	{"TestPutShardRetryRepairsMissingFileEntry", testPutShardRetryRepairsMissingFileEntry},
+	{"TestPutShardCommitsMultiTermFile", testPutShardCommitsMultiTermFile},
 	{"TestPutXorbRejectsWrongIdentity", testPutXorbRejectsWrongIdentity},
 	{"TestPutXorbRejectsForgedChunkSizes", testPutXorbRejectsForgedChunkSizes},
 	{"TestPutFileReusesStoredChunks", testPutFileReusesStoredChunks},

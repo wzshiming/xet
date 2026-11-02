@@ -37,33 +37,33 @@ type File struct {
 }
 
 // EncodeXorb serializes chunks as an xorb, with or without footer.
-func EncodeXorb(t *testing.T, withFooter bool, chunks ...[]byte) ([]byte, xet.XorbHash) {
-	t.Helper()
+func EncodeXorb(tb testing.TB, withFooter bool, chunks ...[]byte) ([]byte, xet.XorbHash) {
+	tb.Helper()
 	var encoded bytes.Buffer
 	enc := xorb.NewEncoder(&encoded, withFooter)
 	for _, c := range chunks {
 		if _, err := enc.Write(c); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 	}
 	if err := enc.Close(); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return encoded.Bytes(), enc.SummoryHash()
 }
 
 // AddFileBlock stores one single-chunk xorb per part and appends the
 // matching file and CAS blocks to shardObj, returning the file's hashes.
-func AddFileBlock(t *testing.T, ctx context.Context, st storage.Storage, shardObj *shard.Shard, parts [][]byte) (xet.FileHash, []xet.XorbHash, []xet.ChunkHash) {
-	t.Helper()
+func AddFileBlock(tb testing.TB, ctx context.Context, st storage.Storage, shardObj *shard.Shard, parts [][]byte) (xet.FileHash, []xet.XorbHash, []xet.ChunkHash) {
+	tb.Helper()
 	fileBlock := shard.FileBlock{}
 	var xorbHashes []xet.XorbHash
 	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
 	for _, part := range parts {
-		encoded, xorbHash := EncodeXorb(t, true, part)
+		encoded, xorbHash := EncodeXorb(tb, true, part)
 		if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		chunkHash := xet.ComputeChunkHash(part)
 		xorbHashes = append(xorbHashes, xorbHash)
@@ -84,16 +84,16 @@ func AddFileBlock(t *testing.T, ctx context.Context, st storage.Storage, shardOb
 
 // PutFile stores one file chunked as parts (one single-chunk xorb per
 // part). Identical parts across files share the same xorb.
-func PutFile(t *testing.T, ctx context.Context, st storage.Storage, parts [][]byte) File {
-	t.Helper()
+func PutFile(tb testing.TB, ctx context.Context, st storage.Storage, parts [][]byte) File {
+	tb.Helper()
 	shardObj := shard.NewShard()
 	var f File
-	f.FileHash, f.XorbHashes, f.ChunkHashes = AddFileBlock(t, ctx, st, shardObj, parts)
+	f.FileHash, f.XorbHashes, f.ChunkHashes = AddFileBlock(tb, ctx, st, shardObj, parts)
 	for _, part := range parts {
 		f.Content = append(f.Content, part...)
 	}
 	if _, err := st.PutShard(ctx, shardObj); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	digest := sha256.Sum256(f.Content)
 	f.SHA256Hex = hex.EncodeToString(digest[:])
@@ -104,34 +104,53 @@ func PutFile(t *testing.T, ctx context.Context, st storage.Storage, parts [][]by
 		}
 		return nil
 	}); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	if f.ShardHash == "" {
-		t.Fatalf("no file index entry for %s", f.FileHash.String())
+		tb.Fatalf("no file index entry for %s", f.FileHash.String())
 	}
+	return f
+}
+
+// PutXorbFile stores a file of one whole-xorb term per element of xorbs, each
+// encoded with a footer from its chunk payloads, and commits its shard. The
+// xorbs must be distinct and non-empty: identical ones dedup into one stored
+// xorb yet would repeat its CAS block.
+func PutXorbFile(tb testing.TB, ctx context.Context, st storage.Storage, xorbs [][][]byte) File {
+	tb.Helper()
+	sh := shard.NewShard()
+	f := addXorbFile(tb, ctx, st, sh, xorbs)
+	if _, err := st.PutShard(ctx, sh); err != nil {
+		tb.Fatal(err)
+	}
+	shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
+	if err != nil || shardHash == "" {
+		tb.Fatalf("no file index entry for %s: %v", f.FileHash.String(), err)
+	}
+	f.ShardHash = shardHash
 	return f
 }
 
 // UnlinkFile removes both of f's index entries — file and SHA-256 — so a
 // sweep can prove the shard dead. Not for empty files (zero digest).
-func UnlinkFile(t *testing.T, ctx context.Context, gcs storage.Storage, f File) {
-	t.Helper()
+func UnlinkFile(tb testing.TB, ctx context.Context, gcs storage.Storage, f File) {
+	tb.Helper()
 	if _, err := storage.NewGC(gcs).Unlink(ctx, f.FileHash); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	if _, err := storage.NewGC(gcs).UnlinkSHA256(ctx, SHA256Digest(f.SHA256Hex)); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 }
 
 // PutUnlinkedFiles stores one single-part file per content and unlinks
 // both its entries, leaving its shard and xorb unreferenced.
-func PutUnlinkedFiles(t *testing.T, ctx context.Context, st storage.Storage, contents ...string) []File {
-	t.Helper()
+func PutUnlinkedFiles(tb testing.TB, ctx context.Context, st storage.Storage, contents ...string) []File {
+	tb.Helper()
 	files := make([]File, 0, len(contents))
 	for _, content := range contents {
-		f := PutFile(t, ctx, st, [][]byte{[]byte(content)})
-		UnlinkFile(t, ctx, st, f)
+		f := PutFile(tb, ctx, st, [][]byte{[]byte(content)})
+		UnlinkFile(tb, ctx, st, f)
 		files = append(files, f)
 	}
 	return files
@@ -139,16 +158,16 @@ func PutUnlinkedFiles(t *testing.T, ctx context.Context, st storage.Storage, con
 
 // LegacyShardBytes serializes a shard the way it was stored before shard
 // objects went footerless, and returns the bytes with their object name.
-func LegacyShardBytes(t *testing.T, s *shard.Shard, creationTime uint64) ([]byte, string) {
-	t.Helper()
+func LegacyShardBytes(tb testing.TB, s *shard.Shard, creationTime uint64) ([]byte, string) {
+	tb.Helper()
 	s.SetFooter(time.Unix(int64(creationTime), 0))
 	r, err := s.Encode(true)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	sum := sha256.Sum256(data)
 	return data, hex.EncodeToString(sum[:])
@@ -191,19 +210,19 @@ func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs storage.Sto
 	}
 }
 
-func AssertFileIntact(t *testing.T, ctx context.Context, st storage.Storage, f File) {
-	t.Helper()
+func AssertFileIntact(tb testing.TB, ctx context.Context, st storage.Storage, f File) {
+	tb.Helper()
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
-		t.Fatalf("GetShard: %v", err)
+		tb.Fatalf("GetShard: %v", err)
 	}
 	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
 	if err != nil {
-		t.Fatalf("GetReconstructedFile: %v", err)
+		tb.Fatalf("GetReconstructedFile: %v", err)
 	}
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(data, f.Content) {
-		t.Fatalf("reconstruction corrupted: %v", err)
+		tb.Fatalf("reconstruction corrupted: %v", err)
 	}
 }
 
@@ -324,19 +343,19 @@ func SortEntries(entries []storage.FileListEntry) {
 // part) and returns its hex file hash together with the exact stored size of
 // its chunks (a footer-less encode of each part is exactly the packed chunk
 // bytes the listing attributes).
-func PutListedFile(t *testing.T, ctx context.Context, st storage.Storage, parts [][]byte) (string, uint64) {
-	t.Helper()
+func PutListedFile(tb testing.TB, ctx context.Context, st storage.Storage, parts [][]byte) (string, uint64) {
+	tb.Helper()
 	shardObj := shard.NewShard()
 	fileBlock := shard.FileBlock{}
 	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
 	var storedSize uint64
 	for _, part := range parts {
-		encoded, xorbHash := EncodeXorb(t, true, part)
+		encoded, xorbHash := EncodeXorb(tb, true, part)
 		if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
-		chunkOnly, _ := EncodeXorb(t, false, part)
+		chunkOnly, _ := EncodeXorb(tb, false, part)
 		storedSize += uint64(len(chunkOnly))
 		chunkHash := xet.ComputeChunkHash(part)
 		chunkHashes = append(chunkHashes, chunkHash)
@@ -353,7 +372,7 @@ func PutListedFile(t *testing.T, ctx context.Context, st storage.Storage, parts 
 	fileBlock.FileHash = fileHash
 	shardObj.AddFile(fileBlock)
 	if _, err := st.PutShard(ctx, shardObj); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return fileHash.String(), storedSize
 }
@@ -361,26 +380,26 @@ func PutListedFile(t *testing.T, ctx context.Context, st storage.Storage, parts 
 // CheckFanoutStore verifies that st, opened over data another instance wrote,
 // resolves the one-file shard sh through every index and that each walker
 // reports the full 64-hex hash. It returns each stored kind mapped to its hash.
-func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh *shard.Shard, fileHash xet.FileHash, content []byte) map[string]string {
-	t.Helper()
+func CheckFanoutStore(tb testing.TB, ctx context.Context, st storage.Storage, sh *shard.Shard, fileHash xet.FileHash, content []byte) map[string]string {
+	tb.Helper()
 	xorbHash := sh.CASInfos[0].CASHash
 	chunkHash := xet.ComputeChunkHash(content)
 	digest := sha256.Sum256(content)
 	shardHash, err := st.GetFileIndexEntry(ctx, fileHash)
 	if err != nil || len(shardHash) != 64 {
-		t.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
+		tb.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
 	}
 	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
-		t.Fatalf("HasXorb() = %v, %v", ok, err)
+		tb.Fatalf("HasXorb() = %v, %v", ok, err)
 	}
 	if _, err := st.GetShard(ctx, fileHash); err != nil {
-		t.Fatalf("GetShard(): %v", err)
+		tb.Fatalf("GetShard(): %v", err)
 	}
 	if _, err := st.GetShardByChunkHash(ctx, chunkHash); err != nil {
-		t.Fatalf("GetShardByChunkHash(): %v", err)
+		tb.Fatalf("GetShardByChunkHash(): %v", err)
 	}
 	if got, err := st.GetFileHashBySHA256(ctx, digest); err != nil || got != fileHash {
-		t.Fatalf("GetFileHashBySHA256() = %s, %v", got, err)
+		tb.Fatalf("GetFileHashBySHA256() = %s, %v", got, err)
 	}
 
 	want := map[string]string{
@@ -407,23 +426,23 @@ func CheckFanoutStore(t *testing.T, ctx context.Context, st storage.Storage, sh 
 		}
 	}
 	if err := st.WalkXorbs(ctx, collect("xorbs")); err != nil {
-		t.Fatalf("WalkXorbs(): %v", err)
+		tb.Fatalf("WalkXorbs(): %v", err)
 	}
 	if err := st.WalkShards(ctx, collect("shards")); err != nil {
-		t.Fatalf("WalkShards(): %v", err)
+		tb.Fatalf("WalkShards(): %v", err)
 	}
 	if err := st.WalkFileIndex(ctx, collectIndex("index/files")); err != nil {
-		t.Fatalf("WalkFileIndex(): %v", err)
+		tb.Fatalf("WalkFileIndex(): %v", err)
 	}
 	if err := st.WalkSHA256Index(ctx, collectIndex("index/sha256")); err != nil {
-		t.Fatalf("WalkSHA256Index(): %v", err)
+		tb.Fatalf("WalkSHA256Index(): %v", err)
 	}
 	for kind, h := range want {
 		if kind == "index/chunks" {
 			continue // no walker exists for the chunk index
 		}
 		if got := walked[kind]; len(got) != 1 || got[0] != h {
-			t.Errorf("walk %s = %q, want [%s]", kind, got, h)
+			tb.Errorf("walk %s = %q, want [%s]", kind, got, h)
 		}
 	}
 	return want
