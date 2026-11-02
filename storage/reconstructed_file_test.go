@@ -30,7 +30,7 @@ import (
 // different packed sizes sit side by side.
 var mixedChunkSizes = []int{1, xet.MaxChunkSize, 3, 4 << 10, 2, 64<<10 + 1, 1000}
 
-var noneClass, lz4Class = benchClasses[0], benchClasses[1]
+var noneClass, lz4Class = storagetest.ChunkClasses[0], storagetest.ChunkClasses[1]
 
 var (
 	errInjected = errors.New("injected read failure")
@@ -57,13 +57,13 @@ var backends = []struct {
 
 // xorbsOf draws xorbs of chunks sized by sizes from class c; xorb x starts x
 // places further along sizes.
-func xorbsOf(c benchClass, xorbs int, sizes []int) [][][]byte {
+func xorbsOf(c storagetest.ChunkClass, xorbs int, sizes []int) [][][]byte {
 	out := make([][][]byte, xorbs)
 	for x := range out {
 		out[x] = make([][]byte, len(sizes))
 		for i := range sizes {
 			out[x][i] = make([]byte, sizes[(i+x)%len(sizes)])
-			c.gen(chunkSource(c.name, x, i), out[x][i])
+			c.Chunk(x, i, out[x][i])
 		}
 	}
 	return out
@@ -583,9 +583,9 @@ func TestReconstructedFileMatchesContent(t *testing.T) {
 		{"io.ReadAll", io.ReadAll},
 	}
 	for _, b := range backends {
-		for _, c := range benchClasses {
+		for _, c := range storagetest.ChunkClasses {
 			for _, n := range []int{1, 3} {
-				t.Run(fmt.Sprintf("%s/%s/xorbs=%d", b.name, c.name, n), func(t *testing.T) {
+				t.Run(fmt.Sprintf("%s/%s/xorbs=%d", b.name, c.Name, n), func(t *testing.T) {
 					st := b.open(t)
 					f := putXorbs(t, st, xorbsOf(c, n, mixedChunkSizes))
 					seen := map[xorb.CompressionType]bool{}
@@ -594,8 +594,8 @@ func TestReconstructedFileMatchesContent(t *testing.T) {
 							seen[fr.Compression] = true
 						}
 					}
-					if !seen[xorb.CompressionType(c.ct)] {
-						t.Fatalf("no chunk of the fixture is stored as %s", c.name)
+					if !seen[c.Compression] {
+						t.Fatalf("no chunk of the fixture is stored as %s", c.Name)
 					}
 					for _, read := range reads {
 						rc, err := st.GetReconstructedFile(t.Context(), f.digest)

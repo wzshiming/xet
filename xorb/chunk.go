@@ -52,34 +52,42 @@ func ParseChunkHeader(b []byte) (ChunkHeader, error) {
 	return h, nil
 }
 
-// DecodeChunk decompresses body, the compressed data described by h, into dst
-// and returns dst[:h.UncompressedSize]. It writes nothing into dst when it
-// fails. It is safe for concurrent use.
+// DecodeChunk decompresses body, the compressed data described by h. A
+// CompressionNone result is body itself; dst is ignored and may be nil. An LZ4
+// or ByteGrouping4 result is dst[:h.UncompressedSize], so dst must be at least
+// that long. LZ4 decodes straight into dst when cap(dst) > h.UncompressedSize.
+// The spare byte makes the reader consume the frame's end mark and is scratch
+// that may be written even on success; nothing past it is ever written. On
+// failure DecodeChunk returns nil and writes nothing into dst, except partial
+// output from a direct decode. It is safe for concurrent use.
 func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 	if len(body) != int(h.CompressedSize) {
 		return nil, fmt.Errorf("chunk body size mismatch: header declares %d bytes, have %d", h.CompressedSize, len(body))
 	}
-	if len(dst) < int(h.UncompressedSize) {
+	if h.Compression != CompressionNone && len(dst) < int(h.UncompressedSize) {
 		return nil, fmt.Errorf("output buffer too small: need %d bytes, have %d", h.UncompressedSize, len(dst))
 	}
 	if h.UncompressedSize > xet.MaxChunkSize {
 		return nil, fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", h.UncompressedSize, xet.MaxChunkSize)
 	}
 	size := int(h.UncompressedSize)
-	dst = dst[:size]
 
 	switch h.Compression {
 	case CompressionNone:
 		if len(body) != size {
 			return nil, fmt.Errorf("decompressed size mismatch: got %d, expected %d", len(body), size)
 		}
-		copy(dst, body)
-		return dst, nil
+		return body, nil
 	case CompressionLZ4, CompressionByteGrouping4:
-		tmp := pool.GetChunkBuf()
-		defer pool.PutChunkBuf(tmp)
-		// The spare byte exposes frames that decode past the declared size.
-		n, err := readLZ4Frame(tmp[:size+1], body)
+		direct := h.Compression == CompressionLZ4 && cap(dst) > size
+		buf := dst
+		if !direct {
+			tmp := pool.GetChunkBuf()
+			defer pool.PutChunkBuf(tmp)
+			buf = tmp[:]
+		}
+		// The spare byte makes the reader consume the frame's end mark, catching over-long frames, bad checksums and trailing bytes.
+		n, err := readLZ4Frame(buf[:size+1], body)
 		if err != nil {
 			return nil, err
 		}
@@ -87,10 +95,12 @@ func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 			return nil, fmt.Errorf("decompressed size mismatch: got %d, expected %d", n, size)
 		}
 		if h.Compression == CompressionByteGrouping4 {
-			return reverseByteGrouping4(dst[:0], tmp[:size]), nil
+			return reverseByteGrouping4(dst[:0], buf[:size]), nil
 		}
-		copy(dst, tmp[:size])
-		return dst, nil
+		if !direct {
+			copy(dst, buf[:size])
+		}
+		return dst[:size], nil
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %d", h.Compression)
 	}
