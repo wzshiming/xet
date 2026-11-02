@@ -14,7 +14,7 @@ import (
 	"github.com/wzshiming/xet/xorb"
 )
 
-// fakeStore serves one xorb's chunk offsets and byte ranges; any other Storage call panics on the nil embedded Storage.
+// fakeStore serves one xorb's chunk offsets and bytes; any other Storage call panics on the nil embedded Storage.
 type fakeStore struct {
 	Storage
 	xorb    []byte
@@ -25,8 +25,8 @@ func (s *fakeStore) GetXorbChunkOffsets(context.Context, xet.XorbHash) ([]uint64
 	return s.offsets, nil
 }
 
-func (s *fakeStore) GetXorbRangeReadCloser(_ context.Context, _ xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	return io.NopCloser(bytes.NewReader(s.xorb[start : end+1])), nil
+func (s *fakeStore) GetXorbReadSeekCloser(context.Context, xet.XorbHash) (io.ReadSeekCloser, error) {
+	return &rangeSeeker{Reader: bytes.NewReader(s.xorb)}, nil
 }
 
 // pipelineFixtureForTest stores an xorb of a None, an LZ4 and a BG4 chunk, in that order, and returns the chunks and the term covering them.
