@@ -18,6 +18,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/internal/httpserve"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/upload"
@@ -118,7 +119,7 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 	if digest == zeroDigest {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("ETag", fmt.Sprintf(`"%s"`, sh256Hash))
-		http.ServeContent(w, r, sh256Hash, time.Time{}, strings.NewReader(""))
+		httpserve.ServeContent(w, r, sh256Hash, time.Time{}, strings.NewReader(""))
 		return
 	}
 
@@ -132,7 +133,7 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, sh256Hash))
-	http.ServeContent(w, r, sh256Hash, time.Time{}, content)
+	httpserve.ServeContent(w, r, sh256Hash, time.Time{}, content)
 }
 
 // handleHasXorb handles HEAD /v1/xorbs/{prefix}/{xorb_hash}
@@ -427,7 +428,7 @@ func (s *Handler) handleDownloadXorb(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, xorbHash.String()))
-	http.ServeContent(w, r, xorbHashStr, time.Time{}, xorbReader)
+	httpserve.ServeContent(w, r, xorbHashStr, time.Time{}, xorbReader)
 }
 
 // handleUploadShard handles the legacy and v1 shard upload endpoints.
