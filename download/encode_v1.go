@@ -8,6 +8,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // Invalid ranges are ignored; unsatisfiable ranges have start > end.
@@ -112,7 +113,11 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		// URL ranges are byte offsets within the compressed-data stream of the
 		// stored xorb (headers stripped).  Load the stored xorb and compute
 		// the accurate ranges from the actual compressed chunk sizes.
-		startByte, endByte, err := storage.GetXorbDataRange(ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		offsets, err := storage.GetXorbChunkOffsets(ctx, entry.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get xorb chunk offsets: %w", err)
+		}
+		startByte, endByte, err := xorb.ChunkDataRangeFromOffsets(offsets, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}

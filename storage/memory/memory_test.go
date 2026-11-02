@@ -19,7 +19,6 @@ import (
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
-	"github.com/wzshiming/xet/xorb"
 )
 
 func TestGetXorbURLUsesBaseURL(t *testing.T) {
@@ -66,47 +65,6 @@ func TestPutXorbOwnsDataAndServesIndependentReaders(t *testing.T) {
 	}
 	if !bytes.Equal(got, encoded) {
 		t.Fatalf("second reader saw %d bytes %x, want the stored xorb %x", len(got), got, encoded)
-	}
-}
-
-func TestXorbRangesMatchScanner(t *testing.T) {
-	ctx := context.Background()
-	st := NewStorage()
-	chunks := [][]byte{[]byte("first"), []byte("second chunk"), []byte("3")}
-	encoded, xorbHash := storagetest.EncodeXorb(t, true, chunks...)
-	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
-		t.Fatal(err)
-	}
-
-	wantStart, wantEnd, err := xorb.ChunkDataRange(bytes.NewReader(encoded), 1, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	start, end, err := st.GetXorbDataRange(ctx, xorbHash, 1, 3)
-	if err != nil || start != wantStart || end != wantEnd {
-		t.Fatalf("GetXorbDataRange() = [%d, %d], %v; want [%d, %d]", start, end, err, wantStart, wantEnd)
-	}
-	offsets, err := st.GetXorbChunkOffsets(ctx, xorbHash)
-	if err != nil || len(offsets) != len(chunks) || int64(offsets[2]) != wantEnd+1 {
-		t.Fatalf("GetXorbChunkOffsets() = %v, %v; want %d chunks ending at %d", offsets, err, len(chunks), wantEnd+1)
-	}
-
-	rc, err := st.GetXorbRangeReadCloser(ctx, xorbHash, start, end)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := io.ReadAll(rc)
-	_ = rc.Close()
-	if err != nil || !bytes.Equal(got, encoded[start:end+1]) {
-		t.Fatalf("GetXorbRangeReadCloser() = %x, %v; want inclusive range %x", got, err, encoded[start:end+1])
-	}
-
-	if _, _, err := st.GetXorbDataRange(ctx, xorbHash, 0, 4); err == nil {
-		t.Fatal("GetXorbDataRange() accepted an out-of-bounds chunk range")
-	}
-	var missing xet.XorbHash
-	if _, _, err := st.GetXorbDataRange(ctx, missing, 0, 1); !errors.Is(err, iofs.ErrNotExist) {
-		t.Fatalf("GetXorbDataRange(missing) = %v, want fs.ErrNotExist", err)
 	}
 }
 

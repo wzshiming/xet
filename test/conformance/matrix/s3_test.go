@@ -52,6 +52,7 @@ func newS3BackedServer(t *testing.T) (runningServer, string) {
 	stor, err := s3storage.NewStorage(context.Background(),
 		s3storage.WithS3Client(s3Client),
 		s3storage.WithBucket(bucket),
+		s3storage.WithCacheDir(t.TempDir()),
 	)
 	if err != nil {
 		t.Fatalf("create S3 storage: %v", err)

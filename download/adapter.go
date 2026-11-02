@@ -12,7 +12,7 @@ import (
 // StorageAdapter provides access to storage operations needed for reconstruction encoding
 type StorageAdapter interface {
 	GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error)
-	GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
+	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)
 }
 
 // ClientAdapter provides access to client operations needed for reconstruction decoding

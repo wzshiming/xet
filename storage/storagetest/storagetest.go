@@ -83,4 +83,5 @@ var cases = []struct {
 	{"TestPutFileReusesStoredChunks", testPutFileReusesStoredChunks},
 	{"TestPutFileEmpty", testPutFileEmpty},
 	{"TestUsageCountsObjectsByKind", testUsageCountsObjectsByKind},
+	{"TestXorbChunkRangesReadBack", testXorbChunkRangesReadBack},
 }

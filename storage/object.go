@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -65,4 +67,23 @@ func ReadXorbChunkOffsets(r io.ReadSeeker) ([]uint64, error) {
 		offsets, err = xorb.ScanChunkOffsets(r)
 	}
 	return offsets, err
+}
+
+// openXorbRange streams bytes [start, end] (inclusive) of a stored xorb; a short xorb ends early at io.EOF.
+func openXorbRange(ctx context.Context, st Storage, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
+	if start < 0 || start > end {
+		return nil, fmt.Errorf("invalid xorb byte range [%d, %d]", start, end)
+	}
+	rs, err := st.GetXorbReadSeekCloser(ctx, xorbHash)
+	if err != nil {
+		return nil, fmt.Errorf("open xorb: %w", err)
+	}
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		rs.Close()
+		return nil, fmt.Errorf("seek xorb to %d: %w", start, err)
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(rs, end-start+1), rs}, nil
 }

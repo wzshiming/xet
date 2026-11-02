@@ -61,6 +61,7 @@ func main() {
 			s3.WithPresignExpiry(*s3PresignExpiry),
 			s3.WithPresignEndpoint(*s3PresignEndpoint),
 			s3.WithBaseURL(*baseURL),
+			s3.WithCacheDir(filepath.Join(*storageDir, "s3-xorbs")),
 		)
 		if err == nil {
 			fmt.Printf("S3 storage enabled, bucket: %s\n", *s3Bucket)

@@ -209,24 +209,6 @@ func (s *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) 
 	return offsets, nil
 }
 
-// GetXorbDataRange returns the inclusive [start, end] byte range of chunks [chunkStart, chunkEnd).
-func (s *Storage) GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error) {
-	offsets, err := s.GetXorbChunkOffsets(ctx, xorbHash)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get chunk data range: %w", err)
-	}
-	return xorb.ChunkDataRangeFromOffsets(offsets, chunkStart, chunkEnd)
-}
-
-// GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-func (s *Storage) GetXorbRangeReadCloser(_ context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error) {
-	obj, ok := s.get("xorbs", xorbHash.String())
-	if !ok {
-		return nil, notFound("xorb", xorbHash.String())
-	}
-	return io.NopCloser(io.NewSectionReader(bytes.NewReader(obj.data), start, end-start+1)), nil
-}
-
 // PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
 func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 	// Only a shard whose every file is already indexed is a no-op

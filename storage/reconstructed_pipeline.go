@@ -44,7 +44,7 @@ type frame struct {
 }
 
 // pipeline delivers the decoded chunks of a run of terms in file order: one
-// fetcher reads each term through a single range read, decodeWorkers()
+// fetcher reads each term through one bounded seeker read, decodeWorkers()
 // workers decode, and decodeWindow frames bound what is in flight.
 type pipeline struct {
 	ctx     context.Context
@@ -95,8 +95,8 @@ func (p *pipeline) fetch(terms []shard.FileDataSequenceEntry) {
 	close(p.ordered)
 }
 
-// fetchTerm reads term's chunks through one range read, each frame with one
-// ReadFull of the packed size its chunk offsets give.
+// fetchTerm reads term's chunks through one bounded seeker read, each frame
+// with one ReadFull of the packed size its chunk offsets give.
 func (p *pipeline) fetchTerm(term *shard.FileDataSequenceEntry) error {
 	// Storage is touched only once the window has room for the term's first frame.
 	fr, err := p.acquire()
@@ -111,7 +111,7 @@ func (p *pipeline) fetchTerm(term *shard.FileDataSequenceEntry) error {
 	if err != nil {
 		return fmt.Errorf("locate xorb %s chunks: %w", term.CASHash, err)
 	}
-	rc, err := p.storage.GetXorbRangeReadCloser(p.ctx, term.CASHash, start, end)
+	rc, err := openXorbRange(p.ctx, p.storage, term.CASHash, start, end)
 	if err != nil {
 		return fmt.Errorf("read xorb %s: %w", term.CASHash, err)
 	}
@@ -254,7 +254,7 @@ func (p *pipeline) release(fr *frame) {
 	p.free <- fr
 }
 
-// stop cancels and joins the fetcher, which closes its range reader, and the
+// stop cancels and joins the fetcher, which closes its term's seeker, and the
 // workers, then returns every buffer the frames still hold.
 func (p *pipeline) stop() {
 	p.cancel()

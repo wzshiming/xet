@@ -6,6 +6,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/xorb"
 )
 
 // BuildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
@@ -80,7 +81,11 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		response.Terms = append(response.Terms, term)
 
 		// Calculate byte ranges for this term
-		startByte, endByte, err := storage.GetXorbDataRange(ctx, entry.CASHash, entry.ChunkIndexStart, entry.ChunkIndexEnd)
+		offsets, err := storage.GetXorbChunkOffsets(ctx, entry.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get xorb chunk offsets: %w", err)
+		}
+		startByte, endByte, err := xorb.ChunkDataRangeFromOffsets(offsets, entry.ChunkIndexStart, entry.ChunkIndexEnd)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}

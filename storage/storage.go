@@ -27,14 +27,9 @@ type Storage interface {
 	// A URL routed through the CAS carries xet-core's fixed /v1/xorbs/default/ prefix.
 	GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error)
 
-	// GetXorbReadSeekCloser returns a ReadSeekCloser for the xorb data, which can be used for range requests.
+	// GetXorbReadSeekCloser returns a seekable reader over the whole stored xorb, wrapping fs.ErrNotExist when absent.
+	// An inclusive [start, end] from xorb.ChunkDataRangeFromOffsets is read by Seek(start) then reading end-start+1 bytes.
 	GetXorbReadSeekCloser(ctx context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error)
-
-	// GetXorbRangeReadCloser streams the inclusive [start, end] byte range of a stored xorb.
-	GetXorbRangeReadCloser(ctx context.Context, xorbHash xet.XorbHash, start, end int64) (io.ReadCloser, error)
-
-	// GetXorbDataRange returns the byte range within the stored xorb for the given chunk range
-	GetXorbDataRange(ctx context.Context, xorbHash xet.XorbHash, chunkStart, chunkEnd uint32) (startByte, endByte int64, err error)
 
 	// GetXorbChunkOffsets returns cumulative packed chunk ends, wrapping fs.ErrNotExist when absent.
 	GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error)

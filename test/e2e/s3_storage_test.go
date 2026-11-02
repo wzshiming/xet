@@ -55,6 +55,7 @@ func TestS3StorageUploadRestartAndDownload(t *testing.T) {
 			s3.WithPrefix("xet-data"),
 			s3.WithEndpoint(endpoint),
 			s3.WithPathStyle(true),
+			s3.WithCacheDir(t.TempDir()),
 		)
 		if err != nil {
 			t.Fatal(err)

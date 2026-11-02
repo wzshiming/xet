@@ -32,7 +32,18 @@ func (c storageClient) DownloadXorbWithURL(ctx context.Context, url string, head
 	if _, err := fmt.Sscanf(header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
 		return nil, fmt.Errorf("parse range %q: %w", header.Get("Range"), err)
 	}
-	return c.st.GetXorbRangeReadCloser(ctx, xorbHash, start, end)
+	rsc, err := c.st.GetXorbReadSeekCloser(ctx, xorbHash)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := rsc.Seek(start, io.SeekStart); err != nil {
+		rsc.Close()
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(rsc, end-start+1), rsc}, nil
 }
 
 func (storageClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
