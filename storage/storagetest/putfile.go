@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	iofs "io/fs"
 	"math/rand/v2"
 	"slices"
 	"testing"
@@ -125,7 +127,7 @@ func testPutFileReusesStoredChunks(t *testing.T, b Backend) {
 	assertNewChunks(t, ctx, st, f2, f1.ChunkHashes)
 }
 
-// An empty file has no chunks and commits under the zero file hash.
+// An empty file stores nothing: no xorb, no shard, no index entry.
 func testPutFileEmpty(t *testing.T, b Backend) {
 	ctx := context.Background()
 	st := b.New(t)
@@ -133,7 +135,10 @@ func testPutFileEmpty(t *testing.T, b Backend) {
 	if err != nil || fileHash != (xet.FileHash{}) {
 		t.Fatalf("PutFile(empty) = %s, %v; want the zero hash", fileHash.String(), err)
 	}
-	if _, err := st.GetShard(ctx, fileHash); err != nil {
-		t.Fatalf("GetShard(zero hash): %v", err)
+	if usage, err := st.Usage(ctx); err != nil || usage != (storage.Usage{}) {
+		t.Fatalf("Usage() after PutFile(empty) = %+v, %v; want nothing stored", usage, err)
+	}
+	if _, err := st.GetShard(ctx, xet.FileHash{}); !errors.Is(err, iofs.ErrNotExist) {
+		t.Fatalf("GetShard(zero hash) = %v, want not found", err)
 	}
 }

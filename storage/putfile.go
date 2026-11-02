@@ -25,7 +25,7 @@ type xorbReader struct {
 
 // PutFile stores the file read from r: chunks already held by a stored shard
 // are reused, the new ones are packed into xorbs, and the shard describing the
-// file is committed. It returns the file's xet hash.
+// file is committed; an empty file stores nothing. It returns the file's xet hash.
 func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, error) {
 	base, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -107,8 +107,10 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 		}
 	}
 
-	if _, err := stor.PutShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
-		return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
+	if len(chunks) > 0 {
+		if _, err := stor.PutShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
+			return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
+		}
 	}
 	return file.Hash, nil
 }
