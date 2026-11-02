@@ -10,10 +10,11 @@ import (
 	"github.com/wzshiming/xet/shard"
 )
 
-// reconstructedFile exposes a shard file as an io.ReadSeekCloser. Its bytes
-// come from a decode pipeline started by the first Read that needs them, so
-// http.ServeContent answers HEAD and range requests without extra I/O.
-// Calls are serialized; Close fails a Read or Seek still waiting with fs.ErrClosed.
+// reconstructedFile exposes a shard file as an io.ReadSeekCloser and an
+// io.WriterTo. Its bytes come from a decode pipeline started by the first Read
+// or WriteTo that needs them, so http.ServeContent answers HEAD and range
+// requests without extra I/O. Calls are serialized; Close fails a Read,
+// WriteTo or Seek still waiting with fs.ErrClosed.
 type reconstructedFile struct {
 	ctx      context.Context
 	life     context.Context // child of ctx every pipeline derives from
@@ -21,7 +22,7 @@ type reconstructedFile struct {
 	storage  Storage
 	entries  []shard.FileDataSequenceEntry
 	size     int64
-	mu       sync.Mutex // held through each Read, Seek and Close
+	mu       sync.Mutex // held through each Read, WriteTo, Seek and Close
 	position int64
 	closed   bool
 	err      error // sticky until a Seek away
@@ -65,18 +66,11 @@ func NewReconstructedFile(ctx context.Context, stor Storage, sh *shard.Shard, di
 func (f *reconstructedFile) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed || f.closing() {
-		return 0, fmt.Errorf("read reconstructed file: %w", fs.ErrClosed)
-	}
-	if err := f.ctx.Err(); err != nil {
-		f.stop()
+	if err := f.check(); err != nil {
 		return 0, err
 	}
 	if len(p) == 0 {
 		return 0, nil
-	}
-	if f.err != nil {
-		return 0, f.err
 	}
 	if f.position >= f.size {
 		return 0, io.EOF
@@ -84,24 +78,49 @@ func (f *reconstructedFile) Read(p []byte) (int, error) {
 
 	n := 0
 	for n < len(p) && f.position < f.size {
-		if f.cur == nil || f.position == f.chunkOff+int64(len(f.cur.data)) {
-			if err := f.advance(); err != nil {
-				return n, f.fail(err)
+		data, withheld, err := f.unread()
+		if err != nil {
+			if withheld && n > 0 {
+				return n, nil // the sticky error ends the next Read
 			}
-			// Withhold the final chunk until the fetcher has checked the last term's size.
-			if f.chunkOff+int64(len(f.cur.data)) >= f.size {
-				if err := f.pipe.drain(f.life); err != nil {
-					err = f.fail(err)
-					if n == 0 {
-						return 0, err
-					}
-					return n, nil // the sticky error ends the next Read
-				}
-			}
+			return n, err
 		}
-		copied := copy(p[n:], f.cur.data[f.position-f.chunkOff:])
+		copied := copy(p[n:], data)
 		f.position += int64(copied)
 		n += copied
+	}
+	return n, nil
+}
+
+// WriteTo writes the file from the current position on to w, one Write per
+// decoded chunk of at most 128 KiB, whose bytes are valid only during the call.
+// Storage, Close and context failures end it as they end Read; a failed or
+// short Write stops the pipeline without sticking, so the next call resumes
+// after the bytes written. Close waits for a Write in progress to return, as
+// mu is held through w.Write.
+func (f *reconstructedFile) WriteTo(w io.Writer) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.check(); err != nil {
+		return 0, err
+	}
+
+	var n int64
+	for f.position < f.size {
+		data, _, err := f.unread()
+		if err != nil {
+			return n, err
+		}
+		m, err := w.Write(data)
+		f.position += int64(m)
+		n += int64(m)
+		if err == nil && m < len(data) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			f.stop()
+			return n, err
+		}
 	}
 	return n, nil
 }
@@ -153,6 +172,39 @@ func (f *reconstructedFile) Close() error {
 // closing reports whether Close has cancelled life while ctx is live.
 func (f *reconstructedFile) closing() bool {
 	return f.life.Err() != nil && f.ctx.Err() == nil
+}
+
+// check reports a Close or a cancelled parent, stopping the pipeline only for
+// the parent: Close stops it itself.
+func (f *reconstructedFile) check() error {
+	if f.closed || f.closing() {
+		return fmt.Errorf("read reconstructed file: %w", fs.ErrClosed)
+	}
+	if err := f.ctx.Err(); err != nil {
+		f.stop()
+		return err
+	}
+	return nil
+}
+
+// unread returns the bytes still to deliver from position to the end of their
+// chunk; withheld marks an error that held back the file's final chunk.
+func (f *reconstructedFile) unread() (data []byte, withheld bool, err error) {
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	if f.cur == nil || f.position == f.chunkOff+int64(len(f.cur.data)) {
+		if err := f.advance(); err != nil {
+			return nil, false, f.fail(err)
+		}
+		// Withhold the final chunk until the fetcher has checked the last term's size.
+		if f.chunkOff+int64(len(f.cur.data)) >= f.size {
+			if err := f.pipe.drain(f.life); err != nil {
+				return nil, true, f.fail(err)
+			}
+		}
+	}
+	return f.cur.data[f.position-f.chunkOff:], false, nil
 }
 
 // advance makes cur the next delivered chunk holding position, starting the
