@@ -28,6 +28,16 @@ var chunkClassesForTest = []struct {
 	{"bg4", CompressionByteGrouping4},
 }
 
+// dstSparesForTest are dst capacities past UncompressedSize; LZ4 decodes straight into dst only with a spare byte.
+var dstSparesForTest = []struct {
+	name  string
+	spare int
+}{
+	{"cap=size", 0},
+	{"cap=size+1", 1},
+	{"cap=size+64", 64},
+}
+
 // payloadForTest returns n deterministic bytes alternating 512-byte runs of random data and little-endian uint32 counters.
 func payloadForTest(n int, seed byte) []byte {
 	b := make([]byte, n)
@@ -140,12 +150,80 @@ func TestDecodeChunkMatchesDecoderRead(t *testing.T) {
 						t.Fatalf("ParseChunkHeader() = %+v, %v; want %+v", h, err, want)
 					}
 					dst := make([]byte, xet.MaxChunkSize)
+					for i := range dst {
+						dst[i] = byte(i*31 + 7)
+					}
+					before := bytes.Clone(dst)
 					got, err := DecodeChunk(dst, h, frame[ChunkHeaderSize:])
 					if err != nil || !bytes.Equal(got, p[:m]) {
 						t.Fatalf("DecodeChunk() = %d bytes, %v; want the %d bytes Decoder.Read returned", len(got), err, m)
 					}
+					if class.ct != CompressionNone {
+						if &got[0] != &dst[0] {
+							t.Fatalf("DecodeChunk() returned memory outside dst, want dst[:%d]", n)
+						}
+						return
+					}
+					if &got[0] != &frame[ChunkHeaderSize] {
+						t.Errorf("DecodeChunk() of a None chunk returned a copy, want the body frame[%d:] itself", ChunkHeaderSize)
+					}
+					if !bytes.Equal(dst, before) {
+						t.Errorf("DecodeChunk() of a None chunk wrote into dst, want dst ignored")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDecodeChunkNoneIgnoresDst(t *testing.T) {
+	payload := payloadForTest(4099, 9)
+	frame, h := chunkFrameForTest(t, CompressionNone, payload)
+	body := frame[ChunkHeaderSize:]
+	for _, tc := range []struct {
+		name string
+		dst  []byte
+	}{
+		{"nil_dst", nil},
+		{"dst_shorter_than_UncompressedSize", bytes.Repeat([]byte{0xA5}, len(payload)-1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DecodeChunk(tc.dst, h, body)
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("DecodeChunk(%d-byte dst, %+v) = %d bytes, %v; want the %d-byte body whatever dst", len(tc.dst), h, len(got), err, len(payload))
+			}
+			if &got[0] != &body[0] {
+				t.Errorf("DecodeChunk(%d-byte dst, %+v) returned a copy, want the body itself", len(tc.dst), h)
+			}
+			if !bytes.Equal(tc.dst, bytes.Repeat([]byte{0xA5}, len(tc.dst))) {
+				t.Errorf("DecodeChunk(%d-byte dst, %+v) wrote into dst, want dst ignored", len(tc.dst), h)
+			}
+		})
+	}
+}
+
+func TestDecodeChunkLZ4DecodesAlikeWithAndWithoutSpareByte(t *testing.T) {
+	for _, n := range []int{1, 4099, xet.MaxChunkSize} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			payload := payloadForTest(n, 5)
+			frame, h := chunkFrameForTest(t, CompressionLZ4, payload)
+			for _, c := range dstSparesForTest {
+				t.Run(c.name, func(t *testing.T) {
+					dst := make([]byte, n, n+c.spare)
+					// dst[n] is scratch on the direct path: pierrec/lz4 may write it even on success.
+					past := dst[min(n+1, cap(dst)):cap(dst)]
+					for i := range past {
+						past[i] = 0xA5
+					}
+					got, err := DecodeChunk(dst, h, frame[ChunkHeaderSize:])
+					if err != nil || !bytes.Equal(got, payload) {
+						t.Fatalf("DecodeChunk(dst len %d cap %d) = %d bytes, %v; want the %d-byte payload", n, cap(dst), len(got), err, n)
+					}
 					if &got[0] != &dst[0] {
-						t.Fatalf("DecodeChunk() returned memory outside dst, want dst[:%d]", n)
+						t.Errorf("DecodeChunk(dst len %d cap %d) returned memory outside dst, want dst[:%d]", n, cap(dst), n)
+					}
+					if !bytes.Equal(past, bytes.Repeat([]byte{0xA5}, len(past))) {
+						t.Errorf("DecodeChunk(dst len %d cap %d) wrote into dst[%d:%d], want nothing past the scratch byte dst[%d] written on success", n, cap(dst), n+1, cap(dst), n)
 					}
 				})
 			}
@@ -164,36 +242,49 @@ func TestDecodeChunkDoesNotAllocate(t *testing.T) {
 		t.Run("class="+class.name, func(t *testing.T) {
 			frame, h := chunkFrameForTest(t, class.ct, payload)
 			body := frame[ChunkHeaderSize:]
-			dst := make([]byte, len(payload))
-			if got, err := DecodeChunk(dst, h, body); err != nil || !bytes.Equal(got, payload) {
-				t.Fatalf("warm-up DecodeChunk() = %d bytes, %v; want the %d-byte payload", len(got), err, len(payload))
-			}
-			allocs := testing.AllocsPerRun(1000, func() {
-				if _, err := DecodeChunk(dst, h, body); err != nil {
-					t.Fatalf("DecodeChunk() error = %v", err)
-				}
-			})
-			if want := maxAllocs[class.ct]; allocs > want {
-				t.Fatalf("DecodeChunk() made %v heap allocations per call with warm pools, want at most %v", allocs, want)
+			for _, c := range dstSparesForTest {
+				t.Run(c.name, func(t *testing.T) {
+					dst := make([]byte, len(payload), len(payload)+c.spare)
+					if got, err := DecodeChunk(dst, h, body); err != nil || !bytes.Equal(got, payload) {
+						t.Fatalf("warm-up DecodeChunk() = %d bytes, %v; want the %d-byte payload", len(got), err, len(payload))
+					}
+					allocs := testing.AllocsPerRun(1000, func() {
+						if _, err := DecodeChunk(dst, h, body); err != nil {
+							t.Fatalf("DecodeChunk() error = %v", err)
+						}
+					})
+					if want := maxAllocs[class.ct]; allocs > want {
+						t.Fatalf("DecodeChunk() made %v heap allocations per call with warm pools, want at most %v", allocs, want)
+					}
+				})
 			}
 		})
 	}
 }
 
-// assertDecodeChunkFails checks that DecodeChunk fails with want in its message and leaves dst, up to its capacity, untouched.
+// assertDecodeChunkFails checks that DecodeChunk fails with want in its message, returns nil and leaves dst untouched, with and without spare capacity.
 func assertDecodeChunkFails(t *testing.T, h ChunkHeader, body []byte, dstLen int, want string) {
 	t.Helper()
-	dst := make([]byte, dstLen, dstLen+64)
-	full := dst[:cap(dst)]
-	for i := range full {
-		full[i] = byte(i*31 + 7)
-	}
-	before := bytes.Clone(full)
-	if _, err := DecodeChunk(dst, h, body); err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("DecodeChunk(%+v, %d-byte body, %d-byte dst) error = %v, want an error containing %q", h, len(body), dstLen, err, want)
-	}
-	if !bytes.Equal(full, before) {
-		t.Errorf("failed DecodeChunk(%+v, %d-byte body, %d-byte dst) wrote into dst", h, len(body), dstLen)
+	size := int(h.UncompressedSize)
+	for _, dstCap := range []int{dstLen, dstLen + 64} {
+		dst := make([]byte, dstLen, dstCap)
+		full := dst[:dstCap]
+		for i := range full {
+			full[i] = byte(i*31 + 7)
+		}
+		before := bytes.Clone(full)
+		got, err := DecodeChunk(dst, h, body)
+		if err == nil || !strings.Contains(err.Error(), want) || got != nil {
+			t.Errorf("DecodeChunk(%+v, %d-byte body, dst len %d cap %d) = %d bytes, %v; want nil and an error containing %q", h, len(body), dstLen, dstCap, len(got), err, want)
+		}
+		// Past the pre-decode checks, LZ4 decodes straight into a dst with a spare byte and may leave output in dst[:size+1].
+		from := 0
+		if h.Compression == CompressionLZ4 && len(body) == int(h.CompressedSize) && size <= xet.MaxChunkSize && dstLen >= size && dstCap > size {
+			from = size + 1
+		}
+		if !bytes.Equal(full[from:], before[from:]) {
+			t.Errorf("failed DecodeChunk(%+v, %d-byte body, dst len %d cap %d) wrote into dst[%d:%d]", h, len(body), dstLen, dstCap, from, dstCap)
+		}
 	}
 }
 
@@ -210,9 +301,6 @@ func TestDecodeChunkErrors(t *testing.T) {
 			t.Run("body_longer_than_CompressedSize", func(t *testing.T) {
 				assertDecodeChunkFails(t, h, append(bytes.Clone(body), 0), n, "")
 			})
-			t.Run("dst_shorter_than_UncompressedSize", func(t *testing.T) {
-				assertDecodeChunkFails(t, h, body, n-1, fmt.Sprintf("output buffer too small: need %d bytes, have %d", n, n-1))
-			})
 			t.Run("UncompressedSize_above_decoded_length", func(t *testing.T) {
 				long := h
 				long.UncompressedSize++
@@ -226,6 +314,9 @@ func TestDecodeChunkErrors(t *testing.T) {
 				})
 				return
 			}
+			t.Run("dst_shorter_than_UncompressedSize", func(t *testing.T) {
+				assertDecodeChunkFails(t, h, body, n-1, fmt.Sprintf("output buffer too small: need %d bytes, have %d", n, n-1))
+			})
 			t.Run("corrupt_LZ4_frame", func(t *testing.T) {
 				corrupt := bytes.Clone(body)
 				corrupt[0] ^= 0xFF // LZ4 frame magic
@@ -248,10 +339,7 @@ func TestDecodeChunkRejectsFrameDecodingPastUncompressedSize(t *testing.T) {
 		t.Run("class="+class.name, func(t *testing.T) {
 			frame, h := chunkFrameForTest(t, class.ct, payload)
 			h.UncompressedSize = 4000
-			_, err := DecodeChunk(make([]byte, h.UncompressedSize), h, frame[ChunkHeaderSize:])
-			if want := "decompressed size mismatch"; err == nil || !strings.HasPrefix(err.Error(), want) {
-				t.Fatalf("DecodeChunk(%+v) of a frame decoding to %d bytes: error = %v, want one beginning %q", h, len(payload), err, want)
-			}
+			assertDecodeChunkFails(t, h, frame[ChunkHeaderSize:], int(h.UncompressedSize), "decompressed size mismatch")
 		})
 	}
 }
@@ -269,10 +357,7 @@ func TestDecodeChunkRejectsCorruptContentChecksum(t *testing.T) {
 				t.Fatalf("DecodeChunk(%+v) of the intact frame = %d bytes, %v; want the %d-byte payload", h, len(got), err, len(payload))
 			}
 			body[len(body)-1] ^= 0xFF // last byte of the frame's xxh32 content checksum
-			_, err := DecodeChunk(make([]byte, h.UncompressedSize), h, body)
-			if want := "checksum"; err == nil || !strings.Contains(err.Error(), want) {
-				t.Fatalf("DecodeChunk(%+v) of a frame with a corrupt content checksum: error = %v, want one containing %q", h, err, want)
-			}
+			assertDecodeChunkFails(t, h, body, int(h.UncompressedSize), "checksum")
 		})
 	}
 }
@@ -288,12 +373,11 @@ func TestDecodeChunkRejectsBytesAfterFrameEnd(t *testing.T) {
 		t.Run("class="+class.name, func(t *testing.T) {
 			frame, h := chunkFrameForTest(t, class.ct, payload)
 			for _, trailer := range trailers {
-				body := append(bytes.Clone(frame[ChunkHeaderSize:]), trailer...)
-				h.CompressedSize = uint32(len(body))
-				_, err := DecodeChunk(make([]byte, h.UncompressedSize), h, body)
-				if want := "bad magic number"; err == nil || !strings.Contains(err.Error(), want) {
-					t.Errorf("DecodeChunk(%+v) of a frame followed by [% x]: error = %v, want one containing %q", h, trailer, err, want)
-				}
+				t.Run(fmt.Sprintf("trailer=%x", trailer), func(t *testing.T) {
+					body := append(bytes.Clone(frame[ChunkHeaderSize:]), trailer...)
+					h.CompressedSize = uint32(len(body))
+					assertDecodeChunkFails(t, h, body, int(h.UncompressedSize), "bad magic number")
+				})
 			}
 		})
 	}

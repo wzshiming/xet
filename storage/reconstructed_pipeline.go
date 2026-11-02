@@ -31,7 +31,8 @@ func decodeWorkers() int {
 }
 
 // frame carries one chunk: the fetcher reads it packed into in, a worker
-// decodes it into out, and Read consumes data until it releases the frame.
+// decodes it into out and returns in, and Read consumes data until it
+// releases the frame. An uncompressed chunk keeps in, which data aliases.
 type frame struct {
 	in, out *frameBuf
 	packed  int
@@ -174,14 +175,21 @@ func (p *pipeline) acquire() (*frame, error) {
 // decode decodes filled frames until the fetcher closes jobs.
 func (p *pipeline) decode() {
 	for fr := range p.jobs {
-		fr.out = pool.GetChunkBuf()
-		data, err := xorb.DecodeChunk(fr.out[:], fr.header, fr.in[xorb.ChunkHeaderSize:fr.packed])
+		body := fr.in[xorb.ChunkHeaderSize:fr.packed]
+		var data []byte
+		var err error
+		if fr.header.Compression == xorb.CompressionNone {
+			data, err = xorb.DecodeChunk(nil, fr.header, body)
+		} else {
+			fr.out = pool.GetChunkBuf()
+			data, err = xorb.DecodeChunk(fr.out[:], fr.header, body)
+			pool.PutChunkBuf(fr.in)
+			fr.in = nil
+		}
 		if err != nil {
 			err = fmt.Errorf("decode xorb %s chunk %d: %w", fr.term.CASHash, fr.index, err)
 		}
 		fr.data, fr.err = data, err
-		pool.PutChunkBuf(fr.in)
-		fr.in = nil
 		fr.ready <- struct{}{}
 	}
 }
@@ -247,10 +255,9 @@ func (p *pipeline) drain(ctx context.Context) error {
 	}
 }
 
-// release returns a delivered frame's buffer and window slot.
+// release returns a delivered frame's buffers and window slot.
 func (p *pipeline) release(fr *frame) {
-	pool.PutChunkBuf(fr.out)
-	fr.out, fr.data = nil, nil
+	fr.putBufs()
 	p.free <- fr
 }
 
@@ -260,13 +267,18 @@ func (p *pipeline) stop() {
 	p.cancel()
 	p.wg.Wait()
 	for i := range p.frames {
-		fr := &p.frames[i]
-		if fr.in != nil {
-			pool.PutChunkBuf(fr.in)
-		}
-		if fr.out != nil {
-			pool.PutChunkBuf(fr.out)
-		}
-		fr.in, fr.out, fr.data = nil, nil, nil
+		p.frames[i].putBufs()
 	}
+}
+
+// putBufs returns whichever buffers fr holds to the pool, which a nil Put
+// would poison, and drops data, which aliases one of them.
+func (fr *frame) putBufs() {
+	if fr.in != nil {
+		pool.PutChunkBuf(fr.in)
+	}
+	if fr.out != nil {
+		pool.PutChunkBuf(fr.out)
+	}
+	fr.in, fr.out, fr.data = nil, nil, nil
 }
