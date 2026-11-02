@@ -46,18 +46,13 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 			return validateWithFooter(r, tmp[:], headerBuf, xorbHash, chunkHashes)
 		}
 
-		version := headerBuf[0]
-		if version != 0 {
-			return fmt.Errorf("unsupported chunk version: %d", version)
+		header, err := ParseChunkHeader(headerBuf[:])
+		if err != nil {
+			return err
 		}
-		compressedSize := uint32(headerBuf[1]) | uint32(headerBuf[2])<<8 | uint32(headerBuf[3])<<16
-		ct := compressionType(headerBuf[4])
-		uncompressedSize := uint32(headerBuf[5]) | uint32(headerBuf[6])<<8 | uint32(headerBuf[7])<<16
+		compressedSize, ct, uncompressedSize := header.CompressedSize, header.Compression, header.UncompressedSize
 		if compressedSize > uint32(len(tmp)) {
 			return fmt.Errorf("invalid compressed chunk size: %d exceeds maximum %d", compressedSize, len(tmp))
-		}
-		if uncompressedSize > xet.MaxChunkSize {
-			return fmt.Errorf("invalid uncompressed chunk size: %d exceeds maximum %d", uncompressedSize, xet.MaxChunkSize)
 		}
 		if len(chunkHashes) >= xet.MaxChunksPerXorb {
 			return fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)

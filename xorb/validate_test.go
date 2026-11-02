@@ -226,7 +226,7 @@ func rawXorbForTest(t *testing.T, declared int, payloads ...[]byte) (chunkOnly, 
 	var stream bytes.Buffer
 	encoder := NewEncoder(&stream, true)
 	for _, p := range payloads {
-		stream.Write([]byte{0, byte(len(p)), 0, 0, byte(compressionNone), byte(declared), 0, 0})
+		stream.Write([]byte{0, byte(len(p)), 0, 0, byte(CompressionNone), byte(declared), 0, 0})
 		stream.Write(p)
 		encoder.chunkHashes = append(encoder.chunkHashes, xet.ComputeChunkHash(p))
 		encoder.chunkSizes = append(encoder.chunkSizes, uint64(declared))
