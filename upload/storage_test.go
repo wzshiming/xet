@@ -119,7 +119,6 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 		{"first", first, 1},
 		// Only the chunks second does not share with first need a new xorb.
 		{"second", second, 2},
-		{"empty", nil, 2},
 	} {
 		want, err := storage.PutFile(ctx, native, bytes.NewReader(file.data))
 		if err != nil {
@@ -138,5 +137,14 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 		if n := len(nativeState.xorbs); n != file.xorbs {
 			t.Fatalf("%s: stores hold %d xorbs, want %d", file.name, n, file.xorbs)
 		}
+	}
+
+	// Unlike UploadFile's zero-entry shard, PutFile stores nothing for an empty file.
+	before := snapshot(t, ctx, native)
+	if fileHash, err := storage.PutFile(ctx, native, bytes.NewReader(nil)); err != nil || fileHash != (xet.FileHash{}) {
+		t.Fatalf("empty: PutFile() = %s, %v; want the zero hash", fileHash.String(), err)
+	}
+	if after := snapshot(t, ctx, native); !reflect.DeepEqual(after, before) {
+		t.Fatalf("empty: PutFile changed the store to shards %v, file index %v from %v, %v", after.shards, after.fileIndex, before.shards, before.fileIndex)
 	}
 }
