@@ -1,0 +1,86 @@
+name: Download benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: go test -bench regexp
+        default: Download
+      benchtime:
+        description: go test -benchtime
+        default: 1x
+      count:
+        description: go test -count
+        default: '3'
+  pull_request:
+    paths:
+    - test/bench/**
+    - .github/workflows/download-bench.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  download-bench:
+    name: Download benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+
+    - name: Install hf CLI
+      run: pip install -U "huggingface_hub[cli,hf_xet]"
+
+    - name: Log environment
+      run: |
+        hf env
+        df -h
+
+    - name: Run benchmark
+      env:
+        BENCH: ${{ inputs.bench || 'Download' }}
+        BENCHTIME: ${{ inputs.benchtime || '1x' }}
+        COUNT: ${{ inputs.count || '3' }}
+      run: |
+        set -o pipefail
+        go test ./test/bench -run '^$' -bench "$BENCH" -benchtime "$BENCHTIME" -count "$COUNT" -timeout 110m | tee bench.txt
+
+    - name: Summarize with benchstat
+      run: |
+        set -o pipefail
+        go run golang.org/x/perf/cmd/benchstat@latest -row /size,/class,/server -col /client bench.txt | tee benchstat.txt
+        {
+          echo '```'
+          cat benchstat.txt
+          echo '```'
+          hf env | grep -E 'huggingface_hub version|Python version|hf_xet'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Disk usage after
+      if: always()
+      run: df -h
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: download-bench
+        path: |
+          bench.txt
+          benchstat.txt
