@@ -8,14 +8,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
+
+// DefaultVersion is the xet-core release used when XET_CORE_VERSION is unset.
+const DefaultVersion = "v1.7.1"
+
+// pinnedVersions maps each xet-core release tag to the commit versions/<tag>/Cargo.toml pins.
+var pinnedVersions = map[string]string{
+	"v1.7.1": "f4665087547e058adb73bec46ce400e1eff0ee61",
+	"v1.6.0": "de71453d952bd8b806edaa997c72313051a49050",
+}
 
 type TokenInfo struct {
 	Token  string `json:"token"`
@@ -68,8 +79,8 @@ type downloadRequest struct {
 }
 
 var (
-	buildOnce sync.Once
-	buildErr  error
+	buildsMu sync.Mutex
+	builds   = map[string]func() error{} // build-once by manifest path
 )
 
 // Server is a running xet-core LocalTestServer owned by the reference helper.
@@ -89,7 +100,8 @@ type Server struct {
 // StartServer starts the xet-core in-memory CAS server and waits until its HTTP
 // endpoint is ready. The returned server must be closed by the caller.
 func StartServer() (*Server, error) {
-	if err := ensureBuilt(); err != nil {
+	binary, err := ensureBuilt()
+	if err != nil {
 		return nil, err
 	}
 
@@ -97,7 +109,7 @@ func StartServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(referenceBinary(), "serve")
+	cmd := exec.Command(binary, "serve")
 	cmd.Env = referenceEnv(cacheDir)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -343,7 +355,8 @@ func runRaw(command string, args []string, input io.Reader, response any) error 
 }
 
 func runBytes(command string, args []string, input io.Reader) ([]byte, error) {
-	if err := ensureBuilt(); err != nil {
+	binary, err := ensureBuilt()
+	if err != nil {
 		return nil, err
 	}
 
@@ -354,7 +367,7 @@ func runBytes(command string, args []string, input io.Reader) ([]byte, error) {
 	defer os.RemoveAll(cacheDir)
 
 	commandArgs := append([]string{command}, args...)
-	cmd := exec.Command(referenceBinary(), commandArgs...)
+	cmd := exec.Command(binary, commandArgs...)
 	cmd.Stdin = input
 	cmd.Env = referenceEnv(cacheDir)
 	var stdout, stderr bytes.Buffer
@@ -382,38 +395,69 @@ func referenceEnv(cacheDir string) []string {
 	)
 }
 
-func ensureBuilt() error {
-	if override := os.Getenv("XET_CORE_REFERENCE_BIN"); override != "" {
-		if info, err := os.Stat(override); err != nil {
-			return fmt.Errorf("XET_CORE_REFERENCE_BIN: %w", err)
+// ensureBuilt returns the reference binary, building each selected manifest once per process.
+func ensureBuilt() (string, error) {
+	manifest, binary, err := resolveReference()
+	if err != nil {
+		return "", err
+	}
+	if manifest == "" {
+		if info, err := os.Stat(binary); err != nil {
+			return "", fmt.Errorf("XET_CORE_REFERENCE_BIN: %w", err)
 		} else if info.IsDir() {
-			return errors.New("XET_CORE_REFERENCE_BIN points to a directory")
+			return "", errors.New("XET_CORE_REFERENCE_BIN points to a directory")
 		}
-		return nil
+		return binary, nil
 	}
 
-	buildOnce.Do(func() {
-		cmd := exec.Command("cargo", "build", "--release", "--locked", "--manifest-path", filepath.Join(conformanceRoot(), "Cargo.toml"))
-		cmd.Dir = conformanceRoot()
-		var output bytes.Buffer
-		cmd.Stdout = &output
-		cmd.Stderr = &output
-		if err := cmd.Run(); err != nil {
-			buildErr = fmt.Errorf("build xet-core reference: %w:\n%s", err, output.String())
-		}
-	})
-	return buildErr
+	buildsMu.Lock()
+	build, ok := builds[manifest]
+	if !ok {
+		build = sync.OnceValue(func() error {
+			cmd := exec.Command("cargo", "build", "--release", "--locked", "--manifest-path", manifest)
+			cmd.Dir = conformanceRoot()
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			cmd.Stderr = &output
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("build xet-core reference %s: %w:\n%s", Version(), err, output.String())
+			}
+			return nil
+		})
+		builds[manifest] = build
+	}
+	buildsMu.Unlock()
+	return binary, build()
 }
 
-func referenceBinary() string {
+// Version returns XET_CORE_VERSION, or DefaultVersion when unset; with XET_CORE_REFERENCE_BIN it only labels that binary.
+func Version() string {
+	if tag := os.Getenv("XET_CORE_VERSION"); tag != "" {
+		return tag
+	}
+	return DefaultVersion
+}
+
+// resolveReference selects the manifest to build and the binary to run; XET_CORE_REFERENCE_BIN wins with no manifest.
+func resolveReference() (manifest, binary string, err error) {
 	if override := os.Getenv("XET_CORE_REFERENCE_BIN"); override != "" {
-		return override
+		return "", override, nil
+	}
+	tag := Version()
+	pinned := strings.Join(slices.Sorted(maps.Keys(pinnedVersions)), ", ")
+	if _, ok := pinnedVersions[tag]; !ok {
+		return "", "", fmt.Errorf("xet-core version %q is not pinned; XET_CORE_VERSION must be one of: %s", tag, pinned)
+	}
+	dir := filepath.Join(conformanceRoot(), "versions", tag)
+	manifest = filepath.Join(dir, "Cargo.toml")
+	if _, err := os.Stat(manifest); err != nil {
+		return "", "", fmt.Errorf("xet-core version %q has no manifest: %w; pinned versions: %s", tag, err, pinned)
 	}
 	name := "xet-core-reference"
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	return filepath.Join(conformanceRoot(), "target", "release", name)
+	return manifest, filepath.Join(dir, "target", "release", name), nil
 }
 
 func conformanceRoot() string {

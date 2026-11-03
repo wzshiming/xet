@@ -1,0 +1,21 @@
+[package]
+name = "xet-core-reference"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "xet-core-reference"
+path = "../../src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+xet-core-structures = { git = "https://github.com/huggingface/xet-core", rev = "f4665087547e058adb73bec46ce400e1eff0ee61" }
+xet-client = { git = "https://github.com/huggingface/xet-core", rev = "f4665087547e058adb73bec46ce400e1eff0ee61", features = ["simulation"] }
+xet-data = { git = "https://github.com/huggingface/xet-core", rev = "f4665087547e058adb73bec46ce400e1eff0ee61" }
+xet-pkg = { git = "https://github.com/huggingface/xet-core", rev = "f4665087547e058adb73bec46ce400e1eff0ee61", package = "hf-xet", features = ["no-default-cache"] }
+xet-runtime = { git = "https://github.com/huggingface/xet-core", rev = "f4665087547e058adb73bec46ce400e1eff0ee61", features = ["no-default-cache"] }
