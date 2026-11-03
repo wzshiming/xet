@@ -66,7 +66,7 @@ var benchClasses = []benchClass{
 type row struct{ server, client string }
 
 var (
-	servers = []string{"plain", "assembled", "xet"}
+	servers = []string{"plain", "assembled", "xet", "xet-split"}
 	clients = []string{"go-http", "go-xet", "hf-http", "hf-xet"}
 )
 
@@ -183,14 +183,14 @@ func (f *upstreamFile) serveCDN(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", time.Time{}, data)
 }
 
-// harness is the topology every row runs on: the fake upstream and the two mirror stacks in front of it.
+// harness is the topology every row runs on: the fake upstream and the three mirror stacks in front of it.
 type harness struct {
-	dir            string
-	hub            *fakeUpstream
-	upstreamURL    string
-	xet, assembled *mirrorStack
-	hfBin          string // "" when hf is not on PATH
-	hfXet          bool
+	dir                      string
+	hub                      *fakeUpstream
+	upstreamURL              string
+	xet, assembled, xetSplit *mirrorStack
+	hfBin                    string // "" when hf is not on PATH
+	hfXet                    bool
 }
 
 func newHarness(tb testing.TB) *harness {
@@ -201,6 +201,7 @@ func newHarness(tb testing.TB) *harness {
 	h.upstreamURL = upstream.URL
 	h.xet = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "xet"), false)
 	h.assembled = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "assembled"), true)
+	h.xetSplit = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "xet-split"), false, server.WithTermSplit(16, 1<<20))
 	h.hfBin, h.hfXet = detectHF(tb, upstream.URL, filepath.Join(h.dir, "hf-env"))
 	return h
 }
@@ -217,7 +218,7 @@ type mirrorStack struct {
 func (s *mirrorStack) counts() [2]int64 { return [2]int64{s.bridge.Load(), s.recon.Load()} }
 
 // newMirrorStack wires test/e2e's newMirrorServer composition under dir, never revalidating against the upstream.
-func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool) *mirrorStack {
+func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool, opts ...server.Option) *mirrorStack {
 	tb.Helper()
 	s := &mirrorStack{stripXet: stripXet}
 	var inner atomic.Value
@@ -258,7 +259,7 @@ func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool) *mirr
 	if err != nil {
 		tb.Fatal(err)
 	}
-	inner.Store(http.Handler(server.NewHandler(
+	inner.Store(http.Handler(server.NewHandler(append([]server.Option{
 		server.WithStorage(stor),
 		server.WithAuthorizer(issuer),
 		server.WithNext(hf.NewHandler(
@@ -273,7 +274,7 @@ func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool) *mirr
 			})),
 			hf.WithNext(hf.NewUpstreamProxy(upstreamProvider)),
 		)),
-	)))
+	}, opts...)...)))
 	return s
 }
 
@@ -394,7 +395,7 @@ func (h *harness) skipUnavailable(tb testing.TB, r row) {
 	}
 }
 
-// fixture writes the class's file of size s for the upstream, then ingests it through both stacks.
+// fixture writes the class's file of size s for the upstream, then ingests it through every stack.
 func (h *harness) fixture(tb testing.TB, c benchClass, s benchSize) *upstreamFile {
 	tb.Helper()
 	dir := filepath.Join(h.dir, "upstream")
@@ -423,7 +424,7 @@ func (h *harness) fixture(tb testing.TB, c benchClass, s benchSize) *upstreamFil
 	f.sum = [32]byte(sum.Sum(nil))
 	f.digest = hex.EncodeToString(f.sum[:])
 	h.hub.add(f)
-	for _, stack := range []*mirrorStack{h.xet, h.assembled} {
+	for _, stack := range []*mirrorStack{h.xet, h.assembled, h.xetSplit} {
 		stack.ingest(tb, f)
 		assertXorbClass(tb, stack.stor, f, c)
 	}
@@ -552,6 +553,8 @@ func (h *harness) download(tb testing.TB, r row, f *upstreamFile, dir string) bo
 		endpoint = h.assembled.url
 	case "xet":
 		endpoint = h.xet.url
+	case "xet-split":
+		endpoint = h.xetSplit.url
 	}
 	switch r.client {
 	case "go-http":
@@ -666,7 +669,7 @@ func checkSize(tb testing.TB, path string, size int64) {
 
 // counts snapshots each server's request counters.
 func (h *harness) counts(f *upstreamFile) map[string][2]int64 {
-	return map[string][2]int64{"plain": f.counts(), "assembled": h.assembled.counts(), "xet": h.xet.counts()}
+	return map[string][2]int64{"plain": f.counts(), "assembled": h.assembled.counts(), "xet": h.xet.counts(), "xet-split": h.xetSplit.counts()}
 }
 
 // finishRow checks the bytes of the last of n downloads, the go-xet fallbacks and the path the downloads took.
@@ -677,7 +680,7 @@ func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, b
 	}
 	if r.client == "go-xet" {
 		want := n
-		if r.server == "xet" {
+		if r.server == "xet" || r.server == "xet-split" {
 			want = 0
 		}
 		if fellBack != want {
@@ -693,7 +696,7 @@ func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, b
 			ok = d == [2]int64{}
 		case s == "plain":
 			ok = true
-		case s == "xet" && (r.client == "go-xet" || r.client == "hf-xet"):
+		case (s == "xet" || s == "xet-split") && (r.client == "go-xet" || r.client == "hf-xet"):
 			ok = d[0] == 0 && d[1] > 0
 		default:
 			ok = d[0] > 0 && d[1] == 0
