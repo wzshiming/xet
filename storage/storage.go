@@ -17,7 +17,7 @@ var ErrInvalidShard = errors.New("invalid shard")
 type Storage interface {
 	// Xorb objects: content-addressed chunk data under xorbs/.
 
-	// PutXorb stores an xorb by its hash
+	// PutXorb stores an xorb by its hash; a repeat put reports false and leaves the stored object untouched.
 	PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error)
 
 	// HasXorb checks whether an xorb exists.

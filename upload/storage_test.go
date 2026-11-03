@@ -125,8 +125,8 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 			t.Fatalf("%s: PutFile: %v", file.name, err)
 		}
 		got, err := UploadFile(ctx, storageClient{uploaded}, bytes.NewReader(file.data), WithEnableSHA256(true), WithCacheManager(NewCacheManager(t.TempDir(), 0)))
-		if err != nil || got != want {
-			t.Fatalf("%s: UploadFile() = %s, %v; PutFile() = %s", file.name, got.String(), err, want.String())
+		if err != nil || got != want.FileHash {
+			t.Fatalf("%s: UploadFile() = %s, %v; PutFile() = %s", file.name, got.String(), err, want.FileHash.String())
 		}
 		nativeState, uploadedState := snapshot(t, ctx, native), snapshot(t, ctx, uploaded)
 		if !reflect.DeepEqual(uploadedState, nativeState) {
@@ -141,8 +141,8 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 
 	// Unlike UploadFile's zero-entry shard, PutFile stores nothing for an empty file.
 	before := snapshot(t, ctx, native)
-	if fileHash, err := storage.PutFile(ctx, native, bytes.NewReader(nil)); err != nil || fileHash != (xet.FileHash{}) {
-		t.Fatalf("empty: PutFile() = %s, %v; want the zero hash", fileHash.String(), err)
+	if res, err := storage.PutFile(ctx, native, bytes.NewReader(nil)); err != nil || res.FileHash != (xet.FileHash{}) {
+		t.Fatalf("empty: PutFile() = %s, %v; want the zero hash", res.FileHash.String(), err)
 	}
 	if after := snapshot(t, ctx, native); !reflect.DeepEqual(after, before) {
 		t.Fatalf("empty: PutFile changed the store to shards %v, file index %v from %v, %v", after.shards, after.fileIndex, before.shards, before.fileIndex)

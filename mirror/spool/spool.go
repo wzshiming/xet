@@ -6,10 +6,11 @@
 // Spool is the ledger of the downloads in flight through one spool directory,
 // keyed by spool path. Accept hands a caller the writer of a new flight or a
 // follower of the one already spooling the same content on the same origin;
-// the writer's Finish verifies and ingests the bytes, and Wait settles every
-// Item on that one result checked against its own expectations. Sweep removes
-// the idle spool files; a leftover spilled by a crashed process is resumed by
-// the next Accept that names it, never scanned for.
+// a writer's Accept starts the ingest tailing the spool, its Finish ends the
+// download and settles the flight on the verified result, and Wait settles
+// every Item on that one result checked against its own expectations. Sweep
+// removes the idle spool files; a leftover spilled by a crashed process is
+// resumed by the next Accept that names it, never scanned for.
 package spool
 
 import (
@@ -18,6 +19,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -72,10 +74,11 @@ type Source struct {
 	SHA256 string // lowercase hex digest the bytes must hash to, "" when unknown
 }
 
-// flight is one download: its spool, size knowledge and outcome, shared by every Item attached to it. Each Item holds the spool until Release; the writer's hold outlasts the registration, so a registered flight's spool is live.
+// flight is one download: its spool, ingest, size knowledge and outcome, shared by every Item attached to it. Each Item holds the spool until Release; the writer's hold outlasts the registration, so a registered flight's spool is live.
 type flight struct {
 	swmr     ioswmr.SWMR
 	path     string // the spool file, present only once spilled or adopted
+	ingest   *ingest
 	sized    chan struct{}
 	sizeOnce sync.Once
 	size     atomic.Int64 // -1 until known
@@ -165,7 +168,7 @@ func (it *Item) SetSize(n int64) {
 	}
 }
 
-// Accept attaches src to the download of its content: as a follower of the flight already spooling it on src.Origin, else as the writer of a new one; ctx bounds only the wait for a leader's size. A spool has one writer: a second Accept naming the same spool while it is in flight is refused.
+// Accept attaches src to the download of its content: as a follower of the flight already spooling it on src.Origin, else as the writer of a new one, whose ingest it starts; ctx bounds only the wait for a leader's size. A spool has one writer: a second Accept naming the same spool while it is in flight is refused.
 func (s *Spool) Accept(ctx context.Context, src Source) (*Item, error) {
 	content := isContentHash(src.ETag)
 	var sharedPath string
@@ -212,19 +215,33 @@ func (s *Spool) Accept(ctx context.Context, src Source) (*Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	hold, _ := swmr.NewReader(0) // a fresh spool cannot have retired; the writer's hold lasts until Release
+	// A fresh spool cannot have retired: the writer's hold lasts until Release, the ingest's tail until PutFile returned.
+	hold, _ := swmr.NewReader(0)
+	r, _ := swmr.NewReader(0)
 	f := &flight{swmr: swmr, path: path, sized: make(chan struct{}), done: make(chan struct{})}
 	f.size.Store(-1)
 	if src.Size >= 0 {
 		f.setSize(src.Size)
 	}
+	ingestCtx, cancel := context.WithCancel(context.Background()) // no caller's disconnect cancels an ingest
+	in := &ingest{src: &tail{swmr: swmr, r: r, want: src.SHA256}, cancel: cancel, done: make(chan struct{})}
+	if src.SHA256 != "" {
+		in.src.sum = sha256.New()
+	}
+	f.ingest = in
+	// Registered before the ingest starts: a storing flight is always in the ledger, so a colliding Accept is refused.
 	s.mu.Lock()
 	s.flights[path] = f
 	s.mu.Unlock()
+	go func() {
+		defer close(in.done)
+		in.res, in.err = storage.PutFile(ingestCtx, s.st, in.src, storage.WithPins(s.pins))
+		_ = r.Close()
+	}()
 	return &Item{s: s, f: f, src: src, hold: hold, w: swmr.Writer()}, nil
 }
 
-// Finish ends the writer's download with err and, on success, verifies and ingests the spooled bytes into storage; once per flight, a no-op for followers, ctx bounds the ingest.
+// Finish ends the writer's download with err and settles the flight once its ingest exited: on success it closes the spool so the running ingest completes, ctx bounding that wait; once per flight, a no-op for followers.
 func (it *Item) Finish(ctx context.Context, err error) {
 	if it.w == nil {
 		return
@@ -232,21 +249,42 @@ func (it *Item) Finish(ctx context.Context, err error) {
 	s, f := it.s, it.f
 	f.once.Do(func() {
 		var res Result
+		in := f.ingest
 		size := it.Written()
 		if want := f.size.Load(); err == nil && want >= 0 && size != want {
 			err = fmt.Errorf("spool: size mismatch: got %d bytes, want %d", size, want)
 		}
 		if err != nil {
 			_ = it.w.CloseWithError(err)
+			in.cancel()
+			<-in.done
 		} else {
 			f.size.Store(size)
 			f.setSize(-1)                // definitive size stored above; size waiters need not wait for the ingest
-			_ = it.w.CloseWithError(nil) // readers drain to EOF while the ingest runs
-			if rs, e := it.NewSeekReader(0, int(size)); e != nil {
-				err = e
-			} else {
-				res, err = ingest(ctx, s.st, rs, it.src.SHA256, storage.WithPins(s.pins))
-				_ = rs.Close()
+			_ = it.w.CloseWithError(nil) // readers drain to EOF while the ingest's tail completes
+			ctxDone := ctx.Done()
+			select {
+			case <-in.done:
+				ctxDone = nil // an ingest already ended keeps its outcome over a done ctx
+			default:
+			}
+			select {
+			case <-in.done:
+				switch {
+				case in.src.err != nil:
+					err = in.src.err
+				case in.err != nil:
+					err = fmt.Errorf("ingest into storage: %w", in.err)
+				default:
+					res = Result{SHA256: hex.EncodeToString(in.res.SHA256[:]), Size: in.res.Size}
+					if res.Size > 0 {
+						res.FileHash = in.res.FileHash.String()
+					}
+				}
+			case <-ctxDone:
+				in.cancel()
+				<-in.done
+				err = fmt.Errorf("ingest into storage: %w", ctx.Err())
 			}
 		}
 		f.setSize(-1)
@@ -272,31 +310,46 @@ type Result struct {
 	Size     int64
 }
 
-// ingest verifies the spooled bytes against wantSHA256 (when given) and
-// stores them in st.
-func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256 string, opts ...storage.PutFileOption) (Result, error) {
-	hasher := sha256.New()
-	size, err := io.Copy(hasher, r)
-	if err != nil {
-		return Result{}, fmt.Errorf("hash spool: %w", err)
-	}
-	digest := hex.EncodeToString(hasher.Sum(nil))
-	if wantSHA256 != "" && digest != wantSHA256 {
-		return Result{}, fmt.Errorf("%w: sha256 mismatch: got %s, expected %s", ErrCorrupt, digest, wantSHA256)
-	}
+// ingest is a writer flight's storage.PutFile over its tail, started by Accept and awaited by Finish.
+type ingest struct {
+	src    *tail
+	cancel context.CancelFunc
+	done   chan struct{} // closed once PutFile returned and the tail reader was closed
+	res    storage.PutFileResult
+	err    error
+}
 
-	res := Result{SHA256: digest, Size: size}
-	if size > 0 {
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return Result{}, fmt.Errorf("rewind spool: %w", err)
-		}
-		fileHash, err := storage.PutFile(ctx, st, r, opts...)
-		if err != nil {
-			return Result{}, fmt.Errorf("ingest into storage: %w", err)
-		}
-		res.FileHash = fileHash.String()
+// tail is the ingest's storage.Source: the spool read from its start, digested only against a sha256 claim, its end refused when the bytes disagree with that claim.
+type tail struct {
+	swmr ioswmr.SWMR
+	r    io.ReadCloser
+	want string // the claimed sha256, "" when unknown
+	sum  hash.Hash
+	err  error // the refused end
+}
+
+func (t *tail) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if t.sum != nil {
+		t.sum.Write(p[:n])
 	}
-	return res, nil
+	if err == io.EOF && t.want != "" {
+		if got := hex.EncodeToString(t.sum.Sum(nil)); got != t.want {
+			t.err = fmt.Errorf("%w: sha256 mismatch: got %s, expected %s", ErrCorrupt, got, t.want)
+			return n, t.err
+		}
+	}
+	return n, err
+}
+
+// ReadAt admits a reader of its own for the delivered range and closes it, so the spool still retires with its last reader.
+func (t *tail) ReadAt(p []byte, off int64) (int, error) {
+	r, err := t.swmr.NewReadSeeker(int(off), int(off)+len(p))
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+	return io.ReadFull(r, p)
 }
 
 // Wait blocks until the Item's flight ended and returns its result, checked against the Item's own Source.

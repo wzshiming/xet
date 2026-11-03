@@ -261,18 +261,19 @@ func isS3NotFound(err error) bool {
 	return false
 }
 
-func (ss *Storage) headObject(ctx context.Context, key string) (int64, bool, error) {
-	out, err := ss.client.HeadObject(ctx, &awss3.HeadObjectInput{
+// headObject reports whether key exists; not-found is false, not an error.
+func (ss *Storage) headObject(ctx context.Context, key string) (bool, error) {
+	_, err := ss.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(ss.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isS3NotFound(err) {
-			return 0, false, nil
+			return false, nil
 		}
-		return 0, false, err
+		return false, err
 	}
-	return aws.ToInt64(out.ContentLength), true, nil
+	return true, nil
 }
 
 func (ss *Storage) getObject(ctx context.Context, key string) ([]byte, error) {
@@ -318,7 +319,7 @@ func (ss *Storage) putIndexObject(ctx context.Context, key string, value []byte)
 func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	key := ss.objectKey("xorbs", xorbHash.String())
 
-	if _, exists, err := ss.headObject(ctx, key); err != nil {
+	if exists, err := ss.headObject(ctx, key); err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
 	} else if exists {
 		// Dedup hits leave the stored object, including LastModified, untouched.
@@ -362,7 +363,7 @@ func (ss *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 	if ss.xorbCache.Has(xorbHash) {
 		return true, nil
 	}
-	_, exists, err := ss.headObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
+	exists, err := ss.headObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
 	if err != nil {
 		return false, fmt.Errorf("check xorb object: %w", err)
 	}
@@ -399,7 +400,7 @@ func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, er
 		return true, nil
 	}
 
-	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
+	exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
 		return false, fmt.Errorf("check file index: %w", err)
 	}
@@ -435,7 +436,7 @@ func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 
 	shardKey := ss.objectKey("shards", shardHash)
 	wasInserted := true
-	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
+	if exists, err := ss.headObject(ctx, shardKey); err != nil {
 		return false, fmt.Errorf("check shard object: %w", err)
 	} else if exists {
 		wasInserted = false
@@ -717,7 +718,7 @@ func (ss *Storage) deleteObject(ctx context.Context, key string) error {
 // whether it existed.
 func (ss *Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error) {
 	key := ss.objectKey("index/files", fileHash.String())
-	_, exists, err := ss.headObject(ctx, key)
+	exists, err := ss.headObject(ctx, key)
 	if err != nil {
 		return false, fmt.Errorf("check file index: %w", err)
 	}
@@ -816,7 +817,7 @@ func (ss *Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (s
 // it existed.
 func (ss *Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
 	key := ss.objectKey("index/sha256", sha256Hex)
-	_, exists, err := ss.headObject(ctx, key)
+	exists, err := ss.headObject(ctx, key)
 	if err != nil {
 		return false, fmt.Errorf("check SHA-256 index: %w", err)
 	}
