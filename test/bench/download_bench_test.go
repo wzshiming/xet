@@ -1,11 +1,14 @@
 // Package bench_test times whole-file downloads over a server × client matrix
-// on an in-process fake upstream hub and two xet mirrors of it.
+// on an in-process fake upstream hub and three xet mirrors of it.
 //
 // Servers:
 //   - plain: the fake upstream; no xet.
 //   - assembled: a mirror whose resolve answers lose Link and X-Xet-Hash to a
 //     test-side filter, so the server reconstructs every download.
-//   - xet: the unfiltered mirror; xet clients reconstruct the file themselves.
+//   - xet: an unfiltered mirror; xet clients reconstruct the file themselves.
+//   - xet-split: xet with server.WithTermSplit(16, 1<<20), xetd's default: a
+//     reconstruction response with fewer than 16 terms has its largest terms
+//     halved until it has 16 or a cut would leave a piece under 1 MiB.
 //
 // Clients:
 //   - go-http: net/http following the resolve redirects.
@@ -26,9 +29,9 @@
 //
 // and compare runs with benchstat. The Download benchmark workflow runs it on
 // demand (workflow_dispatch) and on pull requests that touch test/bench.
-// A full run peaks at about 8.6 GiB in TMPDIR;
+// A full run peaks at about 10.3 GiB in TMPDIR;
 // -bench 'Download/size=(1MiB|64MiB|256MiB)' leaves out the 1 GiB rows, peaks
-// at about 2.1 GiB and needs only -timeout 60m.
+// at about 2.4 GiB and needs only -timeout 60m.
 // Fixtures are built and ingested once per process, and -count repeats only
 // the rows. Results are indicative only.
 package bench_test
