@@ -146,6 +146,10 @@ type SweepOptions struct {
 // writer, S3 its last — so that lookup misses until an upload of the content under a chunking with no
 // files entry rewrites it; the live file stays whole and file-hash resolvable.
 //
+// PutShard writes chunk entries only for probe-able chunks (shard.GlobalDedupEligibleChunks), and
+// the sweep visits exactly those. Entries earlier versions wrote for other chunks are never
+// visited, so they may outlive their shard; that is accepted, with no compatibility for old stores.
+//
 // The grace window shields uploads mid-commit (PutShard: xorbs, shard, chunks, sha256, files entry
 // last); negative Grace disables it — quiescent stores only. Guards are read-then-delete without
 // compare-and-delete: a commit landing between a final read and the delete can lose that shard or
@@ -436,20 +440,18 @@ func sweepShard(ctx context.Context, st Storage, res *SweepResult, anchor SweepA
 			return false, err
 		}
 	}
-	for i := range sh.CASInfos {
-		for _, chunk := range sh.CASInfos[i].Chunks {
-			current, err := st.GetChunkIndexEntry(ctx, chunk.ChunkHash)
-			if err != nil {
-				return false, err
-			}
-			if current != shardHash {
-				continue
-			}
-			if err := st.DeleteChunkIndexEntry(ctx, chunk.ChunkHash); err != nil {
-				return false, err
-			}
-			res.DeletedChunkEntries++
+	for _, e := range sh.GlobalDedupEligibleChunks() {
+		current, err := st.GetChunkIndexEntry(ctx, e.Hash)
+		if err != nil {
+			return false, err
 		}
+		if current != shardHash {
+			continue
+		}
+		if err := st.DeleteChunkIndexEntry(ctx, e.Hash); err != nil {
+			return false, err
+		}
+		res.DeletedChunkEntries++
 	}
 	return true, st.DeleteShard(ctx, shardHash)
 }

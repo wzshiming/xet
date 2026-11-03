@@ -15,6 +15,7 @@ import (
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/test/conformance/rustref"
@@ -428,25 +429,52 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("get shard by file hash: %v", err)
 	}
 
+	fileStart, nonProbeable, ok := testutil.DedupProbeTargets(testutil.LocalChunkHashes(t, data))
+	if !ok {
+		t.Fatal("fixture has no chunk past the first that is neither its first chunk nor hash-sampled")
+	}
+
 	var targetChunk xet.ChunkHash
 	var expectedXorb xet.XorbHash
 	var expectedIndex uint32
 	found := false
-	for _, cas := range shardObj.CASInfos {
-		if len(cas.Chunks) < 2 {
+	for _, file := range shardObj.Files {
+		if file.FileHash != fileHash || len(file.Entries) == 0 {
 			continue
 		}
-		targetChunk = cas.Chunks[1].ChunkHash
-		expectedXorb = cas.CASHash
-		expectedIndex = 1
-		found = true
-		break
+		first := file.Entries[0]
+		for _, cas := range shardObj.CASInfos {
+			if cas.CASHash == first.CASHash {
+				targetChunk = cas.Chunks[first.ChunkIndexStart].ChunkHash
+				expectedXorb = cas.CASHash
+				expectedIndex = first.ChunkIndexStart
+				found = true
+			}
+		}
 	}
 	if !found {
-		t.Skip("uploaded shard did not contain a CAS block with at least two chunks")
+		t.Fatalf("shard stores no chunk at the first term of file %s", fileHash)
+	}
+	if targetChunk != fileStart {
+		t.Fatalf("shard starts file %s with chunk %s, want the fixture's first chunk %s", fileHash, targetChunk, fileStart)
 	}
 
-	body, err := json.Marshal(map[string]any{"chunk_hashes": []string{targetChunk.String()}})
+	loc, ok := shardObj.LookupChunk(nonProbeable)
+	if !ok {
+		t.Fatalf("shard does not store chunk %s", nonProbeable)
+	}
+	for _, cas := range shardObj.CASInfos {
+		if cas.CASHash == loc.XorbHash && cas.Chunks[loc.ChunkIndex].Flags&shard.ChunkGlobalDedupEligible != 0 {
+			t.Fatalf("shard flags chunk %s global-dedup eligible", nonProbeable)
+		}
+	}
+	for _, file := range shardObj.Files {
+		if len(file.Entries) > 0 && file.Entries[0].CASHash == loc.XorbHash && file.Entries[0].ChunkIndexStart == loc.ChunkIndex {
+			t.Fatalf("chunk %s starts file %s", nonProbeable, file.FileHash)
+		}
+	}
+
+	body, err := json.Marshal(map[string]any{"chunk_hashes": []string{targetChunk.String(), nonProbeable.String()}})
 	if err != nil {
 		t.Fatalf("marshal request body: %v", err)
 	}
@@ -462,30 +490,42 @@ func TestServerBatchDedupChunkIndexConformance(t *testing.T) {
 		t.Fatalf("batch dedup status=%d body=%s", resp.StatusCode, string(b))
 	}
 
+	type batchResult struct {
+		ChunkHash  string `json:"chunk_hash"`
+		Found      bool   `json:"found"`
+		XorbHash   string `json:"xorb_hash"`
+		ChunkIndex uint32 `json:"chunk_index"`
+	}
 	var batchResp struct {
-		Results []struct {
-			ChunkHash  string `json:"chunk_hash"`
-			Found      bool   `json:"found"`
-			XorbHash   string `json:"xorb_hash"`
-			ChunkIndex uint32 `json:"chunk_index"`
-		} `json:"results"`
+		Results []batchResult `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 		t.Fatalf("decode batch response: %v", err)
 	}
 
-	if len(batchResp.Results) != 1 {
-		t.Fatalf("expected one batch result, got %d", len(batchResp.Results))
+	if len(batchResp.Results) != 2 {
+		t.Fatalf("expected two batch results, got %d", len(batchResp.Results))
 	}
-	result := batchResp.Results[0]
-	if !result.Found {
+	results := make(map[string]batchResult, len(batchResp.Results))
+	for _, result := range batchResp.Results {
+		results[result.ChunkHash] = result
+	}
+	hit := results[targetChunk.String()]
+	if !hit.Found {
 		t.Fatalf("expected found=true for chunk %s", targetChunk.String())
 	}
-	if result.XorbHash != expectedXorb.String() {
-		t.Fatalf("unexpected xorb hash: got %s want %s", result.XorbHash, expectedXorb.String())
+	if hit.XorbHash != expectedXorb.String() {
+		t.Fatalf("unexpected xorb hash: got %s want %s", hit.XorbHash, expectedXorb.String())
 	}
-	if result.ChunkIndex != expectedIndex {
-		t.Fatalf("unexpected chunk index: got %d want %d", result.ChunkIndex, expectedIndex)
+	if hit.ChunkIndex != expectedIndex {
+		t.Fatalf("unexpected chunk index: got %d want %d", hit.ChunkIndex, expectedIndex)
+	}
+	miss, ok := results[nonProbeable.String()]
+	if !ok {
+		t.Fatalf("no batch result for chunk %s", nonProbeable)
+	}
+	if miss.Found {
+		t.Fatalf("expected found=false for non-probe-able chunk %s, got xorb %s index %d", nonProbeable, miss.XorbHash, miss.ChunkIndex)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -423,6 +424,32 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 				t.Errorf("stored %d objects, want %d: %v", len(keys), len(want), keys)
 			}
 		})
+	}
+}
+
+// TestS3ChunkIndexHoldsOnlyProbeableChunks pins the chunk index objects to a
+// file's probe-able chunks: its first and its sampled chunk, not its plain one.
+func TestS3ChunkIndexHoldsOnlyProbeableChunks(t *testing.T) {
+	ctx := context.Background()
+	ss := newTestS3Storage(t)
+	f := storagetest.PutFile(t, ctx, ss, [][]byte{
+		storagetest.PlainChunk(t, "start"), storagetest.SampledChunk(t, "mid"), storagetest.PlainChunk(t, "tail"),
+	})
+
+	var got []string
+	for key := range listObjectKeys(t, ss) {
+		if strings.HasPrefix(key, "index/chunks/") {
+			got = append(got, key)
+		}
+	}
+	want := []string{
+		ss.objectKey("index/chunks", f.ChunkHashes[0].String()),
+		ss.objectKey("index/chunks", f.ChunkHashes[1].String()),
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("chunk index objects = %v, want exactly %v", got, want)
 	}
 }
 

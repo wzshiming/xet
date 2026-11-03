@@ -195,6 +195,49 @@ func (s *Shard) ChunkLocations() map[xet.ChunkHash]ChunkLocation {
 	return stored
 }
 
+// LocatedChunk is a stored chunk hash with where the shard stores it.
+type LocatedChunk struct {
+	Hash xet.ChunkHash
+	ChunkLocation
+}
+
+// GlobalDedupEligibleChunks lists the chunks a global deduplication probe
+// may ask this shard for, with where it stores each — the counterpart of
+// xet-core's global_dedup_eligible_chunks(): the first chunk of every file
+// whose first term lands in one of the shard's own xorbs, every entry
+// flagged ChunkGlobalDedupEligible, and every hash-sampled entry
+// (IsChunkGlobalDedupEligible). Entries follow CASInfos order then chunk
+// order; a hash stored more than once keeps its first eligible location.
+// Hashes are the stored ones, as in ChunkLocations.
+func (s *Shard) GlobalDedupEligibleChunks() []LocatedChunk {
+	fileStarts := make(map[ChunkLocation]struct{}, len(s.Files))
+	for _, file := range s.Files {
+		if len(file.Entries) == 0 {
+			continue
+		}
+		first := file.Entries[0]
+		fileStarts[ChunkLocation{XorbHash: first.CASHash, ChunkIndex: first.ChunkIndexStart}] = struct{}{}
+	}
+
+	var eligible []LocatedChunk
+	seen := make(map[xet.ChunkHash]struct{})
+	for _, block := range s.CASInfos {
+		for i, chunk := range block.Chunks {
+			loc := ChunkLocation{XorbHash: block.CASHash, ChunkIndex: uint32(i)}
+			_, isFirst := fileStarts[loc]
+			if !IsChunkGlobalDedupEligible(chunk.ChunkHash, isFirst, chunk.Flags) {
+				continue
+			}
+			if _, dup := seen[chunk.ChunkHash]; dup {
+				continue
+			}
+			seen[chunk.ChunkHash] = struct{}{}
+			eligible = append(eligible, LocatedChunk{Hash: chunk.ChunkHash, ChunkLocation: loc})
+		}
+	}
+	return eligible
+}
+
 // LookupChunk finds where the shard stores chunk h.
 func (s *Shard) LookupChunk(h xet.ChunkHash) (ChunkLocation, bool) {
 	stored := s.storedHash(h)

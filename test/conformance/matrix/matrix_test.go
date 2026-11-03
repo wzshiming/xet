@@ -407,19 +407,6 @@ func writeFixtures(t *testing.T, fixtures []fixture, prefix string) []string {
 // Batch endpoint conformance (chunk-dedup query and batch reconstruction).
 // ---------------------------------------------------------------------------
 
-func localChunkHashes(t *testing.T, data []byte) []xet.ChunkHash {
-	t.Helper()
-	var hashes []xet.ChunkHash
-	err := xet.ChunkData(bytes.NewReader(data), func(offset int64, chunk []byte) error {
-		hashes = append(hashes, xet.ComputeChunkHash(chunk))
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("chunk fixture data: %v", err)
-	}
-	return hashes
-}
-
 func batchReconstructionURL(endpoint string, hashes ...xet.FileHash) string {
 	query := url.Values{}
 	for _, hash := range hashes {
@@ -451,9 +438,9 @@ func getJSON[T any](t *testing.T, endpoint string) T {
 }
 
 // testBatchChunkDedup verifies that the batch chunk-dedup query endpoint
-// (POST /v1/chunks/default:query) resolves an uploaded chunk to the xorb and
-// index reported by the file's v1 reconstruction.
-func testBatchChunkDedup(t *testing.T, serverName, endpoint string, fileHash xet.FileHash, targetChunk xet.ChunkHash) {
+// (POST /v1/chunks/default:query) resolves a file's first chunk to the xorb
+// and index where the file's v1 reconstruction starts.
+func testBatchChunkDedup(t *testing.T, serverName, endpoint string, fileHash xet.FileHash, fileStart xet.ChunkHash) {
 	t.Helper()
 
 	reconResp := getJSON[xetdownload.ReconstructionResponseV1](t, endpoint+"/v1/reconstructions/"+fileHash.String())
@@ -462,7 +449,7 @@ func testBatchChunkDedup(t *testing.T, serverName, endpoint string, fileHash xet
 	}
 	term := reconResp.Terms[0]
 
-	body, err := json.Marshal(map[string]any{"chunk_hashes": []string{targetChunk.String()}})
+	body, err := json.Marshal(map[string]any{"chunk_hashes": []string{fileStart.String()}})
 	if err != nil {
 		t.Fatalf("marshal request body: %v", err)
 	}
@@ -498,18 +485,64 @@ func testBatchChunkDedup(t *testing.T, serverName, endpoint string, fileHash xet
 	}
 	result := batchResp.Results[0]
 	if !result.Found {
-		t.Fatalf("expected found=true for chunk %s", targetChunk.String())
+		t.Fatalf("expected found=true for chunk %s", fileStart.String())
 	}
 	if result.XorbHash != term.Hash {
 		t.Errorf("unexpected xorb hash: got %s want %s", result.XorbHash, term.Hash)
 	}
-	if result.ChunkIndex != term.Range.Start+1 {
-		t.Errorf("unexpected chunk index: got %d want %d", result.ChunkIndex, term.Range.Start+1)
+	if result.ChunkIndex != term.Range.Start {
+		t.Errorf("unexpected chunk index: got %d want %d", result.ChunkIndex, term.Range.Start)
 	}
 }
 
-// TestCompatibilityMatrixBatch exercises the batch chunk-dedup query endpoint
-// (POST /v1/chunks/default:query) and the batch reconstruction endpoint
+// testChunkDedupGetProbeableOnly verifies the dedup GET locates fileStart and 404s nonProbeable.
+func testChunkDedupGetProbeableOnly(t *testing.T, endpoint string, fileHash xet.FileHash, fileStart, nonProbeable xet.ChunkHash) {
+	t.Helper()
+
+	reconResp := getJSON[xetdownload.ReconstructionResponseV1](t, endpoint+"/v1/reconstructions/"+fileHash.String())
+	if len(reconResp.Terms) != 1 {
+		t.Skipf("fixture split into %d terms, cannot compute expected xorb/index generically", len(reconResp.Terms))
+	}
+	term := reconResp.Terms[0]
+
+	resp, err := http.Get(endpoint + "/v1/chunks/default/" + fileStart.String())
+	if err != nil {
+		t.Fatalf("GET dedup shard for chunk %s: %v", fileStart, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET dedup shard for file-start chunk %s: status=%d body=%s", fileStart, resp.StatusCode, b)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read dedup shard for chunk %s: %v", fileStart, err)
+	}
+	dedupShard, err := testutil.DecodeDedupShard(body)
+	if err != nil {
+		t.Fatalf("decode dedup shard: %v", err)
+	}
+	loc, ok := dedupShard.LookupChunk(fileStart)
+	if !ok {
+		t.Fatalf("dedup shard does not store chunk %s", fileStart)
+	}
+	if loc.XorbHash.String() != term.Hash || loc.ChunkIndex != term.Range.Start {
+		t.Errorf("chunk %s at %s[%d], want %s[%d]", fileStart, loc.XorbHash, loc.ChunkIndex, term.Hash, term.Range.Start)
+	}
+
+	missResp, err := http.Get(endpoint + "/v1/chunks/default/" + nonProbeable.String())
+	if err != nil {
+		t.Fatalf("GET dedup shard for chunk %s: %v", nonProbeable, err)
+	}
+	missResp.Body.Close()
+	if missResp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET dedup shard for non-probe-able chunk %s: status=%d, want %d", nonProbeable, missResp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// TestCompatibilityMatrixBatch exercises the chunk-dedup endpoints
+// (POST /v1/chunks/default:query and GET /v1/chunks/default/{hash}) and the
+// batch reconstruction endpoint
 // (GET /reconstructions?file_id=<h1>&file_id=<h2>...) against every server
 // kind and protocol, sharing one server and one set of uploads per
 // combination. It only relies on public upload/reconstruction APIs, so the
@@ -521,9 +554,9 @@ func TestCompatibilityMatrixBatch(t *testing.T) {
 		utils.MakeRandData(2 * 1024 * 1024),
 		utils.MakeRepeatData(2 * 1024 * 1024),
 	}
-	dedupChunks := localChunkHashes(t, datasets[1])
-	if len(dedupChunks) < 2 {
-		t.Fatalf("fixture produced %d chunks, want at least 2", len(dedupChunks))
+	fileStart, nonProbeable, ok := testutil.DedupProbeTargets(testutil.LocalChunkHashes(t, datasets[1]))
+	if !ok {
+		t.Fatal("fixture has no chunk past the first that is neither its first chunk nor hash-sampled")
 	}
 
 	runServerProtocolMatrix(t, func(t *testing.T, server serverKind, protocol rustref.ProtocolVersion) {
@@ -540,7 +573,11 @@ func TestCompatibilityMatrixBatch(t *testing.T) {
 		}
 
 		t.Run("chunk_dedup_query", func(t *testing.T) {
-			testBatchChunkDedup(t, server.name, running.endpoint, hashes[1], dedupChunks[1])
+			testBatchChunkDedup(t, server.name, running.endpoint, hashes[1], fileStart)
+		})
+
+		t.Run("chunk_dedup_get_probeable_only", func(t *testing.T) {
+			testChunkDedupGetProbeableOnly(t, running.endpoint, hashes[1], fileStart, nonProbeable)
 		})
 
 		requireBatchReconstruction(t, server.name, running.endpoint)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,33 @@ func EncodeXorb(tb testing.TB, withFooter bool, chunks ...[]byte) ([]byte, xet.X
 		tb.Fatal(err)
 	}
 	return encoded.Bytes(), enc.SummoryHash()
+}
+
+// SampledChunk returns a chunk payload whose hash passes the global-dedup sampling rule.
+func SampledChunk(tb testing.TB, label string) []byte {
+	tb.Helper()
+	return chunkWithSamplingVerdict(tb, label, true)
+}
+
+// PlainChunk returns a chunk payload whose hash fails the sampling rule: it is indexed
+// only as a file's first chunk or when flagged.
+func PlainChunk(tb testing.TB, label string) []byte {
+	tb.Helper()
+	return chunkWithSamplingVerdict(tb, label, false)
+}
+
+// chunkWithSamplingVerdict returns label#n for the least n whose chunk hash's sampling verdict equals sampled.
+func chunkWithSamplingVerdict(tb testing.TB, label string, sampled bool) []byte {
+	tb.Helper()
+	const attempts = 1 << 16
+	for n := range attempts {
+		payload := []byte(label + "#" + strconv.Itoa(n))
+		if shard.IsChunkGlobalDedupEligible(xet.ComputeChunkHash(payload), false, 0) == sampled {
+			return payload
+		}
+	}
+	tb.Fatalf("no %q#n payload with sampled=%v in %d attempts", label, sampled, attempts)
+	return nil
 }
 
 // AddFileBlock stores one single-chunk xorb per part and appends the
@@ -197,7 +225,8 @@ func sortedSwept(objs []storage.SweptObject) []storage.SweptObject {
 }
 
 // assertChunkEntriesIntact fails when an aborted shard deletion touched the
-// chunk entries a racing commit relies on for dedup.
+// chunk entries a racing commit relies on for dedup. It applies to files
+// whose every chunk is probe-able, such as single-chunk files.
 func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs storage.Storage, f File, res *storage.SweepResult) {
 	t.Helper()
 	if res.DeletedChunkEntries != 0 {
@@ -207,6 +236,14 @@ func assertChunkEntriesIntact(t *testing.T, ctx context.Context, gcs storage.Sto
 		if got, err := gcs.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != f.ShardHash {
 			t.Fatalf("chunk entry = %q, %v; want %q", got, err, f.ShardHash)
 		}
+	}
+}
+
+// assertChunkIndexEntry fails unless the chunk index maps chunkHash to want; "" asserts no entry.
+func assertChunkIndexEntry(tb testing.TB, ctx context.Context, st storage.Storage, chunkHash xet.ChunkHash, want string) {
+	tb.Helper()
+	if got, err := st.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != want {
+		tb.Fatalf("chunk entry %s = %q, %v; want %q", chunkHash.String(), got, err, want)
 	}
 }
 
@@ -249,6 +286,9 @@ type hookedGCStore struct {
 	loadShardCalls   int    // LoadShard invocations
 	cachedShardGets  int    // GetShardByHash invocations (GC must not)
 	loadShardErrs    map[string]error
+	// Arguments of every GetChunkIndexEntry / DeleteChunkIndexEntry call, in call order.
+	chunkEntryGets    []xet.ChunkHash
+	chunkEntryDeletes []xet.ChunkHash
 }
 
 // agedStore wraps st so every stored object looks written two hours ago.
@@ -305,6 +345,16 @@ func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex strin
 		h.onSHA256EntryGet(h.sha256EntryGets)
 	}
 	return h.Storage.GetSHA256IndexEntry(ctx, sha256Hex)
+}
+
+func (h *hookedGCStore) GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (string, error) {
+	h.chunkEntryGets = append(h.chunkEntryGets, chunkHash)
+	return h.Storage.GetChunkIndexEntry(ctx, chunkHash)
+}
+
+func (h *hookedGCStore) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error {
+	h.chunkEntryDeletes = append(h.chunkEntryDeletes, chunkHash)
+	return h.Storage.DeleteChunkIndexEntry(ctx, chunkHash)
 }
 
 func (h *hookedGCStore) GetShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {

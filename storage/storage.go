@@ -48,7 +48,9 @@ type Storage interface {
 	// GetShard retrieves a shard by file hash
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)
 
-	// GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)
+	// GetShardByChunkHash retrieves a shard by chunk hash (for deduplication).
+	// PutShard writes an entry only for a probe-able chunk of the shard
+	// (shard.GlobalDedupEligibleChunks); a hash PutShard did not index is not found.
 	GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error)
 
 	// GetShardByHash loads by serialized shard hash, wrapping fs.ErrNotExist when absent.
@@ -82,10 +84,13 @@ type Storage interface {
 	// DeleteFileIndexEntry removes the index/files entry for fileHash, reporting whether it existed.
 	DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error)
 
-	// GetChunkIndexEntry returns the shard hash recorded for chunkHash, "" when absent, bypassing caches.
+	// GetChunkIndexEntry returns the shard hash recorded for chunkHash, "" when absent,
+	// bypassing caches. PutShard writes an entry only for a probe-able chunk of the shard
+	// (shard.GlobalDedupEligibleChunks); a hash PutShard did not index is not found.
 	GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (string, error)
 
 	// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
+	// Sweeps call it only for a dead shard's probe-able chunks.
 	DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error
 
 	// WalkSHA256Index calls fn for every index/sha256 entry.

@@ -222,11 +222,13 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	st := b.New(t)
 
 	shared := []byte("chunk shared by both files")
-	fileA := PutFile(t, ctx, st, [][]byte{shared, []byte("exclusive to A")})
-	fileB := PutFile(t, ctx, st, [][]byte{shared, []byte("exclusive to B")})
+	fileA := PutFile(t, ctx, st, [][]byte{shared, SampledChunk(t, "exclusive to A")})
+	fileB := PutFile(t, ctx, st, [][]byte{shared, PlainChunk(t, "exclusive to B")})
 	if fileA.XorbHashes[0] != fileB.XorbHashes[0] {
 		t.Fatal("test setup: shared part must map to one xorb")
 	}
+	// B's plain second chunk is no probe target, so it never gets an entry.
+	assertChunkIndexEntry(t, ctx, st, fileB.ChunkHashes[1], "")
 
 	// Warm every cache the sweep must invalidate.
 	if _, err := st.GetShard(ctx, fileA.FileHash); err != nil {
@@ -298,6 +300,7 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	}
 
 	// File B is untouched.
+	assertChunkIndexEntry(t, ctx, st, fileB.ChunkHashes[1], "")
 	if _, err := st.GetShard(ctx, fileB.FileHash); err != nil {
 		t.Fatalf("GetShard(fileB): %v", err)
 	}
@@ -462,18 +465,22 @@ func testSweepNegativeGraceSentinelSweepsFreshObjects(t *testing.T, b Backend) {
 }
 
 // testSweepDeletesSharedChunkEntry: two files share chunk A while each also
-// has its own chunk. Sweeping the shard that owns A's entry deletes the
-// entry outright — a dedup miss until a future upload rewrites it, never
-// data loss — and the live shard's data stays resolvable by file hash.
+// has its own sampled chunk and an unindexed plain one. Sweeping the shard
+// that owns A's entry deletes the entry outright — a dedup miss until a
+// future upload rewrites it, never data loss — and the live shard's data
+// stays resolvable by file hash.
 func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 	partA := []byte("chunk shared by both shards")
 	ctx := context.Background()
 	st := b.New(t)
 
-	f1 := PutFile(t, ctx, st, [][]byte{partA, []byte("unique to file one")})
-	f2 := PutFile(t, ctx, st, [][]byte{partA, []byte("unique to file two")})
+	f1 := PutFile(t, ctx, st, [][]byte{partA, SampledChunk(t, "unique to file one"), PlainChunk(t, "plain tail of file one")})
+	f2 := PutFile(t, ctx, st, [][]byte{partA, SampledChunk(t, "unique to file two"), PlainChunk(t, "plain tail of file two")})
 	if f1.ChunkHashes[0] != f2.ChunkHashes[0] {
 		t.Fatal("test setup: shared part must map to one chunk hash")
+	}
+	for _, f := range []File{f1, f2} {
+		assertChunkIndexEntry(t, ctx, st, f.ChunkHashes[2], "")
 	}
 	// FileStorage keeps the first writer (f1), S3 the last (f2); kill
 	// the owner so the shared-entry deletion runs on both backends.
@@ -518,11 +525,77 @@ func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 	if got, err := st.GetChunkIndexEntry(ctx, live.ChunkHashes[1]); err != nil || got != live.ShardHash {
 		t.Fatalf("live exclusive chunk entry = %q, %v; want %q", got, err, live.ShardHash)
 	}
+	for _, f := range []File{f1, f2} {
+		assertChunkIndexEntry(t, ctx, st, f.ChunkHashes[2], "")
+	}
 
 	// The live file itself is whole: file hash and SHA-256 resolve.
 	AssertFileIntact(t, ctx, st, live)
 	if ok, _ := st.HasXorb(ctx, live.XorbHashes[0]); !ok {
 		t.Fatal("shared xorb was swept")
+	}
+}
+
+// testSweepKeepsChunkEntryOwnedByLiveShard: sweeping a dead shard leaves the
+// entry of a chunk it shares with a live shard alone while the live one owns it.
+func testSweepKeepsChunkEntryOwnedByLiveShard(t *testing.T, b Backend) {
+	shared := []byte("chunk shared by a dead and a live shard")
+	ctx := context.Background()
+	st := b.New(t)
+
+	dead := PutFile(t, ctx, st, [][]byte{shared, SampledChunk(t, "unique to the dead file")})
+	live := PutFile(t, ctx, st, [][]byte{shared, SampledChunk(t, "unique to the live file")})
+	// Backends keep different writers of the shared entry; hand it to the live shard on all.
+	b.SetIndexEntry(t, st, "index/chunks", live.ChunkHashes[0].String(), live.ShardHash)
+
+	UnlinkFile(t, ctx, st, dead)
+	res, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	assertChunkIndexEntry(t, ctx, st, live.ChunkHashes[0], live.ShardHash)
+	if res.DeletedChunkEntries != 1 {
+		t.Fatalf("DeletedChunkEntries = %d, want 1: the dead shard's own sampled chunk only", res.DeletedChunkEntries)
+	}
+}
+
+// testSweepReadsOnlyProbeableChunkEntries: a dead shard's chunk entries exist
+// only for its probe-able chunks, so the sweep reads and deletes exactly
+// those and never touches the key of a plain chunk.
+func testSweepReadsOnlyProbeableChunkEntries(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+
+	f := PutFile(t, ctx, st, [][]byte{PlainChunk(t, "start"), SampledChunk(t, "mid"), PlainChunk(t, "tail")})
+	UnlinkFile(t, ctx, st, f)
+
+	hooked := &hookedGCStore{Storage: st}
+	res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: NoGrace})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if got, want := SweptHashes(res.SweptShards), []string{f.ShardHash}; !slices.Equal(got, want) {
+		t.Fatalf("SweptShards = %v, want %v", got, want)
+	}
+
+	sorted := func(hashes []xet.ChunkHash) []string {
+		out := make([]string, 0, len(hashes))
+		for _, h := range hashes {
+			out = append(out, h.String())
+		}
+		slices.Sort(out)
+		return out
+	}
+	want := sorted(f.ChunkHashes[:2])
+	if got := sorted(hooked.chunkEntryGets); !slices.Equal(got, want) {
+		t.Errorf("chunk entries read = %v, want exactly the file start and sampled chunk %v", got, want)
+	}
+	if got := sorted(hooked.chunkEntryDeletes); !slices.Equal(got, want) {
+		t.Errorf("chunk entries deleted = %v, want %v", got, want)
+	}
+	if res.DeletedChunkEntries != 2 {
+		t.Errorf("DeletedChunkEntries = %d, want 2", res.DeletedChunkEntries)
 	}
 }
 

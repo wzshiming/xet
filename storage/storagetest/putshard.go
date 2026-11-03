@@ -168,10 +168,10 @@ func testPutShardVerifiesFileHash(t *testing.T, b Backend) {
 	}
 }
 
-// Chunk hashes are indexed straight from the CAS blocks, so every declared
-// chunk sequence must match the stored xorb even when no file references it.
+// testPutShardVerifiesCASChunks: PutShard rejects a shard whose CAS chunks disagree with the
+// stored xorb, leaving no index entries; an honest retry indexes the file's probe-able chunks.
 func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
-	parts := [][]byte{[]byte("first chunk"), []byte("second chunk, different size")}
+	parts := [][]byte{PlainChunk(t, "first"), SampledChunk(t, "second"), PlainChunk(t, "third")}
 	for _, test := range []struct {
 		name    string
 		mutate  func(sh *shard.Shard)
@@ -194,7 +194,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 			sh := shard.NewShard()
 			f := addXorbFile(t, ctx, st, sh, [][][]byte{parts})
 			unreferenced := shard.NewShard()
-			addXorbFile(t, ctx, st, unreferenced, [][][]byte{{[]byte("chunk of an unreferenced xorb"), []byte("its second chunk")}})
+			orphan := addXorbFile(t, ctx, st, unreferenced, [][][]byte{{PlainChunk(t, "chunk of an unreferenced xorb"), SampledChunk(t, "its second chunk")}})
 			sh.AddCASBlock(unreferenced.CASInfos[0])
 			if test.mutate != nil {
 				test.mutate(sh)
@@ -206,6 +206,19 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 					t.Fatalf("PutShard() = %v, %v", inserted, err)
 				}
 				assertFilesCommitted(t, ctx, st, f)
+				switch test.name {
+				case "full CAS blocks":
+					shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
+					if err != nil {
+						t.Fatal(err)
+					}
+					// No file starts in the unreferenced xorb: only its sampled chunk is probe-able.
+					assertChunkIndexEntry(t, ctx, st, orphan.ChunkHashes[1], shardHash)
+					assertChunkIndexEntry(t, ctx, st, orphan.ChunkHashes[0], "")
+				case "dedup without CAS blocks":
+					// The file's first chunk lives in a xorb the shard does not declare.
+					assertChunkIndexEntry(t, ctx, st, f.ChunkHashes[0], "")
+				}
 				return
 			}
 			if inserted || !errors.Is(err, storage.ErrInvalidShard) || !strings.Contains(err.Error(), test.wantErr) {
@@ -231,12 +244,64 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 				t.Fatalf("honest PutShard() after rejection = %v, %v", inserted, err)
 			}
 			assertFilesCommitted(t, ctx, st, f)
-			for _, chunkHash := range f.ChunkHashes {
+			shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, chunkHash := range f.ChunkHashes[:2] {
+				assertChunkIndexEntry(t, ctx, st, chunkHash, shardHash)
 				if _, err := st.GetShardByChunkHash(ctx, chunkHash); err != nil {
 					t.Fatalf("GetShardByChunkHash(%s) after honest retry: %v", chunkHash.String(), err)
 				}
 			}
+			assertChunkIndexEntry(t, ctx, st, f.ChunkHashes[2], "")
+			if _, err := st.GetShardByChunkHash(ctx, f.ChunkHashes[2]); err == nil {
+				t.Fatal("GetShardByChunkHash(plain chunk) after honest retry resolved; want not found")
+			}
 		})
+	}
+}
+
+// testPutShardIndexesProbeableChunksOnly: PutShard indexes exactly the probe-able chunks — file
+// starts, flagged and hash-sampled ones, also in a xorb no file references — and no other chunk.
+func testPutShardIndexesProbeableChunksOnly(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	sh := shard.NewShard()
+	f := addXorbFile(t, ctx, st, sh, [][][]byte{{PlainChunk(t, "start"), SampledChunk(t, "mid"), PlainChunk(t, "tail"), PlainChunk(t, "flagged")}})
+	sh.CASInfos[0].Chunks[3].Flags = shard.ChunkGlobalDedupEligible
+	unreferenced := shard.NewShard()
+	orphan := addXorbFile(t, ctx, st, unreferenced, [][][]byte{{PlainChunk(t, "orphan-a"), SampledChunk(t, "orphan-b")}})
+	sh.AddCASBlock(unreferenced.CASInfos[0])
+	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+		t.Fatalf("PutShard() = %v, %v", inserted, err)
+	}
+	shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
+	if err != nil || shardHash == "" {
+		t.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
+	}
+
+	for _, c := range []struct {
+		name string
+		hash xet.ChunkHash
+		want string
+	}{
+		{"file start", f.ChunkHashes[0], shardHash},
+		{"sampled", f.ChunkHashes[1], shardHash},
+		{"plain", f.ChunkHashes[2], ""},
+		{"flagged", f.ChunkHashes[3], shardHash},
+		{"unreferenced plain", orphan.ChunkHashes[0], ""},
+		{"unreferenced sampled", orphan.ChunkHashes[1], shardHash},
+	} {
+		if got, err := st.GetChunkIndexEntry(ctx, c.hash); err != nil || got != c.want {
+			t.Errorf("GetChunkIndexEntry(%s chunk) = %q, %v; want %q", c.name, got, err, c.want)
+		}
+	}
+	if _, err := st.GetShardByChunkHash(ctx, f.ChunkHashes[2]); err == nil {
+		t.Error("GetShardByChunkHash(plain chunk) resolved; want not found")
+	}
+	if usage, err := st.Usage(ctx); err != nil || usage.ChunkIndex != (storage.ObjectUsage{Count: 4, Bytes: 4 * 64}) {
+		t.Errorf("Usage().ChunkIndex = %+v, %v; want 4 entries of 64 bytes", usage.ChunkIndex, err)
 	}
 }
 

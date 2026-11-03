@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -154,6 +155,166 @@ func TestResolveChunks(t *testing.T) {
 
 	if got := raw.ResolveChunks(); got == nil || len(got) != 0 {
 		t.Fatalf("no hashes resolved %v, want an empty map", got)
+	}
+}
+
+// eligibleHash returns a chunk hash tagged id that passes hash sampling exactly when sampled.
+func eligibleHash(id byte, sampled bool) xet.ChunkHash {
+	h := xet.ChunkHash{0: id}
+	suffix := uint64(1)
+	if sampled {
+		suffix = 1024
+	}
+	binary.LittleEndian.PutUint64(h[24:], suffix)
+	return h
+}
+
+func eligibleTerm(x xet.XorbHash, start, end uint32) FileDataSequenceEntry {
+	return FileDataSequenceEntry{CASHash: x, ChunkIndexStart: start, ChunkIndexEnd: end}
+}
+
+func TestGlobalDedupEligibleChunks(t *testing.T) {
+	xorbA, xorbB, foreign := xet.XorbHash{0: 1}, xet.XorbHash{0: 2}, xet.XorbHash{0: 9}
+	c1, c2, c3 := eligibleHash(1, false), eligibleHash(2, false), eligibleHash(3, false)
+	sampled1, sampled2 := eligibleHash(1, true), eligibleHash(2, true)
+	a1, a2, b1 := eligibleHash(0xa1, true), eligibleHash(0xa2, false), eligibleHash(0xb1, false)
+
+	tests := []struct {
+		name  string
+		shard *Shard
+		want  []LocatedChunk
+	}{
+		{
+			name: "flagged entry",
+			shard: &Shard{CASInfos: []CASBlock{
+				{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1, Flags: ChunkGlobalDedupEligible}}},
+			}},
+			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+		},
+		{
+			name: "first chunk of a file",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 0, 2)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}}},
+				},
+			},
+			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+		},
+		{
+			name: "hash-sampled entry",
+			shard: &Shard{CASInfos: []CASBlock{
+				{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: sampled2}}},
+			}},
+			want: []LocatedChunk{{Hash: sampled2, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 1}}},
+		},
+		{
+			name: "file whose first term is in a foreign xorb",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(foreign, 0, 1), eligibleTerm(xorbA, 0, 1)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}}},
+				},
+			},
+		},
+		{
+			name: "file starting inside a xorb",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 2, 3)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}, {ChunkHash: c3}}},
+				},
+			},
+			want: []LocatedChunk{{Hash: c3, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 2}}},
+		},
+		{
+			name: "first chunk shared by two files",
+			shard: &Shard{
+				Files: []FileBlock{
+					{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 0, 2)}},
+					{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 0, 1)}},
+				},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}}},
+				},
+			},
+			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+		},
+		{
+			name: "flagged hash-sampled first chunk",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 0, 1)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: sampled1, Flags: ChunkGlobalDedupEligible}}},
+				},
+			},
+			want: []LocatedChunk{{Hash: sampled1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+		},
+		{
+			name: "flagged entry inside a file",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 0, 3)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2, Flags: ChunkGlobalDedupEligible}, {ChunkHash: c3}}},
+				},
+			},
+			want: []LocatedChunk{
+				{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}},
+				{Hash: c2, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 1}},
+			},
+		},
+		{
+			name: "file without terms",
+			shard: &Shard{
+				Files: []FileBlock{{}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}}},
+				},
+			},
+		},
+		{
+			name: "file starting beyond its xorb",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbA, 5, 6)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}}},
+				},
+			},
+		},
+		{
+			name: "CASInfos order and first location of a repeated hash",
+			shard: &Shard{CASInfos: []CASBlock{
+				{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: a1}, {ChunkHash: a2}}},
+				{CASHash: xorbB, Chunks: []CASChunkSequenceEntry{{ChunkHash: b1, Flags: ChunkGlobalDedupEligible}, {ChunkHash: a1}}},
+			}},
+			want: []LocatedChunk{
+				{Hash: a1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}},
+				{Hash: b1, ChunkLocation: ChunkLocation{XorbHash: xorbB, ChunkIndex: 0}},
+			},
+		},
+		{
+			name: "first eligible location when a later file start repeats an earlier sampled hash",
+			shard: &Shard{
+				Files: []FileBlock{{Entries: []FileDataSequenceEntry{eligibleTerm(xorbB, 0, 1)}}},
+				CASInfos: []CASBlock{
+					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: a1}}},
+					{CASHash: xorbB, Chunks: []CASChunkSequenceEntry{{ChunkHash: a1}}},
+				},
+			},
+			want: []LocatedChunk{{Hash: a1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+		},
+		{
+			name:  "empty shard",
+			shard: NewShard(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.shard.GlobalDedupEligibleChunks(); !slices.Equal(got, tt.want) {
+				t.Fatalf("GlobalDedupEligibleChunks() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
