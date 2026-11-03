@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,8 +124,9 @@ func (f *upstreamFile) counts() [2]int64 { return [2]int64{f.probes.Load(), f.ge
 
 // fakeUpstream is a plain hub: resolve answers metadata and redirects to /cdn, which serves the bytes.
 type fakeUpstream struct {
-	mu    sync.Mutex
-	files map[string]*upstreamFile
+	mu      sync.Mutex
+	files   map[string]*upstreamFile
+	traffic traffic
 }
 
 func (u *fakeUpstream) add(f *upstreamFile) {
@@ -196,13 +198,29 @@ type harness struct {
 func newHarness(tb testing.TB) *harness {
 	tb.Helper()
 	h := &harness{dir: tb.TempDir(), hub: &fakeUpstream{files: map[string]*upstreamFile{}}}
-	upstream := httptest.NewServer(h.hub)
+	upstream := httptest.NewServer(h.hub.traffic.wrap(h.hub))
 	tb.Cleanup(upstream.Close)
 	h.upstreamURL = upstream.URL
-	h.xet = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "xet"), false)
-	h.assembled = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "assembled"), true)
+	storOpts := xorbCacheOptions(tb)
+	h.xet = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "xet"), false, storOpts...)
+	h.assembled = newMirrorStack(tb, upstream.URL, filepath.Join(h.dir, "assembled"), true, storOpts...)
 	h.hfBin, h.hfXet = detectHF(tb, upstream.URL, filepath.Join(h.dir, "hf-env"))
 	return h
+}
+
+// xorbCacheOptions turns XET_BENCH_XORB_CACHE=<n> into local.WithXorbCacheSize(n) for every stack.
+func xorbCacheOptions(tb testing.TB) []local.Option {
+	tb.Helper()
+	v := os.Getenv("XET_BENCH_XORB_CACHE")
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		tb.Fatalf("XET_BENCH_XORB_CACHE: %v", err)
+	}
+	tb.Logf("XET_BENCH_XORB_CACHE=%d", n)
+	return []local.Option{local.WithXorbCacheSize(n)}
 }
 
 // mirrorStack is one xet mirror in front of the fake upstream, counting the requests that show who assembled a download.
@@ -212,30 +230,31 @@ type mirrorStack struct {
 	stripXet bool         // its resolve answers lose their xet headers
 	bridge   atomic.Int64 // GET /xet-bridge/*: the server assembles the file
 	recon    atomic.Int64 // GET reconstruction queries: the client assembles it
+	traffic  traffic
 }
 
 func (s *mirrorStack) counts() [2]int64 { return [2]int64{s.bridge.Load(), s.recon.Load()} }
 
 // newMirrorStack wires test/e2e's newMirrorServer composition under dir, never revalidating against the upstream.
-func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool) *mirrorStack {
+func newMirrorStack(tb testing.TB, upstreamURL, dir string, stripXet bool, storOpts ...local.Option) *mirrorStack {
 	tb.Helper()
 	s := &mirrorStack{stripXet: stripXet}
 	var inner atomic.Value
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(s.traffic.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.count(r)
 		if stripXet && (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.HasPrefix(r.URL.Path, "/"+benchRepo+"/resolve/") {
 			w = &xetStripper{ResponseWriter: w}
 		}
 		inner.Load().(http.Handler).ServeHTTP(w, r)
-	}))
+	})))
 	tb.Cleanup(srv.Close)
 	s.url = srv.URL
 
 	storageDir := filepath.Join(dir, "storage")
-	stor, err := local.NewStorage(
+	stor, err := local.NewStorage(append([]local.Option{
 		local.WithBasePath(storageDir),
 		local.WithBaseURL(srv.URL),
-	)
+	}, storOpts...)...)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -282,12 +301,40 @@ func (s *mirrorStack) count(r *http.Request) {
 	if r.Method != http.MethodGet {
 		return
 	}
-	switch p := r.URL.Path; {
-	case strings.HasPrefix(p, "/xet-bridge/"):
+	switch classify(r.URL.Path) {
+	case classBridge:
 		s.bridge.Add(1)
-	case strings.HasPrefix(p, "/v1/reconstructions/"), strings.HasPrefix(p, "/v2/reconstructions/"), p == "/reconstructions":
+	case classRecon:
 		s.recon.Add(1)
 	}
+}
+
+// reqClass is what a request fetches, as its path tells.
+type reqClass int
+
+const (
+	classOther  reqClass = iota
+	classXorb            // /v1/xorbs/*: whole or ranged xorb reads
+	classBridge          // /xet-bridge/*: the server assembles the file
+	classRecon           // reconstruction queries: the client assembles it
+	classCDN             // the fake upstream's /cdn/*: plain file bytes
+	numClasses
+)
+
+var classNames = [numClasses]string{"other", "xorb", "bridge", "recon", "cdn"}
+
+func classify(path string) reqClass {
+	switch {
+	case strings.HasPrefix(path, "/v1/xorbs/"):
+		return classXorb
+	case strings.HasPrefix(path, "/xet-bridge/"):
+		return classBridge
+	case strings.HasPrefix(path, "/v1/reconstructions/"), strings.HasPrefix(path, "/v2/reconstructions/"), path == "/reconstructions":
+		return classRecon
+	case strings.HasPrefix(path, "/cdn/"):
+		return classCDN
+	}
+	return classOther
 }
 
 // xetStripper deletes the xet headers right before the wrapped writer sends the header block.
@@ -321,12 +368,83 @@ func (w *xetStripper) Flush() {
 
 func (w *xetStripper) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// traffic tallies the requests a server answers and the response body bytes it sends, by class.
+type traffic struct {
+	reqs, bytes [numClasses]atomic.Int64
+	xorbGets    atomic.Int64 // GET /v1/xorbs/* in flight
+	peak        atomic.Int64 // the most xorbGets since the last snapshot
+}
+
+func (t *traffic) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := classify(r.URL.Path)
+		t.reqs[c].Add(1)
+		if c == classXorb && r.Method == http.MethodGet {
+			n := t.xorbGets.Add(1)
+			defer t.xorbGets.Add(-1)
+			for p := t.peak.Load(); n > p; p = t.peak.Load() {
+				if t.peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+		}
+		next.ServeHTTP(&countingWriter{ResponseWriter: w, n: &t.bytes[c]}, r)
+	})
+}
+
+// serverCounts is a snapshot of one server's counters.
+type serverCounts struct {
+	path        [2]int64 // what finishRow checks: a stack's counts() or the upstream's of the file
+	reqs, bytes [numClasses]int64
+	peak        int64 // the most concurrent xorb GETs since the previous snapshot
+}
+
+func (t *traffic) snapshot(path [2]int64) serverCounts {
+	c := serverCounts{path: path, peak: t.peak.Swap(t.xorbGets.Load())}
+	for i := range numClasses {
+		c.reqs[i], c.bytes[i] = t.reqs[i].Load(), t.bytes[i].Load()
+	}
+	return c
+}
+
+// countingWriter adds the response body bytes written through it to n.
+type countingWriter struct {
+	http.ResponseWriter
+	n *atomic.Int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.n.Add(int64(n))
+	return n, err
+}
+
+// ReadFrom hands src to the server's own ReadFrom, so http.ServeContent of an *os.File still uses sendfile.
+func (w *countingWriter) ReadFrom(src io.Reader) (int64, error) {
+	n, err := w.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
+	w.n.Add(n)
+	return n, err
+}
+
+func (w *countingWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *countingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // detectHF finds the hf CLI and whether its Python environment ships hf_xet, logging the versions in use.
 func detectHF(tb testing.TB, endpoint, home string) (string, bool) {
 	tb.Helper()
 	bin, err := exec.LookPath("hf")
 	if err != nil {
 		return "", false
+	}
+	for _, name := range hfPassEnv {
+		if v, ok := os.LookupEnv(name); ok {
+			tb.Logf("passing %s=%s to hf", name, v)
+		}
 	}
 	ctx, cancel := context.WithTimeout(tb.Context(), 5*time.Minute)
 	defer cancel()
@@ -352,6 +470,9 @@ func detectHF(tb testing.TB, endpoint, home string) (string, bool) {
 	return bin, hasXet
 }
 
+// hfPassEnv are the parent's HF_* variables hfEnv keeps: hf_xet's download tuning.
+var hfPassEnv = []string{"HF_XET_NUM_CONCURRENT_RANGE_GETS", "HF_XET_HIGH_PERFORMANCE"}
+
 // hfEnv pins the CLI to endpoint with an isolated home and no proxy.
 func hfEnv(endpoint, home string, xet bool) []string {
 	var env []string
@@ -361,7 +482,7 @@ func hfEnv(endpoint, home string, xet bool) []string {
 		case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY":
 			continue
 		}
-		if strings.HasPrefix(name, "HF_") || strings.HasPrefix(name, "HUGGING") {
+		if (strings.HasPrefix(name, "HF_") || strings.HasPrefix(name, "HUGGING")) && !slices.Contains(hfPassEnv, name) {
 			continue
 		}
 		env = append(env, kv)
@@ -664,13 +785,17 @@ func checkSize(tb testing.TB, path string, size int64) {
 	}
 }
 
-// counts snapshots each server's request counters.
-func (h *harness) counts(f *upstreamFile) map[string][2]int64 {
-	return map[string][2]int64{"plain": f.counts(), "assembled": h.assembled.counts(), "xet": h.xet.counts()}
+// counts snapshots each server's counters.
+func (h *harness) counts(f *upstreamFile) map[string]serverCounts {
+	return map[string]serverCounts{
+		"plain":     h.hub.traffic.snapshot(f.counts()),
+		"assembled": h.assembled.traffic.snapshot(h.assembled.counts()),
+		"xet":       h.xet.traffic.snapshot(h.xet.counts()),
+	}
 }
 
 // finishRow checks the bytes of the last of n downloads, the go-xet fallbacks and the path the downloads took.
-func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, before map[string][2]int64, n, fellBack int) {
+func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, before map[string]serverCounts, n, fellBack int) {
 	tb.Helper()
 	if got := sha256File(tb, filepath.Join(dir, f.name)); got != f.digest {
 		tb.Fatalf("%s: sha256 %s, want %s", f.name, got, f.digest)
@@ -686,7 +811,7 @@ func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, b
 	}
 	after := h.counts(f)
 	for _, s := range servers {
-		d := [2]int64{after[s][0] - before[s][0], after[s][1] - before[s][1]}
+		d := [2]int64{after[s].path[0] - before[s].path[0], after[s].path[1] - before[s].path[1]}
 		var ok bool
 		switch {
 		case s != r.server:
@@ -703,7 +828,7 @@ func (h *harness) finishRow(tb testing.TB, r row, f *upstreamFile, dir string, b
 			if s == "plain" {
 				what = "upstream [resolve HEADs, cdn GETs]"
 			}
-			tb.Fatalf("%s went from %v to %v during a %s row", what, before[s], after[s], r.name())
+			tb.Fatalf("%s went from %v to %v during a %s row", what, before[s].path, after[s].path, r.name())
 		}
 	}
 	if err := os.RemoveAll(dir); err != nil {

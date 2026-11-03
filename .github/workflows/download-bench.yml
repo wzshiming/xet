@@ -4,14 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       bench:
-        description: go test -bench regexp
-        default: Download
+        description: go test -bench regexp (empty = Download); ab runs space-separated regexps in order (empty = its 1 GiB rows)
+        default: ''
       benchtime:
-        description: go test -benchtime
-        default: 1x
+        description: go test -benchtime (empty = 1x, for ab 3x)
+        default: ''
       count:
         description: go test -count
         default: '3'
+      rounds:
+        description: ab ABBA rounds
+        default: '4'
   pull_request:
     paths:
     - test/bench/**
@@ -84,3 +87,166 @@ jobs:
         path: |
           bench.txt
           benchstat.txt
+
+  # ab runs the same rows ABBA on this tree (post) and on 43e6575, master
+  # before #252 (pre), with these bench files, in one runner.
+  ab:
+    name: Download A/B (pre-#252 vs this tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BENCH: ${{ inputs.bench || 'Download/size=1GiB/class=none/server=(xet|plain|assembled)/client=(hf-xet|go-xet) Download/size=1GiB/class=lz4/server=xet/client=hf-xet' }}
+      BENCHTIME: ${{ inputs.benchtime || '3x' }}
+      ROUNDS: ${{ inputs.rounds || '4' }}
+      PRIMARY: Download/size=1GiB/class=none/server=xet/client=hf-xet
+
+    steps:
+    - name: Checkout post (this tree)
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        path: post
+
+    - name: Checkout pre (43e6575, master before #252)
+      uses: actions/checkout@v5
+      with:
+        ref: 43e6575ba7db175736b2e7e9da9a3c3e6574a6aa
+        path: pre
+
+    - name: Give pre the same bench files
+      run: |
+        rm -rf pre/test/bench
+        cp -R post/test/bench pre/test/
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: post/go.mod
+        cache-dependency-path: |
+          post/go.sum
+          pre/go.sum
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+
+    - name: Install hf CLI
+      run: pip install -U "huggingface_hub[cli,hf_xet]"
+
+    - name: Log environment
+      run: |
+        {
+          set +e
+          echo "nproc: $(nproc)"
+          lscpu | grep -E '^(Architecture|CPU\(s\)|Model name|Thread|Core|Socket|NUMA node\(s\)|L[123]|Hypervisor|Virtualization)'
+          echo "kernel: $(uname -r)"
+          cat /proc/self/cgroup
+          cg=$(sed -n 's/^0:://p' /proc/self/cgroup)
+          d=/sys/fs/cgroup${cg%/}
+          while [ "${d#/sys/fs/cgroup}" != "$d" ]; do
+            for f in cpu.max memory.max; do
+              if [ -r "$d/$f" ]; then echo "$d/$f: $(cat "$d/$f")"; fi
+            done
+            d=${d%/*}
+          done
+          free -g
+          df -h
+          go version
+          hf env
+          pip show hf_xet huggingface_hub
+        } 2>&1 | tee env.txt
+
+    - name: Smoke test both trees
+      run: |
+        for tree in post pre; do
+          go -C "$tree" vet ./test/bench
+          go -C "$tree" test ./test/bench -run TestDownload -count 1
+        done
+
+    - name: Run ABBA rounds
+      run: |
+        set -o pipefail
+        read -ra res <<< "$BENCH"
+        mkdir -p samples
+        # The kernel's page fault and TLB shootdown counters, those it has.
+        snap() { grep -E '^(pgfault|pgmajfault|nr_tlb_remote_flush[a-z_]*) ' /proc/vmstat > "$1" || true; }
+        # The aggregate cpu line of /proc/stat (user nice system idle iowait irq softirq steal ...) every second.
+        sample() { while :; do echo "$(date +%s.%N) $(head -1 /proc/stat)"; sleep 1; done; }
+        for r in $(seq "$ROUNDS"); do
+          trees=(post pre)
+          if [ $((r % 2)) -eq 0 ]; then trees=(pre post); fi
+          for tree in "${trees[@]}"; do
+            i=0
+            for re in "${res[@]}"; do
+              i=$((i + 1))
+              tag=samples/$tree-r$r-$i
+              snap "$tag.vmstat.before"
+              sample > "$tag.stat" 2> /dev/null &
+              sampler=$!
+              XET_BENCH_PROFILE_DIR=$GITHUB_WORKSPACE/prof/$tree/r$r go -C "$tree" test ./test/bench -run '^$' -bench "$re" -benchtime "$BENCHTIME" -count 1 -timeout 20m | tee -a "$tree.txt"
+              kill "$sampler"
+              snap "$tag.vmstat.after"
+            done
+          done
+        done
+
+    - name: Summarize with benchstat
+      run: |
+        set -o pipefail
+        go run golang.org/x/perf/cmd/benchstat@latest pre.txt post.txt | tee benchstat.txt
+        {
+          echo '### Download A/B: pre = 43e6575 (master before #252), post = this tree'
+          echo '```'
+          cat benchstat.txt
+          echo '```'
+          for tree in post pre; do
+            p=prof/$tree/r1/BenchmarkDownload_size=1GiB_class=none_server=xet_client=hf-xet.pprof
+            echo "<details><summary>$tree: go tool pprof -top -nodecount=40 $p</summary>"
+            echo
+            echo '```'
+            go tool pprof -top -nodecount=40 "$p" 2>&1 || true
+            echo '```'
+            echo
+            echo '</details>'
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Variant XET_BENCH_XORB_CACHE=1 (optional)
+      continue-on-error: true
+      run: |
+        set -o pipefail
+        for tree in post pre; do
+          XET_BENCH_XORB_CACHE=1 XET_BENCH_PROFILE_DIR=$GITHUB_WORKSPACE/prof/$tree/xorb-cache-1 go -C "$tree" test ./test/bench -run '^$' -bench "$PRIMARY" -benchtime "$BENCHTIME" -count 1 -timeout 20m | tee -a "$tree-xorb-cache-1.txt"
+        done
+
+    - name: Variant HF_XET_HIGH_PERFORMANCE=1 (optional)
+      continue-on-error: true
+      run: |
+        set -o pipefail
+        for tree in post pre; do
+          HF_XET_HIGH_PERFORMANCE=1 XET_BENCH_PROFILE_DIR=$GITHUB_WORKSPACE/prof/$tree/hf-high-perf go -C "$tree" test ./test/bench -run '^$' -bench "$PRIMARY" -benchtime "$BENCHTIME" -count 1 -timeout 20m | tee -a "$tree-hf-high-perf.txt"
+        done
+
+    - name: Variant memcg MemoryMax=3G (optional)
+      continue-on-error: true
+      run: |
+        set -o pipefail
+        for tree in post pre; do
+          sudo systemd-run --scope -p MemoryMax=3G runuser -u "$(id -un)" -- env PATH="$PATH" HOME="$HOME" XET_BENCH_PROFILE_DIR="$GITHUB_WORKSPACE/prof/$tree/memcg-3g" go -C "$GITHUB_WORKSPACE/$tree" test ./test/bench -run '^$' -bench "$PRIMARY" -benchtime "$BENCHTIME" -count 1 -timeout 20m | tee -a "$tree-memcg-3g.txt"
+        done
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: download-bench-ab
+        path: |
+          env.txt
+          pre.txt
+          post.txt
+          benchstat.txt
+          prof/
+          samples/
+          pre-*.txt
+          post-*.txt
