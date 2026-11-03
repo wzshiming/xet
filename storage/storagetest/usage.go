@@ -19,8 +19,8 @@ func testUsageCountsObjectsByKind(t *testing.T, b Backend) {
 	}
 
 	partA := []byte("part shared by both files")
-	partB := []byte("part stored only by the first file, a little longer")
-	partC := []byte("second file's own part")
+	partB := SampledChunk(t, "part stored only by the first file, a little longer")
+	partC := PlainChunk(t, "second file's own part")
 	first := PutFile(t, ctx, st, [][]byte{partA, partB})
 	second := PutFile(t, ctx, st, [][]byte{partA, partC})
 
@@ -43,11 +43,12 @@ func testUsageCountsObjectsByKind(t *testing.T, b Backend) {
 		t.Fatalf("stored shards = %v, want the two files' shards", shardBytes)
 	}
 
+	// Probe-able chunks only: A (each file's start) and sampled B, not plain C.
 	want := storage.Usage{
 		Xorbs:       storage.ObjectUsage{Count: 3, Bytes: xorbBytes(partA, partB, partC)},
 		Shards:      storage.ObjectUsage{Count: 2, Bytes: shardBytes[first.ShardHash] + shardBytes[second.ShardHash]},
 		FileIndex:   storage.ObjectUsage{Count: 2, Bytes: 128},
-		ChunkIndex:  storage.ObjectUsage{Count: 3, Bytes: 192},
+		ChunkIndex:  storage.ObjectUsage{Count: 2, Bytes: 128},
 		SHA256Index: storage.ObjectUsage{Count: 2, Bytes: 128},
 	}
 	if got, err = st.Usage(ctx); err != nil || got != want {
@@ -60,7 +61,7 @@ func testUsageCountsObjectsByKind(t *testing.T, b Backend) {
 		t.Fatalf("Sweep: %v", err)
 	}
 	// The dead shard owns chunk A's entry only where PutShard overwrites (S3).
-	chunks := 3 - int64(res.DeletedChunkEntries)
+	chunks := 2 - int64(res.DeletedChunkEntries)
 	want = storage.Usage{
 		Xorbs:       storage.ObjectUsage{Count: 2, Bytes: xorbBytes(partA, partB)},
 		Shards:      storage.ObjectUsage{Count: 1, Bytes: shardBytes[first.ShardHash]},

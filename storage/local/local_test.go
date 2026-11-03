@@ -246,6 +246,31 @@ func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
 	}
 }
 
+// TestChunkIndexHoldsOnlyProbeableChunks pins the on-disk chunk index to a
+// file's probe-able chunks: its first and its sampled chunk, not its plain one.
+func TestChunkIndexHoldsOnlyProbeableChunks(t *testing.T) {
+	ctx := context.Background()
+	basePath := t.TempDir()
+	fs, err := NewStorage(WithBasePath(basePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := storagetest.PutFile(t, ctx, fs, [][]byte{
+		storagetest.PlainChunk(t, "start"), storagetest.SampledChunk(t, "mid"), storagetest.PlainChunk(t, "tail"),
+	})
+
+	got, err := fanoutEntries(filepath.Join(basePath, "index", "chunks"))
+	if err != nil {
+		t.Fatalf("read chunk index directory: %v", err)
+	}
+	want := []string{f.ChunkHashes[0].String(), f.ChunkHashes[1].String()}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("chunk index entries = %v, want exactly %v", got, want)
+	}
+}
+
 func TestXorbChunkOffsetsRanges(t *testing.T) {
 	chunks := [][]byte{
 		bytes.Repeat([]byte{1}, 1000),

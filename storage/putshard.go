@@ -119,14 +119,13 @@ func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	return nil
 }
 
-// File indexes commit last so partial writes remain retryable.
+// PutShardIndexes indexes only the shard's probe-able chunks (shard.GlobalDedupEligibleChunks)
+// and writes the files entries last, so a partial write remains retryable.
 func PutShardIndexes(ctx context.Context, s *shard.Shard, shardHash string, put func(ctx context.Context, kind, name string, value []byte) error) error {
 	value := []byte(shardHash)
-	for _, casBlock := range s.CASInfos {
-		for _, chunk := range casBlock.Chunks {
-			if err := put(ctx, "index/chunks", chunk.ChunkHash.String(), value); err != nil {
-				return fmt.Errorf("write chunk index: %w", err)
-			}
+	for _, e := range s.GlobalDedupEligibleChunks() {
+		if err := put(ctx, "index/chunks", e.Hash.String(), value); err != nil {
+			return fmt.Errorf("write chunk index: %w", err)
 		}
 	}
 	for _, file := range s.Files {
