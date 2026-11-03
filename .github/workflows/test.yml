@@ -35,8 +35,12 @@ jobs:
       run: go build -o xetd ./cmd/xetd
 
   conformance:
-    name: Conformance Tests
+    name: Conformance Tests (xet-core ${{ matrix.version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [v1.7.1, v1.6.0]
 
     steps:
     - name: Checkout code
@@ -53,9 +57,10 @@ jobs:
         rustup default stable
 
     - name: Build xet-core reference
-      working-directory: test/conformance
-      run: cargo build --release --locked
+      run: cargo build --release --locked --manifest-path test/conformance/versions/${{ matrix.version }}/Cargo.toml
 
     - name: Run conformance tests
       working-directory: test/conformance
+      env:
+        XET_CORE_VERSION: ${{ matrix.version }}
       run: go test ./...
