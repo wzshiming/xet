@@ -32,6 +32,8 @@ type SweepResult struct {
 
 	SweptShards []SweptObject `json:"swept_shards"`
 	SweptXorbs  []SweptObject `json:"swept_xorbs"`
+	// SweptStagedXorbs counts staged uploads left uncommitted past the grace window.
+	SweptStagedXorbs int `json:"swept_staged_xorbs"`
 
 	DeletedChunkEntries int `json:"deleted_chunk_entries"`
 	// DeletedFileEntries counts the stale index/files entries of sha-dead shards (AnchorSHA256 only).
@@ -47,9 +49,9 @@ type SweepResult struct {
 	// UnreadableShards are stored shards that failed to load; each is treated as live and the pass deletes no xorbs.
 	UnreadableShards []string `json:"unreadable_shards"`
 
-	// SkippedInGrace counts unreferenced objects spared as written within the grace window.
+	// SkippedInGrace counts unreferenced objects and staged uploads spared as written within the grace window.
 	SkippedInGrace int `json:"skipped_in_grace"`
-	// ReclaimedBytes sums the sizes of swept shards and xorbs.
+	// ReclaimedBytes sums the sizes of swept shards, xorbs and staged uploads.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 
 	// Done reports a finished pass. Remaining* are best-effort; RemainingXorbs is 0
@@ -90,10 +92,11 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 
 // SweepStep runs one independent, stateless pass bounded by MaxDeletes and
 // Budget, failing with ErrGCBusy while another sweep runs; repeat until Done.
-// Only stored shard and xorb deletions count toward the bounds (a shard's
-// index entries go uncounted), so unsweepable items never stall progress.
-// Every step re-marks and reloads every stored shard, so small bounds make
-// a full reclaim cost O(shards) per step. Dry runs ignore the bounds.
+// Only stored shard, xorb and staged-upload deletions count toward the
+// bounds (a shard's index entries go uncounted), so unsweepable items never
+// stall progress. Every step re-marks and reloads every stored shard, so
+// small bounds make a full reclaim cost O(shards) per step. Dry runs ignore
+// the bounds.
 func (g *GC) SweepStep(ctx context.Context, opts SweepOptions) (*SweepResult, error) {
 	if !g.mu.TryLock() {
 		return nil, ErrGCBusy
@@ -126,7 +129,7 @@ type SweepOptions struct {
 	Anchor     SweepAnchor   // which index entries anchor shard liveness; see SweepAnchor
 	Grace      time.Duration // shields objects written (mtime) within the window; negative disables it — quiescent stores only
 	DryRun     bool          // report removable objects without deleting
-	MaxDeletes int           // max shard and xorb object deletions per GC.SweepStep (index entries uncounted); 0 = unlimited, ignored by Sweep and dry runs
+	MaxDeletes int           // max shard, xorb and staged-upload deletions per GC.SweepStep (index entries uncounted); 0 = unlimited, ignored by Sweep and dry runs
 	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items once anything was swept; 0 = unlimited, ignored by Sweep and dry runs
 }
 
@@ -140,6 +143,7 @@ type SweepOptions struct {
 // file-referenced). Zero sha256 never anchors. A xorb is live while any stored shard references it.
 // Phase 1 re-checks and deletes dead shards; phase 2 re-walks the shards and deletes unreferenced
 // xorbs. An unreadable shard is treated as live, reported, and no xorb is deleted that pass.
+// Between the phases, staged uploads written before the grace window are deleted.
 //
 // A dead shard's entries are deleted, never repointed, even when a live shard shares the chunk or
 // (under AnchorFiles) the SHA-256 of identical content — the local backend keeps an entry's first
@@ -289,6 +293,47 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 	}
 
 	// Bounds spent as the queue drained: skip phase 2's loads.
+	if exhausted() {
+		return res, nil
+	}
+
+	// Uploads are staged whole, so one older than the grace window was abandoned uncommitted.
+	stagingWalkStart := time.Now()
+	var staleStaged []SweptObject // Hash holds the grant id
+	err = st.WalkStagedXorbs(ctx, func(grantID string, size int64, modTime time.Time) error {
+		if !modTime.Before(objCutoff) {
+			res.SkippedInGrace++
+			return nil
+		}
+		staleStaged = append(staleStaged, SweptObject{Hash: grantID, Size: size})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Walks are mark work, uncharged to Budget.
+	start = start.Add(time.Since(stagingWalkStart))
+
+	for len(staleStaged) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if exhausted() {
+			return res, nil
+		}
+		obj := staleStaged[0]
+		staleStaged = staleStaged[1:]
+		if !opts.DryRun {
+			if err := st.DeleteStagedXorb(ctx, obj.Hash); err != nil {
+				return nil, err
+			}
+			sweptCount++
+		}
+		res.SweptStagedXorbs++
+		res.ReclaimedBytes += obj.Size
+	}
+
+	// Bounds spent on staged uploads: skip phase 2's loads.
 	if exhausted() {
 		return res, nil
 	}

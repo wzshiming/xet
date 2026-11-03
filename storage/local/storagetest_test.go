@@ -3,6 +3,7 @@ package local
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
@@ -13,6 +14,13 @@ func TestStorage(t *testing.T) {
 		Name: "file",
 		New: func(t *testing.T) storage.Storage {
 			st, err := NewStorage(WithBasePath(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return st
+		},
+		NewWithUploadGrantTTL: func(t *testing.T, ttl time.Duration) storage.Storage {
+			st, err := NewStorage(WithBasePath(t.TempDir()), WithUploadGrantTTL(ttl))
 			if err != nil {
 				t.Fatal(err)
 			}

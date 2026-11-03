@@ -255,7 +255,9 @@ func newCountingCAS(t *testing.T) (*httptest.Server, *casCounters) {
 			c.dedup.Add(1)
 		case strings.HasPrefix(r.URL.Path, "/v1/xorbs/") && r.Method == http.MethodHead:
 			c.xorbHead.Add(1)
-		case strings.HasPrefix(r.URL.Path, "/v1/xorbs/") && r.Method == http.MethodPost:
+		// A grant's PUT carries the xorb as the legacy POST does, so either counts as the upload.
+		case strings.HasPrefix(r.URL.Path, "/v1/xorbs/") && r.Method == http.MethodPost,
+			strings.HasPrefix(r.URL.Path, "/v1/xorb-uploads/") && r.Method == http.MethodPut:
 			c.xorbPost.Add(1)
 			c.xorbBytes.Add(r.ContentLength)
 		case r.URL.Path == "/v1/shards" && r.Method == http.MethodPost:

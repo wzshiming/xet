@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: [v1.7.1, v1.6.0]
+        version: [v1.8.0, v1.7.1, v1.6.0]
 
     steps:
     - name: Checkout code

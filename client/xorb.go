@@ -10,9 +10,12 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/internal/crc64nvme"
 	"github.com/wzshiming/xet/upload"
 )
 
@@ -49,34 +52,104 @@ func (c *Client) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, erro
 	return false, nil
 }
 
-// UploadXorb serializes and uploads a xorb to the server. This is a
-// high-level method that handles serialization and upload of a Xorb object.
+// xorbBodyHandoffTimeout bounds the wait for a transport to close a body it has read from; one that never does would stall the upload until ctx ends.
+var xorbBodyHandoffTimeout = 30 * time.Second
+
+// UploadXorb uploads the serialized xorb read from reader's current offset to
+// EOF, through an upload grant unless WithXorbUploadGrants(false).
 func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader io.ReadSeeker) (*upload.XorbUploadResponse, error) {
 	startOffset, err := reader.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return nil, fmt.Errorf("seek current: %w", err)
 	}
-
-	contentLength, err := reader.Seek(0, io.SeekEnd)
+	checksum := crc64nvme.New()
+	length, err := io.Copy(checksum, reader)
 	if err != nil {
-		return nil, fmt.Errorf("seek to end: %w", err)
-	}
-	if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek to start offset: %w", err)
+		return nil, fmt.Errorf("checksum xorb: %w", err)
 	}
 
 	ctx, baseURL, err := c.casContext(ctx, auth.Write)
 	if err != nil {
 		return nil, fmt.Errorf("get base URL: %w", err)
 	}
-	url := fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String())
 
+	// A transport may drop an unread last body unclosed, so that one is closed here; a read one may still be sending, so its Close is awaited, at most xorbBodyHandoffTimeout.
+	var (
+		mu   sync.Mutex // makeBody may also run as GetBody on a transport's goroutine
+		last *xorbBody
+	)
 	makeBody := func() (io.ReadCloser, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if last != nil && !last.closeUnread() {
+			timer := time.NewTimer(xorbBodyHandoffTimeout)
+			defer timer.Stop()
+			select {
+			case <-last.closed:
+			case <-timer.C:
+				last.Close() // its transport's further Reads fail, leaving the reader to the next body
+			case <-ctx.Done():
+				return nil, fmt.Errorf("wait for the previous xorb body: %w", ctx.Err())
+			}
+		}
 		if _, err := reader.Seek(startOffset, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("seek to start offset: %w", err)
 		}
-		return io.NopCloser(reader), nil
+		last = &xorbBody{reader: reader, closed: make(chan struct{})}
+		return last, nil
 	}
+	if !c.xorbUploadGrants {
+		return c.postXorb(ctx, baseURL, xorbHash, length, makeBody)
+	}
+	return c.uploadXorbThroughGrants(ctx, baseURL, xorbHash, length, checksum.Sum64(), makeBody)
+}
+
+// xorbBody lends the shared xorb reader to one request; Close may come mid-Read from another goroutine (HTTP/2 aborts, redirects), so it waits that Read out.
+type xorbBody struct {
+	mu     sync.Mutex
+	reader io.Reader // nil once closed
+	read   bool      // a Read has returned data
+	closed chan struct{}
+}
+
+func (b *xorbBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reader == nil {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	n, err := b.reader.Read(p)
+	b.read = b.read || n > 0
+	return n, err
+}
+
+func (b *xorbBody) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closeLocked()
+	return nil
+}
+
+// closeUnread closes b unless a byte has been read from it, and reports whether b is closed.
+func (b *xorbBody) closeUnread() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.read {
+		b.closeLocked()
+	}
+	return b.reader == nil
+}
+
+func (b *xorbBody) closeLocked() {
+	if b.reader != nil {
+		b.reader = nil
+		close(b.closed)
+	}
+}
+
+// postXorb uploads the xorb through the legacy POST /v1/xorbs.
+func (c *Client) postXorb(ctx context.Context, baseURL string, xorbHash xet.XorbHash, length int64, makeBody func() (io.ReadCloser, error)) (*upload.XorbUploadResponse, error) {
+	url := fmt.Sprintf("%s/v1/xorbs/default/%s", baseURL, xorbHash.String())
 
 	body, err := makeBody()
 	if err != nil {
@@ -89,7 +162,7 @@ func (c *Client) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, reader i
 	}
 
 	req.GetBody = makeBody
-	req.ContentLength = contentLength - startOffset
+	req.ContentLength = length
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := c.doWithNetworkRetry(req)

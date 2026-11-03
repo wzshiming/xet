@@ -421,7 +421,8 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, uploaded map[xet.Chu
 				staged = append(staged, tmpPath)
 				stagedMu.Unlock()
 
-				encoder := xorb.NewEncoder(tmpFile, true)
+				// The upload wire format is the footer-less chunk sequence, as the upstream client sends.
+				encoder := xorb.NewEncoder(tmpFile, false)
 				for _, chunk := range group.Chunks {
 					if err := chunk.Reader.readAt(buf[:chunk.Size], chunk.Offset); err != nil {
 						_ = tmpFile.Close()

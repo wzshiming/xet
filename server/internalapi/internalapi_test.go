@@ -20,6 +20,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/internal/crc64nvme"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/mirror/spool"
 	"github.com/wzshiming/xet/shard"
@@ -1284,5 +1285,50 @@ func TestGCSweepEndpointBudgetSpansPasses(t *testing.T) {
 	}
 	if left, err := filepath.Glob(filepath.Join(cacheDir, "spool", "*.spool")); err != nil || len(left) != 0 {
 		t.Fatalf("spools left = %v (%v), want none", left, err)
+	}
+}
+
+// slowMarkStorage stalls the storage pass's first mark walk, which the request
+// budget charges but the pass's own Budget does not.
+type slowMarkStorage struct {
+	*local.Storage
+	delay time.Duration
+}
+
+func (s slowMarkStorage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	time.Sleep(s.delay)
+	return s.Storage.WalkFileIndex(ctx, fn)
+}
+
+// TestGCSweepEndpointBudgetCountsStagedDeletes: a stale staged upload the
+// storage pass deleted counts as swept, so a request whose budget is spent
+// defers the later passes instead of handing them the token budget.
+func TestGCSweepEndpointBudgetCountsStagedDeletes(t *testing.T) {
+	ctx := context.Background()
+	fs, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload := []byte("abandoned staged upload")
+	grant, err := fs.GrantXorbUpload(ctx, xet.XorbHash{1}, int64(len(upload)), crc64nvme.Checksum(upload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.PutStagedXorb(ctx, grant.ID, bytes.NewReader(upload)); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := spool.NewSpool(t.TempDir(), fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const budget = 500 * time.Millisecond
+	handler := NewHandler(WithStorage(slowMarkStorage{Storage: fs, delay: budget}), WithSpool(queue))
+
+	got := sweepRequest(t, handler, "?grace=0&budget="+budget.String())
+	if got.Storage == nil || !got.Storage.Done || got.Storage.SweptStagedXorbs != 1 || len(got.Storage.SweptShards)+len(got.Storage.SweptXorbs) != 0 {
+		t.Fatalf("storage pass = %+v, want done after sweeping the stale staged upload alone", got.Storage)
+	}
+	if got.Spools != nil || got.Done {
+		t.Fatalf("spools = %+v, done = %v; want the spool pass deferred: the request swept the staged upload and spent its budget", got.Spools, got.Done)
 	}
 }

@@ -7,7 +7,8 @@ release from that release's own locked manifest, `versions/<tag>/Cargo.toml`:
 
 | Release | Commit | Date |
 | --- | --- | --- |
-| v1.7.1 (default) | `f4665087547e058adb73bec46ce400e1eff0ee61` | 2026-10-28 |
+| v1.8.0 (default) | `e551f0a75f989b8ee1a474c5f83c80ad4903f84d` | 2026-10-30 |
+| v1.7.1 | `f4665087547e058adb73bec46ce400e1eff0ee61` | 2026-10-28 |
 | v1.6.0 | `de71453d952bd8b806edaa997c72313051a49050` | 2026-08-03 |
 
 The test adapter builds `xet-core-reference` automatically with Cargo. It covers
@@ -18,7 +19,7 @@ Run the complete suite against the default release with:
 
 ```sh
 cd test/conformance
-cargo build --release --locked --manifest-path versions/v1.7.1/Cargo.toml
+cargo build --release --locked --manifest-path versions/v1.8.0/Cargo.toml
 go test ./...
 ```
 
