@@ -1039,10 +1039,13 @@ func TestTermReaderReportsFirstFailure(t *testing.T) {
 }
 
 // stallingClient fails the GET of the range starting at fail with err and
-// holds every other GET until its context ends.
+// holds every other GET until its context ends, then closes canceled when
+// set.
 type stallingClient struct {
-	fail int64
-	err  error
+	fail     int64
+	err      error
+	canceled chan struct{}
+	once     sync.Once
 }
 
 func (c *stallingClient) DownloadXorbWithURL(ctx context.Context, _ string, header http.Header) (io.ReadCloser, error) {
@@ -1054,11 +1057,176 @@ func (c *stallingClient) DownloadXorbWithURL(ctx context.Context, _ string, head
 		return nil, c.err
 	}
 	<-ctx.Done()
+	if c.canceled != nil {
+		c.once.Do(func() { close(c.canceled) })
+	}
 	return nil, ctx.Err()
 }
 
 func (*stallingClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
 	panic("not used")
+}
+
+// TestTermReaderFailureCancelsOtherFetches fails one range while the GET of
+// another is held: the failure cancels the held GET at once, with no Read or
+// Close to do it.
+func TestTermReaderFailureCancelsOtherFetches(t *testing.T) {
+	x, terms, _ := stallFixture(t)
+	errRange := errors.New("range failed")
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			stalling := &stallingClient{fail: x.span(terms[1].fetch).Start, err: errRange, canceled: make(chan struct{})}
+			r := openTermReader(t, version, context.Background(), stalling, x, 0, terms, WithConcurrency(2))
+			r.start() // fetch without a Read, which must not run alongside Close
+			if !within(t, "the held GET's cancellation after the other range failed", stalling.canceled) {
+				t.FailNow()
+			}
+			if _, err := io.ReadAll(r); !errors.Is(err, errRange) {
+				t.Fatalf("read: %v, want the failed range's error", err)
+			}
+		})
+	}
+}
+
+// failingRangeClient serves data like fakeClientAdapter, but holds the GET of
+// the range starting at fail until release is closed and then fails it with
+// err.
+type failingRangeClient struct {
+	fakeClientAdapter
+	fail    int64
+	err     error
+	release chan struct{}
+}
+
+func (c *failingRangeClient) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	var start, end int64
+	if _, err := fmt.Sscanf(header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+		return nil, err
+	}
+	if start == c.fail {
+		select {
+		case <-c.release:
+			return nil, c.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.fakeClientAdapter.DownloadXorbWithURL(ctx, url, header)
+}
+
+// TestTermReaderFailureReturnsAdmittedBudget fails a range while admitted
+// terms are undelivered, two of them reading one range: the error sticks, and
+// the budget gets every admitted byte back exactly once, at the error and
+// none again at Close.
+func TestTermReaderFailureReturnsAdmittedBudget(t *testing.T) {
+	x := newFixtureXorb(t, 0x46, randomChunks(47, 4, 1000))
+	a, b, c, d := ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 1, End: 2}, ChunkRange{Start: 2, End: 3}, ChunkRange{Start: 3, End: 4}
+	terms := []fixtureTerm{{a, a}, {b, b}, {a, a}, {c, c}, {d, d}}
+	errRange := errors.New("range d failed")
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			budget := budgetWithTarget(1 << 20)
+			client := &failingRangeClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}, fail: x.span(d).Start, err: errRange, release: make(chan struct{})}
+			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithConcurrency(8), WithMemoryBudget(budget))
+			head := make([]byte, 1500) // the first term and half the second
+			if _, err := io.ReadFull(r, head); err != nil {
+				t.Fatal(err)
+			}
+			close(client.release)
+			if !within(t, "the failure of range d", r.failed) {
+				t.FailNow()
+			}
+			if _, err := io.ReadAll(r); !errors.Is(err, errRange) {
+				t.Fatalf("read after the failure: %v, want %v", err, errRange)
+			}
+			if used := usedOf(budget); used != 0 {
+				t.Fatalf("after the error stuck: %d bytes used, want 0", used)
+			}
+			r.Close()
+			if used, attached := usedOf(budget), attachedOf(budget); used != 0 || attached != 0 {
+				t.Fatalf("after Close: %d bytes used, %d downloads attached; want none", used, attached)
+			}
+		})
+	}
+}
+
+// TestTermReaderCloseWhileWaitingForBudget closes a reader whose dispatcher
+// waits for budget: Close returns at once and leaves nothing used, attached
+// or waiting in the budget, and a Read after it fails with fs.ErrClosed.
+func TestTermReaderCloseWhileWaitingForBudget(t *testing.T) {
+	x := newFixtureXorb(t, 0x47, randomChunks(48, 3, 1000))
+	var terms []fixtureTerm
+	for i := range uint32(3) {
+		terms = append(terms, fixtureTerm{ChunkRange{Start: i, End: i + 1}, ChunkRange{Start: i, End: i + 1}})
+	}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			budget := budgetWithTarget(1000)
+			r := openTermReader(t, version, context.Background(), &fakeClientAdapter{data: x.encoded}, x, 0, terms, WithConcurrency(8), WithMemoryBudget(budget))
+			head := make([]byte, 1)
+			if _, err := io.ReadFull(r, head); err != nil {
+				t.Fatal(err)
+			}
+			awaitQueued(t, budget, 1)
+
+			closed := make(chan struct{})
+			go func() {
+				defer close(closed)
+				r.Close()
+			}()
+			if !within(t, "Close while the dispatcher waits for budget", closed) {
+				t.FailNow()
+			}
+			budget.mu.Lock()
+			waiting := budget.waiters.Len()
+			budget.mu.Unlock()
+			if used, attached := usedOf(budget), attachedOf(budget); used != 0 || attached != 0 || waiting != 0 {
+				t.Fatalf("after Close: %d bytes used, %d downloads attached, %d Acquire calls waiting; want none", used, attached, waiting)
+			}
+			if _, err := r.Read(head); !errors.Is(err, fs.ErrClosed) {
+				t.Fatalf("Read after Close = %v, want fs.ErrClosed", err)
+			}
+		})
+	}
+}
+
+// TestTermReaderSharedRangeHoldsWindow pins the window over a range two terms
+// read: with concurrency 1, the next range starts only once the second of
+// them is delivered.
+func TestTermReaderSharedRangeHoldsWindow(t *testing.T) {
+	x := newFixtureXorb(t, 0x48, randomChunks(49, 2, 1000))
+	a, b := ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 1, End: 2}
+	terms := []fixtureTerm{{a, a}, {a, a}, {b, b}}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
+				r := openTermReader(t, version, t.Context(), client, x, 0, terms, WithConcurrency(1), WithMemoryBudget(budgetWithTarget(1<<40)))
+				var got []byte
+				for _, step := range []struct {
+					read int
+					gets int32
+				}{
+					{1000, 1}, // the first term of range a delivered
+					{1000, 2}, // the second, a's last, delivered
+				} {
+					buf := make([]byte, step.read)
+					if _, err := io.ReadFull(r, buf); err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, buf...)
+					synctest.Wait()
+					if n := client.gets.Load(); n != step.gets {
+						t.Fatalf("after reading %d bytes: %d GETs, want %d", len(got), n, step.gets)
+					}
+				}
+				rest, err := io.ReadAll(r)
+				if got, want := append(got, rest...), x.file(terms); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+				}
+			})
+		})
+	}
 }
 
 // TestTermReaderVerifiesWithFetchHashes corrupts the hash a fetch kept for a
