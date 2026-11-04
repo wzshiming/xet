@@ -747,18 +747,24 @@ func TestTermReaderStreamsRangeToCache(t *testing.T) {
 }
 
 // TestTermReaderFetchDoesNotWaitForStalledCacheWrite stalls the cache write
-// of a range: its fetch completes regardless, and the reader returns io.EOF
-// only once the write is over.
+// of a range before its body arrives: its fetch completes regardless, and the
+// reader returns io.EOF only once the write is over.
 func TestTermReaderFetchDoesNotWaitForStalledCacheWrite(t *testing.T) {
 	x := newFixtureXorb(t, 0x42, randomChunks(43, 3, 1000))
+	// gatedClient ignores Range, so the range is the whole xorb.
 	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 3}, ChunkRange{Start: 0, End: 3}}}
 	for _, version := range readerVersions {
 		t.Run(version, func(t *testing.T) {
 			dir := t.TempDir()
-			r := openTermReader(t, version, context.Background(), &fakeClientAdapter{data: x.encoded}, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)))
+			client := &gatedClient{data: x.encoded, release: make(chan struct{}), stalled: make(chan struct{}), closed: make(chan struct{})}
+			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)))
 			stalled, unstall := stallWrites(t, r.writer)
 			r.start() // fetch without a Read, which must not run alongside Close
-			if !within(t, "the cache write reaching the stalled disk", stalled) || !within(t, "the fetch while its cache write is stalled", r.fetches[0].done) {
+			if !within(t, "the cache write reaching the stalled disk", stalled) {
+				t.FailNow()
+			}
+			close(client.release)
+			if !within(t, "the fetch while its cache write is stalled", r.fetches[0].done) {
 				t.FailNow()
 			}
 
