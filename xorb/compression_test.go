@@ -2,7 +2,10 @@ package xorb
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
+
+	"github.com/wzshiming/xet"
 )
 
 func TestLZ4CompressionDecompression(t *testing.T) {
@@ -174,6 +177,61 @@ func TestSelectBestCompression(t *testing.T) {
 				t.Error("Decompressed data doesn't match original")
 			}
 		})
+	}
+}
+
+// TestCompressLZ4WritesXetCoreFrames pins the frames of xet-core's lz4_flex FrameEncoder::new: FrameInfo::default() with the Auto block size.
+func TestCompressLZ4WritesXetCoreFrames(t *testing.T) {
+	codecs := []struct {
+		name       string
+		compress   func(dst, data []byte) ([]byte, error)
+		decompress func(dst, data []byte, n int) ([]byte, error)
+	}{
+		{"lz4", compressLZ4, decompressLZ4},
+		{"bg4", compressByteGrouping4LZ4, decompressByteGrouping4LZ4},
+	}
+	// BD bits 4-6 hold the block maximum size id: 4 = 64 KB, 5 = 256 KB, 7 = 4 MB.
+	sizes := []struct {
+		n       int
+		bd      byte
+		lz4Only bool
+	}{
+		{1, 0x40, false},
+		{100, 0x40, false},
+		{64 << 10, 0x40, false},
+		{64<<10 + 1, 0x50, false},
+		{xet.MaxChunkSize, 0x50, false},
+		{256 << 10, 0x50, false},
+		{256<<10 + 1, 0x70, true},
+	}
+	// Rounds over all sizes make later calls reuse pooled writers, also after other block sizes.
+	for call := 1; call <= 3; call++ {
+		for _, size := range sizes {
+			for _, c := range codecs {
+				if size.lz4Only && c.name != "lz4" {
+					continue
+				}
+				t.Run(fmt.Sprintf("%s/n=%d/call=%d", c.name, size.n, call), func(t *testing.T) {
+					data := payloadForTest(size.n, byte(size.n))
+					frame, err := c.compress(nil, data)
+					if err != nil {
+						t.Fatalf("compress %d bytes: %v", size.n, err)
+					}
+					if frame[4] != 0x60 {
+						t.Errorf("FLG = %#02x, want 0x60: version 1, independent blocks, no block or content checksum, no content size, no dictionary", frame[4])
+					}
+					if frame[5] != size.bd {
+						t.Errorf("BD = %#02x, want %#02x, the block size lz4_flex picks for %d bytes", frame[5], size.bd, size.n)
+					}
+					if end := frame[len(frame)-4:]; !bytes.Equal(end, []byte{0, 0, 0, 0}) {
+						t.Errorf("frame ends with %x, want the end mark 00000000 and no content checksum", end)
+					}
+					if got, err := c.decompress(nil, frame, size.n); err != nil || !bytes.Equal(got, data) {
+						t.Errorf("round trip = %d bytes, %v; want the %d-byte input", len(got), err, size.n)
+					}
+				})
+			}
+		}
 	}
 }
 

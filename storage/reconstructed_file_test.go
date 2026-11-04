@@ -948,7 +948,8 @@ func TestReconstructedFileFaultFailsAtChunk(t *testing.T) {
 		name string
 		f    faultySeeker
 	}{
-		{"flipped body byte", faultySeeker{flip: (fk.start + xorb.ChunkHeaderSize + fk.end) / 2}},
+		// Frames carry no content checksum (as xet-core's), so a flip inside the compressed payload is caught only when it breaks the stream.
+		{"flipped frame magic byte", faultySeeker{flip: fk.start + xorb.ChunkHeaderSize}},
 		{"header size off its frame", faultySeeker{flip: fk.start + 1}},
 		{"seeker fails mid-frame", faultySeeker{stop: fk.start + xorb.ChunkHeaderSize + 5, err: errInjected}},
 		{"seeker truncated at chunk boundary", faultySeeker{stop: fk.start, err: io.EOF}},
