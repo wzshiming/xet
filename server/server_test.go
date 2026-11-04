@@ -10,11 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,9 +25,12 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/internal/crc64nvme"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/storage/memory"
+	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -116,6 +122,18 @@ func TestRoutesConsultAuthorizer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx := context.Background()
+	staged, err := stor.GrantXorbUpload(ctx, xorbHash, int64(len(xorbBytes)), crc64nvme.Checksum(xorbBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stor.PutStagedXorb(ctx, staged.ID, bytes.NewReader(xorbBytes)); err != nil {
+		t.Fatal(err)
+	}
+	granted, err := stor.GrantXorbUpload(ctx, xorbHash, int64(len(xorbBytes)), crc64nvme.Checksum(xorbBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		name   string
 		method string
@@ -136,9 +154,12 @@ func TestRoutesConsultAuthorizer(t *testing.T) {
 		{"write legacy", "POST", "/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
 		{"write v2", "POST", "/v2/shards", shardBytes, []auth.Grant{{Permission: auth.Write}, {Permission: auth.Write, File: &fileHash, SHA256: hex.EncodeToString(digest[:])}}},
 		{"report telemetry", "POST", "/v1/telemetry", telemetryTestEnvelope(t, nil), []auth.Grant{{Permission: auth.Read}}},
+		{"grant stored xorb", "POST", "/v1/xorb-grants/default/" + xorbHash.String(), grantTestBody(xorbBytes), []auth.Grant{{Permission: auth.Write}}},
+		{"commit staged xorb", "POST", "/v1/xorb-commits/default/" + xorbHash.String() + "/grant/" + staged.ID, nil, []auth.Grant{{Permission: auth.Write}}},
 		{"download xorb", "GET", "/v1/xorbs/default/" + xorbHash.String(), nil, nil},
 		{"bridge get", "GET", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
 		{"bridge head", "HEAD", "/xet-bridge/" + hex.EncodeToString(digest[:]), nil, nil},
+		{"upload granted xorb", "PUT", storage.XorbUploadPath(granted.ID), xorbBytes, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			authorizer := &recordingAuthorizer{}
@@ -172,6 +193,15 @@ func TestRoutesConsultAuthorizer(t *testing.T) {
 				if last.Type != "result" {
 					t.Fatalf("terminal event = %+v", last)
 				}
+			}
+			if strings.HasPrefix(test.path, "/v1/xorb-commits/") {
+				var response map[string]any
+				if err := json.NewDecoder(rec.Body).Decode(&response); err != nil || !reflect.DeepEqual(response, map[string]any{"was_inserted": false}) {
+					t.Fatalf("commit response = %v (%v), want {\"was_inserted\":false}", response, err)
+				}
+			}
+			if (strings.HasPrefix(test.path, "/v1/xorb-grants/") || strings.HasPrefix(test.path, "/v1/xorb-uploads/")) && rec.Body.Len() != 0 {
+				t.Fatalf("body = %q, want empty", rec.Body)
 			}
 		})
 	}
@@ -443,13 +473,23 @@ type untouchedStorage struct {
 }
 
 func (s *untouchedStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) {
-	s.t.Error("HasXorb called for a rejected shard upload")
+	s.t.Error("HasXorb called for a rejected upload")
 	return false, errors.New("rejected upload")
 }
 
 func (s *untouchedStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
-	s.t.Error("PutShard called for a rejected shard upload")
+	s.t.Error("PutShard called for a rejected upload")
 	return false, errors.New("rejected upload")
+}
+
+func (s *untouchedStorage) GrantXorbUpload(context.Context, xet.XorbHash, int64, uint64) (*storage.XorbUploadGrant, error) {
+	s.t.Error("GrantXorbUpload called for a rejected upload")
+	return nil, errors.New("rejected upload")
+}
+
+func (s *untouchedStorage) PutStagedXorb(context.Context, string, io.Reader) error {
+	s.t.Error("PutStagedXorb called for a rejected upload")
+	return errors.New("rejected upload")
 }
 
 func TestShardUploadRejectsContentLengthBeforeBody(t *testing.T) {
@@ -725,6 +765,8 @@ func TestRoutesAuthorizationParsingOrder(t *testing.T) {
 		{"POST", "/shards", "", 403, 1},
 		{"POST", "/v2/shards", "", 403, 1},
 		{"POST", "/v1/telemetry", "{", 403, 1},
+		{"POST", "/v1/xorb-grants/default/nothex", "{", 403, 1},
+		{"POST", "/v1/xorb-commits/default/nothex/grant/x", "", 403, 1},
 	} {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			calls := 0
@@ -1102,6 +1144,567 @@ func TestTelemetryDeniedBeforeBody(t *testing.T) {
 			}
 			if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Read}}) {
 				t.Fatalf("authorizations = %v, want one untargeted read", authorizer.calls)
+			}
+		})
+	}
+}
+
+// grantTestBackends are the stores the xorb grant routes run on end to end.
+var grantTestBackends = []struct {
+	name string
+	new  func(t *testing.T) storage.Storage
+}{
+	{"local", func(t *testing.T) storage.Storage {
+		stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stor
+	}},
+	{"memory", func(*testing.T) storage.Storage { return memory.NewStorage() }},
+}
+
+// grantTestHandler serves stor and fails t on any request no route matched, so a missing route never passes for a handler's 404.
+func grantTestHandler(t *testing.T, stor storage.Storage) *Handler {
+	return NewHandler(WithStorage(stor), WithNext(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("%s %s matched no route", r.Method, r.URL.Path)
+		http.Error(w, "no route", http.StatusTeapot)
+	})))
+}
+
+// grantTestBody is the grant request body declaring data's length and CRC-64/NVME.
+func grantTestBody(data []byte) []byte {
+	return fmt.Appendf(nil, `{"length":%d,"checksum":{"algo":"crc64nvme","value":"%d"}}`, len(data), crc64nvme.Checksum(data))
+}
+
+// grantTestResponse is the body of a 201 answer to POST /v1/xorb-grants.
+type grantTestResponse struct {
+	ID      string            `json:"id"`
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+}
+
+// grantTestDecode fails unless status and body are a 201 grant, and returns the grant.
+func grantTestDecode(t *testing.T, status int, body []byte) grantTestResponse {
+	t.Helper()
+	var grant grantTestResponse
+	if status != http.StatusCreated || json.Unmarshal(body, &grant) != nil {
+		t.Fatalf("grant = %d %q, want 201 with a grant", status, body)
+	}
+	return grant
+}
+
+// grantTestSend sends method to url with body and returns the response status and body.
+func grantTestSend(t *testing.T, method, url string, body []byte) (int, []byte) {
+	t.Helper()
+	request, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	got, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response.StatusCode, got
+}
+
+// grantTestUpload grants, PUTs and commits data as xorbHash on the CAS at baseURL, failing unless each step succeeds.
+func grantTestUpload(t *testing.T, baseURL string, xorbHash xet.XorbHash, data []byte) grantTestResponse {
+	t.Helper()
+	status, body := grantTestSend(t, http.MethodPost, baseURL+"/v1/xorb-grants/default/"+xorbHash.String(), grantTestBody(data))
+	grant := grantTestDecode(t, status, body)
+	if status, body := grantTestSend(t, grant.Method, grant.URL, data); status != http.StatusOK || len(body) != 0 {
+		t.Fatalf("%s %s = %d %q, want 200 with an empty body", grant.Method, grant.URL, status, body)
+	}
+	status, body = grantTestSend(t, http.MethodPost, baseURL+"/v1/xorb-commits/default/"+xorbHash.String()+"/grant/"+grant.ID, nil)
+	var committed map[string]any
+	if status != http.StatusOK || json.Unmarshal(body, &committed) != nil || !reflect.DeepEqual(committed, map[string]any{"was_inserted": true}) {
+		t.Fatalf("commit = %d %q, want 200 {\"was_inserted\":true}", status, body)
+	}
+	return grant
+}
+
+// grantTestStaged lists stor's completely staged uploads as grant id to size.
+func grantTestStaged(t *testing.T, stor storage.Storage) map[string]int64 {
+	t.Helper()
+	staged := map[string]int64{}
+	if err := stor.WalkStagedXorbs(context.Background(), func(grantID string, size int64, _ time.Time) error {
+		staged[grantID] = size
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return staged
+}
+
+func TestXorbGrantDeniedBeforeBody(t *testing.T) {
+	for _, test := range []struct {
+		err       error
+		status    int
+		challenge string
+	}{
+		{auth.ErrUnauthenticated, http.StatusUnauthorized, "Bearer"},
+		{auth.ErrForbidden, http.StatusForbidden, ""},
+	} {
+		t.Run(test.err.Error(), func(t *testing.T) {
+			authorizer := &recordingAuthorizer{err: test.err}
+			request := httptest.NewRequest(http.MethodPost, "/v1/xorb-grants/default/"+strings.Repeat("ab", 32), &unreadBody{t: t})
+			request.ContentLength = 16 << 20
+			rec := httptest.NewRecorder()
+			NewHandler(WithStorage(&untouchedStorage{t: t}), WithAuthorizer(authorizer)).ServeHTTP(rec, request)
+			if rec.Code != test.status || rec.Header().Get("WWW-Authenticate") != test.challenge {
+				t.Fatalf("response = %d %v, want %d with challenge %q", rec.Code, rec.Header(), test.status, test.challenge)
+			}
+			if !reflect.DeepEqual(authorizer.calls, []auth.Grant{{Permission: auth.Write}}) {
+				t.Fatalf("authorizations = %v, want one untargeted write", authorizer.calls)
+			}
+		})
+	}
+}
+
+// TestXorbGrantFlow: grant, PUT and commit store the xorb; afterwards a grant answers 200 and the commit and the PUT 404.
+func TestXorbGrantFlow(t *testing.T) {
+	data, xorbHash := storagetest.EncodeXorb(t, true, []byte("granted chunk one"), []byte("granted chunk two"))
+	for _, backend := range grantTestBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			srv := httptest.NewServer(grantTestHandler(t, backend.new(t)))
+			defer srv.Close()
+			grant := grantTestUpload(t, srv.URL, xorbHash, data)
+			if status, body := grantTestSend(t, http.MethodGet, srv.URL+"/v1/xorbs/default/"+xorbHash.String(), nil); status != http.StatusOK || !bytes.Equal(body, data) {
+				t.Fatalf("download = %d with %d bytes, want 200 with the %d committed", status, len(body), len(data))
+			}
+			if status, body := grantTestSend(t, http.MethodPost, srv.URL+"/v1/xorb-grants/default/"+xorbHash.String(), grantTestBody(data)); status != http.StatusOK || len(body) != 0 {
+				t.Fatalf("grant for the stored xorb = %d %q, want 200 with an empty body", status, body)
+			}
+			if status, body := grantTestSend(t, http.MethodPost, srv.URL+"/v1/xorb-commits/default/"+xorbHash.String()+"/grant/"+grant.ID, nil); status != http.StatusNotFound {
+				t.Fatalf("second commit = %d %q, want 404", status, body)
+			}
+			if status, body := grantTestSend(t, grant.Method, grant.URL, data); status != http.StatusNotFound {
+				t.Fatalf("PUT after the commit = %d %q, want 404", status, body)
+			}
+		})
+	}
+}
+
+// statusTestWriter remembers the status its handler wrote.
+type statusTestWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusTestWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func TestClientUploadsThroughXorbGrants(t *testing.T) {
+	content := make([]byte, 256<<10)
+	rand.New(rand.NewSource(1)).Read(content)
+	for _, backend := range grantTestBackends {
+		t.Run(backend.name, func(t *testing.T) {
+			handler := NewHandler(WithStorage(backend.new(t)))
+			var mu sync.Mutex
+			seen := map[string]int{}
+			var puts [][]byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut {
+					body, _ := io.ReadAll(r.Body)
+					r.Body = io.NopCloser(bytes.NewReader(body))
+					mu.Lock()
+					puts = append(puts, body)
+					mu.Unlock()
+				}
+				status := &statusTestWriter{ResponseWriter: w, status: http.StatusOK}
+				handler.ServeHTTP(status, r)
+				segments := strings.SplitN(r.URL.Path, "/", 4)
+				mu.Lock()
+				seen[fmt.Sprintf("%s %s %d", r.Method, strings.Join(segments[:min(len(segments), 3)], "/"), status.status)]++
+				mu.Unlock()
+			}))
+			defer srv.Close()
+			newClient := func() *client.Client {
+				c, err := client.NewClient(client.WithCache(client.NewCache(t.TempDir(), 0, 0)), client.WithUpstreamProvider(client.StaticUpstreamProvider(srv.URL, "")))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+
+			fileHash, err := newClient().UploadFile(t.Context(), bytes.NewReader(content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			requests := maps.Clone(seen)
+			mu.Unlock()
+			// Dedup queries depend on the client's probing, not on how the xorb goes up.
+			maps.DeleteFunc(requests, func(request string, _ int) bool { return strings.Contains(request, " /v1/chunks ") })
+			want := map[string]int{
+				"HEAD /v1/xorbs 404":        1,
+				"POST /v1/xorb-grants 201":  1,
+				"PUT /v1/xorb-uploads 200":  1,
+				"POST /v1/xorb-commits 200": 1,
+				"POST /v1/shards 200":       1,
+			}
+			if !maps.Equal(requests, want) {
+				t.Fatalf("upload requests = %v, want %v and no POST /v1/xorbs", requests, want)
+			}
+			// xet-core 1.8.0 servers stage only the chunk sequence, without a footer.
+			mu.Lock()
+			bodies := slices.Clone(puts)
+			mu.Unlock()
+			for _, body := range bodies {
+				if offsets, err := xorb.ReadChunkOffsets(bytes.NewReader(body)); !errors.Is(err, xorb.ErrNoFooter) {
+					t.Fatalf("PUT body of %d bytes ends in a xorb footer listing %d chunks (err %v), want the footer-less chunk sequence", len(body), len(offsets), err)
+				}
+			}
+
+			readers, _, err := newClient().DownloadFiles(t.Context(), []xet.FileHash{fileHash})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if readers[0] == nil {
+				t.Fatal("uploaded file not found")
+			}
+			defer readers[0].Close()
+			got, err := io.ReadAll(readers[0])
+			if err != nil || !bytes.Equal(got, content) {
+				t.Fatalf("downloaded %d bytes (%v), want the %d uploaded", len(got), err, len(content))
+			}
+		})
+	}
+}
+
+func TestXorbUploadStatuses(t *testing.T) {
+	ctx := context.Background()
+	data, xorbHash := storagetest.EncodeXorb(t, true, []byte("granted chunk one"), []byte("granted chunk two"))
+	flipped := bytes.Clone(data)
+	flipped[len(flipped)/2] ^= 1
+	for _, test := range []struct {
+		name   string
+		ttl    time.Duration // grant TTL; zero keeps the default
+		id     string        // empty PUTs to a fresh grant for data
+		staged bool          // data is staged under the grant before the PUT
+		body   []byte
+		status int
+	}{
+		{name: "unknown id", id: strings.Repeat("ab", 16), body: data, status: http.StatusNotFound},
+		{name: "malformed id", id: "not-a-grant", body: data, status: http.StatusNotFound},
+		{name: "expired", ttl: time.Nanosecond, body: data, status: http.StatusForbidden},
+		{name: "repeat", staged: true, body: data, status: http.StatusPreconditionFailed},
+		{name: "one byte short", body: data[:len(data)-1], status: http.StatusBadRequest},
+		{name: "one byte long", body: append(bytes.Clone(data), 0), status: http.StatusBadRequest},
+		{name: "flipped byte", body: flipped, status: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stor, err := local.NewStorage(local.WithBasePath(t.TempDir()), local.WithUploadGrantTTL(test.ttl))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, want := test.id, map[string]int64{}
+			if id == "" {
+				grant, err := stor.GrantXorbUpload(ctx, xorbHash, int64(len(data)), crc64nvme.Checksum(data))
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = grant.ID
+			}
+			if test.staged {
+				if err := stor.PutStagedXorb(ctx, id, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
+				want[id] = int64(len(data))
+			}
+			rec := httptest.NewRecorder()
+			grantTestHandler(t, stor).ServeHTTP(rec, httptest.NewRequest(http.MethodPut, storage.XorbUploadPath(id), bytes.NewReader(test.body)))
+			if rec.Code != test.status {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, test.status, rec.Body)
+			}
+			if staged := grantTestStaged(t, stor); !maps.Equal(staged, want) {
+				t.Fatalf("staged uploads = %v, want %v", staged, want)
+			}
+		})
+	}
+}
+
+func TestXorbUploadRequiresContentLength(t *testing.T) {
+	for _, length := range []int64{0, -1} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPut, storage.XorbUploadPath(strings.Repeat("ab", 16)), &unreadBody{t: t})
+			request.ContentLength = length
+			rec := httptest.NewRecorder()
+			grantTestHandler(t, &untouchedStorage{t: t}).ServeHTTP(rec, request)
+			if rec.Code != http.StatusLengthRequired || strings.TrimSpace(rec.Body.String()) != "Content-Length header required" {
+				t.Fatalf("response = %d %q, want 411 Content-Length header required", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// putStagedTestStorage fails every PutStagedXorb with err.
+type putStagedTestStorage struct {
+	storage.Storage
+	err   error
+	calls int
+}
+
+func (s *putStagedTestStorage) PutStagedXorb(context.Context, string, io.Reader) error {
+	s.calls++
+	return s.err
+}
+
+func TestXorbUploadMapsStorageErrors(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"grant not found", storage.ErrUploadGrantNotFound, http.StatusNotFound},
+		{"other", errors.New("disk full"), http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stor := &putStagedTestStorage{err: test.err}
+			rec := httptest.NewRecorder()
+			grantTestHandler(t, stor).ServeHTTP(rec, httptest.NewRequest(http.MethodPut, storage.XorbUploadPath(strings.Repeat("ab", 16)), strings.NewReader("xorb bytes")))
+			if rec.Code != test.status || stor.calls != 1 {
+				t.Fatalf("status = %d after %d PutStagedXorb calls, want %d after one", rec.Code, stor.calls, test.status)
+			}
+		})
+	}
+}
+
+func TestXorbUploadRoundTripsMultiChunkXorb(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	chunks := make([][]byte, 10)
+	for i := range chunks {
+		chunks[i] = make([]byte, xet.MaxChunkSize)
+		random.Read(chunks[i])
+	}
+	data, xorbHash := storagetest.EncodeXorb(t, true, chunks...)
+	if len(data) <= 1<<20 {
+		t.Fatalf("xorb = %d bytes, want over 1 MiB", len(data))
+	}
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(grantTestHandler(t, stor))
+	defer srv.Close()
+	grantTestUpload(t, srv.URL, xorbHash, data)
+	if status, body := grantTestSend(t, http.MethodGet, srv.URL+"/v1/xorbs/default/"+xorbHash.String(), nil); status != http.StatusOK || !bytes.Equal(body, data) {
+		t.Fatalf("download = %d with %d bytes, want 200 with the %d committed", status, len(body), len(data))
+	}
+}
+
+func TestXorbCommitStatuses(t *testing.T) {
+	ctx := context.Background()
+	dataA, _ := storagetest.EncodeXorb(t, true, []byte("xorb A's only chunk"))
+	_, hashB := storagetest.EncodeXorb(t, true, []byte("xorb B's only chunk"))
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// grantB issues B's grant declaring A's length and checksum, so A's bytes stage under it.
+	grantB := func(t *testing.T) string {
+		t.Helper()
+		grant, err := stor.GrantXorbUpload(ctx, hashB, int64(len(dataA)), crc64nvme.Checksum(dataA))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return grant.ID
+	}
+	commit := func(t *testing.T, xorbHash, grantID string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		grantTestHandler(t, stor).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/xorb-commits/default/"+xorbHash+"/grant/"+grantID, nil))
+		return rec
+	}
+
+	t.Run("bad hash", func(t *testing.T) {
+		if rec := commit(t, "nothex", grantB(t)); rec.Code != http.StatusBadRequest || strings.TrimSpace(rec.Body.String()) != "Invalid xorb hash" {
+			t.Fatalf("response = %d %q, want 400 Invalid xorb hash", rec.Code, rec.Body)
+		}
+	})
+	t.Run("nothing staged", func(t *testing.T) {
+		if rec := commit(t, hashB.String(), grantB(t)); rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body)
+		}
+	})
+	t.Run("another xorb's bytes", func(t *testing.T) {
+		id := grantB(t)
+		if err := stor.PutStagedXorb(ctx, id, bytes.NewReader(dataA)); err != nil {
+			t.Fatal(err)
+		}
+		if rec := commit(t, hashB.String(), id); rec.Code != http.StatusBadRequest || strings.TrimSpace(rec.Body.String()) != "Invalid xorb" {
+			t.Fatalf("response = %d %q, want 400 Invalid xorb", rec.Code, rec.Body)
+		}
+		if exists, err := stor.HasXorb(ctx, hashB); err != nil || exists {
+			t.Fatalf("HasXorb(B) = %v, %v; want false", exists, err)
+		}
+		if staged := grantTestStaged(t, stor); len(staged) != 0 {
+			t.Fatalf("staged uploads = %v, want none", staged)
+		}
+	})
+}
+
+func TestXorbGrantRequestBody(t *testing.T) {
+	const lengthCap, bodyCap = 2 * xet.MaxXorbSize, 4 << 10
+	body := func(length, checksum string) string {
+		return fmt.Sprintf(`{"length":%s,"checksum":%s}`, length, checksum)
+	}
+	crc := func(value string) string {
+		return fmt.Sprintf(`{"algo":"crc64nvme","value":%s}`, value)
+	}
+	valid := body("5", crc(`"1"`))
+	// padded is a valid body of exactly size bytes, filled out by an unknown key.
+	padded := func(size int) string {
+		prefix := `{"length":5,"checksum":` + crc(`"1"`) + `,"padding":"`
+		return prefix + strings.Repeat("x", size-len(prefix)-2) + `"}`
+	}
+	stor := memory.NewStorage()
+	for _, test := range []struct {
+		name          string
+		body          string
+		unknownLength bool
+		status        int
+	}{
+		{"valid", valid, false, http.StatusCreated},
+		{"invalid JSON", "{", false, http.StatusBadRequest},
+		{"top-level array", "[" + valid + "]", false, http.StatusBadRequest},
+		{"top-level null", "null", false, http.StatusBadRequest},
+		{"missing length", `{"checksum":` + crc(`"1"`) + `}`, false, http.StatusBadRequest},
+		{"missing checksum", `{"length":5}`, false, http.StatusBadRequest},
+		{"algo crc32c", body("5", `{"algo":"crc32c","value":"1"}`), false, http.StatusBadRequest},
+		{"value hex", body("5", crc(`"0x1"`)), false, http.StatusBadRequest},
+		{"value negative", body("5", crc(`"-1"`)), false, http.StatusBadRequest},
+		{"value JSON number", body("5", crc(`1`)), false, http.StatusBadRequest},
+		{"value past uint64", body("5", crc(`"18446744073709551616"`)), false, http.StatusBadRequest},
+		{"value max uint64", body("5", crc(`"18446744073709551615"`)), false, http.StatusCreated},
+		{"length 0", body("0", crc(`"1"`)), false, http.StatusBadRequest},
+		{"length -1", body("-1", crc(`"1"`)), false, http.StatusBadRequest},
+		{"length 1.5", body("1.5", crc(`"1"`)), false, http.StatusBadRequest},
+		{"length string", body(`"5"`, crc(`"1"`)), false, http.StatusBadRequest},
+		{"length past cap", body(fmt.Sprint(lengthCap+1), crc(`"1"`)), false, http.StatusBadRequest},
+		{"length at cap", body(fmt.Sprint(lengthCap), crc(`"1"`)), false, http.StatusCreated},
+		{"unknown key at body cap", padded(bodyCap), false, http.StatusCreated},
+		{"one byte past body cap", padded(bodyCap + 1), false, http.StatusRequestEntityTooLarge},
+		{"one byte past body cap unknown length", padded(bodyCap + 1), true, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/xorb-grants/default/"+strings.Repeat("ab", 32), strings.NewReader(test.body))
+			if test.unknownLength {
+				request.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+			grantTestHandler(t, stor).ServeHTTP(rec, request)
+			message := map[int]string{http.StatusBadRequest: "Invalid request body", http.StatusRequestEntityTooLarge: "Request body too large"}[test.status]
+			if rec.Code != test.status || (message != "" && strings.TrimSpace(rec.Body.String()) != message) {
+				t.Fatalf("response = %d %.80q, want %d %s", rec.Code, rec.Body, test.status, message)
+			}
+		})
+	}
+}
+
+// nilHeadersTestStorage issues its grants with nil Headers.
+type nilHeadersTestStorage struct{ storage.Storage }
+
+func (s nilHeadersTestStorage) GrantXorbUpload(ctx context.Context, xorbHash xet.XorbHash, length int64, checksum uint64) (*storage.XorbUploadGrant, error) {
+	grant, err := s.Storage.GrantXorbUpload(ctx, xorbHash, length, checksum)
+	if err != nil {
+		return nil, err
+	}
+	grant.Headers = nil
+	return grant, nil
+}
+
+func TestXorbGrantResponse(t *testing.T) {
+	data, xorbHash := storagetest.EncodeXorb(t, true, []byte("granted chunk"))
+	for _, test := range []struct {
+		name string
+		stor storage.Storage
+	}{
+		{"routed grant", memory.NewStorage()},
+		{"nil headers", nilHeadersTestStorage{memory.NewStorage()}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			grantTestHandler(t, test.stor).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/xorb-grants/default/"+xorbHash.String(), bytes.NewReader(grantTestBody(data))))
+			if rec.Code != http.StatusCreated || rec.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("response = %d %q %q, want 201 application/json", rec.Code, rec.Header().Get("Content-Type"), rec.Body)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &fields); err != nil {
+				t.Fatalf("body %q: %v", rec.Body, err)
+			}
+			if keys := slices.Sorted(maps.Keys(fields)); !slices.Equal(keys, []string{"headers", "id", "method", "url"}) {
+				t.Fatalf("keys = %v, want headers, id, method and url", keys)
+			}
+			var id, method string
+			if string(fields["headers"]) != "{}" || json.Unmarshal(fields["id"], &id) != nil || json.Unmarshal(fields["method"], &method) != nil {
+				t.Fatalf("body = %s, want string id and method and \"headers\":{}", rec.Body)
+			}
+			if !storage.ValidGrantID(id) || method != http.MethodPut {
+				t.Fatalf("id %q, method %q; want a valid grant id and PUT", id, method)
+			}
+		})
+	}
+}
+
+func TestXorbGrantURL(t *testing.T) {
+	data, xorbHash := storagetest.EncodeXorb(t, true, []byte("granted chunk"))
+	grantPath := "/v1/xorb-grants/default/" + xorbHash.String()
+	serveGrant := func(t *testing.T, handler http.Handler, request *http.Request) grantTestResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, request)
+		return grantTestDecode(t, rec.Code, rec.Body.Bytes())
+	}
+
+	t.Run("storage base URL", func(t *testing.T) {
+		srv := httptest.NewUnstartedServer(nil)
+		stor, err := local.NewStorage(local.WithBasePath(t.TempDir()), local.WithBaseURL("http://"+srv.Listener.Addr().String()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.Config.Handler = grantTestHandler(t, stor)
+		srv.Start()
+		defer srv.Close()
+		// Asked as example.com, so a URL rebuilt from the request cannot match.
+		grant := serveGrant(t, srv.Config.Handler, httptest.NewRequest(http.MethodPost, grantPath, bytes.NewReader(grantTestBody(data))))
+		if want := srv.URL + storage.XorbUploadPath(grant.ID); grant.URL != want {
+			t.Fatalf("url = %q, want %q", grant.URL, want)
+		}
+		if status, body := grantTestSend(t, grant.Method, grant.URL, data); status != http.StatusOK {
+			t.Fatalf("%s %s = %d %q, want 200", grant.Method, grant.URL, status, body)
+		}
+	})
+	for _, test := range []struct {
+		name   string
+		target string
+		proto  string
+		want   string
+	}{
+		{"request host", grantPath, "", "http://example.com"},
+		{"forwarded https", grantPath, "https", "https://example.com"},
+		{"TLS", "https://example.com" + grantPath, "", "https://example.com"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, test.target, bytes.NewReader(grantTestBody(data)))
+			if test.proto != "" {
+				request.Header.Set("X-Forwarded-Proto", test.proto)
+			}
+			grant := serveGrant(t, grantTestHandler(t, stor), request)
+			if want := test.want + storage.XorbUploadPath(grant.ID); grant.URL != want {
+				t.Fatalf("url = %q, want %q", grant.URL, want)
 			}
 		})
 	}

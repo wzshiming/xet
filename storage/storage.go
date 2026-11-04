@@ -12,6 +12,45 @@ import (
 
 var ErrInvalidShard = errors.New("invalid shard")
 
+var (
+	// ErrUploadGrantNotFound: the grant id was never issued by this process, or its entry was purged.
+	ErrUploadGrantNotFound = errors.New("upload grant not found")
+	// ErrUploadGrantExpired: the grant no longer accepts its upload.
+	ErrUploadGrantExpired = errors.New("upload grant expired")
+	// ErrStagedXorbExists: the grant's upload is already completely staged.
+	ErrStagedXorbExists = errors.New("staged xorb already exists")
+	// ErrStagedXorbMismatch: the upload's length or checksum differs from the grant, or its bytes are not the committed xorb.
+	ErrStagedXorbMismatch = errors.New("staged xorb mismatch")
+	// ErrStagedXorbNotFound: nothing is completely staged under the grant id.
+	ErrStagedXorbNotFound = errors.New("staged xorb not found")
+)
+
+// XorbUploadGrant tells a client how to upload one serialized xorb: Method to
+// URL with exactly Headers and no credentials.
+type XorbUploadGrant struct {
+	ID, Method, URL string
+	Headers         map[string]string
+}
+
+// XorbUploadPath is the CAS route a server-routed grant uploads through.
+func XorbUploadPath(grantID string) string {
+	return "/v1/xorb-uploads/" + grantID
+}
+
+// ValidGrantID reports whether id has the issued form, 32 lowercase hex
+// characters; check it before deriving any key or path from an id.
+func ValidGrantID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Storage is the backend contract implemented by the local, s3 and memory
 // packages; the package overview describes the shared layout and semantics.
 type Storage interface {
@@ -39,6 +78,25 @@ type Storage interface {
 
 	// DeleteXorb removes a stored xorb object.
 	DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error
+
+	// Staged xorb uploads: granted uploads under staging/, named by grant id, until committed or reclaimed.
+
+	// GrantXorbUpload issues a grant for an upload of length bytes with the given
+	// CRC-64/NVME; it always issues, whether or not the xorb is already stored.
+	GrantXorbUpload(ctx context.Context, xorbHash xet.XorbHash, length int64, checksum uint64) (*XorbUploadGrant, error)
+
+	// PutStagedXorb stages the upload of a live grant once its length and checksum match the grant.
+	PutStagedXorb(ctx context.Context, grantID string, r io.Reader) error
+
+	// CommitStagedXorb validates the staged upload as xorbHash and stores it as that xorb,
+	// reporting whether it was inserted; only the staged object, not a live grant, is needed.
+	CommitStagedXorb(ctx context.Context, grantID string, xorbHash xet.XorbHash) (bool, error)
+
+	// WalkStagedXorbs calls fn for every completely staged upload.
+	WalkStagedXorbs(ctx context.Context, fn func(grantID string, size int64, modTime time.Time) error) error
+
+	// DeleteStagedXorb removes a staged upload; a missing one is not an error.
+	DeleteStagedXorb(ctx context.Context, grantID string) error
 
 	// Shard objects: serialized shards under shards/, resolved through the indexes.
 

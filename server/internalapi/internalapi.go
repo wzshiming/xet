@@ -318,7 +318,7 @@ func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
 		done = false
 	} else {
 		resp.Storage = result
-		swept = len(result.SweptShards) + len(result.SweptXorbs)
+		swept = len(result.SweptShards) + len(result.SweptXorbs) + result.SweptStagedXorbs
 		done = result.Done
 	}
 	// The later passes wait for the storage pass to finish, not for one that failed.

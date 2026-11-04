@@ -71,13 +71,13 @@ func assertUnpinned(t *testing.T, err error, tag string) {
 func TestNoEnvSelectsDefaultVersion(t *testing.T) {
 	testUnsetenv(t, "XET_CORE_REFERENCE_BIN")
 	testUnsetenv(t, "XET_CORE_VERSION")
-	assertSelected(t, "v1.7.1")
+	assertSelected(t, "v1.8.0")
 }
 
 func TestXetCoreVersionSelectsPinnedRelease(t *testing.T) {
 	testUnsetenv(t, "XET_CORE_REFERENCE_BIN")
-	t.Setenv("XET_CORE_VERSION", "v1.6.0")
-	assertSelected(t, "v1.6.0")
+	t.Setenv("XET_CORE_VERSION", "v1.7.1")
+	assertSelected(t, "v1.7.1")
 }
 
 func TestReferenceBinOverridesVersion(t *testing.T) {
@@ -86,7 +86,7 @@ func TestReferenceBinOverridesVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("XET_CORE_REFERENCE_BIN", bin)
-	for _, tag := range []string{"", "v1.6.0", "v1.7.0"} {
+	for _, tag := range []string{"", "v1.7.1", "v1.7.0"} {
 		t.Setenv("XET_CORE_VERSION", tag)
 		if _, binary, err := resolveReference(); err != nil || binary != bin {
 			t.Errorf("XET_CORE_VERSION=%q: resolveReference() = %s, %v; want %s, nil", tag, binary, err, bin)
@@ -116,9 +116,9 @@ func TestEntryPointsReportUnpinnedVersion(t *testing.T) {
 
 func TestVersionWithoutVPrefixIsRejected(t *testing.T) {
 	testUnsetenv(t, "XET_CORE_REFERENCE_BIN")
-	t.Setenv("XET_CORE_VERSION", "1.7.1")
+	t.Setenv("XET_CORE_VERSION", "1.8.0")
 	if manifest, _, err := resolveReference(); err == nil {
-		t.Errorf("XET_CORE_VERSION=1.7.1 resolved to %s, want an error", manifest)
+		t.Errorf("XET_CORE_VERSION=1.8.0 resolved to %s, want an error", manifest)
 	}
 }
 

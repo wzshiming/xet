@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -735,7 +736,7 @@ func wireConformance(t *testing.T, sk serverKind, protocol rustref.ProtocolVersi
 		checkContent(t, download.name+" download", got, fx.data)
 	}
 
-	compareDownloadRequests(t, protocol, rustrefDownloadReqs, nativeDownloadReqs, fileHash.String())
+	compareDownloadRequests(t, protocol, rustrefDownloadReqs, nativeDownloadReqs, fileHash.String(), downloadReq[0].FileSize)
 }
 
 // TestCompatibilityMatrixWireExistingData verifies upload wire conformance when
@@ -901,14 +902,20 @@ func compareUploadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustr
 
 	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
+	t.Logf("xet-core upload requests: %s", requestHistogram(rustrefByType))
+	t.Logf("native upload requests: %s", requestHistogram(nativeByType))
 
 	// STRICT: All non-dedup request type counts must match for this exact
-	// protocol. Dedup probes are validated semantically below.
+	// protocol. Dedup probes and xorb uploads are validated semantically below.
 	assertTypeCountEquality(t, rustrefByType, nativeByType, map[string]bool{
 		"GET:/v1/chunks/default/{hash}": true,
 		"POST:/v1/chunks/default:query": true,
 		"HEAD:/v1/xorbs/default/{hash}": true,
-		"POST:/v1/xorbs/default/{hash}": true,
+		xorbPostReqType:                 true,
+		xorbGrantReqType:                true,
+		rustrefXorbPutReqType:           true,
+		goXorbPutReqType:                true,
+		xorbCommitReqType:               true,
 		telemetryReqType:                true,
 	})
 
@@ -926,25 +933,49 @@ func compareUploadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustr
 		t.Errorf("%s shard endpoint mismatch: xet-core=%d native=%d", protocol, len(rustrefByType[wantShardType]), len(nativeByType[wantShardType]))
 	}
 
+	// STRICT: Each client's xorb uploads must be self-consistent.
+	rustrefUploads := modelUploads(rustrefReqs)
+	nativeUploads := modelUploads(nativeReqs)
+	for _, side := range []struct {
+		name    string
+		uploads uploadModel
+	}{
+		{name: "xet-core", uploads: rustrefUploads},
+		{name: "native", uploads: nativeUploads},
+	} {
+		for _, problem := range side.uploads.problems {
+			t.Errorf("%s xorb upload: %s", side.name, problem)
+		}
+		for _, note := range side.uploads.notes {
+			t.Logf("%s xorb upload: %s", side.name, note)
+		}
+	}
+
 	// STRICT: Dedup chunk queries must target the same chunk hash set.
-	compareChunkDedupQueries(t, rustrefReqs, nativeReqs)
+	compareChunkDedupQueries(t, rustrefReqs, nativeReqs, rustrefUploads, nativeUploads)
 
 	// Compare xorb uploads - validate chunk content
-	rustrefXorbReqs := rustrefByType["POST:/v1/xorbs/default/{hash}"]
-	nativeXorbReqs := nativeByType["POST:/v1/xorbs/default/{hash}"]
-	if len(rustrefXorbReqs) > 0 && len(nativeXorbReqs) > 0 {
-		compareXorbRequests(t, rustrefXorbReqs, nativeXorbReqs)
-	} else {
-		t.Logf("Skip strict xorb upload body comparison: xet-core posts=%d native posts=%d", len(rustrefXorbReqs), len(nativeXorbReqs))
+	switch {
+	case rustrefUploads.bypassed() || nativeUploads.bypassed():
+		t.Logf("Skip chunk-level xorb body comparison: grant uploads bypassed the recording proxy (xet-core: %d committed grants, %d proxied bodies; native: %d, %d); comparing xorb hash sets from grant/commit paths instead",
+			len(rustrefUploads.commitHashes), len(rustrefUploads.bodies), len(nativeUploads.commitHashes), len(nativeUploads.bodies))
+		if !maps.Equal(rustrefUploads.xorbHashes, nativeUploads.xorbHashes) {
+			t.Errorf("Xorb hash set mismatch:\nxet-core=%v\nnative=%v",
+				slices.Sorted(maps.Keys(rustrefUploads.xorbHashes)), slices.Sorted(maps.Keys(nativeUploads.xorbHashes)))
+		}
+	case len(rustrefUploads.bodies) > 0 && len(nativeUploads.bodies) > 0:
+		compareXorbRequests(t, rustrefUploads.bodies, nativeUploads.bodies)
+	default:
+		t.Logf("Skip strict xorb upload body comparison: xet-core bodies=%d native bodies=%d", len(rustrefUploads.bodies), len(nativeUploads.bodies))
 	}
 
 	// STRICT: Compare shard content
 	rustrefShardReqs := appendShardRequests(rustrefByType)
 	nativeShardReqs := appendShardRequests(nativeByType)
-	if len(rustrefXorbReqs) == len(nativeXorbReqs) {
+	if len(rustrefUploads.xorbHashes) == len(nativeUploads.xorbHashes) {
 		compareShardRequests(t, rustrefShardReqs, nativeShardReqs)
 	} else {
-		t.Logf("Skip strict shard CAS comparison because xorb upload counts differ: xet-core=%d native=%d", len(rustrefXorbReqs), len(nativeXorbReqs))
+		t.Logf("Skip strict shard CAS comparison because xorb upload counts differ: xet-core=%d native=%d", len(rustrefUploads.xorbHashes), len(nativeUploads.xorbHashes))
 	}
 }
 
@@ -968,12 +999,28 @@ const fetchTermReqType = "GET:/v1/fetch_term"
 // xet-core >= 1.7.0 posts a best-effort telemetry report after each transfer; the Go client does not, so it is not compared.
 const telemetryReqType = "POST:/v1/telemetry"
 
+// Xorb upload request types: a legacy POST, or a grant POST, a PUT to the granted URL and a commit POST.
+const (
+	xorbPostReqType       = "POST:/v1/xorbs/default/{hash}"
+	xorbGrantReqType      = "POST:/v1/xorb-grants/default/{hash}"
+	rustrefXorbPutReqType = "PUT:/simulation/xorb-uploads/{grant}"
+	goXorbPutReqType      = "PUT:/v1/xorb-uploads/{grant}"
+	xorbCommitReqType     = "POST:/v1/xorb-commits/default/{hash}/grant/{grant}"
+)
+
 // compareDownloadRequests compares HTTP requests from xet-core and native clients for downloads.
-func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustrefReqs, nativeReqs []RequestRecord, fileHash string) {
+func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rustrefReqs, nativeReqs []RequestRecord, fileHash string, fileSize int64) {
 	t.Helper()
 
 	rustrefByType := groupRequestsByType(rustrefReqs)
 	nativeByType := groupRequestsByType(nativeReqs)
+	t.Logf("xet-core download requests: %s", requestHistogram(rustrefByType))
+	t.Logf("native download requests: %s", requestHistogram(nativeByType))
+
+	if emptyFileWithoutReconstruction(fileSize, rustrefByType) {
+		t.Log("Skip download comparison for the empty file: xet-core issued no reconstruction query")
+		return
+	}
 
 	// STRICT: Both must use only the selected reconstruction protocol. xet-core
 	// may repeat the query internally, so request counts are not compared.
@@ -1022,6 +1069,11 @@ func compareDownloadRequests(t *testing.T, protocol rustref.ProtocolVersion, rus
 	})
 }
 
+// emptyFileWithoutReconstruction reports a 0-byte download with no xet-core reconstruction query, as xet-core >= 1.8.0 does (xet-core#995).
+func emptyFileWithoutReconstruction(fileSize int64, rustrefByType map[string][]RequestRecord) bool {
+	return fileSize == 0 && len(rustrefByType["GET:/v1/reconstructions/{hash}"]) == 0 && len(rustrefByType["GET:/v2/reconstructions/{hash}"]) == 0
+}
+
 // assertTypeCountEquality enforces exact equality of request-type counts.
 func assertTypeCountEquality(t *testing.T, rustrefByType, nativeByType map[string][]RequestRecord, skipTypes map[string]bool) {
 	t.Helper()
@@ -1049,17 +1101,22 @@ func assertTypeCountEquality(t *testing.T, rustrefByType, nativeByType map[strin
 // compareChunkDedupQueries validates dedup probes semantically. Clients may choose
 // different probing strategies, but every probed chunk hash must belong to that
 // client's uploaded chunk set.
-func compareChunkDedupQueries(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
+func compareChunkDedupQueries(t *testing.T, rustrefReqs, nativeReqs []RequestRecord, rustrefUploads, nativeUploads uploadModel) {
 	t.Helper()
 
 	for _, client := range []struct {
-		name string
-		reqs []RequestRecord
+		name    string
+		reqs    []RequestRecord
+		uploads uploadModel
 	}{
-		{name: "xet-core", reqs: rustrefReqs},
-		{name: "native", reqs: nativeReqs},
+		{name: "xet-core", reqs: rustrefReqs, uploads: rustrefUploads},
+		{name: "native", reqs: nativeReqs, uploads: nativeUploads},
 	} {
-		uploaded := extractUploadedChunkHashes(t, client.reqs)
+		if client.uploads.bypassed() {
+			t.Logf("Skip dedup-probe membership check for %s: uploaded chunk set unavailable because grant uploads bypassed the recording proxy", client.name)
+			continue
+		}
+		uploaded := extractUploadedChunkHashes(client.uploads.bodies)
 		for hash := range queriedChunkHashes(client.reqs) {
 			if !uploaded[hash] {
 				t.Errorf("%s queried dedup chunk %s that is not in its uploaded chunks", client.name, hash)
@@ -1088,37 +1145,110 @@ type xorbInfo struct {
 	chunkSizes  []int
 }
 
-func decodeXorbRequest(t *testing.T, source string, req RequestRecord) xorbInfo {
-	t.Helper()
-	info := xorbInfo{hash: req.Path}
-	dec := xorb.NewDecoder(bytes.NewReader(req.Body), false)
+// decodeXorbBody derives the xorb hash from the decoded chunks, not from any footer.
+func decodeXorbBody(body []byte) (xorbInfo, error) {
+	var info xorbInfo
+	dec := xorb.NewDecoder(bytes.NewReader(body), false)
 	var buf [xet.MaxChunkSize]byte
 	for {
 		n, err := dec.Read(buf[:])
 		if err == io.EOF {
-			return info
+			info.hash = dec.SummoryHash().String()
+			return info, nil
 		}
 		if err != nil {
-			t.Errorf("decode %s xorb: %v", source, err)
-			return info
+			return info, err
 		}
-		hash := xet.ComputeChunkHash(buf[:n])
-		info.chunkHashes = append(info.chunkHashes, hash)
+		info.chunkHashes = append(info.chunkHashes, xet.ComputeChunkHash(buf[:n]))
 		info.chunkSizes = append(info.chunkSizes, n)
 	}
 }
 
-func extractUploadedChunkHashes(t *testing.T, reqs []RequestRecord) map[string]bool {
-	t.Helper()
+// uploadModel is one client's xorb upload traffic as seen by the recording proxy.
+type uploadModel struct {
+	bodies       []xorbInfo      // legacy POST and grant-upload PUT bodies
+	puts         int             // grant-upload PUT records
+	grantHashes  map[string]bool // from grant POST paths
+	commitHashes map[string]bool // from commit paths
+	xorbHashes   map[string]bool // from legacy POST and commit paths
+	problems     []string        // reported with t.Errorf
+	notes        []string        // reported with t.Logf
+}
 
-	result := make(map[string]bool)
+// bypassed reports grant uploads whose PUTs never reached the proxy, as with presigned S3 URLs.
+func (m uploadModel) bypassed() bool {
+	return len(m.commitHashes) > 0 && m.puts == 0
+}
+
+// modelUploads pairs bodies with grants and commits by decoded xorb hash, not by position: uploads run concurrently.
+func modelUploads(reqs []RequestRecord) uploadModel {
+	m := uploadModel{
+		grantHashes:  make(map[string]bool),
+		commitHashes: make(map[string]bool),
+		xorbHashes:   make(map[string]bool),
+	}
 	for _, req := range reqs {
-		if req.Method != http.MethodPost || normalizePath(req.Path) != "/v1/xorbs/default/{hash}" {
+		switch req.Method + ":" + normalizePath(req.Path) {
+		case xorbGrantReqType:
+			m.grantHashes[pathHash(req.Path)] = true
+		case xorbCommitReqType:
+			m.commitHashes[pathHash(req.Path)] = true
+			m.xorbHashes[pathHash(req.Path)] = true
+		case xorbPostReqType:
+			m.xorbHashes[pathHash(req.Path)] = true
+		}
+	}
+
+	bodyHashes := make(map[string]bool)
+	for _, req := range reqs {
+		reqType := req.Method + ":" + normalizePath(req.Path)
+		put := reqType == rustrefXorbPutReqType || reqType == goXorbPutReqType
+		if !put && reqType != xorbPostReqType {
 			continue
 		}
+		if put {
+			m.puts++
+		}
+		info, err := decodeXorbBody(req.Body)
+		if err != nil {
+			m.problems = append(m.problems, fmt.Sprintf("decode %s %s: %v", req.Method, req.Path, err))
+			continue
+		}
+		if put && !m.grantHashes[info.hash] {
+			m.problems = append(m.problems, fmt.Sprintf("PUT %s body is xorb %s, which has no grant", req.Path, info.hash))
+		}
+		if !put && info.hash != pathHash(req.Path) {
+			m.problems = append(m.problems, fmt.Sprintf("POST %s body is xorb %s", req.Path, info.hash))
+		}
+		m.bodies = append(m.bodies, info)
+		bodyHashes[info.hash] = true
+	}
 
-		info := decodeXorbRequest(t, "uploaded", req)
-		for _, hash := range info.chunkHashes {
+	for _, hash := range slices.Sorted(maps.Keys(m.commitHashes)) {
+		if !m.grantHashes[hash] {
+			m.problems = append(m.problems, fmt.Sprintf("commit of xorb %s has no grant", hash))
+		}
+		if m.puts > 0 && !bodyHashes[hash] {
+			m.problems = append(m.problems, fmt.Sprintf("committed xorb %s has no proxied body", hash))
+		}
+	}
+	for _, hash := range slices.Sorted(maps.Keys(m.grantHashes)) {
+		if !m.xorbHashes[hash] {
+			m.notes = append(m.notes, fmt.Sprintf("grant for xorb %s was not committed (the server may already hold it)", hash))
+		}
+	}
+	return m
+}
+
+// pathHash returns the {hash} segment of /v1/<route>/default/{hash}[/grant/{grant}].
+func pathHash(path string) string {
+	return strings.Split(path, "/")[4]
+}
+
+func extractUploadedChunkHashes(bodies []xorbInfo) map[string]bool {
+	result := make(map[string]bool)
+	for _, body := range bodies {
+		for _, hash := range body.chunkHashes {
 			result[hash.String()] = true
 		}
 	}
@@ -1135,13 +1265,27 @@ func groupRequestsByType(reqs []RequestRecord) map[string][]RequestRecord {
 	return result
 }
 
-// normalizePath normalizes request paths by replacing hash values with placeholders.
+// requestHistogram renders grouped requests as sorted "type=count" pairs.
+func requestHistogram(byType map[string][]RequestRecord) string {
+	pairs := make([]string, 0, len(byType))
+	for _, reqType := range slices.Sorted(maps.Keys(byType)) {
+		pairs = append(pairs, fmt.Sprintf("%s=%d", reqType, len(byType[reqType])))
+	}
+	return strings.Join(pairs, " ")
+}
+
+// normalizePath normalizes request paths by replacing hash values and grant ids with placeholders.
 func normalizePath(path string) string {
 	parts := strings.Split(path, "/")
+	prev := ""
 	for i, part := range parts {
-		if len(part) == 64 && isHexString(part) {
+		switch {
+		case prev == "xorb-uploads" || prev == "grant":
+			parts[i] = "{grant}"
+		case len(part) == 64 && isHexString(part):
 			parts[i] = "{hash}"
 		}
+		prev = part
 	}
 	return strings.Join(parts, "/")
 }
@@ -1156,35 +1300,27 @@ func isHexString(s string) bool {
 	return true
 }
 
-// compareXorbRequests compares xorb upload requests by deserializing and comparing chunk content.
-func compareXorbRequests(t *testing.T, rustrefReqs, nativeReqs []RequestRecord) {
+// compareXorbRequests compares xorb upload bodies by their decoded chunk content.
+func compareXorbRequests(t *testing.T, rustrefXorbs, nativeXorbs []xorbInfo) {
 	t.Helper()
 
 	// STRICT: Both clients must upload the same number of xorbs
-	if len(rustrefReqs) != len(nativeReqs) {
-		t.Errorf("Xorb upload count mismatch: xet-core=%d native=%d", len(rustrefReqs), len(nativeReqs))
+	if len(rustrefXorbs) != len(nativeXorbs) {
+		t.Errorf("Xorb upload count mismatch: xet-core=%d native=%d", len(rustrefXorbs), len(nativeXorbs))
 		return
 	}
 
-	// Decode and sort by path (which contains the xorb hash) so that the
-	// positional comparison is stable even when xorbs are uploaded concurrently
-	// and the server records them in a different arrival order.
-	decode := func(source string, reqs []RequestRecord) []xorbInfo {
-		xorbs := make([]xorbInfo, 0, len(reqs))
-		for _, req := range reqs {
-			xorbs = append(xorbs, decodeXorbRequest(t, source, req))
-		}
-		sort.Slice(xorbs, func(i, j int) bool { return xorbs[i].hash < xorbs[j].hash })
-		return xorbs
-	}
-	rustrefXorbs := decode("xet-core", rustrefReqs)
-	nativeXorbs := decode("native", nativeReqs)
+	// Sort by the body-derived xorb hash so that the positional comparison is
+	// stable even when xorbs are uploaded concurrently and the server records
+	// them in a different arrival order.
+	sort.Slice(rustrefXorbs, func(i, j int) bool { return rustrefXorbs[i].hash < rustrefXorbs[j].hash })
+	sort.Slice(nativeXorbs, func(i, j int) bool { return nativeXorbs[i].hash < nativeXorbs[j].hash })
 
 	// STRICT: Corresponding xorbs must contain identical chunk sequences
 	// (same chunking algorithm should produce same chunks).
 	for i := range rustrefXorbs {
 		if rustrefXorbs[i].hash != nativeXorbs[i].hash {
-			t.Errorf("Xorb %d path mismatch: xet-core=%s native=%s", i, rustrefXorbs[i].hash, nativeXorbs[i].hash)
+			t.Errorf("Xorb %d hash mismatch: xet-core=%s native=%s", i, rustrefXorbs[i].hash, nativeXorbs[i].hash)
 			continue
 		}
 		if !slices.Equal(rustrefXorbs[i].chunkHashes, nativeXorbs[i].chunkHashes) {

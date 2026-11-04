@@ -27,6 +27,7 @@ type object struct {
 // Storage keeps xorbs, shards, and index entries in maps keyed by kind then name.
 type Storage struct {
 	baseURL string
+	grants  *storage.GrantRegistry
 
 	mu      sync.RWMutex
 	objects map[string]map[string]object
@@ -40,9 +41,20 @@ func WithBaseURL(baseURL string) Option {
 	}
 }
 
+// WithUploadGrantTTL sets how long upload grants accept their upload;
+// non-positive values keep storage.DefaultUploadGrantTTL.
+func WithUploadGrantTTL(ttl time.Duration) Option {
+	return func(s *Storage) {
+		s.grants = storage.NewGrantRegistry(ttl)
+	}
+}
+
 // NewStorage creates an empty in-memory store.
 func NewStorage(opts ...Option) *Storage {
-	s := &Storage{objects: map[string]map[string]object{}}
+	s := &Storage{
+		grants:  storage.NewGrantRegistry(storage.DefaultUploadGrantTTL),
+		objects: map[string]map[string]object{},
+	}
 	for _, opt := range opts {
 		opt(s)
 	}

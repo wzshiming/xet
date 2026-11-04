@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
@@ -13,6 +14,9 @@ func TestStorage(t *testing.T) {
 		Name: "memory",
 		New: func(t *testing.T) storage.Storage {
 			return NewStorage()
+		},
+		NewWithUploadGrantTTL: func(t *testing.T, ttl time.Duration) storage.Storage {
+			return NewStorage(WithUploadGrantTTL(ttl))
 		},
 		SetIndexEntry: func(t *testing.T, st storage.Storage, kind, name, shardHash string) {
 			st.(*Storage).put(kind, name, []byte(shardHash), true)

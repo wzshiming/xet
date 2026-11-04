@@ -20,10 +20,11 @@ import (
 )
 
 // DefaultVersion is the xet-core release used when XET_CORE_VERSION is unset.
-const DefaultVersion = "v1.7.1"
+const DefaultVersion = "v1.8.0"
 
 // pinnedVersions maps each xet-core release tag to the commit versions/<tag>/Cargo.toml pins.
 var pinnedVersions = map[string]string{
+	"v1.8.0": "e551f0a75f989b8ee1a474c5f83c80ad4903f84d",
 	"v1.7.1": "f4665087547e058adb73bec46ce400e1eff0ee61",
 	"v1.6.0": "de71453d952bd8b806edaa997c72313051a49050",
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,6 +106,10 @@ func (s *Handler) registerRoutes() {
 	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleUploadXorb).Methods(http.MethodPost)
 	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleHasXorb).Methods(http.MethodHead)
 	s.root.HandleFunc("/v1/xorbs/{prefix}/{xorb_hash}", s.handleDownloadXorb).Methods(http.MethodGet)
+	// xet-core >= 1.8.0 uploads a xorb through a grant: request it, send the bytes as it directs, then commit.
+	s.root.HandleFunc("/v1/xorb-grants/{prefix}/{xorb_hash}", s.handleXorbGrant).Methods(http.MethodPost)
+	s.root.HandleFunc("/v1/xorb-uploads/{grant_id}", s.handleXorbUpload).Methods(http.MethodPut)
+	s.root.HandleFunc("/v1/xorb-commits/{prefix}/{xorb_hash}/grant/{grant_id}", s.handleXorbCommit).Methods(http.MethodPost)
 	s.root.HandleFunc("/v1/chunks/{prefix}/{chunk_hash}", s.handleQueryChunk).Methods(http.MethodGet)
 	s.root.HandleFunc("/v1/chunks/{prefix}:query", s.handleQueryChunksBatch).Methods(http.MethodPost)
 	s.root.HandleFunc("/v2/shards", s.handleUploadShardV2).Methods(http.MethodPost)
@@ -225,11 +230,19 @@ func externalBase(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
+// absoluteURL prefixes a path-only u with the request's external base.
+func absoluteURL(r *http.Request, u string) string {
+	if strings.HasPrefix(u, "/") {
+		return externalBase(r) + u
+	}
+	return u
+}
+
 // requestBaseStorage resolves relative xorb URLs against a request-derived
 // base; xet clients reject relative URLs ("relative URL without a base").
 type requestBaseStorage struct {
 	download.StorageAdapter
-	base string
+	r *http.Request
 }
 
 func (s requestBaseStorage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (string, error) {
@@ -237,16 +250,13 @@ func (s requestBaseStorage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHas
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(u, "/") {
-		return s.base + u, nil
-	}
-	return u, nil
+	return absoluteURL(s.r, u), nil
 }
 
 // reconstructionStorage returns the storage to use when building
 // reconstruction responses for the given request.
 func (s *Handler) reconstructionStorage(r *http.Request) download.StorageAdapter {
-	return requestBaseStorage{StorageAdapter: s.storage, base: externalBase(r)}
+	return requestBaseStorage{StorageAdapter: s.storage, r: r}
 }
 
 func (s *Handler) splitsTerms() bool {
@@ -429,7 +439,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 
 	body = io.LimitReader(body, r.ContentLength)
 
-	// Store xorb directly. PutXorb will normalize to full format with footer.
+	// Storage keeps the validated bytes as received, adding no footer.
 	wasInserted, err := s.storage.PutXorb(r.Context(), xorbHash, body)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
@@ -443,6 +453,143 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// maxXorbGrantBodyBytes caps a grant request body; xet-core's is under 100 bytes.
+const maxXorbGrantBodyBytes = 4 << 10
+
+// maxGrantedXorbBytes is twice a conformant serialized xorb's ~64.4 MiB bound, capping what an unauthenticated PUT stages.
+const maxGrantedXorbBytes = 2 * xet.MaxXorbSize
+
+// xorbUploadGrantResponse is the 201 body of POST /v1/xorb-grants.
+type xorbUploadGrantResponse struct {
+	ID      string            `json:"id"`
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+}
+
+// handleXorbGrant handles POST /v1/xorb-grants/{prefix}/{xorb_hash}
+func (s *Handler) handleXorbGrant(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
+		return
+	}
+
+	xorbHash, err := xet.ParseXorbHash(mux.Vars(r)["xorb_hash"])
+	if err != nil {
+		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxXorbGrantBodyBytes))
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	var req struct {
+		Length   int64 `json:"length"`
+		Checksum struct {
+			Algo  string `json:"algo"`
+			Value string `json:"value"`
+		} `json:"checksum"`
+	}
+	var checksum uint64
+	if err == nil {
+		err = json.Unmarshal(body, &req)
+	}
+	if err == nil {
+		checksum, err = strconv.ParseUint(req.Checksum.Value, 10, 64)
+	}
+	if err != nil || req.Length <= 0 || req.Length > maxGrantedXorbBytes || req.Checksum.Algo != "crc64nvme" {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	exists, err := s.storage.HasXorb(r.Context(), xorbHash)
+	if err != nil {
+		http.Error(w, "Failed to check xorb", http.StatusInternalServerError)
+		return
+	}
+	if exists {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	grant, err := s.storage.GrantXorbUpload(r.Context(), xorbHash, req.Length, checksum)
+	if err != nil {
+		http.Error(w, "Failed to grant xorb upload", http.StatusInternalServerError)
+		return
+	}
+	// Clients require headers to be an object, never null.
+	headers := grant.Headers
+	if headers == nil {
+		headers = map[string]string{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(xorbUploadGrantResponse{
+		ID:      grant.ID,
+		Method:  grant.Method,
+		URL:     absoluteURL(r, grant.URL),
+		Headers: headers,
+	})
+}
+
+// handleXorbUpload handles PUT /v1/xorb-uploads/{grant_id}
+func (s *Handler) handleXorbUpload(w http.ResponseWriter, r *http.Request) {
+	// Served without authorization: the grant id is the capability, and xet clients send no credentials here.
+	if r.ContentLength <= 0 {
+		http.Error(w, "Content-Length header required", http.StatusLengthRequired)
+		return
+	}
+
+	err := s.storage.PutStagedXorb(r.Context(), mux.Vars(r)["grant_id"], io.LimitReader(r.Body, r.ContentLength))
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusOK)
+	case errors.Is(err, storage.ErrUploadGrantNotFound):
+		http.Error(w, "Upload grant not found", http.StatusNotFound)
+	case errors.Is(err, storage.ErrUploadGrantExpired):
+		http.Error(w, "Upload grant expired", http.StatusForbidden)
+	case errors.Is(err, storage.ErrStagedXorbExists):
+		http.Error(w, "Xorb already uploaded", http.StatusPreconditionFailed)
+	case errors.Is(err, storage.ErrStagedXorbMismatch):
+		http.Error(w, "Upload does not match the grant", http.StatusBadRequest)
+	default:
+		http.Error(w, "Failed to stage xorb", http.StatusInternalServerError)
+	}
+}
+
+// handleXorbCommit handles POST /v1/xorb-commits/{prefix}/{xorb_hash}/grant/{grant_id}
+func (s *Handler) handleXorbCommit(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r, auth.Grant{Permission: auth.Write}) {
+		return
+	}
+
+	vars := mux.Vars(r)
+	xorbHash, err := xet.ParseXorbHash(vars["xorb_hash"])
+	if err != nil {
+		http.Error(w, "Invalid xorb hash", http.StatusBadRequest)
+		return
+	}
+
+	wasInserted, err := s.storage.CommitStagedXorb(r.Context(), vars["grant_id"], xorbHash)
+	switch {
+	case errors.Is(err, storage.ErrStagedXorbNotFound):
+		http.Error(w, "Staged xorb not found", http.StatusNotFound)
+		return
+	case errors.Is(err, storage.ErrStagedXorbMismatch):
+		http.Error(w, "Invalid xorb", http.StatusBadRequest)
+		return
+	case err != nil:
+		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(upload.XorbUploadResponse{WasInserted: wasInserted})
 }
 
 // handleDownloadXorb handles GET /v1/xorbs/{prefix}/{xorb_hash}
