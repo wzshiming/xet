@@ -99,10 +99,16 @@ jobs:
       if: always()
       run: |
         : > prof-top.txt
+        skipped=0
         for f in prof/*.pprof; do
           [ -e "$f" ] || continue
           top=$(go tool pprof -top -nodecount=30 server.test "$f" 2>&1 | head -45)
           printf '== %s\n%s\n\n' "$f" "$top" >> prof-top.txt
+          # GitHub drops a step summary over 1 MiB; prof-top.txt keeps every top.
+          if [ "$(wc -c < "$GITHUB_STEP_SUMMARY")" -ge 900000 ]; then
+            skipped=$((skipped + 1))
+            continue
+          fi
           {
             echo "<details><summary>$(basename "$f")</summary>"
             echo
@@ -113,6 +119,9 @@ jobs:
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
         done
+        if [ "$skipped" -gt 0 ]; then
+          echo "$skipped more profile tops are in prof-top.txt of the serve-bench artifact." >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Upload results
       if: always()
