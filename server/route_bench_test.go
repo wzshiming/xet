@@ -342,18 +342,22 @@ func TestRoute(t *testing.T) {
 		t.Run("revalidate="+v.name, func(t *testing.T) {
 			st := routeStackFor(t, v.name, v.interval)
 			f := st.fileFor(t, shapes[0], storagetest.ChunkClasses[0])
-			heads, gets, cdnGets := st.hub.heads.Load(), st.hub.gets.Load(), st.hub.cdnGets.Load()
+			gets, cdnGets := st.hub.gets.Load(), st.hub.cdnGets.Load()
 			for _, s := range routeStages {
+				heads := st.hub.heads.Load()
 				h := sha256.New()
 				s.do(t, st, f, h, buf)
 				if sum := hex.EncodeToString(h.Sum(nil)); s.bodied && sum != f.sha256 {
 					t.Errorf("stage=%s: body SHA-256 %s, want %s", s.name, sum, f.sha256)
 				}
-			}
-			// head, get302 and chain resolve; bridge does not.
-			stale := v.interval >= 0
-			if probes := st.hub.heads.Load() - heads; stale && probes < 3 || !stale && probes != 0 {
-				t.Errorf("%d hub probes over 3 resolves; want 0 when fresh, >= 3 when stale", probes)
+				// A stale stack probes once per resolve; every stage but bridge resolves.
+				want := int64(0)
+				if v.name == "stale" && s.name != "bridge" {
+					want = 1
+				}
+				if probes := st.hub.heads.Load() - heads; probes != want {
+					t.Errorf("stage=%s: %d hub probes; want %d", s.name, probes, want)
+				}
 			}
 			if refetches := st.hub.gets.Load() - gets + st.hub.cdnGets.Load() - cdnGets; refetches != 0 {
 				t.Errorf("%d hub GETs after the ingest; want 0", refetches)
