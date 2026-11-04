@@ -715,6 +715,113 @@ func TestTermReaderFinishesCacheWritesAtEOF(t *testing.T) {
 	}
 }
 
+// TestTermReaderStreamsRangeToCache stalls a range's body after its first
+// chunk: the decoded chunk reaches the range's cache entry while the range is
+// still downloading, and the entry is sealed once the range completes.
+func TestTermReaderStreamsRangeToCache(t *testing.T) {
+	x, _, firstChunk := stallFixture(t)
+	// gatedClient ignores Range, so the range is the whole xorb.
+	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 3}, ChunkRange{Start: 0, End: 3}}}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			client := &gatedClient{data: x.encoded, stallAt: firstChunk, release: make(chan struct{}), stalled: make(chan struct{}), closed: make(chan struct{})}
+			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)))
+			r.start() // fetch without a Read, which must not run alongside Close
+			if !within(t, "the stall", client.stalled) {
+				t.FailNow()
+			}
+			awaitEntryData(t, cacheFilePath(dir, x.hash, 0, 3, 0, x.span(terms[0].fetch).End), 3, x.chunks[0])
+
+			close(client.release)
+			if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, x.file(terms)) {
+				t.Fatalf("read %d bytes, %v", len(got), err)
+			}
+			c := mustLookup(t, NewCacheManager(dir, 0), testXorbHash(0x39), 0, 3)
+			defer c.release()
+			if got, want := readSpan(t, c, 0, 3), string(x.file(terms)); got != want {
+				t.Fatalf("cached range holds %d bytes, want %d", len(got), len(want))
+			}
+		})
+	}
+}
+
+// TestTermReaderFetchDoesNotWaitForStalledCacheWrite stalls the cache write
+// of a range: its fetch completes regardless, and the reader returns io.EOF
+// only once the write is over.
+func TestTermReaderFetchDoesNotWaitForStalledCacheWrite(t *testing.T) {
+	x := newFixtureXorb(t, 0x42, randomChunks(43, 3, 1000))
+	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 3}, ChunkRange{Start: 0, End: 3}}}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			r := openTermReader(t, version, context.Background(), &fakeClientAdapter{data: x.encoded}, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)))
+			stalled, unstall := stallWrites(t, r.writer)
+			r.start() // fetch without a Read, which must not run alongside Close
+			if !within(t, "the cache write reaching the stalled disk", stalled) || !within(t, "the fetch while its cache write is stalled", r.fetches[0].done) {
+				t.FailNow()
+			}
+
+			var got []byte
+			var err error
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				got, err = io.ReadAll(r)
+			}()
+			select {
+			case <-read:
+				t.Fatalf("the reader returned %d bytes, %v while its cache write was stalled", len(got), err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			unstall()
+			if !within(t, "the reader", read) {
+				t.FailNow()
+			}
+			if want := x.file(terms); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+			}
+			mustLookup(t, NewCacheManager(dir, 0), testXorbHash(0x42), 0, 3).release()
+		})
+	}
+}
+
+// TestTermReaderDiscardsEntryOfFailedRange serves a range's body one byte
+// short: the read fails and the entry the range streamed to the cache is
+// removed, so a later download of the range caches it whole.
+func TestTermReaderDiscardsEntryOfFailedRange(t *testing.T) {
+	x := newFixtureXorb(t, 0x43, randomChunks(44, 3, 1000))
+	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 3}, ChunkRange{Start: 0, End: 3}}}
+	short := bodyClient(func(start, end int64) []byte { return x.encoded[start:end] })
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			m := NewCacheManager(dir, 0)
+			r := openTermReader(t, version, context.Background(), short, x, 0, terms, WithCacheManager(m))
+			if got, err := io.ReadAll(r); err == nil {
+				t.Fatalf("read %d bytes of a short range, want an error", len(got))
+			}
+			closed := make(chan struct{})
+			go func() {
+				defer close(closed)
+				r.Close()
+			}()
+			if !within(t, "Close after the failed range", closed) {
+				t.FailNow()
+			}
+			if _, err := os.Stat(cacheFilePath(dir, x.hash, 0, 3, 0, x.span(terms[0].fetch).End)); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the failed range left its cache entry: %v", err)
+			}
+
+			r = openTermReader(t, version, context.Background(), &fakeClientAdapter{data: x.encoded}, x, 0, terms, WithCacheManager(m))
+			if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, x.file(terms)) {
+				t.Fatalf("read after the failed range: %d bytes, %v", len(got), err)
+			}
+			mustLookup(t, NewCacheManager(dir, 0), testXorbHash(0x43), 0, 3).release()
+		})
+	}
+}
+
 // stallFixture is one xorb of three compressible chunks read as terms [0,2)
 // and [2,3), each with its own range, and the packed end of its first chunk.
 func stallFixture(t *testing.T) (*fixtureXorb, []fixtureTerm, int) {

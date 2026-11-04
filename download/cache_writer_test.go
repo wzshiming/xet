@@ -451,7 +451,7 @@ func awaitEntryData(t *testing.T, path string, n int, want []byte) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s holds %d bytes after 3s, want %q at offset %d", path, len(got), want, at)
+			t.Fatalf("%s holds %d bytes after 3s, want %d data bytes from offset %d", path, len(got), len(want), at)
 		}
 	}
 }
