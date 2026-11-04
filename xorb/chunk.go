@@ -86,19 +86,15 @@ func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 			defer pool.PutChunkBuf(tmp)
 			buf = tmp[:]
 		}
-		// The spare byte makes the reader consume the frame's end mark, catching over-long frames, trailing bytes and a bad content checksum when the frame declares one.
-		n, err := readLZ4Frame(buf[:size+1], body)
+		buf, err := decompressLZ4(buf[:0], body, size)
 		if err != nil {
 			return nil, err
 		}
-		if n != size {
-			return nil, fmt.Errorf("decompressed size mismatch: got %d, expected %d", n, size)
-		}
 		if h.Compression == CompressionByteGrouping4 {
-			return reverseByteGrouping4(dst[:0], buf[:size]), nil
+			return reverseByteGrouping4(dst[:0], buf), nil
 		}
 		if !direct {
-			copy(dst, buf[:size])
+			copy(dst, buf)
 		}
 		return dst[:size], nil
 	default:

@@ -66,18 +66,29 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 // The result is appended to dst; pass nil to allocate a new slice.
 func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	off := len(dst)
-	dst = slices.Grow(dst, uncompressedSize)[:off+uncompressedSize]
+	// The spare byte makes the reader consume the frame's end mark, catching over-long frames, trailing bytes and a bad content checksum when the frame declares one.
+	dst = slices.Grow(dst, uncompressedSize+1)[:off+uncompressedSize+1]
 
-	n, err := readLZ4Frame(dst[off:], data)
-	if err != nil {
-		return dst[:off], err
+	fr := lz4ReaderPool.Get().(*lz4FrameReader)
+	fr.src.Reset(data)
+	fr.zr.Reset(&fr.src)
+
+	n, err := io.ReadFull(fr.zr, dst[off:])
+
+	// Release data and the frame's block buffers before pooling.
+	fr.zr.Reset(nil)
+	fr.src.Reset(nil)
+	lz4ReaderPool.Put(fr)
+
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return dst[:off], fmt.Errorf("failed to decompress LZ4: %w", err)
 	}
 
 	if n != uncompressedSize {
 		return dst[:off], fmt.Errorf("decompressed size mismatch: got %d, expected %d", n, uncompressedSize)
 	}
 
-	return dst, nil
+	return dst[:off+uncompressedSize], nil
 }
 
 // compressByteGrouping4LZ4 applies ByteGrouping4 transform then LZ4 compression.
@@ -234,24 +245,4 @@ var lz4ReaderPool = sync.Pool{
 		fr.zr = lz4.NewReader(&fr.src)
 		return fr
 	},
-}
-
-// readLZ4Frame decodes the LZ4 frame in data into buf until buf is full or the
-// frame ends, and returns the number of bytes decoded.
-func readLZ4Frame(buf, data []byte) (int, error) {
-	fr := lz4ReaderPool.Get().(*lz4FrameReader)
-	fr.src.Reset(data)
-	fr.zr.Reset(&fr.src)
-
-	n, err := io.ReadFull(fr.zr, buf)
-
-	// Release data and the frame's block buffers before pooling.
-	fr.zr.Reset(nil)
-	fr.src.Reset(nil)
-	lz4ReaderPool.Put(fr)
-
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return n, fmt.Errorf("failed to decompress LZ4: %w", err)
-	}
-	return n, nil
 }
