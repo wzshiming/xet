@@ -66,6 +66,16 @@ func TestCgroupLimitV1UnlimitedSentinelIsNone(t *testing.T) {
 	}
 }
 
+// A cgroup v1 hierarchy can bind several controllers, memory among them.
+func TestCgroupLimitV1MemoryAmongSeveralControllers(t *testing.T) {
+	root := t.TempDir()
+	writeCgroupFile(t, root, "memory/some/path/memory.limit_in_bytes", "268435456\n")
+	limit, ok := cgroupLimit(root, []byte("12:memory,hugetlb:/some/path\n"))
+	if !ok || limit != 268435456 {
+		t.Fatalf("cgroupLimit = %d, %v; want 268435456, true", limit, ok)
+	}
+}
+
 func TestCgroupLimitMalformedIsNone(t *testing.T) {
 	for _, content := range []string{"", "lots\n", "512M\n", "1.5e9\n", "-1\n", "0\n"} {
 		t.Run(strconv.Quote(content), func(t *testing.T) {
