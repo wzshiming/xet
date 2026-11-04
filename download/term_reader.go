@@ -512,7 +512,7 @@ func (r *termReader) WriteTo(w io.Writer) (int64, error) {
 				return n, err
 			}
 		}
-		written, err := writeChunk(w, r.cur)
+		written, err := writeTerm(w, r.cur)
 		r.consume(written)
 		n += int64(written)
 		if err != nil {
