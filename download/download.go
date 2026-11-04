@@ -17,9 +17,12 @@ type options struct {
 	expectedHash *xet.FileHash
 }
 
-// WithCacheManager shares one CacheManager across readers so the capacity
-// bound applies to the whole cache directory. When unset, each reader uses a
-// private manager for the cacheDir passed to its constructor.
+// WithCacheManager decodes fetched xorb ranges into cache's directory, where
+// later readers reuse them; share one CacheManager across readers so the
+// capacity bound applies to the whole cache directory. Without it, or with
+// nil, a reader writes nothing to disk: it starts fetching on its first Read,
+// keeps each decoded range in memory until the last term reading it is read,
+// and fetches at most WithConcurrency ranges ahead of the one being read.
 func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
 		o.cache = cache

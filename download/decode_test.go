@@ -427,7 +427,8 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 
 // TestReaderVerifiesWithDecoderChunkHashes corrupts the hash a writer kept for
 // a chunk it decoded: verification must fail although every byte is intact,
-// so the verifier uses the decoder's hash instead of hashing the chunk again.
+// so the verifier uses the decoder's hash instead of hashing the chunk again,
+// with or without a cache manager.
 func TestReaderVerifiesWithDecoderChunkHashes(t *testing.T) {
 	chunks := randomChunks(5, 3, 1000)
 	encoded := buildTestXorb(t, chunks)
@@ -435,36 +436,51 @@ func TestReaderVerifiesWithDecoderChunkHashes(t *testing.T) {
 	key := fetchKey{Hash: testCacheHash, Start: 0, End: int64(len(encoded) - 1)}
 	whole := ChunkRange{Start: 0, End: 3}
 	for name, newReader := range rangeReaders {
-		t.Run(name, func(t *testing.T) {
-			r, err := newReader(&fakeClientAdapter{data: encoded}, whole, whole, key.End, NewCacheManager(t.TempDir(), 0), WithExpectedFileHash(fileHash))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer r.Close()
-			cache, err := readerPrefetcher(t, r).Get(key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Tamper only once the whole range is decoded.
-			if _, err := cache.Chunk(2, make([]byte, 1000)); err != nil {
-				t.Fatal(err)
-			}
-			cache.mut.Lock()
-			kept := cache.metas[1].hashed
-			cache.metas[1].hash[0] ^= 0xff
-			cache.mut.Unlock()
-			if !kept {
-				t.Fatal("decoded chunk 1 kept no decoder hash")
-			}
+		for _, cached := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/cached=%v", name, cached), func(t *testing.T) {
+				var m *CacheManager
+				if cached {
+					m = NewCacheManager(t.TempDir(), 0)
+				}
+				r, err := newReader(&fakeClientAdapter{data: encoded}, whole, whole, key.End, m, WithExpectedFileHash(fileHash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				src, err := readerPrefetcher(t, r).Get(key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Tamper only once the whole range is decoded.
+				if _, err := src.readChunk(2, make([]byte, 1000)); err != nil {
+					t.Fatal(err)
+				}
+				var kept bool
+				switch src := src.(type) {
+				case *chunkCache:
+					src.mut.Lock()
+					kept = src.metas[1].hashed
+					src.metas[1].hash[0] ^= 0xff
+					src.mut.Unlock()
+				case *memoryRange:
+					src.mu.Lock()
+					kept = src.chunks[1].ref.hashed
+					src.chunks[1].ref.hash[0] ^= 0xff
+					src.mu.Unlock()
+				}
+				if !kept {
+					t.Fatal("decoded chunk 1 kept no decoder hash")
+				}
 
-			got, err := io.ReadAll(r)
-			if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
-				t.Fatalf("err = %v, want the corrupted kept hash to fail verification", err)
-			}
-			if want := bytes.Join(chunks, nil); !bytes.Equal(got, want) {
-				t.Fatalf("read %d bytes, want the %d intact bytes", len(got), len(want))
-			}
-		})
+				got, err := io.ReadAll(r)
+				if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+					t.Fatalf("err = %v, want the corrupted kept hash to fail verification", err)
+				}
+				if want := bytes.Join(chunks, nil); !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, want the %d intact bytes", len(got), len(want))
+				}
+			})
+		}
 	}
 }
 

@@ -2,12 +2,18 @@ package client
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/download"
 	"github.com/wzshiming/xet/upload"
 )
@@ -18,6 +24,53 @@ func TestCacheUsageSkipsNilManagers(t *testing.T) {
 		if u, err := c.Usage(t.Context()); err != nil || u != (Usage{}) {
 			t.Fatalf("Usage(%+v) = %+v, %v; want zero", c, u, err)
 		}
+	}
+}
+
+// A Cache without a download manager downloads, resumes and batches without a
+// chunk cache, and leaves the default cache root alone.
+func TestDownloadWithoutChunkCache(t *testing.T) {
+	fx := newDownloadFixture(t, 1, 2)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	c, err := NewClient(WithCache(&Cache{}), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		get    func(context.Context, xet.FileHash, io.WriteSeeker) error
+	}{
+		{"v2", nil, c.DownloadFile},
+		{"v1", nil, c.DownloadFileV1},
+		{"resume", fx.data[0][:fixtureChunkSize+1], c.DownloadFile},
+	} {
+		got, err := downloadInto(t, tc.prefix, func(w io.WriteSeeker) error { return tc.get(ctx, fx.hashes[0], w) })
+		if err != nil || !bytes.Equal(got, fx.data[0]) {
+			t.Fatalf("%s: got %d bytes, %v; want %d", tc.name, len(got), err, len(fx.data[0]))
+		}
+	}
+
+	readers, _, err := c.DownloadFiles(ctx, fx.hashes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range readers {
+		got, err := io.ReadAll(r)
+		r.Close()
+		if err != nil || !bytes.Equal(got, fx.data[i]) {
+			t.Fatalf("DownloadFiles[%d]: got %d bytes, %v; want %d", i, len(got), err, len(fx.data[i]))
+		}
+	}
+
+	if u, err := c.Usage(ctx); err != nil || u != (Usage{}) {
+		t.Fatalf("Usage = %+v, %v; want zero", u, err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "xet-cache")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("downloads without a chunk cache touched the default cache root: %v", err)
 	}
 }
 

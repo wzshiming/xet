@@ -49,12 +49,23 @@ func checkFetchRange(term *Term, chunks ChunkRange, span ByteRange) error {
 	return nil
 }
 
+// chunkSource serves the decoded chunks of one fetched xorb range, indexed
+// from the start of the range: a *chunkCache, or a *memoryRange when there is
+// no on-disk cache.
+type chunkSource interface {
+	readChunk(idx uint32, buf []byte) (chunkRef, error)
+	Done()
+}
+
 type prefetchEntry struct {
 	task  fetchTask
-	cache *chunkCache
+	cache chunkSource
 	err   error
 	ready chan struct{}
 	once  sync.Once
+
+	lastTerm  int  // index of the last term reading the range
+	requested bool // the reader asked for the range; touched by the reader only
 }
 
 type prefetcher struct {
@@ -63,8 +74,16 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	cache        *CacheManager
+	cache        *CacheManager  // nil keeps decoded ranges in memory instead
 	workers      sync.WaitGroup // feeder and worker goroutines started by start
+
+	// Without a cache the feeder dispatches each range for one window token.
+	// The reader's first request grants lookahead+1 tokens and each request
+	// for a further range one more, so at most lookahead ranges are fetched
+	// ahead of the one being read and nothing before the first Read.
+	window    chan struct{}
+	lookahead int
+	started   bool // the reader requested a range; touched by the reader only
 }
 
 type progressReader struct {
@@ -105,6 +124,9 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries[task.key] = item
 		items = append(items, item)
 	}
+	for i, selected := range termFetches {
+		entries[selected.key].lastTerm = i
+	}
 
 	if len(items) == 0 {
 		return &prefetcher{
@@ -138,18 +160,20 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	newItems := make([]*prefetchEntry, 0, len(items))
 	for _, item := range items {
-		cc, err := openCachedRange(p.cache, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
-		if err != nil {
-			return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
-		}
 		size := item.task.key.Size()
-		if cc != nil {
-			p.reportProgress(item.task.key, size, size)
-			p.publishEntry(item, cc)
-		} else {
-			p.reportProgress(item.task.key, 0, size)
-			newItems = append(newItems, item)
+		if p.cache != nil {
+			cc, err := openCachedRange(p.cache, item.task.key.Hash, item.task.chunkStart, item.task.chunkEnd)
+			if err != nil {
+				return fmt.Errorf("check cache for %s: %w", item.task.key.String(), err)
+			}
+			if cc != nil {
+				p.reportProgress(item.task.key, size, size)
+				p.publishEntry(item, cc)
+				continue
+			}
 		}
+		p.reportProgress(item.task.key, 0, size)
+		newItems = append(newItems, item)
 	}
 	if len(newItems) == 0 {
 		return nil
@@ -158,12 +182,23 @@ func (p *prefetcher) start(items []*prefetchEntry, desiredWorkers int) error {
 	if desiredWorkers <= 0 {
 		desiredWorkers = 1
 	}
+	if p.cache == nil {
+		p.lookahead = desiredWorkers
+		p.window = make(chan struct{}, len(newItems)+desiredWorkers)
+	}
 	desiredWorkers = min(desiredWorkers, len(newItems))
 
 	jobs := make(chan *prefetchEntry)
 	p.workers.Go(func() {
 		defer close(jobs)
 		for _, item := range newItems {
+			if p.window != nil {
+				// Once canceled, workers fail the remaining ranges without a token.
+				select {
+				case <-p.window:
+				case <-p.ctx.Done():
+				}
+			}
 			jobs <- item
 		}
 	})
@@ -213,6 +248,10 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		p.failEntry(entry, err)
 		return
 	}
+	if p.cache == nil {
+		p.fetchToMemory(entry)
+		return
+	}
 	lockFile, err := lockChunkCache(p.ctx, p.cache.dir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
 	if err != nil {
 		p.failEntry(entry, err)
@@ -237,32 +276,13 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		return
 	}
 
-	header := http.Header{
-		"Range": {fmt.Sprintf("bytes=%d-%d", key.Start, key.End)},
-	}
-
-	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
+	dec, closeBody, err := p.openRange(entry)
 	if err != nil {
 		p.failEntry(entry, err)
 		return
 	}
-	closeBody := sync.OnceValue(rc.Close)
 	defer closeBody()
-	// Bodies not bound to ctx only stop a stalled Read when closed.
-	stop := context.AfterFunc(p.ctx, func() { closeBody() })
-	defer stop()
 
-	var reader io.Reader = rc
-	if p.progressFunc != nil {
-		reader = &progressReader{
-			r:            rc,
-			name:         entry.task.key.String(),
-			total:        entry.task.key.Size(),
-			progressFunc: p.progressFunc,
-		}
-	}
-
-	dec := xorb.NewDecoder(reader, false)
 	cache, err = newLockedChunkCache(dec, p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
 	if err != nil {
 		p.failEntry(entry, err)
@@ -283,7 +303,50 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 	}
 }
 
-func (p *prefetcher) publishEntry(entry *prefetchEntry, cache *chunkCache) {
+// fetchToMemory decodes entry's range into memory, publishing it before the
+// first chunk so the reader consumes chunks while they arrive.
+func (p *prefetcher) fetchToMemory(entry *prefetchEntry) {
+	dec, closeBody, err := p.openRange(entry)
+	if err != nil {
+		p.failEntry(entry, err)
+		return
+	}
+	defer closeBody()
+
+	r := newMemoryRange(entry.task.chunkEnd - entry.task.chunkStart)
+	p.publishEntry(entry, r)
+	r.fill(dec)
+}
+
+// openRange requests entry's byte range and returns its chunk decoder.
+// closeBody may be called repeatedly; canceling p.ctx calls it too, since
+// bodies not bound to ctx only stop a stalled Read when closed.
+func (p *prefetcher) openRange(entry *prefetchEntry) (dec *xorb.Decoder, closeBody func(), err error) {
+	key := entry.task.key
+	header := http.Header{
+		"Range": {fmt.Sprintf("bytes=%d-%d", key.Start, key.End)},
+	}
+
+	rc, err := p.client.DownloadXorbWithURL(p.ctx, entry.task.url, header)
+	if err != nil {
+		return nil, nil, err
+	}
+	closeOnce := sync.OnceValue(rc.Close)
+	stop := context.AfterFunc(p.ctx, func() { closeOnce() })
+
+	var reader io.Reader = rc
+	if p.progressFunc != nil {
+		reader = &progressReader{
+			r:            rc,
+			name:         key.String(),
+			total:        key.Size(),
+			progressFunc: p.progressFunc,
+		}
+	}
+	return xorb.NewDecoder(reader, false), func() { stop(); closeOnce() }, nil
+}
+
+func (p *prefetcher) publishEntry(entry *prefetchEntry, cache chunkSource) {
 	p.completeEntry(entry, cache, nil)
 }
 
@@ -291,7 +354,7 @@ func (p *prefetcher) failEntry(entry *prefetchEntry, err error) {
 	p.completeEntry(entry, nil, err)
 }
 
-func (p *prefetcher) completeEntry(entry *prefetchEntry, cache *chunkCache, err error) {
+func (p *prefetcher) completeEntry(entry *prefetchEntry, cache chunkSource, err error) {
 	done := false
 	entry.once.Do(func() {
 		entry.cache = cache
@@ -325,12 +388,25 @@ func (p *prefetcher) Close() {
 	}
 }
 
-// Get returns the cache for key, blocking until the fetch task has published its
-// first chunk. The prefetcher retains ownership of the returned cache.
-func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
+// Get returns the source for key, blocking until its fetch task publishes it:
+// a cache after its first chunk, a memory range once the response arrives.
+// The prefetcher retains ownership of the returned source.
+func (p *prefetcher) Get(key fetchKey) (chunkSource, error) {
 	entry, ok := p.entries[key]
 	if !ok {
 		return nil, fmt.Errorf("xorb fetch task %q not found", key)
+	}
+
+	if p.window != nil && !entry.requested {
+		entry.requested = true
+		grant := 1
+		if !p.started {
+			p.started = true
+			grant += p.lookahead
+		}
+		for range grant {
+			p.window <- struct{}{}
+		}
 	}
 
 	<-entry.ready
@@ -338,4 +414,15 @@ func (p *prefetcher) Get(key fetchKey) (*chunkCache, error) {
 		return nil, entry.err
 	}
 	return entry.cache, nil
+}
+
+// finishTerm tells p the reader is done with term termIdx, which read key.
+// Without a cache the range's memory is released once no later term reads it.
+func (p *prefetcher) finishTerm(key fetchKey, termIdx int) {
+	if p.cache != nil {
+		return
+	}
+	if entry := p.entries[key]; entry.lastTerm == termIdx {
+		entry.cache.Done()
+	}
 }

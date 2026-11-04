@@ -25,7 +25,7 @@ type ReaderV1 struct {
 	chunkIdx     uint32
 	chunkOffset  int
 	currentTerm  *Term
-	currentCache *chunkCache
+	currentCache chunkSource
 	localStart   uint32 // Local chunk index start (relative to downloaded xorb)
 	localEnd     uint32 // Local chunk index end (relative to downloaded xorb)
 	err          error
@@ -38,25 +38,23 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 		opt(options)
 	}
 
-	cache := options.cache
-	if cache == nil {
-		return nil, fmt.Errorf("no cache manager provided")
-	}
 	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
 	if err != nil {
 		return nil, err
 	}
-	// Adopt pre-existing entries and clean up orphaned partial files before
-	// the download starts; only the manager's first prepare walks the cache
-	// directory.
-	cache.prepare()
+	if options.cache != nil {
+		// Adopt pre-existing entries and clean up orphaned partial files before
+		// the download starts; only the manager's first prepare walks the cache
+		// directory.
+		options.cache.prepare()
+	}
 
 	termFetches, tasks, err := planReaderV1(reconstruction)
 	if err != nil {
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
 
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options)
+	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, options.cache, options)
 	if err != nil {
 		return nil, fmt.Errorf("initialize prefetcher: %w", err)
 	}
@@ -192,6 +190,7 @@ func (r *ReaderV1) finishCurrentTerm() {
 		return
 	}
 
+	r.prefetcher.finishTerm(r.termFetches[r.termIdx].key, r.termIdx)
 	r.currentTerm = nil
 	r.termIdx++
 }
