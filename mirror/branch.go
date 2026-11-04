@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,9 +76,10 @@ func (m *Mirror) branchBackoff(key resolveKey) bool {
 	return m.entries[key].inBackoff() || (b != nil && time.Now().Before(b.nextRetry))
 }
 
-// Rate limiting is transient, unlike other 4xx responses.
-func authoritative(pr *probeResult) bool {
-	return pr != nil && pr.status >= 400 && pr.status < 500 && pr.status != http.StatusTooManyRequests
+// Rate limiting is transient, unlike other 4xx answers.
+func authoritative(err error) bool {
+	var ue *UpstreamError
+	return errors.As(err, &ue) && ue.Status >= 400 && ue.Status < 500 && ue.Status != http.StatusTooManyRequests
 }
 
 // branchCommit resolves a branch rev to its pinned commit, probing origin with token when stale; only a 2xx probe pins.
@@ -106,14 +108,11 @@ func (m *Mirror) branchCommit(origin, token string, key resolveKey) (string, *pr
 		}
 		// Background context: the probe is shared by every requester of the file, so one disconnect must not fail it.
 		pr, err := m.probe(withUpstreamAuth(context.Background(), origin, token), origin, key)
-		if err == nil {
-			err = probeErr(pr)
-		}
 		if err != nil {
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			// A transport fault, 5xx or 429 keeps an existing pin serving between bounded retries.
-			if b := m.branches[name]; b != nil && !authoritative(pr) && prev == nil {
+			if b := m.branches[name]; b != nil && !authoritative(err) && prev == nil {
 				b.failures++
 				b.nextRetry = time.Now().Add(retryBackoff(b.failures))
 				return &branchProbe{b: b}, nil

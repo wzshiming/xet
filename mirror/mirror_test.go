@@ -93,6 +93,16 @@ func newTestMirror(t *testing.T, upstream string, storageDir, cacheDir string, o
 	return &testMirror{Mirror: m, upstream: upstream, spoolDir: filepath.Join(cacheDir, "spool")}, stor
 }
 
+// withProbeBudget shortens the wall clock of each probe.
+func withProbeBudget(d time.Duration) Option {
+	return func(m *Mirror) { m.probeBudget = d }
+}
+
+// withStallTimeout shortens how long an upstream request may go without a byte.
+func withStallTimeout(d time.Duration) Option {
+	return func(m *Mirror) { m.stallTimeout = d }
+}
+
 // readStored fetches the reconstructed bytes for a sha256 hex digest straight
 // from storage, proving an ingest landed in the CAS.
 func readStored(t *testing.T, stor storage.Storage, shaHex string) []byte {
@@ -1846,11 +1856,103 @@ func TestMirrorProbeRetriesDroppedHop(t *testing.T) {
 	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
 
 	pr, err := m.probe(context.Background(), srv.URL, resolveKey{repo: "org/repo", rev: "main", path: "f.bin"})
-	if err != nil || pr.status != http.StatusOK || pr.size != int64(len(data)) {
-		t.Fatalf("probe = %+v, %v; want a 200 of %d bytes after the dropped hops", pr, err, len(data))
+	if err != nil || pr.size != int64(len(data)) {
+		t.Fatalf("probe = %+v, %v; want %d bytes after the dropped hops", pr, err, len(data))
 	}
 	if got := requests.Load(); got != 4 {
 		t.Fatalf("upstream requests = %d, want 4: two dropped hops, then the hub and CDN hops", got)
+	}
+}
+
+// An upstream that accepts the probe and never answers fails it as a Timeout
+// once the probe budget is spent; during the backoff Resolve answers from the
+// recorded failure at once.
+func TestMirrorProbeBudget(t *testing.T) {
+	release := make(chan struct{})
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() { close(release) })
+	const budget = 300 * time.Millisecond
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), withProbeBudget(budget))
+
+	start := time.Now()
+	_, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+	elapsed := time.Since(start)
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Kind != UpstreamTimeout || ue.Attempts != 1 || ue.Elapsed < budget {
+		t.Fatalf("Resolve err = %#v; want a Timeout after one attempt of at least %v", err, budget)
+	}
+	if elapsed > budget+time.Second {
+		t.Fatalf("Resolve took %v, want the %v probe budget", elapsed, budget)
+	}
+	if ue.RetryAfter <= 0 || ue.RetryAfter > failureBackoffBase {
+		t.Fatalf("RetryAfter = %v, want the rest of the first %v backoff", ue.RetryAfter, failureBackoffBase)
+	}
+
+	start = time.Now()
+	_, err = m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+	if again := (*UpstreamError)(nil); !errors.As(err, &again) || again.Kind != UpstreamTimeout || again.RetryAfter > ue.RetryAfter || time.Since(start) > budget/2 {
+		t.Fatalf("Resolve during the backoff = %v after %v; want the recorded Timeout at once", err, time.Since(start))
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("upstream requests = %d, want the one probe", got)
+	}
+}
+
+// A redirect chain longer than a probe follows is the upstream's answer: a
+// Status failure naming the last redirect, never retried.
+func TestMirrorProbeRedirectLoop(t *testing.T) {
+	srv, requests, _ := countingServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.URL.Path+"/next", http.StatusFound)
+	}))
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+
+	_, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Kind != UpstreamStatus || ue.Status != http.StatusFound || ue.Attempts != 1 || errors.Is(err, ErrUpstreamNotFound) {
+		t.Fatalf("Resolve err = %#v; want a Status 302 failure after one attempt", err)
+	}
+	if !strings.Contains(err.Error(), "upstream status 302") || !errors.Is(err, errTooManyRedirects) {
+		t.Fatalf("Resolve err = %q; want it to name the status and the redirect chain", err)
+	}
+	if got := requests.Load(); got != maxProbeHops {
+		t.Fatalf("upstream requests = %d, want the %d hops of one attempt", got, maxProbeHops)
+	}
+}
+
+// Every upstream answer the probe ends on is typed by its status; only a 404 matches ErrUpstreamNotFound.
+func TestResolveUpstreamStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		kind   UpstreamErrorKind
+	}{
+		{http.StatusNotFound, UpstreamNotFound},
+		{http.StatusUnauthorized, UpstreamStatus},
+		{http.StatusServiceUnavailable, UpstreamStatus},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(srv.Close)
+			m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+
+			_, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+			var ue *UpstreamError
+			if !errors.As(err, &ue) || ue.Kind != tc.kind || ue.Status != tc.status || ue.Attempts != 1 || ue.RetryAfter <= 0 {
+				t.Fatalf("Resolve err = %#v; want a %v failure of status %d after one attempt with a retry delay", err, tc.kind, tc.status)
+			}
+			if notFound := errors.Is(err, ErrUpstreamNotFound); notFound != (tc.status == http.StatusNotFound) {
+				t.Fatalf("errors.Is(%v, ErrUpstreamNotFound) = %v", err, notFound)
+			}
+			if tc.kind == UpstreamStatus && !strings.Contains(err.Error(), fmt.Sprintf("upstream status %d after 1 attempt in ", tc.status)) {
+				t.Fatalf("Resolve err = %q; want it to name the status, attempts and elapsed time", err)
+			}
+		})
 	}
 }
 

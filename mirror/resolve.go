@@ -47,9 +47,10 @@ type Entry struct {
 // for anonymous access); the resolver that starts an ingest pins its origin
 // and token on it, and later resolvers of the same file join it. It returns
 // the ready entry, the stream of the in-flight ingest, or the terminal
-// ingest failure as an error (not-found matching ErrUpstreamNotFound). The
-// URL path is taken in its escaped form, matching the HTTP route: tasks,
-// entries, and spools are keyed by it.
+// ingest failure as an error: an *UpstreamError when the upstream failed,
+// whose RetryAfter is the rest of the failure's retry backoff (not-found
+// matching ErrUpstreamNotFound). The URL path is taken in its escaped form,
+// matching the HTTP route: tasks, entries, and spools are keyed by it.
 //
 // The upstream probe runs before anything is returned: content local storage
 // already holds comes back as an Entry, and a probe failure as the error. ctx
@@ -86,8 +87,15 @@ func exportEntry(key resolveKey, e *fileEntry) *Entry {
 }
 
 // entryErr maps a failed entry to the error Resolve reports; not-found
-// failures match ErrUpstreamNotFound.
+// failures match ErrUpstreamNotFound, and an upstream failure carries the time
+// left in its backoff.
 func entryErr(e *fileEntry) error {
+	var ue *UpstreamError
+	if errors.As(e.lastErr, &ue) {
+		c := *ue
+		c.RetryAfter = max(time.Until(e.nextRetry), 0)
+		return &c
+	}
 	if e.lastErr != nil {
 		return e.lastErr
 	}
@@ -113,9 +121,10 @@ func (st *Stream) Meta() (etag, commit string) {
 // WaitSize blocks until the content length is known — some hubs carry no
 // size on probes (e.g. modelscope.cn sends none on HEAD), so it may only be
 // learned from the ingest download's first response headers — or until no
-// early size source remains, or ctx is done. It returns the final size, or
-// -1 when the size stays unknown until the ingest completes; ok is false
-// only when ctx was done first.
+// early size source remains, or ctx is done. The wait is bounded by the
+// download's stall timeout and attempts, never by the transfer. It returns
+// the final size, or -1 when the size stays unknown until the ingest
+// completes; ok is false only when ctx was done first.
 func (st *Stream) WaitSize(ctx context.Context) (size int64, ok bool) {
 	select {
 	case <-st.t.item.Sized():
@@ -173,13 +182,14 @@ func (m *Mirror) fileHashBySHA256(ctx context.Context, hexDigest string) (xet.Fi
 	return fileHash, digest, true
 }
 
-// FetchUpstream GETs rawURL with token as the bearer credential for its origin, following redirects and resuming body reads; the caller owns the response body.
+// FetchUpstream GETs rawURL with token as the bearer credential for its origin, following redirects and resuming body reads within maxFetchAttempts upstream opens; the caller owns the response body.
 func (m *Mirror) FetchUpstream(ctx context.Context, rawURL, token string) (*http.Response, error) {
 	_, origin, err := upstreamOrigin(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(withUpstreamAuth(ctx, origin, token), http.MethodGet, rawURL, nil)
+	ctx = context.WithValue(withUpstreamAuth(ctx, origin, token), attemptsKey{}, &attempts{n: 1, max: maxFetchAttempts})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +200,7 @@ func (m *Mirror) FetchUpstream(ctx context.Context, rawURL, token string) (*http
 func (m *Mirror) revalidate(ctx context.Context, origin string, key, src resolveKey, e *fileEntry, pr *probeResult) bool {
 	if pr == nil {
 		var err error
-		if pr, err = m.probe(ctx, origin, src); err != nil || probeErr(pr) != nil {
+		if pr, err = m.probe(ctx, origin, src); err != nil {
 			return true
 		}
 	}
