@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/wzshiming/xet"
 )
 
@@ -351,8 +352,24 @@ func TestDecodeChunkRejectsCorruptContentChecksum(t *testing.T) {
 			continue
 		}
 		t.Run("class="+class.name, func(t *testing.T) {
-			frame, h := chunkFrameForTest(t, class.ct, payload)
-			body := frame[ChunkHeaderSize:]
+			// Xorbs stored before frames matched xet-core's carry an xxh32 content checksum.
+			src := payload
+			if class.ct == CompressionByteGrouping4 {
+				src = applyByteGrouping4(nil, payload)
+			}
+			var buf bytes.Buffer
+			w := lz4.NewWriter(&buf)
+			if err := w.Apply(lz4.ChecksumOption(true), lz4.BlockSizeOption(lz4.Block64Kb)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(src); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			body := buf.Bytes()
+			h := ChunkHeader{CompressedSize: uint32(len(body)), UncompressedSize: uint32(len(payload)), Compression: class.ct}
 			if got, err := DecodeChunk(make([]byte, h.UncompressedSize), h, body); err != nil || !bytes.Equal(got, payload) {
 				t.Fatalf("DecodeChunk(%+v) of the intact frame = %d bytes, %v; want the %d-byte payload", h, len(got), err, len(payload))
 			}

@@ -86,7 +86,7 @@ func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 			defer pool.PutChunkBuf(tmp)
 			buf = tmp[:]
 		}
-		// The spare byte makes the reader consume the frame's end mark, catching over-long frames, bad checksums and trailing bytes.
+		// The spare byte makes the reader consume the frame's end mark, catching over-long frames, trailing bytes and a bad content checksum when the frame declares one.
 		n, err := readLZ4Frame(buf[:size+1], body)
 		if err != nil {
 			return nil, err

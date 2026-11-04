@@ -35,10 +35,21 @@ func decompressChunk(dst, data []byte, compressionType CompressionType, uncompre
 // compressLZ4 compresses data using LZ4 Frame format.
 // The result is appended to dst; pass nil to allocate a new slice.
 func compressLZ4(dst, data []byte) ([]byte, error) {
-	buf := bytes.NewBuffer(dst)
+	writers := lz4Writers64Kb
+	switch {
+	case len(data) > 256<<10:
+		writers = lz4Writers4Mb
+	case len(data) > 64<<10:
+		writers = lz4Writers256Kb
+	}
 
-	w := getLZ4Writer(buf)
-	defer putLZ4Writer(w)
+	buf := bytes.NewBuffer(dst)
+	w := writers.Get().(*lz4.Writer)
+	w.Reset(buf)
+	defer func() {
+		w.Reset(nil)
+		writers.Put(w)
+	}()
 
 	if _, err := w.Write(data); err != nil {
 		return dst, fmt.Errorf("failed to write to LZ4 writer: %w", err)
@@ -195,23 +206,19 @@ func selectBestCompression(dst, data []byte) ([]byte, CompressionType, error) {
 	return dst, bestType, nil
 }
 
-// lz4WriterPool pools lz4.Writer objects to avoid per-call allocation.
-var lz4WriterPool sync.Pool
+// Frames match xet-core's lz4_flex defaults: hf_xet allocates a frame's declared block size for every chunk it decodes.
+var (
+	lz4Writers64Kb  = newLZ4WriterPool(lz4.Block64Kb)
+	lz4Writers256Kb = newLZ4WriterPool(lz4.Block256Kb)
+	lz4Writers4Mb   = newLZ4WriterPool(lz4.Block4Mb)
+)
 
-// getLZ4Writer returns a pooled *lz4.Writer reset to w, or a new one if the pool is empty.
-func getLZ4Writer(w io.Writer) *lz4.Writer {
-	if v := lz4WriterPool.Get(); v != nil {
-		lw := v.(*lz4.Writer)
-		lw.Reset(w)
-		return lw
-	}
-	return lz4.NewWriter(w)
-}
-
-// putLZ4Writer resets the writer to io.Discard (releasing buffer references) and returns it to the pool.
-func putLZ4Writer(w *lz4.Writer) {
-	w.Reset(nil)
-	lz4WriterPool.Put(w)
+func newLZ4WriterPool(size lz4.BlockSize) *sync.Pool {
+	return &sync.Pool{New: func() any {
+		w := lz4.NewWriter(nil)
+		_ = w.Apply(lz4.BlockSizeOption(size), lz4.ChecksumOption(false))
+		return w
+	}}
 }
 
 // lz4FrameReader keeps a pooled lz4.Reader together with the bytes.Reader it

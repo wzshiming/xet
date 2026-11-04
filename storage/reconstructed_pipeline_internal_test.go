@@ -154,12 +154,12 @@ func TestPipelineStopReturnsFrameBuffersAfterDecodeError(t *testing.T) {
 		want    string
 	}{
 		{
-			name:  "lz4_content_checksum",
+			name:  "lz4_frame_magic",
 			chunk: 1,
 			corrupt: func(packed []byte, _ *shard.FileDataSequenceEntry) {
-				packed[len(packed)-1] ^= 0xFF // last byte of the LZ4 frame's xxh32 content checksum
+				packed[xorb.ChunkHeaderSize] ^= 0xFF // first byte of the LZ4 frame magic
 			},
-			want: "checksum",
+			want: "failed to decompress LZ4",
 		},
 		{
 			name:  "none_uncompressed_size",
