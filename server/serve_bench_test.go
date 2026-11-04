@@ -81,7 +81,7 @@ func (fx *fixture) url(route string) string {
 }
 
 var (
-	fixtureRoot string                  // made by the first fixture
+	fixtureRoot string                  // made by benchRoot
 	fixtures    = map[string]*fixture{} // by "<size>/<class>"
 )
 
@@ -92,6 +92,19 @@ func TestMain(m *testing.M) {
 	}
 	os.RemoveAll(fixtureRoot)
 	os.Exit(code)
+}
+
+// benchRoot returns the temp dir all fixtures live under, making it on first use.
+func benchRoot(tb testing.TB) string {
+	tb.Helper()
+	if fixtureRoot == "" {
+		root, err := os.MkdirTemp("", "xet-serve-bench-*")
+		if err != nil {
+			tb.Fatal(err)
+		}
+		fixtureRoot = root
+	}
+	return fixtureRoot
 }
 
 // fixtureFor returns the fixture of s and c, building it on first use.
@@ -106,14 +119,7 @@ func fixtureFor(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 
 func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 	tb.Helper()
-	if fixtureRoot == "" {
-		root, err := os.MkdirTemp("", "xet-serve-bench-*")
-		if err != nil {
-			tb.Fatal(err)
-		}
-		fixtureRoot = root
-	}
-	dir := filepath.Join(fixtureRoot, s.name, c.Name)
+	dir := filepath.Join(benchRoot(tb), s.name, c.Name)
 	st, err := local.NewStorage(local.WithBasePath(filepath.Join(dir, "store")))
 	if err != nil {
 		tb.Fatal(err)
