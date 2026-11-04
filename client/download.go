@@ -162,6 +162,10 @@ func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []do
 // With WithVerifyDownloads, each reader verifies its content against the requested hash before EOF.
 // Readers release their cache references when read to EOF; close any reader
 // that is not fully consumed.
+// Readers take the client's memory budget only once read, and each holds at
+// most concurrency × (largest xorb range) bytes: consume them concurrently or
+// one after another, as alternating small reads across readers can stall only
+// when the budget cannot hold one window per reader.
 func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.FileHash) ([]io.ReadCloser, []int64, error) {
 	if len(fileHashes) == 0 {
 		return nil, nil, nil
