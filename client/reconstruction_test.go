@@ -719,10 +719,24 @@ func TestDownloadsAreUnverifiedByDefault(t *testing.T) {
 	})
 }
 
+// TestNewClientBuildsMemoryBudget pins that a client given no memory budget,
+// or a nil one, builds its own.
+func TestNewClientBuildsMemoryBudget(t *testing.T) {
+	for name, opts := range map[string][]Options{"default": nil, "nil": {WithMemoryBudget(nil)}} {
+		c, err := NewClient(opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.budget == nil {
+			t.Fatalf("%s: NewClient built no download memory budget", name)
+		}
+	}
+}
+
 // TestDownloadsHoldTermsInClientBudget pins that a client's downloads hold
-// their terms in the one memory budget the client owns: while a download
-// waits for its xorb, the budget cannot admit its whole target, and once the
-// download is done it can.
+// their terms in the memory budget WithMemoryBudget gives it: while a
+// download waits for its xorb, the budget cannot admit its whole target, and
+// once the download is done it can.
 func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
 	fx := newDownloadFixture(t, 1)
 	requested := make(chan struct{}, 1)
@@ -742,15 +756,12 @@ func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
 	t.Cleanup(releaseXorbs)
 	fx.srv = srv // reconstructions name xorb URLs on fx.srv
 
-	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
+	const target = 1 << 20
+	budget := download.NewMemoryBudget(download.MemorySizes{Base: target, Limit: target})
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")), WithMemoryBudget(budget))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.budget == nil {
-		t.Fatal("NewClient built no download memory budget")
-	}
-	const target = 1 << 20
-	c.budget = download.NewMemoryBudget(download.MemorySizes{Base: target, Limit: target})
 
 	f, err := os.CreateTemp(t.TempDir(), "out")
 	if err != nil {
@@ -767,7 +778,7 @@ func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
 
 	waiting, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	if err := c.budget.Acquire(waiting, target); !errors.Is(err, context.DeadlineExceeded) {
+	if err := budget.Acquire(waiting, target); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("acquiring the whole client budget during a download = %v, want it to wait for the download's term", err)
 	}
 	releaseXorbs()
@@ -776,7 +787,7 @@ func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
 	}
 	admitted, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	if err := c.budget.Acquire(admitted, target); err != nil {
+	if err := budget.Acquire(admitted, target); err != nil {
 		t.Fatalf("acquiring the whole client budget after the download = %v, want it admitted", err)
 	}
 }
