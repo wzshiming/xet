@@ -3,6 +3,8 @@ package server_test
 import (
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -134,6 +136,25 @@ func windowMetrics(from, to rusage, writes, bytes, size int64, n int) map[string
 		"majflt/GiB":  float64(to.majflt-from.majflt) / gib,
 		"writes/GiB":  float64(writes) / gib,
 		"served/file": float64(bytes) / file,
+	}
+}
+
+// TestWindowMetrics requests a 256 MiB file 3 times, 0.75 GiB in all.
+func TestWindowMetrics(t *testing.T) {
+	from := rusage{usr: time.Second, sys: 250 * time.Millisecond, minflt: 100, majflt: 1}
+	to := rusage{usr: 2500 * time.Millisecond, sys: 750 * time.Millisecond, minflt: 1600, majflt: 7}
+	got := windowMetrics(from, to, 6147, 3<<28, 1<<28, 3)
+	want := map[string]float64{
+		"cpu-s/GiB":   8.0 / 3,
+		"usr-s/GiB":   2,
+		"sys-s/GiB":   2.0 / 3,
+		"minflt/GiB":  2000,
+		"majflt/GiB":  8,
+		"writes/GiB":  8196,
+		"served/file": 1,
+	}
+	if !maps.EqualFunc(got, want, func(g, w float64) bool { return math.Abs(g-w) <= 1e-9*w }) {
+		t.Errorf("windowMetrics = %v\nwant %v", got, want)
 	}
 }
 
