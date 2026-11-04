@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"io"
 	"net"
@@ -9,11 +10,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet/auth"
+	"github.com/wzshiming/xet/download"
+	"github.com/wzshiming/xet/storage/local"
+	"github.com/wzshiming/xet/storage/storagetest"
 )
 
 func TestXetdProcess(t *testing.T) {
@@ -41,6 +46,30 @@ func TestXetdRequiresInternalToken(t *testing.T) {
 	output, err := command.CombinedOutput()
 	if err == nil || !strings.Contains(string(output), "-internal requires -internal-token") {
 		t.Fatalf("startup = %v, output = %s", err, output)
+	}
+}
+
+func TestXetdHelpListsTermSplitDefaults(t *testing.T) {
+	output, err := xetdCommand(t, "-help").CombinedOutput()
+	for _, entry := range []string{
+		`-reconstruction-min-terms int\n.*\(default 16\)`,
+		`-reconstruction-min-term-bytes int\n.*\(default 1048576\)`,
+	} {
+		if !regexp.MustCompile(`(?m)^  ` + entry + `$`).Match(output) {
+			t.Errorf("-help = %v, output = %s; want an entry matching %#q", err, output, entry)
+		}
+	}
+}
+
+func TestXetdRejectsNegativeTermSplitFlags(t *testing.T) {
+	for _, name := range []string{"-reconstruction-min-terms", "-reconstruction-min-term-bytes"} {
+		t.Run(name, func(t *testing.T) {
+			command := xetdCommand(t, name+"=-1", "-addr=invalid", "-storage="+t.TempDir())
+			output, err := command.CombinedOutput()
+			if want := name + " must not be negative"; err == nil || !strings.Contains(string(output), want) {
+				t.Fatalf("startup with %s=-1 = %v, output = %s; want a failure with %q", name, err, output, want)
+			}
+		})
 	}
 }
 
@@ -156,6 +185,74 @@ func TestXetdInternalTokenIsolation(t *testing.T) {
 					if want == http.StatusUnauthorized && response.Header.Get("WWW-Authenticate") != "Bearer" {
 						t.Fatalf("%s: missing Bearer challenge", route.path)
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestXetdReconstructionTermSplit(t *testing.T) {
+	storageDir := t.TempDir()
+	st, err := local.NewStorage(local.WithBasePath(storageDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 16 MiB in one xorb of 64 KiB chunks: a single V2 term unless split.
+	file := storagetest.PutXorbFile(t, t.Context(), st, storagetest.ChunkClasses[0].Xorbs(1, 256, 64<<10))
+	for _, c := range []struct {
+		name  string
+		flags []string
+		terms int
+	}{
+		{"default splits into 16 terms", nil, 16},
+		{"-reconstruction-min-terms=0 keeps 1 term", []string{"-reconstruction-min-terms=0"}, 1},
+		{"-reconstruction-min-term-bytes=8388608 stops at 2 terms", []string{"-reconstruction-min-term-bytes=8388608"}, 2},
+		{"-reconstruction-min-term-bytes=0 starts and splits into 16 terms", []string{"-reconstruction-min-term-bytes=0"}, 16},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := listener.Addr().String()
+			if err := listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			command := xetdCommand(t, append([]string{"-addr=" + address, "-storage=" + storageDir}, c.flags...)...)
+			var output bytes.Buffer
+			command.Stdout = &output
+			command.Stderr = &output
+			if err := command.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				_ = command.Wait()
+				close(done)
+			}()
+			t.Cleanup(func() {
+				_ = command.Process.Kill()
+				<-done
+			})
+			client := &http.Client{Timeout: 10 * time.Second}
+			deadline := time.After(10 * time.Second)
+			for {
+				response, err := client.Get("http://" + address + "/v2/reconstructions/" + file.FileHash.String())
+				if err == nil {
+					var reconstruction download.ReconstructionResponseV2
+					err = json.NewDecoder(response.Body).Decode(&reconstruction)
+					_ = response.Body.Close()
+					if response.StatusCode != http.StatusOK || err != nil || len(reconstruction.Terms) != c.terms {
+						t.Fatalf("xetd %q: V2 reconstruction of a 16 MiB term = status %d, %d terms, %v; want %d terms", c.flags, response.StatusCode, len(reconstruction.Terms), err, c.terms)
+					}
+					return
+				}
+				select {
+				case <-done:
+					t.Fatalf("xetd %q exited: %s", c.flags, output.String())
+				case <-deadline:
+					t.Fatal("xetd did not start")
+				case <-time.After(10 * time.Millisecond):
 				}
 			}
 		})

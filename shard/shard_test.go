@@ -318,6 +318,37 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 	}
 }
 
+func TestShardFile(t *testing.T) {
+	sh := NewShard()
+	for id := range byte(3) {
+		sh.AddFile(FileBlock{FileHash: xet.FileHash{id + 1}, Entries: []FileDataSequenceEntry{{CASHash: xet.XorbHash{id + 1}, UnpackedSegBytes: uint32(id) + 1, ChunkIndexEnd: 1}}})
+	}
+	for i, want := range sh.Files {
+		if got := sh.File(want.FileHash); got == nil || got.FileHash != want.FileHash || !slices.Equal(got.Entries, want.Entries) {
+			t.Errorf("File(%s) = %+v, want file %d of the shard: %+v", want.FileHash, got, i, want)
+		}
+	}
+	if got := sh.File(xet.FileHash{9}); got != nil {
+		t.Errorf("File of a hash the shard does not hold = %+v, want nil", got)
+	}
+}
+
+func TestFileBlockUnpackedSize(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		file *FileBlock
+		want int64
+	}{
+		{"nil, as File returns for an absent file", nil, 0},
+		{"no entries", &FileBlock{}, 0},
+		{"several entries past 4 GiB", &FileBlock{Entries: []FileDataSequenceEntry{{UnpackedSegBytes: 1000}, {UnpackedSegBytes: 1<<32 - 1}, {UnpackedSegBytes: 500}}}, 1000 + 1<<32 - 1 + 500},
+	} {
+		if got := c.file.UnpackedSize(); got != c.want {
+			t.Errorf("UnpackedSize of %s = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 // TestNewShard tests that a new shard encodes with the correct default header values.
 func TestNewShard(t *testing.T) {
 	s := NewShard()
