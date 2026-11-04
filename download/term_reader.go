@@ -164,7 +164,7 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 		cancel:      cancel,
 		client:      client,
 		cache:       o.cache,
-		writer:      o.cache.newWriter(concurrency),
+		writer:      o.cache.newWriter(0),
 		budget:      budget,
 		concurrency: concurrency,
 		detach:      func() {},
