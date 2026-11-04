@@ -98,27 +98,23 @@ func (x *fixtureXorb) v2(offset int64, terms []fixtureTerm) *ReconstructionRespo
 
 var readerVersions = []string{"v1", "v2"}
 
-// newVersionReader builds the term reader of version's reconstruction of terms over x.
+// newVersionReader opens version's reader of the reconstruction of terms over x.
 func newVersionReader(version string, ctx context.Context, client ClientAdapter, x *fixtureXorb, offset int64, terms []fixtureTerm, opts ...Option) (*termReader, error) {
-	var tasks []fetchTask
-	var resp []Term
-	var err error
 	switch version {
 	case "v1":
-		r := x.v1(offset, terms)
-		_, tasks, err = planReaderV1(r)
-		resp = r.Terms
+		r, err := NewReaderV1(ctx, client, x.v1(offset, terms), opts...)
+		if err != nil {
+			return nil, err
+		}
+		return r.(*ReaderV1).termReader, nil
 	case "v2":
-		r := x.v2(offset, terms)
-		_, tasks, err = planReaderV2(r)
-		resp = r.Terms
-	default:
-		panic(version)
+		r, err := NewReaderV2(ctx, client, x.v2(offset, terms), opts...)
+		if err != nil {
+			return nil, err
+		}
+		return r.(*ReaderV2).termReader, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return newTermReader(ctx, client, resp, offset, tasks, opts...)
+	panic(version)
 }
 
 // openTermReader is newVersionReader failing the test on error and closing the reader at its end.
