@@ -94,7 +94,7 @@ func TestCacheLookupMissesEntryUntilSealed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer writer.Done()
-	if err := writer.LoadTo(0); err != nil {
+	if _, err := writer.load(); err != nil {
 		t.Fatal(err)
 	}
 	if c, err := m.lookup(t.Context(), hash, 4, 6); c != nil || err != nil {

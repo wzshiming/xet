@@ -23,9 +23,7 @@ import (
 type chunkRef struct {
 	offset  int64
 	size    int32
-	fileIdx int           // index into chunkCache.files; 0 means chunkCache.file
-	hash    xet.ChunkHash // the decoder's hash of the chunk, valid when hashed
-	hashed  bool          // unset for adopted chunks, which no decoder here has seen
+	fileIdx int // index into chunkCache.files; 0 means chunkCache.file
 }
 
 type cacheRange struct {
@@ -564,15 +562,6 @@ func readCacheFileMetas(f *os.File, layout cacheFileLayout, fileStart, chunkStar
 // Chunk returns the decoded chunk at idx, waiting while the loader is still
 // decoding toward it. Already-decoded chunks are served from the backing file.
 func (c *chunkCache) Chunk(idx uint32, buf []byte) (int64, error) {
-	m, err := c.readChunk(idx, buf)
-	if err != nil {
-		return 0, err
-	}
-	return int64(m.size), nil
-}
-
-// readChunk is Chunk returning the chunk's ref, which carries its decoder hash.
-func (c *chunkCache) readChunk(idx uint32, buf []byte) (chunkRef, error) {
 	c.mut.Lock()
 	for int(idx) >= c.shown && idx < c.expectedChunks && !c.readonly && !c.done && c.err == nil {
 		c.changed.Wait()
@@ -581,9 +570,9 @@ func (c *chunkCache) readChunk(idx uint32, buf []byte) (chunkRef, error) {
 		total, err := c.shown, c.err
 		c.mut.Unlock()
 		if err != nil {
-			return chunkRef{}, fmt.Errorf("load chunk %d: %w", idx, err)
+			return 0, fmt.Errorf("load chunk %d: %w", idx, err)
 		}
-		return chunkRef{}, fmt.Errorf("chunk %d out of range (total: %d)", idx, total)
+		return 0, fmt.Errorf("chunk %d out of range (total: %d)", idx, total)
 	}
 	m := c.metas[idx]
 	var f *os.File
@@ -595,20 +584,15 @@ func (c *chunkCache) readChunk(idx uint32, buf []byte) (chunkRef, error) {
 	c.mut.Unlock()
 
 	if f == nil {
-		return chunkRef{}, fmt.Errorf("chunk %d: file closed", idx)
+		return 0, fmt.Errorf("chunk %d: file closed", idx)
 	}
 	if int(m.size) > len(buf) {
-		return chunkRef{}, fmt.Errorf("buffer too small for chunk: need %d bytes", m.size)
+		return 0, fmt.Errorf("buffer too small for chunk: need %d bytes", m.size)
 	}
 	if _, err := f.ReadAt(buf[:m.size], m.offset); err != nil {
-		return chunkRef{}, err
+		return 0, err
 	}
-	return m, nil
-}
-
-// chunkHasher is a decoder that hashes the chunks it decodes, like *xorb.Decoder.
-type chunkHasher interface {
-	Chunks() ([]xet.ChunkHash, []uint64)
+	return int64(m.size), nil
 }
 
 // load decodes the next chunk, writes it to the backing file and shows it to
@@ -646,12 +630,6 @@ func (c *chunkCache) load() (int, error) {
 	}
 	c.crc = crc32.Update(c.crc, crc32.IEEETable, tmp[:n])
 	m := chunkRef{offset: c.writePos, size: int32(n)}
-	if d, ok := c.dec.(chunkHasher); ok {
-		// Its hashes line up with metas only if every chunk it decoded was stored.
-		if hashes, _ := d.Chunks(); len(hashes) == len(c.metas)+1 {
-			m.hash, m.hashed = hashes[len(c.metas)], true
-		}
-	}
 	c.writePos += int64(n)
 
 	c.mut.Lock()
@@ -696,34 +674,6 @@ func (c *chunkCache) fail(err error) error {
 	c.changed.Broadcast()
 	c.mut.Unlock()
 	return err
-}
-
-// loadTo decodes and caches chunks until index idx is available or the decoder
-// is exhausted.
-func (c *chunkCache) loadTo(idx uint32) error {
-	for {
-		c.mut.Lock()
-		curr := c.shown
-		done := c.done
-		c.mut.Unlock()
-
-		if curr > int(idx) || done {
-			return nil
-		}
-
-		_, err := c.load()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-// LoadTo decodes and caches chunks up to the specified index.
-func (c *chunkCache) LoadTo(idx uint32) error {
-	return c.loadTo(idx)
 }
 
 // LoadAll decodes remaining chunks and ensures the entry is sealed.
