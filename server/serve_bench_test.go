@@ -31,6 +31,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/storage/storagetest"
 )
@@ -126,9 +127,14 @@ func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 	if err := os.WriteFile(plain, f.Content, 0o644); err != nil {
 		tb.Fatal(err)
 	}
+	return serveFixture(st, plain, int64(len(f.Content)), f.SHA256Hex)
+}
 
+// serveFixture serves the file of SHA-256 hex sum on /plain/ from the file
+// plain and on /xet-bridge/ from st.
+func serveFixture(st storage.Storage, plain string, size int64, sum string) *fixture {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/plain/"+f.SHA256Hex, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/plain/"+sum, func(w http.ResponseWriter, r *http.Request) {
 		file, err := os.Open(plain)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -140,7 +146,7 @@ func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 		http.ServeContent(w, r, plain, time.Time{}, file)
 	})
 	mux.Handle("/", server.NewHandler(server.WithStorage(st)))
-	return &fixture{srv: httptest.NewServer(mux), size: int64(len(f.Content)), sha256: f.SHA256Hex}
+	return &fixture{srv: httptest.NewServer(mux), size: size, sha256: sum}
 }
 
 // checkGet fails tb unless url answers 200 with fx's length and SHA-256.
