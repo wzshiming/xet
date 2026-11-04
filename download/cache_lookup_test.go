@@ -85,6 +85,24 @@ func TestCacheLookupNeedsEntryCoveringSpan(t *testing.T) {
 	}
 }
 
+// TestCacheLookupCoversSpanEndExactly pins the end boundary: an entry of
+// chunks [0,4) serves a span ending at chunk 4 and none ending past it.
+func TestCacheLookupCoversSpanEndExactly(t *testing.T) {
+	m := NewCacheManager(t.TempDir(), 0)
+	hash := testXorbHash(0xab)
+	chunks := spanChunks(4)
+	writeRangeEntry(t, m, hash.String(), 0, 4, 0, 400, chunks)
+
+	if c, err := m.lookup(t.Context(), hash, 0, 5); c != nil || err != nil {
+		t.Fatalf("lookup [0,5) over entry [0,4) = %v, %v; want a miss", c, err)
+	}
+	c := mustLookup(t, m, hash, 1, 4)
+	defer c.release()
+	if got, want := readSpan(t, c, 1, 4), strings.Join(chunks[1:4], ""); got != want {
+		t.Fatalf("read(1, 4) = %q, want %q", got, want)
+	}
+}
+
 func TestCacheLookupMissesEntryUntilSealed(t *testing.T) {
 	m := NewCacheManager(t.TempDir(), 0)
 	hash := testXorbHash(0xa2)
