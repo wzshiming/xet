@@ -23,9 +23,9 @@ import (
 // term, every term then waits for its unpacked length in the memory budget,
 // and a fetch starts with its first term. A fetch fills one buffer with the
 // decoded chunks its terms read, from the cache when an entry covers the range
-// and from the network otherwise, and hands a downloaded range to the cache
-// writer. Read and WriteTo deliver each term from its fetch's buffer and
-// return its bytes to the budget once it is delivered.
+// and from the network otherwise, and streams a downloaded range to the cache
+// writer as it decodes it. Read and WriteTo deliver each term from its fetch's
+// buffer and return its bytes to the budget once it is delivered.
 type termReader struct {
 	terms   []Term
 	fetches []*rangeFetch // fetches[i] serves terms[i]; dropped once it is delivered
@@ -385,7 +385,7 @@ func (r *termReader) readCached(f *rangeFetch, c *cachedChunks) error {
 	return nil
 }
 
-// download fetches f's range, decodes it into f and hands it to the cache writer.
+// download fetches f's range and decodes it into f, streaming it to the cache writer.
 func (r *termReader) download(f *rangeFetch) error {
 	header := http.Header{
 		"Range": {fmt.Sprintf("bytes=%d-%d", f.key.Start, f.key.End)},
@@ -409,14 +409,17 @@ func (r *termReader) download(f *rangeFetch) error {
 			progressFunc: r.progress,
 		}
 	}
-	if err := r.decode(f, body); err != nil {
-		return err
-	}
+	var entry *entryWrite
 	if f.cacheable {
 		key := cacheKey{Hash: f.xorbHash, ChunkStart: int(f.chunkStart), ChunkEnd: int(f.chunkEnd), ByteStart: f.key.Start, ByteEnd: f.key.End}
-		// The writer keeps data alive until it is written; nothing waits for that.
-		r.writer.put(key, f.offsets, f.data, func() {})
+		// The writer keeps the data alive until it is written; nothing waits for that.
+		entry = r.writer.begin(key, func() {})
 	}
+	defer entry.abort()
+	if err := r.decode(f, body, entry); err != nil {
+		return err
+	}
+	entry.finish(f.offsets)
 	// The range ends with its last chunk; reading on to EOF also lets the connection be reused.
 	var trailing [1]byte
 	if _, err := io.ReadFull(body, trailing[:]); err != io.EOF {
@@ -429,9 +432,10 @@ func (r *termReader) download(f *rangeFetch) error {
 }
 
 // decode reads the chunks of f's range from body and decodes those it keeps,
-// in order, straight into one buffer; the others are skipped undecoded. The
-// needed chunks are hashed when verifying.
-func (r *termReader) decode(f *rangeFetch, body io.Reader) error {
+// in order, straight into one buffer, handing the buffer to entry after each
+// one; the others are skipped undecoded. The needed chunks are hashed when
+// verifying.
+func (r *termReader) decode(f *rangeFetch, body io.Reader, entry *entryWrite) error {
 	n := int(f.chunkEnd - f.chunkStart)
 	offsets := make([]int64, n+1)
 	// DecodeChunk may scribble on the byte after a chunk; the next chunk overwrites it.
@@ -487,6 +491,7 @@ func (r *termReader) decode(f *rangeFetch, body io.Reader) error {
 		}
 		data = data[:len(data)+size]
 		offsets[i+1] = int64(len(data))
+		entry.advance(data)
 		if hashes != nil && f.needed[i] {
 			hashes[i] = computeChunkHash(chunk)
 		}
