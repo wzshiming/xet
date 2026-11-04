@@ -103,6 +103,7 @@ func (h *routeHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveData(w, r, path)
 		return
 	}
+	// Unknown files count too: a 404 is a round trip the delay applies to.
 	if r.Method == http.MethodHead {
 		h.heads.Add(1)
 	} else {
