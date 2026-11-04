@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wzshiming/xet/client/hf"
 )
@@ -42,7 +44,6 @@ func withUpstreamAuth(ctx context.Context, origin, token string) context.Context
 // probeResult captures upstream metadata for one resolve path. Everything is
 // taken from response headers only, so no platform-specific adapters exist.
 type probeResult struct {
-	status    int
 	size      int64 // -1 when unknown
 	etag      string
 	sha256    string // lowercase digest when the upstream etag looks like a SHA-256
@@ -57,28 +58,41 @@ func pseudoCommit(repo, rev string) string {
 	return hex.EncodeToString(sum[:20])
 }
 
+var errTooManyRedirects = fmt.Errorf("more than %d redirect hops", maxProbeHops)
+
 // probe issues HEAD requests for the resolve key on origin, following
 // redirects manually so that metadata headers from the hub hop are retained
 // while later hops can still supply the content length; ctx carries the
-// origin's credential. A hop that fails to answer is retried like a fetch;
-// a non-2xx answer is the result. Upstreams whose HEAD responses carry no
-// size at all (e.g. modelscope.cn) leave size at -1; the ingest download
-// learns it from its first response headers and resolve replies wait for
-// that (Stream.WaitSize).
+// origin's credential. One budget of m.probeBudget bounds every hop, retry and
+// backoff. A hop that fails to answer is retried like a fetch; an answer
+// other than a 2xx ends the probe with its typed failure. Upstreams whose
+// HEAD responses carry no size at all (e.g. modelscope.cn) leave size at -1;
+// the ingest download learns it from its first response headers and resolve
+// replies wait for that (Stream.WaitSize).
 func (m *Mirror) probe(ctx context.Context, origin string, key resolveKey) (*probeResult, error) {
-	var res *probeResult
-	err := fetchWithRetries(ctx, "probe", func() (err error) {
-		res, err = m.probeOnce(ctx, origin, key)
-		return err
-	})
-	return res, err
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, m.probeBudget)
+	defer cancel()
+	a := &attempts{max: maxProbeAttempts}
+	var err error
+	for a.next(ctx) {
+		var res *probeResult
+		if res, err = m.probeOnce(ctx, origin, key); err == nil {
+			return res, nil
+		}
+		var answer *UpstreamError
+		if errors.As(err, &answer) {
+			break
+		}
+	}
+	return nil, upstreamFailure(ctx, err, a.n, time.Since(start))
 }
 
 func (m *Mirror) probeOnce(ctx context.Context, origin string, key resolveKey) (*probeResult, error) {
 	res := &probeResult{size: -1}
 
 	cur := origin + key.String()
-	for range 8 { // redirect hops, as http.Client caps them; attempts are the caller's
+	for hop := 1; ; hop++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, cur, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create probe request: %w", err)
@@ -94,11 +108,11 @@ func (m *Mirror) probeOnce(ctx context.Context, origin string, key resolveKey) (
 
 		res.collect(resp.Header)
 
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			loc := resp.Header.Get("Location")
-			if loc == "" {
-				res.status = resp.StatusCode
-				return res, nil
+		if loc := resp.Header.Get("Location"); resp.StatusCode >= 300 && resp.StatusCode < 400 && loc != "" {
+			if hop == maxProbeHops {
+				ue := statusError(resp.StatusCode)
+				ue.err = errTooManyRedirects
+				return nil, ue
 			}
 			u, err := req.URL.Parse(loc)
 			if err != nil {
@@ -108,7 +122,9 @@ func (m *Mirror) probeOnce(ctx context.Context, origin string, key resolveKey) (
 			continue
 		}
 
-		res.status = resp.StatusCode
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, statusError(resp.StatusCode)
+		}
 		if res.size < 0 && resp.ContentLength >= 0 {
 			res.size = resp.ContentLength
 		}

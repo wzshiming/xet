@@ -189,7 +189,7 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 	repo, rev, path := vars["repo"], vars["rev"], vars["path"]
 	target, token, err := h.upstreamURL(r.Context(), "/"+repo+"/resolve/"+rev+"/"+path)
 	if err != nil {
-		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+		serveFetchError(w, err)
 		return
 	}
 	// Bounded retry: a resolution can hand back a stream whose ingest
@@ -201,7 +201,7 @@ func (h *Handler) handleResolve(w http.ResponseWriter, r *http.Request) {
 			if r.Context().Err() != nil {
 				return
 			}
-			serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+			serveFetchError(w, err)
 			return
 		}
 		if res.Entry != nil {
@@ -233,17 +233,28 @@ func (h *Handler) serveReady(w http.ResponseWriter, r *http.Request, e *mirror.E
 }
 
 // serveFetchError maps a failed ingest to its HTTP response: 404 when the
-// upstream lacks the file, 502 with the underlying error otherwise.
-func serveFetchError(w http.ResponseWriter, notFound bool, err error) {
-	if notFound {
+// upstream lacks the file; 504 when the upstream timed out and 502 for any
+// other failure, both with the underlying error, and for an upstream failure
+// a Retry-After of the rest of its retry backoff.
+func serveFetchError(w http.ResponseWriter, err error) {
+	if errors.Is(err, mirror.ErrUpstreamNotFound) {
 		http.Error(w, "File not found upstream", http.StatusNotFound)
 		return
+	}
+	status := http.StatusBadGateway
+	var ue *mirror.UpstreamError
+	if errors.As(err, &ue) {
+		if ue.Kind == mirror.UpstreamTimeout {
+			status = http.StatusGatewayTimeout
+		}
+		// Whole seconds, rounded up, at least one.
+		w.Header().Set("Retry-After", strconv.FormatInt(max(int64((ue.RetryAfter+time.Second-1)/time.Second), 1), 10))
 	}
 	msg := "upstream fetch failed"
 	if err != nil {
 		msg = err.Error()
 	}
-	http.Error(w, msg, http.StatusBadGateway)
+	http.Error(w, msg, status)
 }
 
 // serveFromStream streams a file that is still being ingested. Bytes are
@@ -255,7 +266,8 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 
 	// The size may only be learned from the ingest download's first response
 	// headers (e.g. modelscope.cn sends none on HEAD); downstream hub clients
-	// refuse metadata without it, so wait rather than answer size-less.
+	// refuse metadata without it, so wait for those — bounded by the upstream
+	// stall timeout — rather than answer size-less.
 	size, ok := st.WaitSize(r.Context())
 	if !ok {
 		return true
@@ -271,9 +283,9 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 	}
 
 	if size < 0 {
-		// Total size unknown until the ingest completes (xet upstream whose
-		// probe carried no size): ServeContent cannot handle that, so stream
-		// the whole body as it lands, ignoring Range.
+		// Total size unknown until the ingest completes (neither the probe nor
+		// the first upstream response carried one): ServeContent cannot handle
+		// that, so stream the whole body as it lands, ignoring Range.
 		rc, err := st.NewReader(0)
 		if err != nil {
 			return false
@@ -282,7 +294,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 			_ = rc.Close()
 		}()
 		writeMetadataHeaders(w, etag, size, commit)
-		_, _ = io.Copy(w, rc)
+		_, _ = io.Copy(flushWriter{w}, rc)
 		return true
 	}
 
@@ -296,6 +308,19 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 	writeMetadataHeaders(w, etag, size, commit)
 	http.ServeContent(w, r, "", time.Time{}, rs)
 	return true
+}
+
+// flushWriter hands every write to the client at once, so a trickling ingest reaches it as the bytes land.
+type flushWriter struct {
+	http.ResponseWriter
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.ResponseWriter.Write(p)
+	if err == nil {
+		_ = http.NewResponseController(f.ResponseWriter).Flush()
+	}
+	return n, err
 }
 
 // writeMetadataHeaders emits the header set downstream tooling relies on,
@@ -408,12 +433,12 @@ func (h *Handler) handleTree(w http.ResponseWriter, r *http.Request) {
 	}
 	target, token, err := h.upstreamURL(r.Context(), pathAndQuery)
 	if err != nil {
-		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+		serveFetchError(w, err)
 		return
 	}
 	resp, err := h.mirror.FetchUpstream(r.Context(), target, token)
 	if err != nil {
-		serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+		serveFetchError(w, err)
 		return
 	}
 	defer func() {

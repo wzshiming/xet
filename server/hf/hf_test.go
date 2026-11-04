@@ -900,6 +900,178 @@ func TestMirrorUpstreamNotFound(t *testing.T) {
 	}
 }
 
+func TestServeFetchError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		status     int
+		retryAfter string
+	}{
+		{"not found", &mirror.UpstreamError{Kind: mirror.UpstreamNotFound, Status: http.StatusNotFound, Attempts: 1, RetryAfter: 5 * time.Second}, http.StatusNotFound, ""},
+		{"timeout rounds up", &mirror.UpstreamError{Kind: mirror.UpstreamTimeout, Attempts: 2, Elapsed: time.Minute, RetryAfter: 9100 * time.Millisecond}, http.StatusGatewayTimeout, "10"},
+		{"status", &mirror.UpstreamError{Kind: mirror.UpstreamStatus, Status: http.StatusServiceUnavailable, Attempts: 1, RetryAfter: 3 * time.Second}, http.StatusBadGateway, "3"},
+		{"transport at least a second", &mirror.UpstreamError{Kind: mirror.UpstreamTransport, Attempts: 5}, http.StatusBadGateway, "1"},
+		{"not an upstream failure", errors.New("spool: size mismatch"), http.StatusBadGateway, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			serveFetchError(rec, tc.err)
+			body := tc.err.Error()
+			if tc.status == http.StatusNotFound {
+				body = "File not found upstream"
+			}
+			if rec.Code != tc.status || rec.Header().Get("Retry-After") != tc.retryAfter || !strings.Contains(rec.Body.String(), body) {
+				t.Fatalf("= %d, Retry-After %q, body %q; want %d, %q, containing %q", rec.Code, rec.Header().Get("Retry-After"), rec.Body, tc.status, tc.retryAfter, body)
+			}
+		})
+	}
+}
+
+// While a failure backs off, GET and HEAD both answer from it at once: 504
+// for an upstream that timed out, 502 for one that answered a failing
+// status, each with a Retry-After and a body naming the failure's kind,
+// attempts and elapsed time.
+func TestMirrorUpstreamFailureBackoff(t *testing.T) {
+	const resolvePath = "/org/repo/resolve/main/f.bin"
+	expect := func(t *testing.T, resolveURL string, status int, body string) {
+		t.Helper()
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			resp, got := roundTrip(t, noRedirect(), method, resolveURL, "")
+			retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+			if resp.StatusCode != status || err != nil || retryAfter < 1 || retryAfter > 10 {
+				t.Fatalf("%s = %d, Retry-After %q; want %d with 1-10 seconds", method, resp.StatusCode, resp.Header.Get("Retry-After"), status)
+			}
+			if method == http.MethodGet && (!strings.Contains(string(got), body) || !strings.Contains(string(got), " in ")) {
+				t.Fatalf("GET body %q; want it to name %q and the elapsed time", got, body)
+			}
+		}
+	}
+
+	t.Run("status", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(srv.Close)
+		fx := newHubFixture(t, srv.URL, t.TempDir(), t.TempDir())
+
+		expect(t, fx.srv.URL+resolvePath, http.StatusBadGateway, "upstream status 503 after 1 attempt")
+		if got := requests.Load(); got != 1 {
+			t.Fatalf("upstream requests = %d, want the one probe", got)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		upstream := newPlainUpstream()
+		upstream.set(resolvePath, []byte("never sent"))
+		release := make(chan struct{})
+		var gets atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/cdn") {
+				gets.Add(1)
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+				return
+			}
+			upstream.ServeHTTP(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { close(release) })
+		// The transport's header timeout fails the data GETs as the mirror's stall timeout would.
+		fx := newHubFixture(t, srv.URL, t.TempDir(), t.TempDir(), mirror.WithTransport(&http.Transport{ResponseHeaderTimeout: 50 * time.Millisecond}))
+		resolveURL := fx.srv.URL + resolvePath
+
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			resp, _ := roundTrip(t, noRedirect(), http.MethodHead, resolveURL, "")
+			if resp.StatusCode == http.StatusGatewayTimeout {
+				break
+			}
+			if resp.StatusCode != http.StatusOK || time.Now().After(deadline) {
+				t.Fatalf("HEAD while the ingest runs = %d; want 200 until it fails with 504", resp.StatusCode)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		expect(t, resolveURL, http.StatusGatewayTimeout, "upstream timeout after 2 attempts")
+		if got := gets.Load(); got != 2 {
+			t.Fatalf("upstream data GETs = %d, want 2", got)
+		}
+	})
+}
+
+// A plain upstream whose probe and first response carry no size is streamed
+// chunked as its bytes land, not held until the ingest completes; a HEAD
+// meanwhile answers without a Content-Length.
+func TestMirrorUnknownSizeStreams(t *testing.T) {
+	data := make([]byte, 64*1024)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	const resolvePath, first = "/org/repo/resolve/main/nosize.bin", 1024 // under the response writer's buffer
+	gate := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case resolvePath:
+			w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+			w.Header().Set("X-Repo-Commit", "commit-1")
+			http.Redirect(w, r, "/cdn"+resolvePath, http.StatusFound)
+		case "/cdn" + resolvePath:
+			if r.Method == http.MethodHead {
+				return // no size
+			}
+			_, _ = w.Write(data[:first])
+			w.(http.Flusher).Flush() // chunked: no Content-Length
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write(data[first:])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	fx := newHubFixture(t, srv.URL, t.TempDir(), t.TempDir())
+	resolveURL := fx.srv.URL + resolvePath
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolveURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.ContentLength != -1 {
+		t.Fatalf("GET = %d with Content-Length %d; want a 200 of unknown length", resp.StatusCode, resp.ContentLength)
+	}
+	head := make([]byte, first)
+	if _, err := io.ReadFull(resp.Body, head); err != nil || !bytes.Equal(head, data[:first]) {
+		t.Fatalf("first block while the upstream holds the rest: %v", err)
+	}
+
+	hresp, _ := roundTrip(t, noRedirect(), http.MethodHead, resolveURL, "")
+	if hresp.StatusCode != http.StatusOK || hresp.Header.Get("Content-Length") != "" || hresp.Header.Get("X-Linked-Size") != "" {
+		t.Fatalf("HEAD mid-ingest = %d, Content-Length %q, X-Linked-Size %q; want 200 without a size", hresp.StatusCode, hresp.Header.Get("Content-Length"), hresp.Header.Get("X-Linked-Size"))
+	}
+
+	release()
+	if tail, err := io.ReadAll(resp.Body); err != nil || !bytes.Equal(tail, data[first:]) {
+		t.Fatalf("rest of the body: %v", err)
+	}
+	waitReady(t, resolveURL)
+}
+
 func TestMirrorRevalidateStale(t *testing.T) {
 	upstream := newPlainUpstream()
 	upstreamSrv := httptest.NewServer(upstream)
