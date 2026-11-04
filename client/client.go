@@ -88,6 +88,15 @@ func WithCache(cache *Cache) Options {
 // defaultCache is the cache root every client built without WithCache shares.
 var defaultCache = sync.OnceValue(func() *Cache { return NewCache("", download.DefaultCacheSize, upload.DefaultCacheSize) })
 
+// WithMemoryBudget holds the terms of the client's downloads in budget, which
+// clients may share; without it, or with nil, the client builds its own sized
+// by download.DefaultMemorySizes.
+func WithMemoryBudget(budget *download.MemoryBudget) Options {
+	return func(c *Client) {
+		c.budget = budget
+	}
+}
+
 // WithVerifyDownloads verifies every full download against its xet file hash by hashing each chunk (BLAKE3); off by default.
 func WithVerifyDownloads() Options {
 	return func(c *Client) {
@@ -109,7 +118,6 @@ func NewClient(opts ...Options) (*Client, error) {
 		concurrency: 4,
 		retries:     5,
 		idleTimeout: DefaultIdleTimeout,
-		budget:      download.NewMemoryBudget(download.DefaultMemorySizes()),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -117,6 +125,9 @@ func NewClient(opts ...Options) (*Client, error) {
 
 	if c.cache == nil {
 		c.cache = defaultCache()
+	}
+	if c.budget == nil {
+		c.budget = download.NewMemoryBudget(download.DefaultMemorySizes())
 	}
 
 	// Copy the caller's client so wrapping its transport never mutates it.
