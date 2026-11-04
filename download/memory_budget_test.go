@@ -169,6 +169,21 @@ func TestMemoryBudgetServesWaitersInArrivalOrder(t *testing.T) {
 	requireAdmitted(t, second, "Acquire(5) with 50 of 100 used")
 }
 
+func TestMemoryBudgetReleaseAdmitsTwoFittingWaiters(t *testing.T) {
+	b := budgetWithTarget(100)
+	mustAcquire(t, b, 100)
+	first := acquireAsync(context.Background(), b, 30)
+	awaitQueued(t, b, 1)
+	second := acquireAsync(context.Background(), b, 40)
+	awaitQueued(t, b, 2)
+	b.Release(100)
+	requireAdmitted(t, first, "Acquire(30) after Release(100)")
+	requireAdmitted(t, second, "Acquire(40) queued behind Acquire(30) after Release(100)")
+	if used := usedOf(b); used != 70 {
+		t.Fatalf("%d used after one Release admitted Acquire(30) and Acquire(40), want 70", used)
+	}
+}
+
 func TestMemoryBudgetAcquireStopsWhenContextIsDone(t *testing.T) {
 	b := budgetWithTarget(100)
 	mustAcquire(t, b, 90)
