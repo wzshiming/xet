@@ -83,16 +83,6 @@ type fileVerifier struct {
 // computeChunkHash is xet.ComputeChunkHash; tests count its calls.
 var computeChunkHash = xet.ComputeChunkHash
 
-// add records one chunk occurrence, hashing data only when no decoder did.
-func (v *fileVerifier) add(m chunkRef, data []byte) {
-	hash := m.hash
-	if !m.hashed {
-		hash = xet.ComputeChunkHash(data)
-	}
-	v.hashes = append(v.hashes, hash)
-	v.sizes = append(v.sizes, uint64(len(data)))
-}
-
 // addChunks records the chunks of one term occurrence: hashes[i] is the hash
 // of a chunk of offsets[i+1]-offsets[i] bytes.
 func (v *fileVerifier) addChunks(hashes []xet.ChunkHash, offsets []int64) {
