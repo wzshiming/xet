@@ -18,11 +18,14 @@ import (
 func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
+	// Chunks decompress into their own buffer: decoding into tmp would overwrite the frame being read.
+	out := pool.GetChunkBuf()
+	defer pool.PutChunkBuf(out)
 
 	var headerBuf [8]byte
 	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
-	var uncompressedBuf []byte
+	uncompressedBuf := out[:0]
 	var packedEndOffset uint64   // cumulative compressed bytes (header + data) per chunk
 	var unpackedEndOffset uint64 // cumulative uncompressed bytes per chunk
 
