@@ -110,6 +110,10 @@ func TestMain(m *testing.M) {
 	for _, fx := range fixtures {
 		fx.srv.Close()
 	}
+	for _, st := range routeStacks {
+		st.srv.Close()
+		st.hubSrv.Close()
+	}
 	os.RemoveAll(fixtureRoot)
 	os.Exit(code)
 }
