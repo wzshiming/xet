@@ -200,14 +200,16 @@ func BenchmarkServe(b *testing.B) {
 	for _, s := range shapes {
 		b.Run("size="+s.name, func(b *testing.B) {
 			for _, c := range classes {
-				b.Run("class="+c.Name, func(b *testing.B) {
-					fx := fixtureFor(b, s, c)
-					for _, p := range paths {
-						b.Run("path="+p.name, func(b *testing.B) { benchmarkGet(b, fx, fx.url(p.route)) })
-					}
-				})
+				b.Run("class="+c.Name, func(b *testing.B) { benchmarkPaths(b, fixtureFor(b, s, c)) })
 			}
 		})
+	}
+}
+
+// benchmarkPaths runs one row per path of fx.
+func benchmarkPaths(b *testing.B, fx *fixture) {
+	for _, p := range paths {
+		b.Run("path="+p.name, func(b *testing.B) { benchmarkGet(b, fx, fx.url(p.route)) })
 	}
 }
 
