@@ -30,7 +30,10 @@ func WithCacheManager(cache *CacheManager) Option {
 	}
 }
 
-// WithConcurrency configures how many xorb ranges are prefetched concurrently.
+// WithConcurrency sets the reader's window: at most concurrency xorb ranges
+// are being fetched or hold terms not yet delivered, as range k+concurrency
+// starts only once range k has delivered its last term. A range read again
+// beyond the window is fetched again, from the cache when it holds the range.
 func WithConcurrency(concurrency int) Option {
 	return func(o *options) {
 		o.concurrency = concurrency
@@ -46,7 +49,9 @@ func WithExpectedFileHash(fileHash xet.FileHash) Option {
 
 // WithMemoryBudget holds the reader's fetched terms within budget, which
 // readers may share; without it, or with nil, the reader uses its own budget
-// sized by DefaultMemorySizes.
+// sized by DefaultMemorySizes. The budget bounds the readers sharing it, and
+// WithConcurrency each one: a reader holds at most concurrency × (largest
+// range) bytes, besides ranges still being written to the cache.
 func WithMemoryBudget(budget *MemoryBudget) Option {
 	return func(o *options) {
 		o.budget = budget

@@ -18,14 +18,14 @@ import (
 
 // termReader reconstructs a file by delivering its terms in order, as
 // xet-core's file reconstructor does. Its first Read or WriteTo starts a
-// dispatcher that walks the terms in file order: each takes a worker slot
-// when its range still has to be fetched, then waits for its unpacked length
-// in the memory budget, and the first term of every distinct xorb range
-// starts that range's fetch. A fetch fills one buffer with the decoded chunks
-// its terms read, from the cache when an entry covers the range and from the
-// network otherwise, and hands a downloaded range to the cache writer. Read
-// and WriteTo deliver each term from its fetch's buffer and return its bytes
-// to the budget once it is delivered.
+// dispatcher that walks the terms in file order: the first term of each fetch
+// waits until the fetch concurrency places earlier has delivered its last
+// term, every term then waits for its unpacked length in the memory budget,
+// and a fetch starts with its first term. A fetch fills one buffer with the
+// decoded chunks its terms read, from the cache when an entry covers the range
+// and from the network otherwise, and hands a downloaded range to the cache
+// writer. Read and WriteTo deliver each term from its fetch's buffer and
+// return its bytes to the budget once it is delivered.
 type termReader struct {
 	terms   []Term
 	fetches []*rangeFetch // fetches[i] serves terms[i]; dropped once it is delivered
@@ -61,7 +61,7 @@ type termReader struct {
 	err      error
 }
 
-// rangeFetch is one distinct xorb range and the decoded chunks its terms read.
+// rangeFetch is one fetch of an xorb range and the decoded chunks its terms read.
 type rangeFetch struct {
 	key        fetchKey
 	url        string
@@ -71,7 +71,10 @@ type rangeFetch struct {
 	cacheable  bool   // looked up in and written to the cache, so decoded whole
 	needed     []bool // local chunks some term reads
 	size       int    // decoded length of the needed chunks, from their terms
+	last       int    // index of the last term the fetch serves
 	started    bool   // the dispatcher started the fetch
+
+	delivered chan struct{} // closed once its last term is delivered
 
 	done    chan struct{}   // closed once the fields below are set
 	data    []byte          // decoded chunks in order
@@ -139,17 +142,17 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 	if err != nil {
 		return nil, err
 	}
-	fetches, err := planFetches(terms, tasks, o.cache != nil)
+	concurrency := o.concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	fetches, err := planFetches(terms, tasks, o.cache != nil, concurrency)
 	if err != nil {
 		return nil, err
 	}
 	budget := o.budget
 	if budget == nil {
 		budget = NewMemoryBudget(DefaultMemorySizes())
-	}
-	concurrency := o.concurrency
-	if concurrency <= 0 {
-		concurrency = defaultConcurrency
 	}
 	// Fetches run on a context Close cancels, so callers sharing ctx are unaffected.
 	ctx, cancel := context.WithCancel(ctx)
@@ -172,10 +175,10 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 		verifier:    verifier,
 	}
 	if r.progress != nil {
-		reported := make(map[*rangeFetch]bool, len(fetches))
+		reported := make(map[fetchKey]bool, len(fetches))
 		for _, f := range fetches {
-			if !reported[f] {
-				reported[f] = true
+			if !reported[f.key] {
+				reported[f.key] = true
 				r.progress(f.key.String(), 0, f.key.Size())
 			}
 		}
@@ -201,41 +204,54 @@ func (r *termReader) start() {
 	r.workers.Go(func() { r.dispatch(order, r.concurrency) })
 }
 
-// planFetches returns the fetch serving each term, one per distinct range.
-func planFetches(terms []Term, tasks []fetchTask, cached bool) ([]*rangeFetch, error) {
-	byKey := make(map[fetchKey]*rangeFetch)
-	sized := make(map[fetchKey]map[ChunkRange]bool)
+// planFetches returns the fetch serving each term. A term shares the latest
+// fetch of its range while fewer than concurrency fetches follow that one in
+// fetch order, so every term of a fetch comes before the first term of the
+// fetch concurrency places later; a range read again after that is fetched
+// again.
+func planFetches(terms []Term, tasks []fetchTask, cached bool, concurrency int) ([]*rangeFetch, error) {
+	type planned struct {
+		fetch *rangeFetch
+		seq   int                 // place in fetch order
+		sized map[ChunkRange]bool // term ranges counted in fetch.size
+	}
+	latest := make(map[fetchKey]*planned)
 	fetches := make([]*rangeFetch, len(terms))
+	plannedFetches := 0
 	for i, task := range tasks {
-		f := byKey[task.key]
-		if f == nil {
-			f = &rangeFetch{
+		p := latest[task.key]
+		if p != nil && (p.fetch.chunkStart != task.chunkStart || p.fetch.chunkEnd != task.chunkEnd) {
+			return nil, fmt.Errorf("xorb range %s holds chunks [%d, %d) and [%d, %d)", task.key, p.fetch.chunkStart, p.fetch.chunkEnd, task.chunkStart, task.chunkEnd)
+		}
+		if p == nil || p.seq < plannedFetches-concurrency {
+			f := &rangeFetch{
 				key:        task.key,
 				url:        task.url,
 				chunkStart: task.chunkStart,
 				chunkEnd:   task.chunkEnd,
 				needed:     make([]bool, task.chunkEnd-task.chunkStart),
+				delivered:  make(chan struct{}),
 				done:       make(chan struct{}),
 			}
 			if cached {
 				hash, err := xet.ParseXorbHash(task.key.Hash)
 				f.xorbHash, f.cacheable = hash, err == nil
 			}
-			byKey[task.key] = f
-			sized[task.key] = map[ChunkRange]bool{}
+			p = &planned{fetch: f, seq: plannedFetches, sized: map[ChunkRange]bool{}}
+			latest[task.key] = p
+			plannedFetches++
 		}
-		if f.chunkStart != task.chunkStart || f.chunkEnd != task.chunkEnd {
-			return nil, fmt.Errorf("xorb range %s holds chunks [%d, %d) and [%d, %d)", task.key, f.chunkStart, f.chunkEnd, task.chunkStart, task.chunkEnd)
-		}
+		f := p.fetch
 		rg := terms[i].Range
 		for c := rg.Start; c < rg.End; c++ {
 			f.needed[c-f.chunkStart] = true
 		}
 		// Overlapping terms make this an upper bound; a range holds at most an xorb.
-		if !sized[task.key][rg] {
-			sized[task.key][rg] = true
+		if !p.sized[rg] {
+			p.sized[rg] = true
 			f.size = int(min(uint64(f.size)+terms[i].UnpackedLength, xet.MaxXorbSize))
 		}
+		f.last = i
 		fetches[i] = f
 	}
 	return fetches, nil
@@ -246,42 +262,37 @@ func termBytes(term Term) int64 {
 	return int64(min(term.UnpackedLength, math.MaxInt64))
 }
 
-// dispatch admits the terms in file order and starts the fetch of each range
-// for the first term that reads it.
+// dispatch admits the terms in file order and starts each fetch with its
+// first term, once the fetch concurrency places earlier has delivered its
+// last term.
 func (r *termReader) dispatch(order []*rangeFetch, concurrency int) {
-	slots := make(chan struct{}, concurrency)
+	var window []chan struct{} // delivered of the last concurrency fetches started, in order
 	for i, f := range order {
 		order[i] = nil
 		if err := r.ctx.Err(); err != nil {
 			r.fail(err)
 			return
 		}
-		n := termBytes(r.terms[i])
-		if f.started {
-			if err := r.budget.Acquire(r.ctx, n); err != nil {
-				r.fail(err)
+		if !f.started && len(window) == concurrency {
+			select {
+			case <-window[0]:
+			case <-r.ctx.Done():
+				r.fail(r.ctx.Err())
 				return
 			}
-			r.admit(n)
-			continue
+			window = window[1:]
 		}
-		select {
-		case slots <- struct{}{}:
-		case <-r.ctx.Done():
-			r.fail(r.ctx.Err())
-			return
-		}
+		n := termBytes(r.terms[i])
 		if err := r.budget.Acquire(r.ctx, n); err != nil {
-			<-slots
 			r.fail(err)
 			return
 		}
 		r.admit(n)
-		f.started = true
-		r.workers.Go(func() {
-			defer func() { <-slots }()
-			r.fetch(f)
-		})
+		if !f.started {
+			f.started = true
+			window = append(window, f.delivered)
+			r.workers.Go(func() { r.fetch(f) })
+		}
 	}
 }
 
@@ -565,13 +576,24 @@ func (r *termReader) stick(err error) error {
 	return err
 }
 
-// consume marks n bytes of the current term delivered, and returns its budget
+// consume marks n bytes of the current term delivered, and delivers the term
 // once all of it is.
 func (r *termReader) consume(n int) {
 	r.cur = r.cur[n:]
 	if len(r.cur) == 0 {
 		r.cur = nil
-		r.release(termBytes(r.terms[r.next-1]))
+		r.deliver(r.next - 1)
+	}
+}
+
+// deliver returns the budget of term i, which is delivered, and closes its
+// fetch's delivered after the fetch's last term.
+func (r *termReader) deliver(i int) {
+	r.release(termBytes(r.terms[i]))
+	f := r.fetches[i]
+	r.fetches[i] = nil
+	if f.last == i {
+		close(f.delivered)
 	}
 }
 
@@ -603,13 +625,12 @@ func (r *termReader) advance() error {
 		if r.next == 0 {
 			data = data[min(r.skip, int64(len(data))):]
 		}
-		r.fetches[r.next] = nil
 		r.next++
 		if len(data) > 0 {
 			r.cur = data
 			return nil
 		}
-		r.release(termBytes(term))
+		r.deliver(r.next - 1)
 	}
 	if r.verifier != nil {
 		if err := r.verifier.verify(); err != nil {

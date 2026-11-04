@@ -401,6 +401,80 @@ func TestTermReaderWaitsForBudget(t *testing.T) {
 	}
 }
 
+// TestTermReaderFetchesWithinWindow pins the per-reader window: with an
+// unlimited budget and concurrency 2, range k+2 starts only once range k has
+// delivered its last term.
+func TestTermReaderFetchesWithinWindow(t *testing.T) {
+	x := newFixtureXorb(t, 0x3f, randomChunks(41, 6, 1000))
+	var terms []fixtureTerm
+	for i := range uint32(6) {
+		terms = append(terms, fixtureTerm{ChunkRange{Start: i, End: i + 1}, ChunkRange{Start: i, End: i + 1}})
+	}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
+				r := openTermReader(t, version, t.Context(), client, x, 0, terms, WithConcurrency(2), WithMemoryBudget(budgetWithTarget(1<<40)))
+				var got []byte
+				for _, step := range []struct {
+					read int
+					gets int32
+				}{
+					{999, 2}, // the first term partly delivered
+					{1, 3},   // the first term delivered
+					{999, 3}, // the second term partly delivered
+					{1, 4},   // the second term delivered
+				} {
+					buf := make([]byte, step.read)
+					if _, err := io.ReadFull(r, buf); err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, buf...)
+					synctest.Wait()
+					if n := client.gets.Load(); n != step.gets {
+						t.Fatalf("after reading %d bytes: %d GETs, want %d", len(got), n, step.gets)
+					}
+				}
+				rest, err := io.ReadAll(r)
+				if got, want := append(got, rest...), x.file(terms); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+				}
+			})
+		})
+	}
+}
+
+// TestTermReaderRefetchesRangeBeyondWindow pins how the window bounds the
+// sharing of a range: a term shares the fetch of its range while fewer than
+// concurrency fetches have started after it, and a range read again later is
+// fetched again, so a window never waits for a term behind it.
+func TestTermReaderRefetchesRangeBeyondWindow(t *testing.T) {
+	x := newFixtureXorb(t, 0x40, randomChunks(42, 2, 1000))
+	a, b := ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 1, End: 2}
+	terms := []fixtureTerm{{a, a}, {b, b}, {a, a}}
+	for _, version := range readerVersions {
+		for _, test := range []struct {
+			concurrency int
+			gets        int32
+		}{{1, 3}, {2, 2}} {
+			t.Run(fmt.Sprintf("%s/concurrency=%d", version, test.concurrency), func(t *testing.T) {
+				// A window waiting for a later term fails the read here instead of hanging it.
+				ctx, cancel := context.WithTimeout(t.Context(), hangGuard)
+				defer cancel()
+				client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
+				r := openTermReader(t, version, ctx, client, x, 0, terms, WithConcurrency(test.concurrency))
+				got, err := io.ReadAll(r)
+				if want := x.file(terms); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+				}
+				if n := client.gets.Load(); n != test.gets {
+					t.Fatalf("%d GETs, want %d", n, test.gets)
+				}
+			})
+		}
+	}
+}
+
 // TestTermReaderCreatesNoFiles pins that terms stay in memory: a download
 // larger than its budget creates no file in the temporary directory, and with
 // a cache files only in the cache directory.
