@@ -114,16 +114,27 @@ func (w *window) stop(b *testing.B, size int64, n int) {
 	to := readRusage(b)
 	writes, bytes := w.conns.writes.Load()-w.writes, w.conns.bytes.Load()-w.bytes
 	w.stopProfile()
+	for unit, v := range windowMetrics(w.from, to, writes, bytes, size, n) {
+		b.ReportMetric(v, unit)
+	}
+}
+
+// windowMetrics turns a window over n requests for a file of size bytes,
+// its rusage from and to and its connections' writes and bytes, into metrics
+// by unit, per GiB of file requested.
+func windowMetrics(from, to rusage, writes, bytes, size int64, n int) map[string]float64 {
 	file := float64(size) * float64(n)
 	gib := file / (1 << 30)
-	usr, sys := (to.usr - w.from.usr).Seconds(), (to.sys - w.from.sys).Seconds()
-	b.ReportMetric((usr+sys)/gib, "cpu-s/GiB")
-	b.ReportMetric(usr/gib, "usr-s/GiB")
-	b.ReportMetric(sys/gib, "sys-s/GiB")
-	b.ReportMetric(float64(to.minflt-w.from.minflt)/gib, "minflt/GiB")
-	b.ReportMetric(float64(to.majflt-w.from.majflt)/gib, "majflt/GiB")
-	b.ReportMetric(float64(writes)/gib, "writes/GiB")
-	b.ReportMetric(float64(bytes)/file, "served/file")
+	usr, sys := (to.usr - from.usr).Seconds(), (to.sys - from.sys).Seconds()
+	return map[string]float64{
+		"cpu-s/GiB":   (usr + sys) / gib,
+		"usr-s/GiB":   usr / gib,
+		"sys-s/GiB":   sys / gib,
+		"minflt/GiB":  float64(to.minflt-from.minflt) / gib,
+		"majflt/GiB":  float64(to.majflt-from.majflt) / gib,
+		"writes/GiB":  float64(writes) / gib,
+		"served/file": float64(bytes) / file,
+	}
 }
 
 // profiles numbers the CPU profiles of this process, so -count keeps each.
