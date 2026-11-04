@@ -20,9 +20,10 @@ type options struct {
 	budget       *MemoryBudget
 }
 
-// WithCacheManager shares one CacheManager across readers so the capacity
-// bound applies to the whole cache directory. When unset, each reader uses a
-// private manager for the cacheDir passed to its constructor.
+// WithCacheManager makes the reader look each xorb range up in the chunk cache
+// before fetching it and add the ranges it fetches, off the delivery path.
+// Share one CacheManager across readers so the capacity bound applies to the
+// whole cache directory. Without it the reader uses no cache.
 func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
 		o.cache = cache
