@@ -5,7 +5,7 @@ on:
     inputs:
       bench:
         description: go test -bench regexp
-        default: Download
+        default: Download/size=(64MiB|256MiB|1GiB)/class=none/server=(plain|xet)
       benchtime:
         description: go test -benchtime
         default: 1x
@@ -52,9 +52,29 @@ jobs:
         hf env
         df -h
 
+    - name: Runner diagnostics
+      shell: bash
+      run: |
+        set +e
+        uname -a
+        nproc
+        lscpu | sed -n 1,25p
+        free -m
+        cat /sys/kernel/mm/transparent_hugepage/enabled
+        cat /sys/kernel/mm/transparent_hugepage/defrag
+        cat /proc/sys/vm/dirty_ratio /proc/sys/vm/dirty_background_ratio /proc/sys/vm/swappiness
+        df -hT / /tmp
+        lsblk -d -o NAME,ROTA,MODEL,SIZE,TYPE
+        for q in /sys/block/*/queue; do echo "$q rotational=$(cat $q/rotational) nr_requests=$(cat $q/nr_requests) scheduler=$(cat $q/scheduler)"; done
+        grep -m1 model.name /proc/cpuinfo
+        head -5 /proc/meminfo
+        sysctl -n net.core.somaxconn net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+        ulimit -a | head -20
+        echo IMAGE=$ImageOS/$ImageVersion
+
     - name: Run benchmark
       env:
-        BENCH: ${{ inputs.bench || 'Download' }}
+        BENCH: ${{ inputs.bench || 'Download/size=(64MiB|256MiB|1GiB)/class=none/server=(plain|xet)' }}
         BENCHTIME: ${{ inputs.benchtime || '1x' }}
         COUNT: ${{ inputs.count || '3' }}
       run: |
