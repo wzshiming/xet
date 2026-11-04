@@ -7,18 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"math"
-	"mime/multipart"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/flock"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -654,72 +651,15 @@ func TestDefaultCacheDir(t *testing.T) {
 	}
 }
 
-type countingDownloadClient struct {
-	body    []byte
-	calls   atomic.Int32
-	started chan struct{}
-	release chan struct{}
-}
-
-func (c *countingDownloadClient) DownloadXorbWithURL(context.Context, string, http.Header) (io.ReadCloser, error) {
-	if c.calls.Add(1) == 1 {
-		close(c.started)
-		<-c.release
-	}
-	return io.NopCloser(bytes.NewReader(c.body)), nil
-}
-
-func (*countingDownloadClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
-	panic("not used")
-}
-
-func TestPrefetcherLocksBeforeNetworkRequest(t *testing.T) {
-	var encoded bytes.Buffer
-	encoder := xorb.NewEncoder(&encoded, false)
-	if _, err := encoder.Write([]byte("chunk")); err != nil {
+func assertEntryUnlocked(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := encoder.Close(); err != nil {
-		t.Fatal(err)
+	defer f.Close()
+	if err := flock.TryLock(f); err != nil {
+		t.Fatalf("entry %s still locked: %v", path, err)
 	}
-
-	client := &countingDownloadClient{
-		body:    encoded.Bytes(),
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	task := fetchTask{
-		key:        fetchKey{Hash: testCacheHash, Start: 10, End: 20},
-		url:        "https://example.invalid/xorb",
-		chunkStart: 0,
-		chunkEnd:   1,
-	}
-	entry1 := &prefetchEntry{task: task, ready: make(chan struct{})}
-	entry2 := &prefetchEntry{task: task, ready: make(chan struct{})}
-	// Separate managers over the same directory simulate two processes.
-	dir := t.TempDir()
-	p1 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
-	p2 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
-
-	done1 := make(chan struct{})
-	done2 := make(chan struct{})
-	go func() { p1.runJob(entry1); close(done1) }()
-	<-client.started
-	go func() { p2.runJob(entry2); close(done2) }()
-
-	time.Sleep(150 * time.Millisecond)
-	if got := client.calls.Load(); got != 1 {
-		t.Fatalf("got %d network requests while first writer held the lock, want 1", got)
-	}
-	close(client.release)
-	<-done1
-	<-done2
-	if entry1.err != nil || entry2.err != nil {
-		t.Fatalf("prefetch errors: first=%v second=%v", entry1.err, entry2.err)
-	}
-	defer entry1.cache.Done()
-	defer entry2.cache.Done()
-	if got := client.calls.Load(); got != 1 {
-		t.Fatalf("got %d network requests, want 1", got)
-	}
+	flock.Unlock(f) //nolint:errcheck
 }

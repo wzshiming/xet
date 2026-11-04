@@ -78,6 +78,53 @@ type rangeFetch struct {
 
 const defaultConcurrency = 4
 
+type fetchKey struct {
+	Hash  string
+	Start int64
+	End   int64
+}
+
+func (k fetchKey) String() string {
+	return fmt.Sprintf("%s:%d-%d", k.Hash, k.Start, k.End)
+}
+
+// Size is the length of the inclusive byte range [Start, End].
+func (k fetchKey) Size() int64 {
+	return k.End - k.Start + 1
+}
+
+type fetchTask struct {
+	key        fetchKey
+	url        string
+	chunkStart uint32
+	chunkEnd   uint32
+}
+
+// checkFetchRange rejects server-supplied ranges before any cache file is sized from them.
+func checkFetchRange(term *Term, chunks ChunkRange, span ByteRange) error {
+	if term.Range.Start >= term.Range.End || !validChunkRange(chunks.Start, chunks.End) || span.Start < 0 || span.End < span.Start {
+		return fmt.Errorf("invalid range for term chunks [%d, %d) of xorb %s", term.Range.Start, term.Range.End, term.Hash)
+	}
+	return nil
+}
+
+type progressReader struct {
+	r            io.Reader
+	name         string
+	current      int64
+	total        int64
+	progressFunc progress.ProgressFunc
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 && r.progressFunc != nil {
+		r.current += int64(n)
+		r.progressFunc(r.name, r.current, r.total)
+	}
+	return n, err
+}
+
 // newTermReader starts reconstructing terms; tasks[i] is the fetch of
 // terms[i], and offset bytes of the first term are not delivered.
 func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offset int64, tasks []fetchTask, opts ...Option) (*termReader, error) {

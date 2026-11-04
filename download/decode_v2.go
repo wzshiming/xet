@@ -15,7 +15,7 @@ type ReaderV2 struct {
 // NewReaderV2 creates a new V2 reconstruction reader. It starts fetching at
 // once; Close stops it.
 func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
-	_, tasks, err := planReaderV2(reconstruction)
+	tasks, err := planReaderV2(reconstruction)
 	if err != nil {
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
@@ -26,17 +26,16 @@ func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	return &ReaderV2{r}, nil
 }
 
-func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []fetchTask, error) {
-	selected := make([]selectedFetch, len(reconstruction.Terms))
+func planReaderV2(reconstruction *ReconstructionResponseV2) ([]fetchTask, error) {
 	tasks := make([]fetchTask, 0, len(reconstruction.Terms))
 	for i := range reconstruction.Terms {
 		term := &reconstruction.Terms[i]
 		fetch, rg, err := selectFetchInfoV2(reconstruction, term)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if err := checkFetchRange(term, rg.Chunks, rg.Bytes); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		key := fetchKey{
@@ -45,11 +44,6 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 			End:   rg.Bytes.End,
 		}
 
-		selected[i] = selectedFetch{
-			key:        key,
-			chunkStart: rg.Chunks.Start,
-			chunkEnd:   rg.Chunks.End,
-		}
 		tasks = append(tasks, fetchTask{
 			key:        key,
 			url:        fetch.URL,
@@ -57,7 +51,7 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 			chunkEnd:   rg.Chunks.End,
 		})
 	}
-	return selected, tasks, nil
+	return tasks, nil
 }
 
 func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*XorbMultiRangeFetch, *XorbRangeDescriptor, error) {
@@ -90,7 +84,7 @@ func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*X
 // ExpectedTransferBytesV2 computes the total compressed bytes that will be transferred
 // over the network when reconstructing a V2 file. Deduplicated ranges are counted once.
 func ExpectedTransferBytesV2(reconstruction *ReconstructionResponseV2) int64 {
-	_, tasks, err := planReaderV2(reconstruction)
+	tasks, err := planReaderV2(reconstruction)
 	if err != nil {
 		return 0
 	}

@@ -15,7 +15,7 @@ type ReaderV1 struct {
 // NewReaderV1 creates a new V1 reconstruction reader. It starts fetching at
 // once; Close stops it.
 func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
-	_, tasks, err := planReaderV1(reconstruction)
+	tasks, err := planReaderV1(reconstruction)
 	if err != nil {
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
@@ -26,28 +26,22 @@ func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *Reco
 	return &ReaderV1{r}, nil
 }
 
-func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []fetchTask, error) {
-	selected := make([]selectedFetch, len(reconstruction.Terms))
+func planReaderV1(reconstruction *ReconstructionResponseV1) ([]fetchTask, error) {
 	tasks := make([]fetchTask, 0, len(reconstruction.Terms))
 	for i := range reconstruction.Terms {
 		term := &reconstruction.Terms[i]
 		fetchInfo, err := selectFetchInfoV1(reconstruction, term)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if err := checkFetchRange(term, fetchInfo.Range, fetchInfo.URLRange); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		key := fetchKey{
 			Hash:  term.Hash,
 			Start: fetchInfo.URLRange.Start,
 			End:   fetchInfo.URLRange.End,
-		}
-		selected[i] = selectedFetch{
-			key:        key,
-			chunkStart: fetchInfo.Range.Start,
-			chunkEnd:   fetchInfo.Range.End,
 		}
 		tasks = append(tasks, fetchTask{
 			key:        key,
@@ -56,7 +50,7 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 			chunkEnd:   fetchInfo.Range.End,
 		})
 	}
-	return selected, tasks, nil
+	return tasks, nil
 }
 
 func selectFetchInfoV1(reconstruction *ReconstructionResponseV1, term *Term) (*FetchInfoEntry, error) {
@@ -84,7 +78,7 @@ func selectFetchInfoV1(reconstruction *ReconstructionResponseV1, term *Term) (*F
 // ExpectedTransferBytesV1 computes the total compressed bytes that will be transferred
 // over the network when reconstructing a V1 file. Deduplicated ranges are counted once.
 func ExpectedTransferBytesV1(reconstruction *ReconstructionResponseV1) int64 {
-	_, tasks, err := planReaderV1(reconstruction)
+	tasks, err := planReaderV1(reconstruction)
 	if err != nil {
 		return 0
 	}
