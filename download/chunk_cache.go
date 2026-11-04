@@ -728,15 +728,13 @@ func (c *chunkCache) seal() error {
 	if _, err := file.WriteAt(trailer[:], c.writePos); err != nil {
 		return fmt.Errorf("write cache trailer: %w", err)
 	}
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync cache file: %w", err)
-	}
+	// Not fsynced: the size arithmetic and the CRC reject what a crash leaves behind.
 	c.published = true
 	if c.manager != nil {
 		// Track the sealed entry (still referenced by this open cache) before
-		// releasing the lock so eviction never catches it unreferenced. The
-		// freshly synced file matches the checksum it was sealed with, so
-		// remember it as verified.
+		// releasing the lock so eviction never catches it unreferenced. This
+		// writer computed the checksum over the bytes it just wrote, so
+		// remember the entry as verified.
 		c.manager.acquire(c.path, c.writePos+4)
 		c.manager.markVerified(c.path)
 		c.refPaths = append(c.refPaths, c.path)
