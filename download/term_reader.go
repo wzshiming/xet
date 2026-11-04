@@ -17,30 +17,33 @@ import (
 )
 
 // termReader reconstructs a file by delivering its terms in order, as
-// xet-core's file reconstructor does. A dispatcher walks the terms in file
-// order: each takes a worker slot when its range still has to be fetched,
-// then waits for its unpacked length in the memory budget, and the first term
-// of every distinct xorb range starts that range's fetch. A fetch fills one
-// buffer with the decoded chunks its terms read, from the cache when an entry
-// covers the range and from the network otherwise, and hands a downloaded
-// range to the cache writer. Read and WriteTo deliver each term from its
-// fetch's buffer and return its bytes to the budget once it is delivered.
+// xet-core's file reconstructor does. Its first Read or WriteTo starts a
+// dispatcher that walks the terms in file order: each takes a worker slot
+// when its range still has to be fetched, then waits for its unpacked length
+// in the memory budget, and the first term of every distinct xorb range
+// starts that range's fetch. A fetch fills one buffer with the decoded chunks
+// its terms read, from the cache when an entry covers the range and from the
+// network otherwise, and hands a downloaded range to the cache writer. Read
+// and WriteTo deliver each term from its fetch's buffer and return its bytes
+// to the budget once it is delivered.
 type termReader struct {
 	terms   []Term
 	fetches []*rangeFetch // fetches[i] serves terms[i]; dropped once it is delivered
 	skip    int64         // OffsetIntoFirstRange
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	client   ClientAdapter
-	cache    *CacheManager
-	writer   *cacheWriter
-	budget   *MemoryBudget
-	detach   func()
-	progress progress.ProgressFunc
-	verify   bool
-	admitted chan struct{}  // one token per term the dispatcher admitted, in order
-	workers  sync.WaitGroup // the dispatcher and the fetches
+	ctx         context.Context
+	cancel      context.CancelFunc
+	client      ClientAdapter
+	cache       *CacheManager
+	writer      *cacheWriter
+	budget      *MemoryBudget
+	concurrency int
+	started     bool // the first Read or WriteTo started the dispatcher
+	detach      func()
+	progress    progress.ProgressFunc
+	verify      bool
+	admitted    chan struct{}  // one token per term the dispatcher admitted, in order
+	workers     sync.WaitGroup // the dispatcher and the fetches
 
 	failed   chan struct{} // closed on the first failure
 	failErr  error         // set before failed is closed
@@ -125,7 +128,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// newTermReader starts reconstructing terms; tasks[i] is the fetch of
+// newTermReader plans the reconstruction of terms; tasks[i] is the fetch of
 // terms[i], and offset bytes of the first term are not delivered.
 func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offset int64, tasks []fetchTask, opts ...Option) (*termReader, error) {
 	o := &options{}
@@ -140,12 +143,6 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 	if err != nil {
 		return nil, err
 	}
-	if o.cache != nil {
-		// Adopt pre-existing entries and clean up orphaned partial files before
-		// the download starts; only the manager's first prepare walks the cache
-		// directory.
-		o.cache.prepare()
-	}
 	budget := o.budget
 	if budget == nil {
 		budget = NewMemoryBudget(DefaultMemorySizes())
@@ -157,21 +154,22 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 	// Fetches run on a context Close cancels, so callers sharing ctx are unaffected.
 	ctx, cancel := context.WithCancel(ctx)
 	r := &termReader{
-		terms:    terms,
-		fetches:  fetches,
-		skip:     offset,
-		ctx:      ctx,
-		cancel:   cancel,
-		client:   client,
-		cache:    o.cache,
-		writer:   o.cache.newWriter(concurrency),
-		budget:   budget,
-		detach:   budget.Attach(),
-		progress: o.progressFunc,
-		verify:   verifier != nil,
-		admitted: make(chan struct{}, len(terms)),
-		failed:   make(chan struct{}),
-		verifier: verifier,
+		terms:       terms,
+		fetches:     fetches,
+		skip:        offset,
+		ctx:         ctx,
+		cancel:      cancel,
+		client:      client,
+		cache:       o.cache,
+		writer:      o.cache.newWriter(concurrency),
+		budget:      budget,
+		concurrency: concurrency,
+		detach:      func() {},
+		progress:    o.progressFunc,
+		verify:      verifier != nil,
+		admitted:    make(chan struct{}, len(terms)),
+		failed:      make(chan struct{}),
+		verifier:    verifier,
 	}
 	if r.progress != nil {
 		reported := make(map[*rangeFetch]bool, len(fetches))
@@ -182,9 +180,25 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 			}
 		}
 	}
-	order := slices.Clone(fetches)
-	r.workers.Go(func() { r.dispatch(order, concurrency) })
 	return r, nil
+}
+
+// start readies the cache, attaches the download to the budget and starts the
+// dispatcher, once.
+func (r *termReader) start() {
+	if r.started {
+		return
+	}
+	r.started = true
+	if r.cache != nil {
+		// Adopt pre-existing entries and clean up orphaned partial files before
+		// the download starts; only the manager's first prepare walks the cache
+		// directory.
+		r.cache.prepare()
+	}
+	r.detach = r.budget.Attach()
+	order := slices.Clone(r.fetches)
+	r.workers.Go(func() { r.dispatch(order, r.concurrency) })
 }
 
 // planFetches returns the fetch serving each term, one per distinct range.
@@ -475,6 +489,7 @@ func (r *termReader) Read(p []byte) (int, error) {
 	if err := r.check(); err != nil {
 		return 0, err
 	}
+	r.start()
 	n := 0
 	for n < len(p) {
 		if len(r.cur) == 0 {
@@ -504,6 +519,7 @@ func (r *termReader) WriteTo(w io.Writer) (int64, error) {
 			}
 			return n, err
 		}
+		r.start()
 		if len(r.cur) == 0 {
 			if err := r.advance(); err != nil {
 				if err == io.EOF {

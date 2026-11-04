@@ -416,6 +416,7 @@ type downloadFixture struct {
 	served       [][]byte // encoded xorb bytes returned for each file
 	rejectRange  bool     // refuse Range reconstruction requests
 	offsetOnFull int64    // OffsetIntoFirstRange reported without a Range header
+	splitBatch   bool     // the batch API serves each file as one term per chunk, each with its own fetch range
 }
 
 const fixtureChunkSize = 1000
@@ -493,6 +494,26 @@ func (f *downloadFixture) fetchInfo(i int) download.FetchInfoEntry {
 	}
 }
 
+// chunkTerms returns file i as one term per chunk, each with its own fetch range.
+func (f *downloadFixture) chunkTerms(i int) ([]download.Term, []download.FetchInfoEntry, error) {
+	ends, err := xorb.ScanChunkOffsets(bytes.NewReader(f.served[i]))
+	if err != nil {
+		return nil, nil, err
+	}
+	var terms []download.Term
+	var infos []download.FetchInfoEntry
+	for c := range uint32(len(ends)) {
+		chunks := download.ChunkRange{Start: c, End: c + 1}
+		start, end, err := xorb.ChunkDataRangeFromOffsets(ends, c, c+1)
+		if err != nil {
+			return nil, nil, err
+		}
+		terms = append(terms, download.Term{Hash: f.xorbHashes[i], UnpackedLength: fixtureChunkSize, Range: chunks})
+		infos = append(infos, download.FetchInfoEntry{Range: chunks, URL: f.srv.URL + "/xorbs/" + strconv.Itoa(i), URLRange: download.ByteRange{Start: start, End: end}})
+	}
+	return terms, infos, nil
+}
+
 func (f *downloadFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if name, ok := strings.CutPrefix(r.URL.Path, "/xorbs/"); ok {
 		i, err := strconv.Atoi(name)
@@ -507,8 +528,16 @@ func (f *downloadFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		resp := download.BatchReconstructionResponse{Files: map[string][]download.Term{}, FetchInfo: map[string][]download.FetchInfoEntry{}}
 		for _, id := range r.URL.Query()["file_id"] {
 			if i := f.index(id); i >= 0 {
-				resp.Files[id] = []download.Term{f.term(i)}
-				resp.FetchInfo[f.xorbHashes[i]] = []download.FetchInfoEntry{f.fetchInfo(i)}
+				terms, infos := []download.Term{f.term(i)}, []download.FetchInfoEntry{f.fetchInfo(i)}
+				if f.splitBatch {
+					var err error
+					if terms, infos, err = f.chunkTerms(i); err != nil {
+						http.Error(w, err.Error(), http.StatusInternalServerError)
+						return
+					}
+				}
+				resp.Files[id] = terms
+				resp.FetchInfo[f.xorbHashes[i]] = infos
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -789,5 +818,32 @@ func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
 	defer cancel()
 	if err := budget.Acquire(admitted, target); err != nil {
 		t.Fatalf("acquiring the whole client budget after the download = %v, want it admitted", err)
+	}
+}
+
+// TestDownloadFilesReadOneAfterAnother pins that the readers of a batch take
+// budget only once read: three readers that each fetch more than the client
+// budget holds complete when read one after another.
+func TestDownloadFilesReadOneAfterAnother(t *testing.T) {
+	fx := newDownloadFixture(t, 1, 2, 3)
+	fx.splitBatch = true
+	budget := download.NewMemoryBudget(download.MemorySizes{Base: fixtureChunkSize, Limit: fixtureChunkSize})
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")), WithMemoryBudget(budget))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A reader waiting for budget that unread readers hold fails here instead of hanging.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	readers, _, err := c.DownloadFiles(ctx, fx.hashes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range readers {
+		got, err := io.ReadAll(r)
+		r.Close()
+		if err != nil || !bytes.Equal(got, fx.data[i]) {
+			t.Fatalf("file %d: read %d bytes, %v; want its %d bytes", i, len(got), err, len(fx.data[i]))
+		}
 	}
 }
