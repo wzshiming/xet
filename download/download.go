@@ -17,6 +17,7 @@ type options struct {
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
 	expectedHash *xet.FileHash
+	budget       *MemoryBudget
 }
 
 // WithCacheManager shares one CacheManager across readers so the capacity
@@ -39,6 +40,15 @@ func WithConcurrency(concurrency int) Option {
 func WithExpectedFileHash(fileHash xet.FileHash) Option {
 	return func(o *options) {
 		o.expectedHash = &fileHash
+	}
+}
+
+// WithMemoryBudget holds the reader's fetched terms within budget, which
+// readers may share; without it, or with nil, the reader uses its own budget
+// sized by DefaultMemorySizes.
+func WithMemoryBudget(budget *MemoryBudget) Option {
+	return func(o *options) {
+		o.budget = budget
 	}
 }
 
@@ -70,6 +80,9 @@ type fileVerifier struct {
 	sizes    []uint64
 }
 
+// computeChunkHash is xet.ComputeChunkHash; tests count its calls.
+var computeChunkHash = xet.ComputeChunkHash
+
 // add records one chunk occurrence, hashing data only when no decoder did.
 func (v *fileVerifier) add(m chunkRef, data []byte) {
 	hash := m.hash
@@ -78,6 +91,15 @@ func (v *fileVerifier) add(m chunkRef, data []byte) {
 	}
 	v.hashes = append(v.hashes, hash)
 	v.sizes = append(v.sizes, uint64(len(data)))
+}
+
+// addChunks records the chunks of one term occurrence: hashes[i] is the hash
+// of a chunk of offsets[i+1]-offsets[i] bytes.
+func (v *fileVerifier) addChunks(hashes []xet.ChunkHash, offsets []int64) {
+	for i, hash := range hashes {
+		v.hashes = append(v.hashes, hash)
+		v.sizes = append(v.sizes, uint64(offsets[i+1]-offsets[i]))
+	}
 }
 
 func (v *fileVerifier) verify() error {
