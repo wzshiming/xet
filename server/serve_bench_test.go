@@ -10,8 +10,15 @@
 // 8.8 GiB of temp disk (2.1 GiB without the 1 GiB rows, whose fixtures also
 // hold 2 GiB of memory while they are built), which TestMain removes. One client
 // keeps its connections warm and drains bodies through a 1 MiB buffer into a
-// writer without ReadFrom; allocs include the in-process server. Numbers are
-// indicative; compare the paths with
+// writer without ReadFrom; allocs include the in-process server.
+//
+// Each row also reports, per GiB (2^30 bytes) of file requested in its timed
+// loop: cpu-s/GiB, usr-s/GiB and sys-s/GiB, this process's CPU seconds
+// (getrusage RUSAGE_SELF), which include the client's drain, the same on both
+// paths, so compare differences between paths; minflt/GiB and majflt/GiB, its
+// page faults; writes/GiB, the socket writes of the server's connections, a
+// sendfile counting as one. served/file is the bytes those connections wrote
+// per file byte requested. Numbers are indicative; compare the paths with
 //
 //	go test ./server -run '^$' -bench Serve -benchtime 3x -count 3 >serve.txt
 //	benchstat -row .name -col /path serve.txt
@@ -72,6 +79,7 @@ var client = func() *http.Client {
 // fixture is what a (size, class) cell keeps once its payloads are dropped.
 type fixture struct {
 	srv    *httptest.Server
+	conns  *connStats
 	size   int64
 	sha256 string
 }
@@ -152,7 +160,8 @@ func serveFixture(st storage.Storage, plain string, size int64, sum string) *fix
 		http.ServeContent(w, r, plain, time.Time{}, file)
 	})
 	mux.Handle("/", server.NewHandler(server.WithStorage(st)))
-	return &fixture{srv: httptest.NewServer(mux), size: size, sha256: sum}
+	srv, conns := newCountingServer(mux)
+	return &fixture{srv: srv, conns: conns, size: size, sha256: sum}
 }
 
 // checkGet fails tb unless url answers 200 with fx's length and SHA-256.
@@ -220,6 +229,8 @@ func benchmarkGet(b *testing.B, fx *fixture, url string) {
 	var body countWriter
 	b.SetBytes(fx.size)
 	b.ReportAllocs()
+	n := 0
+	w := startWindow(b, fx.conns)
 	for b.Loop() {
 		resp, err := client.Get(url)
 		if err != nil {
@@ -234,5 +245,7 @@ func benchmarkGet(b *testing.B, fx *fixture, url string) {
 		if err != nil || body.n != fx.size {
 			b.Fatalf("GET %s: drained %d bytes, %v; want %d", url, body.n, err, fx.size)
 		}
+		n++
 	}
+	w.stop(b, fx.size, n)
 }
