@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,6 +153,81 @@ func (c *heldClient) DownloadXorbWithURL(ctx context.Context, url string, header
 		return nil, ctx.Err()
 	}
 	return c.fakeClientAdapter.DownloadXorbWithURL(ctx, url, header)
+}
+
+type gatedClient struct {
+	data      []byte
+	stallAt   int
+	ignoreCtx bool // a stalled Read returns only on release or body Close, like a body not bound to ctx
+	release   chan struct{}
+	stalled   chan struct{}
+	closed    chan struct{}
+	calls     atomic.Int32
+	once      sync.Once
+	closeOnce sync.Once
+}
+
+func (c *gatedClient) DownloadXorbWithURL(ctx context.Context, _ string, _ http.Header) (io.ReadCloser, error) {
+	c.calls.Add(1)
+	return &gatedBody{client: c, ctx: ctx}, nil
+}
+
+func (*gatedClient) DownloadXorbsMultipartWithURL(context.Context, string, http.Header) (*multipart.Reader, io.Closer, error) {
+	panic("not used")
+}
+
+type gatedBody struct {
+	client   *gatedClient
+	ctx      context.Context
+	pos      int
+	released bool
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	c := b.client
+	if !b.released && b.pos >= c.stallAt {
+		c.once.Do(func() { close(c.stalled) })
+		ctxDone := b.ctx.Done()
+		if c.ignoreCtx {
+			ctxDone = nil
+		}
+		select {
+		case <-c.release:
+			b.released = true
+		case <-ctxDone:
+			return 0, b.ctx.Err()
+		case <-c.closed:
+			return 0, errors.New("body closed")
+		}
+	}
+	limit := c.stallAt
+	if b.released {
+		limit = len(c.data)
+	}
+	if b.pos >= limit {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data[b.pos:limit])
+	b.pos += n
+	return n, nil
+}
+
+func (b *gatedBody) Close() error {
+	b.client.closeOnce.Do(func() { close(b.client.closed) })
+	return nil
+}
+
+// within fails the test unless done closes promptly, so a stuck Close or
+// leaked worker fails the run instead of hanging it.
+func within(t *testing.T, what string, done <-chan struct{}) bool {
+	t.Helper()
+	select {
+	case <-done:
+		return true
+	case <-time.After(3 * time.Second):
+		t.Errorf("%s did not finish within 3s", what)
+		return false
+	}
 }
 
 // bodyClient serves body(start, end) for the inclusive Range [start, end].
