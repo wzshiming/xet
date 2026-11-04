@@ -32,6 +32,7 @@ type Client struct {
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cache         *Cache
+	budget        *download.MemoryBudget // shared by the client's downloads
 
 	verifyDownloads bool
 }
@@ -108,6 +109,7 @@ func NewClient(opts ...Options) (*Client, error) {
 		concurrency: 4,
 		retries:     5,
 		idleTimeout: DefaultIdleTimeout,
+		budget:      download.NewMemoryBudget(download.DefaultMemorySizes()),
 	}
 	for _, opt := range opts {
 		opt(c)

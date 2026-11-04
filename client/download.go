@@ -143,6 +143,7 @@ func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []do
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithCacheManager(c.cache.Download),
+		download.WithMemoryBudget(c.budget),
 	}
 	if c.verifyDownloads && resumeOffset == 0 {
 		opts = append(opts, download.WithExpectedFileHash(fileHash))
