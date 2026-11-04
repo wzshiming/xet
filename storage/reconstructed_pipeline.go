@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	// decodeWindow bounds the chunks of one reader between fetch and Read.
-	decodeWindow = 8
+	// decodeWindow bounds the chunks of one reader between fetch and Read;
+	// 32 is the knee of the #284 sweep, at up to 4 MiB of buffers per reader.
+	decodeWindow = 32
 	// maxDecodeWorkers bounds the goroutines decoding one reader's chunks.
 	maxDecodeWorkers = 4
 )
