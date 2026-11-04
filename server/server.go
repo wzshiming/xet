@@ -29,6 +29,9 @@ type Handler struct {
 	root       *mux.Router
 	next       http.Handler
 	authorizer auth.Authorizer
+
+	splitMinTerms   int
+	splitPieceBytes int64
 }
 
 const maxShardUploadBytes = 256 << 20
@@ -54,6 +57,20 @@ func WithNext(next http.Handler) Option {
 func WithStorage(storage storage.Storage) Option {
 	return func(h *Handler) {
 		h.storage = storage
+	}
+}
+
+// WithTermSplit, off by default, halves the largest terms of single-file V1 and V2 reconstruction responses with
+// fewer than minTerms terms until they have minTerms or every cut would leave a piece under pieceBytes requested
+// bytes; batch reconstruction responses are not split.
+// minTerms <= 1 disables splitting and pieceBytes <= 0 means no floor.
+// Terms are counted per response, so a ranged query of a big file is split even where the whole file
+// would not be; terms whose xorb has no CAS block in the file's shard stay whole.
+// If splitting a response fails, the error is logged and the response is served unsplit.
+func WithTermSplit(minTerms int, pieceBytes int64) Option {
+	return func(h *Handler) {
+		h.splitMinTerms = minTerms
+		h.splitPieceBytes = pieceBytes
 	}
 }
 
@@ -232,6 +249,10 @@ func (s *Handler) reconstructionStorage(r *http.Request) download.StorageAdapter
 	return requestBaseStorage{StorageAdapter: s.storage, base: externalBase(r)}
 }
 
+func (s *Handler) splitsTerms() bool {
+	return s.splitMinTerms > 1
+}
+
 // handleGetReconstruction handles GET /v1/reconstructions/{file_hash}
 func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request) {
 	// Extract file hash from path using mux
@@ -249,17 +270,27 @@ func (s *Handler) handleGetReconstruction(w http.ResponseWriter, r *http.Request
 	}
 
 	// Get shard for this file
-	shard, err := s.storage.GetShard(r.Context(), fileHash)
+	sh, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
 	// Build reconstruction response
-	response, err := download.BuildReconstructionResponseV1(r.Context(), s.reconstructionStorage(r), shard, fileHash, r.Header.Get("Range"))
+	rng := download.ParseByteRange(r.Header.Get("Range"), sh.File(fileHash).UnpackedSize())
+	response, err := download.BuildReconstructionResponseV1(r.Context(), s.reconstructionStorage(r), sh, fileHash, rng)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if s.splitsTerms() {
+		split, err := download.SplitTermsV1(r.Context(), s.storage, sh, response, rng, s.splitMinTerms, s.splitPieceBytes)
+		if err != nil {
+			// Splitting is only an optimization: the builder's response stays valid.
+			fmt.Fprintf(os.Stderr, "Error splitting reconstruction terms of file %s, serving them unsplit: %v\n", fileHash, err)
+		} else {
+			response = split
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -309,7 +340,8 @@ func (s *Handler) handleBatchGetReconstruction(w http.ResponseWriter, r *http.Re
 			// Skip files not found; caller can check which hashes are absent.
 			continue
 		}
-		single, err := download.BuildReconstructionResponseV1(r.Context(), recStorage, sh, fileHash, "")
+		rng := download.ParseByteRange("", sh.File(fileHash).UnpackedSize())
+		single, err := download.BuildReconstructionResponseV1(r.Context(), recStorage, sh, fileHash, rng)
 		if err != nil {
 			continue
 		}
@@ -344,17 +376,27 @@ func (s *Handler) handleGetReconstructionV2(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Get shard for this file
-	shard, err := s.storage.GetShard(r.Context(), fileHash)
+	sh, err := s.storage.GetShard(r.Context(), fileHash)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
 	// Build V2 reconstruction response
-	response, err := download.BuildReconstructionResponseV2(r.Context(), s.reconstructionStorage(r), shard, fileHash, r.Header.Get("Range"))
+	rng := download.ParseByteRange(r.Header.Get("Range"), sh.File(fileHash).UnpackedSize())
+	response, err := download.BuildReconstructionResponseV2(r.Context(), s.reconstructionStorage(r), sh, fileHash, rng)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if s.splitsTerms() {
+		split, err := download.SplitTermsV2(r.Context(), s.storage, sh, response, rng, s.splitMinTerms, s.splitPieceBytes)
+		if err != nil {
+			// Splitting is only an optimization: the builder's response stays valid.
+			fmt.Fprintf(os.Stderr, "Error splitting reconstruction terms of file %s, serving them unsplit: %v\n", fileHash, err)
+		} else {
+			response = split
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -175,6 +175,28 @@ func (s *Shard) AddCASBlock(cb CASBlock) {
 	s.CASInfos = append(s.CASInfos, cb)
 }
 
+// File returns the first block of the file with the given hash, or nil if the shard has none.
+func (s *Shard) File(hash xet.FileHash) *FileBlock {
+	for i := range s.Files {
+		if s.Files[i].FileHash == hash {
+			return &s.Files[i]
+		}
+	}
+	return nil
+}
+
+// UnpackedSize returns the file's size, the sum of its entries' unpacked bytes; 0 for a nil block.
+func (f *FileBlock) UnpackedSize() int64 {
+	if f == nil {
+		return 0
+	}
+	var size int64
+	for _, entry := range f.Entries {
+		size += int64(entry.UnpackedSegBytes)
+	}
+	return size
+}
+
 // ChunkLocation is where a shard stores a chunk: the xorb and the chunk's
 // index within it.
 type ChunkLocation struct {

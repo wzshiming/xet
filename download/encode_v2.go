@@ -12,25 +12,12 @@ import (
 // BuildReconstructionResponseV2 builds a V2 reconstruction response from a shard.
 // The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
 // into multi-range fetch entries for more efficient downloading.
-func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV2, error) {
-	// Find the file block for this file hash
-	var fileBlock *shard.FileBlock
-	for i := range sh.Files {
-		if sh.Files[i].FileHash == fileHash {
-			fileBlock = &sh.Files[i]
-			break
-		}
-	}
-
+// The terms are those holding bytes of rng; ParseByteRange("", size) selects the whole file.
+func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rng ByteRange) (*ReconstructionResponseV2, error) {
+	fileBlock := sh.File(fileHash)
 	if fileBlock == nil {
 		return nil, fmt.Errorf("file not found in shard")
 	}
-
-	var fileSize int64
-	for _, entry := range fileBlock.Entries {
-		fileSize += int64(entry.UnpackedSegBytes)
-	}
-	requestedStart, requestedEnd, hasRange := parseByteRange(rangeHeader, fileSize)
 
 	response := &ReconstructionResponseV2{
 		OffsetIntoFirstRange: 0,
@@ -55,19 +42,17 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
 
 		// Skip terms that are completely outside the requested range
-		if hasRange {
-			if termEnd <= requestedStart {
-				currentByteOffset = termEnd
-				continue
-			}
-			if termStart > requestedEnd {
-				break
-			}
+		if termEnd <= rng.Start {
+			currentByteOffset = termEnd
+			continue
+		}
+		if termStart > rng.End {
+			break
 		}
 
 		// Calculate offset into first term if this is the first included term
-		if len(response.Terms) == 0 && hasRange && termStart < requestedStart {
-			response.OffsetIntoFirstRange = requestedStart - termStart
+		if len(response.Terms) == 0 && termStart < rng.Start {
+			response.OffsetIntoFirstRange = rng.Start - termStart
 		}
 
 		term := Term{

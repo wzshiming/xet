@@ -41,9 +41,19 @@ func main() {
 	s3Presign := flag.Bool("s3-presign", true, "Serve xorb downloads as presigned S3 GET URLs; disable when clients cannot reach the S3 endpoint")
 	s3PresignExpiry := flag.Duration("s3-presign-expiry", time.Hour, "Validity of presigned xorb URLs")
 	s3PresignEndpoint := flag.String("s3-presign-endpoint", "", "Endpoint used in presigned xorb URLs when clients reach the object store at a different address than the server (optional, defaults to -s3-endpoint)")
+	reconstructionMinTerms := flag.Int("reconstruction-min-terms", 16, "Split large reconstruction terms until a response has at least this many terms; 0 disables splitting")
+	reconstructionMinTermBytes := flag.Int64("reconstruction-min-term-bytes", 1<<20, "Never split a reconstruction term into pieces smaller than this many bytes")
 	flag.Parse()
 	if *internalAPI && *internalToken == "" {
 		fmt.Fprintln(os.Stderr, "-internal requires -internal-token")
+		os.Exit(1)
+	}
+	if *reconstructionMinTerms < 0 {
+		fmt.Fprintln(os.Stderr, "-reconstruction-min-terms must not be negative")
+		os.Exit(1)
+	}
+	if *reconstructionMinTermBytes < 0 {
+		fmt.Fprintln(os.Stderr, "-reconstruction-min-term-bytes must not be negative")
 		os.Exit(1)
 	}
 
@@ -137,6 +147,7 @@ func main() {
 	next = server.NewHandler(
 		server.WithStorage(stor),
 		server.WithAuthorizer(authorizer),
+		server.WithTermSplit(*reconstructionMinTerms, *reconstructionMinTermBytes),
 		server.WithNext(next),
 	)
 

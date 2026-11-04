@@ -86,17 +86,17 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 	}
 	boundary := int64(entries[0].UnpackedSegBytes)
 
-	readers := map[string]func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error){
-		"v1": func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error) {
-			resp, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, rangeHeader)
+	readers := map[string]func(rng ByteRange, opts ...Option) (io.ReadCloser, int64, error){
+		"v1": func(rng ByteRange, opts ...Option) (io.ReadCloser, int64, error) {
+			resp, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, rng)
 			if err != nil {
 				return nil, 0, err
 			}
 			r, err := NewReaderV1(ctx, storageClient{st}, resp, opts...)
 			return r, ExpectedLengthV1(resp), err
 		},
-		"v2": func(rangeHeader string, opts ...Option) (io.ReadCloser, int64, error) {
-			resp, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, rangeHeader)
+		"v2": func(rng ByteRange, opts ...Option) (io.ReadCloser, int64, error) {
+			resp, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, rng)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -113,7 +113,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 				} else {
 					rangeHeader = fmt.Sprintf("bytes=%d-", offset)
 				}
-				r, length, err := newReader(rangeHeader, opts...)
+				r, length, err := newReader(ParseByteRange(rangeHeader, size), opts...)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -447,11 +447,11 @@ func TestBuildReconstructionForwardsContext(t *testing.T) {
 	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash, Entries: []shard.FileDataSequenceEntry{{UnpackedSegBytes: 1, ChunkIndexEnd: 1}}}}}
 	build := map[string]func(StorageAdapter) error{
 		"v1": func(st StorageAdapter) error {
-			_, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, "")
+			_, err := BuildReconstructionResponseV1(ctx, st, sh, fileHash, ParseByteRange("", 1))
 			return err
 		},
 		"v2": func(st StorageAdapter) error {
-			_, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, "")
+			_, err := BuildReconstructionResponseV2(ctx, st, sh, fileHash, ParseByteRange("", 1))
 			return err
 		},
 	}
@@ -466,12 +466,43 @@ func TestBuildReconstructionForwardsContext(t *testing.T) {
 	}
 }
 
-// TestBuildReconstructionRangeHeader pins which whole terms a Range header
-// selects; tails are never trimmed, so ExpectedLength rounds up to a term end.
+func TestBuildReconstructionFileAbsentFromShardIsAnError(t *testing.T) {
+	present, absent := xet.FileHash{1}, xet.FileHash{2}
+	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: present, Entries: []shard.FileDataSequenceEntry{{UnpackedSegBytes: 1, ChunkIndexEnd: 1}}}}}
+	// The handlers parse the Range against the absent file's size, 0.
+	rng := ParseByteRange("", 0)
+	build := map[string]func() error{
+		"v1": func() error {
+			_, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, sh, absent, rng)
+			return err
+		},
+		"v2": func() error {
+			_, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, sh, absent, rng)
+			return err
+		},
+	}
+	for name, fn := range build {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("building the %s response of a file absent from its shard panicked: %v", name, r)
+				}
+			}()
+			if err := fn(); err == nil {
+				t.Errorf("building the %s response of a file absent from its shard succeeded, want an error", name)
+			}
+		})
+	}
+}
+
+// TestBuildReconstructionRangeHeader pins which whole terms a Range header,
+// parsed against the file's size, selects; tails are never trimmed, so
+// ExpectedLength rounds up to a term end.
 func TestBuildReconstructionRangeHeader(t *testing.T) {
 	var fileHash xet.FileHash
 	var entries []shard.FileDataSequenceEntry
 	var allTerms []Term
+	var size int64
 	for index, length := range []uint32{1000, 1000, 500} {
 		entry := shard.FileDataSequenceEntry{
 			CASHash:          xet.XorbHash{byte(index + 1)},
@@ -485,6 +516,7 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 			UnpackedLength: uint64(length),
 			Range:          ChunkRange{Start: entry.ChunkIndexStart, End: entry.ChunkIndexEnd},
 		})
+		size += int64(length)
 	}
 	sh := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash, Entries: entries}}}
 	emptyShard := &shard.Shard{Files: []shard.FileBlock{{FileHash: fileHash}}}
@@ -494,16 +526,16 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 		offset int64
 		length int64
 	}
-	build := map[string]func(sh *shard.Shard, header string) (result, error){
-		"v1": func(sh *shard.Shard, header string) (result, error) {
-			resp, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, sh, fileHash, header)
+	build := map[string]func(sh *shard.Shard, rng ByteRange) (result, error){
+		"v1": func(sh *shard.Shard, rng ByteRange) (result, error) {
+			resp, err := BuildReconstructionResponseV1(context.Background(), &recordingStorageAdapter{}, sh, fileHash, rng)
 			if err != nil {
 				return result{}, err
 			}
 			return result{resp.Terms, resp.OffsetIntoFirstRange, ExpectedLengthV1(resp)}, nil
 		},
-		"v2": func(sh *shard.Shard, header string) (result, error) {
-			resp, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, sh, fileHash, header)
+		"v2": func(sh *shard.Shard, rng ByteRange) (result, error) {
+			resp, err := BuildReconstructionResponseV2(context.Background(), &recordingStorageAdapter{}, sh, fileHash, rng)
 			if err != nil {
 				return result{}, err
 			}
@@ -524,6 +556,7 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 		{"open last byte", "bytes=2499-", 2, 3, 499, 1},
 		{"open at end of file", "bytes=2500-", 0, 0, 0, 0},
 		{"explicit", "bytes=500-1499", 0, 2, 500, 1500},
+		{"explicit ending at a term start", "bytes=500-1000", 0, 2, 500, 1500},
 		{"explicit clamped", "bytes=2400-9999", 2, 3, 400, 100},
 		{"suffix", "bytes=-300", 2, 3, 200, 300},
 		{"suffix at term boundary", "bytes=-500", 2, 3, 0, 500},
@@ -541,7 +574,7 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 	for name, fn := range build {
 		for _, test := range tests {
 			t.Run(name+"/"+test.name, func(t *testing.T) {
-				got, err := fn(sh, test.header)
+				got, err := fn(sh, ParseByteRange(test.header, size))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -553,7 +586,7 @@ func TestBuildReconstructionRangeHeader(t *testing.T) {
 			})
 		}
 		for _, header := range []string{"", "bytes=0-", "bytes=-1", "bytes=0-0"} {
-			got, err := fn(emptyShard, header)
+			got, err := fn(emptyShard, ParseByteRange(header, 0))
 			if err != nil {
 				t.Fatal(err)
 			}

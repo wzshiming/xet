@@ -3,42 +3,11 @@ package download
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
-
-// Invalid ranges are ignored; unsatisfiable ranges have start > end.
-func parseByteRange(header string, size int64) (start, end int64, ok bool) {
-	spec, isBytes := strings.CutPrefix(header, "bytes=")
-	first, last, hasDash := strings.Cut(spec, "-")
-	if !isBytes || !hasDash {
-		return 0, 0, false
-	}
-	if first == "" {
-		suffix, err := strconv.ParseUint(last, 10, 63)
-		if err != nil {
-			return 0, 0, false
-		}
-		return max(size-int64(suffix), 0), size - 1, true
-	}
-	firstPos, err := strconv.ParseUint(first, 10, 63)
-	if err != nil {
-		return 0, 0, false
-	}
-	start, end = int64(firstPos), size-1
-	if last != "" {
-		lastPos, err := strconv.ParseUint(last, 10, 63)
-		if err != nil || int64(lastPos) < start {
-			return 0, 0, false
-		}
-		end = min(int64(lastPos), end)
-	}
-	return start, end, true
-}
 
 // BuildReconstructionResponseV1 builds a reconstruction response from a shard.
 //
@@ -48,25 +17,13 @@ func parseByteRange(header string, size int64) (start, end int64, ok bool) {
 // convention used by xet-core: ByteRangeStart is an offset into the
 // header-stripped stream, and range requests to the xorb download endpoint
 // are served from the same stripped stream (see handleDownloadXorb).
-func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rangeHeader string) (*ReconstructionResponseV1, error) {
-	// Find the file block for this file hash
-	var fileBlock *shard.FileBlock
-	for i := range sh.Files {
-		if sh.Files[i].FileHash == fileHash {
-			fileBlock = &sh.Files[i]
-			break
-		}
-	}
-
+//
+// The terms are those holding bytes of rng; ParseByteRange("", size) selects the whole file.
+func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rng ByteRange) (*ReconstructionResponseV1, error) {
+	fileBlock := sh.File(fileHash)
 	if fileBlock == nil {
 		return nil, fmt.Errorf("file not found in shard")
 	}
-
-	var fileSize int64
-	for _, entry := range fileBlock.Entries {
-		fileSize += int64(entry.UnpackedSegBytes)
-	}
-	requestedStart, requestedEnd, hasRange := parseByteRange(rangeHeader, fileSize)
 
 	response := &ReconstructionResponseV1{
 		OffsetIntoFirstRange: 0,
@@ -83,19 +40,17 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
 
 		// Skip terms that are completely outside the requested range
-		if hasRange {
-			if termEnd <= requestedStart {
-				currentByteOffset = termEnd
-				continue
-			}
-			if termStart > requestedEnd {
-				break
-			}
+		if termEnd <= rng.Start {
+			currentByteOffset = termEnd
+			continue
+		}
+		if termStart > rng.End {
+			break
 		}
 
 		// Calculate offset into first term if this is the first included term
-		if len(response.Terms) == 0 && hasRange && termStart < requestedStart {
-			response.OffsetIntoFirstRange = requestedStart - termStart
+		if len(response.Terms) == 0 && termStart < rng.Start {
+			response.OffsetIntoFirstRange = rng.Start - termStart
 		}
 
 		term := Term{
