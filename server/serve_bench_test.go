@@ -22,6 +22,11 @@
 //
 //	go test ./server -run '^$' -bench Serve -benchtime 3x -count 3 >serve.txt
 //	benchstat -row .name -col /path serve.txt
+//
+// XET_BENCH_PROFILE_DIR=<absolute dir> writes each row's CPU profile, over its
+// timed loop only, to <dir>/<b.Name() with "/" as "_">-<n>.pprof, n numbering
+// this process's profiles so -count keeps every run's. A bridge reader decodes
+// with min(GOMAXPROCS, 4) workers; vary them with GOMAXPROCS=n go test ....
 package server_test
 
 import (

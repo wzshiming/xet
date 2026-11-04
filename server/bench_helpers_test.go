@@ -1,11 +1,15 @@
 package server_test
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime/pprof"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,17 +91,18 @@ type rusage struct {
 	minflt, majflt int64
 }
 
-// window measures a row's timed loop: this process's rusage and the writes
-// of the server's connections.
+// window measures a row's timed loop: this process's rusage, the writes of
+// the server's connections and, with XET_BENCH_PROFILE_DIR, a CPU profile.
 type window struct {
 	conns         *connStats
 	from          rusage
 	writes, bytes int64
+	stopProfile   func()
 }
 
 // startWindow opens b's window just before its timed loop.
 func startWindow(b *testing.B, conns *connStats) *window {
-	w := &window{conns: conns}
+	w := &window{conns: conns, stopProfile: startProfile(b)}
 	w.writes, w.bytes = conns.writes.Load(), conns.bytes.Load()
 	w.from = readRusage(b)
 	return w
@@ -108,6 +113,7 @@ func startWindow(b *testing.B, conns *connStats) *window {
 func (w *window) stop(b *testing.B, size int64, n int) {
 	to := readRusage(b)
 	writes, bytes := w.conns.writes.Load()-w.writes, w.conns.bytes.Load()-w.bytes
+	w.stopProfile()
 	file := float64(size) * float64(n)
 	gib := file / (1 << 30)
 	usr, sys := (to.usr - w.from.usr).Seconds(), (to.sys - w.from.sys).Seconds()
@@ -118,4 +124,40 @@ func (w *window) stop(b *testing.B, size int64, n int) {
 	b.ReportMetric(float64(to.majflt-w.from.majflt)/gib, "majflt/GiB")
 	b.ReportMetric(float64(writes)/gib, "writes/GiB")
 	b.ReportMetric(float64(bytes)/file, "served/file")
+}
+
+// profiles numbers the CPU profiles of this process, so -count keeps each.
+var profiles int
+
+// startProfile writes b's CPU profile into XET_BENCH_PROFILE_DIR, if set,
+// until stop.
+func startProfile(b *testing.B) (stop func()) {
+	dir := os.Getenv("XET_BENCH_PROFILE_DIR")
+	if dir == "" {
+		return func() {}
+	}
+	if !filepath.IsAbs(dir) {
+		b.Fatalf("XET_BENCH_PROFILE_DIR=%q is not absolute", dir)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	profiles++
+	name := filepath.Join(dir, fmt.Sprintf("%s-%d.pprof", strings.ReplaceAll(b.Name(), "/", "_"), profiles))
+	f, err := os.Create(name)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		b.Logf("no CPU profile: %v", err)
+		f.Close()
+		os.Remove(name)
+		return func() {}
+	}
+	return func() {
+		pprof.StopCPUProfile()
+		if err := f.Close(); err != nil {
+			b.Error(err)
+		}
+	}
 }
