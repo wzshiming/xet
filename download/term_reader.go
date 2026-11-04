@@ -641,7 +641,7 @@ func (r *termReader) advance() error {
 	r.cancel()
 	r.detach()
 	// A reader read to its end need not be closed, so its cache writes end here.
-	r.writer.wait()
+	_ = r.writer // experiment: no wait
 	return io.EOF
 }
 
@@ -653,7 +653,7 @@ func (r *termReader) Close() error {
 	r.workers.Wait()
 	r.returnBudget()
 	r.detach()
-	r.writer.wait()
+	_ = r.writer // experiment: no wait
 	if r.err == nil {
 		r.err = fs.ErrClosed
 	}
