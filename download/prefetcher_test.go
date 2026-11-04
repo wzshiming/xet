@@ -347,8 +347,8 @@ func TestReaderV2CancelAfterFirstChunkReleasesEntry(t *testing.T) {
 	}
 }
 
-// TestReaderCloseAbortsStalledDownload closes a reader while its worker holds
-// cache.mut inside a network read that never completes and the parent context
+// TestReaderCloseAbortsStalledDownload closes a reader while its worker is
+// stalled inside a network read that never completes and the parent context
 // stays live: Close must cancel the fetch instead of waiting for it, leave no
 // queued fetch running, and keep the caller's context and cache usable.
 func TestReaderCloseAbortsStalledDownload(t *testing.T) {
@@ -372,7 +372,7 @@ func TestReaderCloseAbortsStalledDownload(t *testing.T) {
 					t.Fatal(err)
 				}
 				p := readerPrefetcher(t, r)
-				// The first chunk is published; LoadAll now blocks on the second with cache.mut held.
+				// The first chunk is published; LoadAll now blocks on the second.
 				<-client.stalled
 
 				closed := make(chan struct{})
@@ -434,7 +434,7 @@ func TestReaderCloseKeepsCompletedRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := readerPrefetcher(t, r)
-			// The decoder consumed the whole first range; LoadAll now blocks on its trailing read with cache.mut held.
+			// The decoder consumed the whole first range; LoadAll now blocks on its trailing read.
 			<-client.stalled
 
 			closed := make(chan struct{})
@@ -475,6 +475,54 @@ func TestReaderCloseKeepsCompletedRange(t *testing.T) {
 			m.mu.Unlock()
 			if !ok || e.refs != 0 {
 				t.Fatalf("sealed entry tracked = %v, refs after Close = %v; want tracked with 0 refs", ok, e)
+			}
+		})
+	}
+}
+
+// TestReaderFinishesAfterTrailingRead stalls the worker's read past the last
+// chunk of its range. The reader closes the fetch, and with it the response
+// body, once it is done, so it must not finish before that read returns.
+func TestReaderFinishesAfterTrailingRead(t *testing.T) {
+	chunks := randomChunks(1, 3, 1000)
+	encoded := buildTestXorb(t, chunks)
+	whole := ChunkRange{Start: 0, End: 3}
+	for name, newReader := range rangeReaders {
+		t.Run(name, func(t *testing.T) {
+			client := &gatedClient{
+				data:    encoded,
+				stallAt: len(encoded),
+				release: make(chan struct{}),
+				stalled: make(chan struct{}),
+				closed:  make(chan struct{}),
+			}
+			r, err := newReader(client, whole, whole, int64(len(encoded)-1), NewCacheManager(t.TempDir(), 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := readerPrefetcher(t, r)
+			var got []byte
+			read := make(chan struct{})
+			go func() {
+				defer close(read)
+				got, err = io.ReadAll(r)
+			}()
+			<-client.stalled
+			select {
+			case <-read:
+				t.Fatalf("the reader finished (%d bytes, %v) while the worker was still reading the response body", len(got), err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(client.release)
+			if !within(t, "the reader", read) {
+				t.FailNow()
+			}
+			r.Close()
+			if want := bytes.Join(chunks, nil); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+			}
+			if !awaitWorkers(t, p) {
+				t.FailNow()
 			}
 		})
 	}
