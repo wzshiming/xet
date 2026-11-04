@@ -27,6 +27,12 @@
 // timed loop only, to <dir>/<b.Name() with "/" as "_">-<n>.pprof, n numbering
 // this process's profiles so -count keeps every run's. A bridge reader decodes
 // with min(GOMAXPROCS, 4) workers; vary them with GOMAXPROCS=n go test ....
+//
+// XET_SERVE_BENCH_STORE=<dir> with XET_SERVE_BENCH_SHA256=<64 hex> adds the
+// rows size=real/class=real: path=bridge serves that file from dir, the
+// -storage directory of an xetd, and path=plain a copy reconstructed once
+// from it and checked against the digest. Pass a copy of the directory:
+// opening it creates any storage subdirectory it lacks.
 package server_test
 
 import (
@@ -38,6 +44,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,6 +225,54 @@ func BenchmarkServe(b *testing.B) {
 			}
 		})
 	}
+	if dir, sum := os.Getenv("XET_SERVE_BENCH_STORE"), os.Getenv("XET_SERVE_BENCH_SHA256"); dir != "" && sum != "" {
+		b.Run("size=real", func(b *testing.B) {
+			b.Run("class=real", func(b *testing.B) { benchmarkPaths(b, realFixture(b, dir, sum)) })
+		})
+	}
+}
+
+// realFixture serves the file of SHA-256 hex sum stored in the storage dir
+// of an xetd: on /xet-bridge/ from dir, on /plain/ from a copy reconstructed
+// once and checked against sum.
+func realFixture(tb testing.TB, dir, sum string) *fixture {
+	tb.Helper()
+	const key = "real/real"
+	if fixtures[key] != nil {
+		return fixtures[key]
+	}
+	sum = strings.ToLower(sum)
+	digest, err := hex.DecodeString(sum)
+	if err != nil || len(digest) != sha256.Size {
+		tb.Fatalf("XET_SERVE_BENCH_SHA256=%q is not 64 hex digits", sum)
+	}
+	st, err := local.NewStorage(local.WithBasePath(dir))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	rc, err := st.GetReconstructedFile(tb.Context(), [sha256.Size]byte(digest))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer rc.Close()
+	plain := filepath.Join(benchRoot(tb), "real")
+	out, err := os.Create(plain)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(out, h), rc)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != sum {
+		tb.Fatalf("%s reconstructs %d bytes with SHA-256 %s, want %s", dir, size, got, sum)
+	}
+	fixtures[key] = serveFixture(st, plain, size, sum)
+	return fixtures[key]
 }
 
 // benchmarkPaths runs one row per path of fx.
