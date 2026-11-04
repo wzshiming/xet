@@ -326,6 +326,42 @@ func TestChunkCacheDoneKeepsCompletedRange(t *testing.T) {
 	}
 }
 
+// TestChunkCacheKeepsDecoderChunkHashes pins that a writer keeps the hash its
+// xorb decoder computed for every chunk, while adopted chunks carry none.
+func TestChunkCacheKeepsDecoderChunkHashes(t *testing.T) {
+	chunks := randomChunks(4, 3, 1000)
+	encoded := buildTestXorb(t, chunks)
+	m := NewCacheManager(t.TempDir(), 0)
+	dec := xorb.NewDecoder(bytes.NewReader(encoded), false)
+	cache, err := newChunkCache(dec, m, testCacheHash, 0, 3, 0, int64(len(encoded)-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Done()
+	if err := cache.LoadAll(); err != nil {
+		t.Fatal(err)
+	}
+	for i, chunk := range chunks {
+		if ref, want := cache.metas[i], xet.ComputeChunkHash(chunk); !ref.hashed || ref.hash != want {
+			t.Fatalf("chunk %d kept hash %v (hashed=%v), want %v", i, ref.hash, ref.hashed, want)
+		}
+	}
+
+	adopted, err := openCachedRange(m, testCacheHash, 0, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted == nil {
+		t.Fatal("sealed range was not adopted")
+	}
+	defer adopted.Done()
+	for i, ref := range adopted.metas {
+		if ref.hashed {
+			t.Fatalf("adopted chunk %d carries a decoder hash", i)
+		}
+	}
+}
+
 // corruptDataByte flips the last byte of the data region, which sits just
 // before the four-byte crc32 trailer.
 func corruptDataByte(t *testing.T, path string) {

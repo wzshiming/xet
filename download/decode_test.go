@@ -160,22 +160,22 @@ func (*refusingClient) DownloadXorbsMultipartWithURL(context.Context, string, ht
 }
 
 // rangeReaders build V1 and V2 readers for one term served from a fetch range spanning bytes [0, bytesEnd].
-var rangeReaders = map[string]func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error){
-	"v1": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
+var rangeReaders = map[string]func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager, opts ...Option) (io.ReadCloser, error){
+	"v1": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager, opts ...Option) (io.ReadCloser, error) {
 		return NewReaderV1(context.Background(), client, &ReconstructionResponseV1{
 			Terms: []Term{{Hash: testCacheHash, Range: term}},
 			FetchInfo: map[string][]FetchInfoEntry{
 				testCacheHash: {{Range: fetch, URL: "test://xorb", URLRange: ByteRange{Start: 0, End: bytesEnd}}},
 			},
-		}, WithCacheManager(cache))
+		}, append(opts, WithCacheManager(cache))...)
 	},
-	"v2": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager) (io.ReadCloser, error) {
+	"v2": func(client ClientAdapter, term, fetch ChunkRange, bytesEnd int64, cache *CacheManager, opts ...Option) (io.ReadCloser, error) {
 		return NewReaderV2(context.Background(), client, &ReconstructionResponseV2{
 			Terms: []Term{{Hash: testCacheHash, Range: term}},
 			Xorbs: map[string][]XorbMultiRangeFetch{
 				testCacheHash: {{URL: "test://xorb", Ranges: []XorbRangeDescriptor{{Chunks: fetch, Bytes: ByteRange{Start: 0, End: bytesEnd}}}}},
 			},
-		}, WithCacheManager(cache))
+		}, append(opts, WithCacheManager(cache))...)
 	},
 }
 
@@ -421,6 +421,49 @@ func TestReaderVerifiesFileHash(t *testing.T) {
 					t.Fatal("expected an error: a partial reconstruction cannot be verified")
 				}
 			})
+		})
+	}
+}
+
+// TestReaderVerifiesWithDecoderChunkHashes corrupts the hash a writer kept for
+// a chunk it decoded: verification must fail although every byte is intact,
+// so the verifier uses the decoder's hash instead of hashing the chunk again.
+func TestReaderVerifiesWithDecoderChunkHashes(t *testing.T) {
+	chunks := randomChunks(5, 3, 1000)
+	encoded := buildTestXorb(t, chunks)
+	fileHash := xet.ComputeFileHash(chunkHashes(chunks), []uint64{1000, 1000, 1000})
+	key := fetchKey{Hash: testCacheHash, Start: 0, End: int64(len(encoded) - 1)}
+	whole := ChunkRange{Start: 0, End: 3}
+	for name, newReader := range rangeReaders {
+		t.Run(name, func(t *testing.T) {
+			r, err := newReader(&fakeClientAdapter{data: encoded}, whole, whole, key.End, NewCacheManager(t.TempDir(), 0), WithExpectedFileHash(fileHash))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			cache, err := readerPrefetcher(t, r).Get(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Tamper only once the whole range is decoded.
+			if _, err := cache.Chunk(2, make([]byte, 1000)); err != nil {
+				t.Fatal(err)
+			}
+			cache.mut.Lock()
+			kept := cache.metas[1].hashed
+			cache.metas[1].hash[0] ^= 0xff
+			cache.mut.Unlock()
+			if !kept {
+				t.Fatal("decoded chunk 1 kept no decoder hash")
+			}
+
+			got, err := io.ReadAll(r)
+			if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
+				t.Fatalf("err = %v, want the corrupted kept hash to fail verification", err)
+			}
+			if want := bytes.Join(chunks, nil); !bytes.Equal(got, want) {
+				t.Fatalf("read %d bytes, want the %d intact bytes", len(got), len(want))
+			}
 		})
 	}
 }
