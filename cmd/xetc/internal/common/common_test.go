@@ -92,7 +92,7 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	cli, err := client.NewClient(append(Options(2, t.TempDir(), false, &out), client.WithUpstreamProvider(provider))...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestExecuteUploadThenDownload(t *testing.T) {
 			}
 			before := requests()
 			var out bytes.Buffer
-			cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+			cli, err := client.NewClient(append(Options(2, t.TempDir(), false, &out), client.WithUpstreamProvider(provider))...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +171,7 @@ func TestExecuteResolveDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	cli, err := client.NewClient(append(Options(2, t.TempDir(), &out), client.WithUpstreamProvider(provider))...)
+	cli, err := client.NewClient(append(Options(2, t.TempDir(), false, &out), client.WithUpstreamProvider(provider))...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestExecuteResolveDownload(t *testing.T) {
 
 	output := filepath.Join(dir, "resolved")
 	out.Reset()
-	if err := ExecuteResolveDownload(context.Background(), hub.URL+resolvePath, "hub-token", output, 2, t.TempDir(), false, &out); err != nil {
+	if err := ExecuteResolveDownload(context.Background(), hub.URL+resolvePath, "hub-token", output, 2, t.TempDir(), false, false, &out); err != nil {
 		t.Fatal(err)
 	}
 	got := out.String()
@@ -238,7 +238,7 @@ func TestExecuteResolveDownloadKeepsDestinationOnFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			var out bytes.Buffer
-			err := ExecuteResolveDownload(context.Background(), tc.resolveURL, "", output, 1, t.TempDir(), false, &out)
+			err := ExecuteResolveDownload(context.Background(), tc.resolveURL, "", output, 1, t.TempDir(), false, false, &out)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
 			}
