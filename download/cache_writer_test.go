@@ -2,6 +2,8 @@ package download
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/flock"
 )
 
 // entryData lays chunks out the way put takes them.
@@ -413,4 +416,263 @@ func TestCacheWriterMarksEntryVerified(t *testing.T) {
 	// The writer checksummed what it wrote, as seal does, so its manager trusts the entry.
 	corruptDataByte(t, cacheFilePath(dir, hash.String(), 0, 2, 0, 100))
 	mustLookup(t, m, hash, 0, 2).release()
+}
+
+// mustBegin fails the test unless w begins writing the entry key.
+func mustBegin(t *testing.T, w *cacheWriter, key cacheKey, done func()) *entryWrite {
+	t.Helper()
+	e := w.begin(key, done)
+	if e == nil {
+		t.Fatalf("begin declined the write of %+v", key)
+	}
+	return e
+}
+
+// handOver hands chunks to e with one advance per chunk, on a buffer that
+// moves to a larger array along the way, and then finishes e.
+func handOver(e *entryWrite, chunks []string) {
+	offsets, _ := entryData(chunks)
+	data := make([]byte, 0, len(chunks[0]))
+	for _, c := range chunks {
+		data = append(data, c...)
+		e.advance(data)
+	}
+	e.finish(offsets)
+}
+
+// awaitEntryData waits until the data region of the entry file at path,
+// which holds n chunks, begins with want.
+func awaitEntryData(t *testing.T, path string, n int, want []byte) {
+	t.Helper()
+	at := 4 + 4*(n+1)
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		got, _ := os.ReadFile(path)
+		if len(got) >= at+len(want) && bytes.Equal(got[at:at+len(want)], want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s holds %d bytes after 3s, want %q at offset %d", path, len(got), want, at)
+		}
+	}
+}
+
+func TestCacheWriterStreamedEntryMatchesPutAndLoadPath(t *testing.T) {
+	hash := testXorbHash(0xe1)
+	chunks := spanChunks(4)
+	key := cacheKey{Hash: hash, ChunkStart: 2, ChunkEnd: 6, ByteStart: 100, ByteEnd: 500}
+	want, err := os.ReadFile(writeRangeEntry(t, NewCacheManager(t.TempDir(), 0), hash.String(), 2, 6, 100, 500, chunks))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putDir, streamDir := t.TempDir(), t.TempDir()
+	putAndWait(t, NewCacheManager(putDir, 0).newWriter(1), key, chunks)
+	w := NewCacheManager(streamDir, 0).newWriter(1)
+	var calls atomic.Int32
+	handOver(mustBegin(t, w, key, func() { calls.Add(1) }), chunks)
+	w.wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("done ran %d times, want 1", n)
+	}
+
+	if names, want := listEntryNames(t, streamDir, hash.String()), []string{cacheFileName(2, 6, 100, 500)}; !slices.Equal(names, want) {
+		t.Fatalf("the streamed write left %v in the hash directory, want %v", names, want)
+	}
+	for name, dir := range map[string]string{"put": putDir, "streamed": streamDir} {
+		got, err := os.ReadFile(cacheFilePath(dir, hash.String(), 2, 6, 100, 500))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("the %s entry is %x, want the load path's %x", name, got, want)
+		}
+	}
+}
+
+func TestCacheWriterStreamedEntryAdoptedByFreshManager(t *testing.T) {
+	dir := t.TempDir()
+	hash := testXorbHash(0xe2)
+	w := NewCacheManager(dir, 0).newWriter(1)
+	handOver(mustBegin(t, w, cacheKey{Hash: hash, ChunkStart: 0, ChunkEnd: 3, ByteEnd: 300}, func() {}), []string{"aaa", "bbbb", "cc"})
+	w.wait()
+
+	c := mustLookup(t, NewCacheManager(dir, 0), hash, 0, 3)
+	defer c.release()
+	if got := readSpan(t, c, 0, 3); got != "aaabbbbcc" {
+		t.Fatalf("fresh manager read %q, want %q", got, "aaabbbbcc")
+	}
+}
+
+func TestCacheWriterAbortRemovesPartialEntry(t *testing.T) {
+	dir := t.TempDir()
+	hash := testXorbHash(0xe3)
+	key := cacheKey{Hash: hash, ChunkStart: 0, ChunkEnd: 2, ByteEnd: 100}
+	path := cacheFilePath(dir, hash.String(), 0, 2, 0, 100)
+	w := NewCacheManager(dir, 0).newWriter(1)
+	var calls atomic.Int32
+	e := mustBegin(t, w, key, func() { calls.Add(1) })
+	e.advance([]byte("aaa"))
+	awaitEntryData(t, path, 2, []byte("aaa"))
+	e.abort()
+	w.wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("done ran %d times, want 1", n)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("abort left the partial entry: %v", err)
+	}
+
+	// The lock went with the file, so another writer takes the entry over.
+	other := NewCacheManager(dir, 0).newWriter(1)
+	handOver(mustBegin(t, other, key, func() {}), []string{"aaa", "bbb"})
+	other.wait()
+	c := mustLookup(t, NewCacheManager(dir, 0), hash, 0, 2)
+	defer c.release()
+	if got := readSpan(t, c, 0, 2); got != "aaabbb" {
+		t.Fatalf("rewritten entry reads %q, want %q", got, "aaabbb")
+	}
+}
+
+func TestCacheWriterStreamDoesNotWaitForStalledDisk(t *testing.T) {
+	dir := t.TempDir()
+	hash := testXorbHash(0xe4)
+	w := NewCacheManager(dir, 0).newWriter(1)
+	stalled, unstall := stallWrites(t, w)
+	var calls atomic.Int32
+	e := mustBegin(t, w, cacheKey{Hash: hash, ChunkStart: 0, ChunkEnd: 3, ByteEnd: 300}, func() { calls.Add(1) })
+	if !within(t, "the write reaching the stalled disk", stalled) {
+		t.FailNow()
+	}
+	handed := make(chan struct{})
+	go func() {
+		defer close(handed)
+		handOver(e, []string{"aaa", "bbbb", "cc"})
+	}()
+	if !within(t, "advance and finish on a stalled disk", handed) {
+		t.FailNow()
+	}
+
+	waited := make(chan struct{})
+	go func() {
+		defer close(waited)
+		w.wait()
+	}()
+	select {
+	case <-waited:
+		t.Fatal("wait returned while the disk was stalled")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("done ran %d times before the stalled write was over, want 0", n)
+	}
+	unstall()
+	if !within(t, "wait", waited) {
+		t.FailNow()
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("done ran %d times, want 1", n)
+	}
+	c := mustLookup(t, NewCacheManager(dir, 0), hash, 0, 3)
+	defer c.release()
+	if got := readSpan(t, c, 0, 3); got != "aaabbbbcc" {
+		t.Fatalf("entry reads %q, want %q", got, "aaabbbbcc")
+	}
+}
+
+func TestCacheWriterBeginDeclinesWhatItCannotWrite(t *testing.T) {
+	key := func(b byte) cacheKey {
+		return cacheKey{Hash: testXorbHash(b), ChunkStart: 0, ChunkEnd: 2, ByteEnd: 100}
+	}
+	declined := func(t *testing.T) func() { return func() { t.Error("done ran for a declined write") } }
+
+	t.Run("nil writer", func(t *testing.T) {
+		var w *cacheWriter
+		e := w.begin(key(0xe5), declined(t))
+		if e != nil {
+			t.Fatalf("begin on a nil writer = %v, want nil", e)
+		}
+		// A declined write is a nil entry, which ignores the data.
+		e.advance([]byte("aaa"))
+		e.finish([]int64{0, 3})
+		e.abort()
+	})
+	t.Run("beyond maxInflight", func(t *testing.T) {
+		dir := t.TempDir()
+		w := NewCacheManager(dir, 0).newWriter(1)
+		stalled, unstall := stallWrites(t, w)
+		first := mustBegin(t, w, key(0xe6), func() {})
+		if !within(t, "the first write reaching the hook", stalled) {
+			t.FailNow()
+		}
+		if e := w.begin(key(0xe7), declined(t)); e != nil {
+			t.Fatalf("begin with maxInflight writes in flight = %v, want nil", e)
+		}
+		first.abort()
+		unstall()
+		w.wait()
+		if entryExists(t, dir, testXorbHash(0xe7).String()) {
+			t.Fatal("a declined write created its entry")
+		}
+	})
+	t.Run("locked elsewhere", func(t *testing.T) {
+		dir := t.TempDir()
+		path := cacheFilePath(dir, testXorbHash(0xe8).String(), 0, 2, 0, 100)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		holder, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Close()
+		if err := flock.TryLock(holder); err != nil {
+			t.Fatal(err)
+		}
+		defer flock.Unlock(holder) //nolint:errcheck
+		if e := NewCacheManager(dir, 0).newWriter(1).begin(key(0xe8), declined(t)); e != nil {
+			t.Fatalf("begin on an entry locked elsewhere = %v, want nil", e)
+		}
+	})
+	t.Run("sealed", func(t *testing.T) {
+		m := NewCacheManager(t.TempDir(), 0)
+		path := writeRangeEntry(t, m, testXorbHash(0xe9).String(), 0, 2, 0, 100, []string{"aaa", "bbb"})
+		want, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e := m.newWriter(1).begin(key(0xe9), declined(t)); e != nil {
+			t.Fatalf("begin on a sealed entry = %v, want nil", e)
+		}
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("begin changed the sealed entry to %x, %v", got, err)
+		}
+	})
+}
+
+// TestCacheWriterEntryCompleteOnlyAfterItsLastWrite holds back a streamed
+// entry's data until finish, so the data and the seal are written together:
+// the entry must look complete to the size arithmetic lookups trust only
+// after the last write, whatever order the writes take.
+func TestCacheWriterEntryCompleteOnlyAfterItsLastWrite(t *testing.T) {
+	dir := t.TempDir()
+	hash := testXorbHash(0xea)
+	path := cacheFilePath(dir, hash.String(), 0, 3, 0, 300)
+	w := NewCacheManager(dir, 0).newWriter(1)
+	var complete []bool // after each write to the entry file, in order
+	w.afterWrite = func() {
+		info, err := os.Stat(path)
+		complete = append(complete, err == nil && isCompleteCacheFile(path, 0, 3, info.Size()))
+	}
+	stalled, unstall := stallWrites(t, w)
+	e := mustBegin(t, w, cacheKey{Hash: hash, ChunkStart: 0, ChunkEnd: 3, ByteEnd: 300}, func() {})
+	if !within(t, "the write reaching the hook", stalled) {
+		t.FailNow()
+	}
+	handOver(e, []string{"aaa", "bbbb", "cc"})
+	unstall()
+	w.wait()
+
+	if n := len(complete); n < 2 || slices.Contains(complete[:n-1], true) || !complete[n-1] {
+		t.Fatalf("complete after each write: %v, want only after the last", complete)
+	}
+	mustLookup(t, NewCacheManager(dir, 0), hash, 0, 3).release()
 }
