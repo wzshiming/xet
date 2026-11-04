@@ -477,7 +477,7 @@ func respond(w http.ResponseWriter, status int, contentType string, body []byte)
 
 // blobSHA1 is the git object id of a blob holding content.
 func blobSHA1(content []byte) string {
-	return sha1Hex(append([]byte(fmt.Sprintf("blob %d\x00", len(content))), content...))
+	return sha1Hex(append(fmt.Appendf(nil, "blob %d\x00", len(content)), content...))
 }
 
 func sha1Hex(data []byte) string {

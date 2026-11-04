@@ -295,7 +295,7 @@ func uploadCacheEntries(t *testing.T, cacheDir string) []string {
 }
 
 // countMultiEntryXorbDirs counts xorb hash directories holding more than one
-// cache entry file.
+// cache entry; empty files are lock placeholders that readers and the merger skip.
 func countMultiEntryXorbDirs(t *testing.T, cacheDir string) int {
 	t.Helper()
 	count := 0
@@ -324,7 +324,13 @@ func countMultiEntryXorbDirs(t *testing.T, cacheDir string) int {
 				if err != nil {
 					continue
 				}
-				if len(entries) > 1 {
+				nonEmpty := 0
+				for _, entry := range entries {
+					if info, err := entry.Info(); err == nil && info.Size() > 0 {
+						nonEmpty++
+					}
+				}
+				if nonEmpty > 1 {
 					count++
 				}
 			}
