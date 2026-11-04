@@ -3,10 +3,12 @@
 // storage.NewReconstructedFile through http.ServeContent) and by path=plain
 // (http.ServeContent of the same bytes from an *os.File, which net sends with
 // sendfile). Files are 64 KiB chunks in xorbs of at most xet.MaxXorbSize:
-// 1 MiB = 1 xorb × 16 chunks, 64 MiB = 1 × 1024, 256 MiB = 4 × 1024; the
-// 64 MiB row differs from the storage bench's 4 × 256 shape. Each (size, class)
-// fixture is built once per process, so -count repeats rows only; the full
-// matrix takes about 1.6 GiB of temp disk, which TestMain removes. One client
+// 1 MiB = 1 xorb × 16 chunks, 64 MiB = 1 × 1024, 256 MiB = 4 × 1024,
+// 1 GiB = 16 × 1024; the 64 MiB row differs from the storage bench's 4 × 256
+// shape. Each (size, class) fixture is built once per process, when a row
+// first selects it, so -count repeats rows only; the full matrix takes about
+// 8.8 GiB of temp disk (2.1 GiB without the 1 GiB rows, whose fixtures also
+// hold 2 GiB of memory while they are built), which TestMain removes. One client
 // keeps its connections warm and drains bodies through a 1 MiB buffer into a
 // writer without ReadFrom; allocs include the in-process server. Numbers are
 // indicative; compare the paths with
@@ -48,6 +50,7 @@ var shapes = []shape{
 	{"1MiB", 1, 16},
 	{"64MiB", 1, xet.MaxXorbSize / chunkSize},
 	{"256MiB", 4, xet.MaxXorbSize / chunkSize},
+	{"1GiB", 16, xet.MaxXorbSize / chunkSize},
 }
 
 // classes are the storage classes plus bf16 model weights.
