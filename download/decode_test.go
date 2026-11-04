@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"math/rand"
 	"mime/multipart"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
@@ -142,6 +144,80 @@ func TestReaderOffsetIntoFirstRange(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestReaderProgressCountsWholeRange pins WithProgressFunc: each fetched range
+// reports its response body bytes against a total of its inclusive byte range,
+// so it ends at current == total, and the totals add up to the expected
+// transfer bytes.
+func TestReaderProgressCountsWholeRange(t *testing.T) {
+	chunks := randomChunks(3, 4, 1000)
+	encoded := buildTestXorb(t, chunks)
+	split := int64(len(buildTestXorb(t, chunks[:2])))
+	ranges := []XorbRangeDescriptor{
+		{Chunks: ChunkRange{Start: 0, End: 2}, Bytes: ByteRange{Start: 0, End: split - 1}},
+		{Chunks: ChunkRange{Start: 2, End: 4}, Bytes: ByteRange{Start: split, End: int64(len(encoded) - 1)}},
+	}
+	terms := []Term{
+		{Hash: testCacheHash, UnpackedLength: 2000, Range: ranges[0].Chunks},
+		{Hash: testCacheHash, UnpackedLength: 2000, Range: ranges[1].Chunks},
+		{Hash: testCacheHash, UnpackedLength: 2000, Range: ranges[0].Chunks},
+	}
+	v1 := &ReconstructionResponseV1{Terms: terms, FetchInfo: map[string][]FetchInfoEntry{testCacheHash: {
+		{Range: ranges[0].Chunks, URL: "test://xorb", URLRange: ranges[0].Bytes},
+		{Range: ranges[1].Chunks, URL: "test://xorb", URLRange: ranges[1].Bytes},
+	}}}
+	v2 := &ReconstructionResponseV2{Terms: terms, Xorbs: map[string][]XorbMultiRangeFetch{testCacheHash: {{URL: "test://xorb", Ranges: ranges}}}}
+	readers := map[string]struct {
+		open     func(opts ...Option) (io.ReadCloser, error)
+		transfer int64
+	}{
+		"v1": {func(opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV1(context.Background(), &fakeClientAdapter{data: encoded}, v1, opts...)
+		}, ExpectedTransferBytesV1(v1)},
+		"v2": {func(opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV2(context.Background(), &fakeClientAdapter{data: encoded}, v2, opts...)
+		}, ExpectedTransferBytesV2(v2)},
+	}
+	for name, reader := range readers {
+		t.Run(name, func(t *testing.T) {
+			var mu sync.Mutex
+			last := map[string][2]int64{}
+			progress := func(name string, current, total int64) {
+				mu.Lock()
+				defer mu.Unlock()
+				if current > total {
+					t.Errorf("%s: current %d exceeds total %d", name, current, total)
+				}
+				last[name] = [2]int64{current, total}
+			}
+			r, err := reader.open(WithCacheManager(NewCacheManager(t.TempDir(), 0)), WithProgressFunc(progress))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadAll(r); err != nil {
+				t.Fatal(err)
+			}
+			r.Close()
+			mu.Lock()
+			defer mu.Unlock()
+			want := map[string][2]int64{}
+			for _, rg := range ranges {
+				size := rg.Bytes.End - rg.Bytes.Start + 1
+				want[fetchKey{Hash: testCacheHash, Start: rg.Bytes.Start, End: rg.Bytes.End}.String()] = [2]int64{size, size}
+			}
+			if !maps.Equal(last, want) {
+				t.Fatalf("last reports %v, want %v", last, want)
+			}
+			var total int64
+			for _, report := range last {
+				total += report[1]
+			}
+			if total != reader.transfer || total != int64(len(encoded)) {
+				t.Fatalf("totals add up to %d; expected transfer bytes %d, body bytes %d", total, reader.transfer, len(encoded))
+			}
+		})
 	}
 }
 

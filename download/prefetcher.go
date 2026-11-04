@@ -24,8 +24,9 @@ func (k fetchKey) String() string {
 	return fmt.Sprintf("%s:%d-%d", k.Hash, k.Start, k.End)
 }
 
+// Size is the length of the inclusive byte range [Start, End].
 func (k fetchKey) Size() int64 {
-	return k.End - k.Start
+	return k.End - k.Start + 1
 }
 
 type fetchTask struct {

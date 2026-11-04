@@ -43,11 +43,10 @@ func WithExpectedFileHash(fileHash xet.FileHash) Option {
 }
 
 // WithProgressFunc sets a callback to receive download progress updates.
-// name identifies this download in the callback (e.g. file hash string).
-// total is computed upfront from the reconstruction plan so the caller always
-// knows the expected transfer size before any xorb is fetched.
-// progress is reported only when individual fetch entries complete successfully,
-// so retries do not inflate the reported current value.
+// name identifies one fetched xorb range in the callback, and total, its
+// length in bytes, is reported before any range is fetched. current counts the
+// response body bytes as they arrive, so it ends at total; a range served from
+// the cache reports total at once.
 func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
