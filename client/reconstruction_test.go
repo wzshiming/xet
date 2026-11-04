@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -716,4 +717,66 @@ func TestDownloadsAreUnverifiedByDefault(t *testing.T) {
 			t.Fatalf("got %d bytes, err %v; want the %d substituted bytes", len(got), err, len(want))
 		}
 	})
+}
+
+// TestDownloadsHoldTermsInClientBudget pins that a client's downloads hold
+// their terms in the one memory budget the client owns: while a download
+// waits for its xorb, the budget cannot admit its whole target, and once the
+// download is done it can.
+func TestDownloadsHoldTermsInClientBudget(t *testing.T) {
+	fx := newDownloadFixture(t, 1)
+	requested := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/xorbs/") {
+			select {
+			case requested <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		fx.serveHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	releaseXorbs := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseXorbs)
+	fx.srv = srv // reconstructions name xorb URLs on fx.srv
+
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.budget == nil {
+		t.Fatal("NewClient built no download memory budget")
+	}
+	const target = 1 << 20
+	c.budget = download.NewMemoryBudget(download.MemorySizes{Base: target, Limit: target})
+
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	done := make(chan error, 1)
+	go func() { done <- c.DownloadFile(t.Context(), fx.hashes[0], f) }()
+	select {
+	case <-requested:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the download requested no xorb")
+	}
+
+	waiting, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := c.budget.Acquire(waiting, target); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquiring the whole client budget during a download = %v, want it to wait for the download's term", err)
+	}
+	releaseXorbs()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	admitted, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := c.budget.Acquire(admitted, target); err != nil {
+		t.Fatalf("acquiring the whole client budget after the download = %v, want it admitted", err)
+	}
 }
