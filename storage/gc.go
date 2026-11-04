@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/shard"
 )
 
@@ -49,6 +50,8 @@ type SweepResult struct {
 
 	// SkippedInGrace counts unreferenced objects spared as written within the grace window.
 	SkippedInGrace int `json:"skipped_in_grace"`
+	// SkippedPinned counts unreferenced xorbs spared as pinned (SweepOptions.Pins) at some instant of the pass.
+	SkippedPinned int `json:"skipped_pinned"`
 	// ReclaimedBytes sums the sizes of swept shards and xorbs.
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 
@@ -122,16 +125,19 @@ const (
 
 // SweepOptions configures one sweep pass; a zero Grace means
 // DefaultSweepGrace, a negative one disables the window.
+// In-flight writers keep the xorbs they depend on pinned in Pins, not by Grace; pins cover xorbs only — a shard relies on Grace like any upload.
 type SweepOptions struct {
-	Anchor     SweepAnchor   // which index entries anchor shard liveness; see SweepAnchor
-	Grace      time.Duration // shields objects written (mtime) within the window; negative disables it — quiescent stores only
-	DryRun     bool          // report removable objects without deleting
-	MaxDeletes int           // max shard and xorb object deletions per GC.SweepStep (index entries uncounted); 0 = unlimited, ignored by Sweep and dry runs
-	Budget     time.Duration // wall-clock cap per GC.SweepStep, checked between dead-queue items once anything was swept; 0 = unlimited, ignored by Sweep and dry runs
+	Anchor     SweepAnchor               // which index entries anchor shard liveness; see SweepAnchor
+	Grace      time.Duration             // shields objects written (mtime) within the window; negative disables it — quiescent stores only
+	Pins       *pins.Table[xet.XorbHash] // xorbs pinned here are never deleted by this pass; nil consults none
+	DryRun     bool                      // report removable objects without deleting
+	MaxDeletes int                       // max shard and xorb object deletions per GC.SweepStep (index entries uncounted); 0 = unlimited, ignored by Sweep and dry runs
+	Budget     time.Duration             // wall-clock cap per GC.SweepStep, checked between dead-queue items once anything was swept; 0 = unlimited, ignored by Sweep and dry runs
 }
 
 // Sweep runs one full mark-and-sweep pass. GC never rewrites: it only deletes whole objects and
 // entries it can prove dead from fresh reads. MaxDeletes/Budget bound GC.SweepStep only.
+// Sweep spares xorbs pinned in opts.Pins.
 //
 // A shard is live under AnchorBoth while any files or non-zero sha256 entry points at it; under
 // AnchorFiles while any files entry does (the sha256 index is not walked; a dead shard's sha256
@@ -177,6 +183,8 @@ func markUnreadable(res *SweepResult, shardHash string) {
 // sweepPass is the stateless pass behind Sweep and GC.SweepStep: maxDeletes caps
 // actual deletions and budget the wall clock spent deleting; zero means unlimited.
 func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes int, budget time.Duration) (*SweepResult, error) {
+	opts.Pins.BeginPass()
+	defer opts.Pins.EndPass()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -331,6 +339,10 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 		if refXorbs[hash] {
 			return nil
 		}
+		if xorbHash, err := xet.ParseXorbHash(hash); err == nil && opts.Pins.Held(xorbHash) {
+			res.SkippedPinned++
+			return nil
+		}
 		if !modTime.Before(objCutoff) {
 			res.SkippedInGrace++
 			return nil
@@ -359,8 +371,13 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 			if err != nil {
 				return nil, fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
 			}
-			if err := st.DeleteXorb(ctx, xorbHash); err != nil {
+			held, err := opts.Pins.DeleteUnlessHeld(xorbHash, func() error { return st.DeleteXorb(ctx, xorbHash) })
+			if err != nil {
 				return nil, err
+			}
+			if held {
+				res.SkippedPinned++
+				continue
 			}
 			sweptCount++
 		}

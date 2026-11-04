@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/mirror/spool"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
@@ -1284,5 +1288,339 @@ func TestGCSweepEndpointBudgetSpansPasses(t *testing.T) {
 	}
 	if left, err := filepath.Glob(filepath.Join(cacheDir, "spool", "*.spool")); err != nil || len(left) != 0 {
 		t.Fatalf("spools left = %v (%v), want none", left, err)
+	}
+}
+
+// putTestXorb stores one unreferenced single-chunk xorb; mtime from Go's clock, which coarse filesystem clocks can trail.
+func putTestXorb(t *testing.T, ctx context.Context, stor storage.Storage, base string, content []byte, mtime time.Time) xet.XorbHash {
+	t.Helper()
+	var encoded bytes.Buffer
+	encoder := xorb.NewEncoder(&encoded, true)
+	if _, err := encoder.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	xorbHash := encoder.SummoryHash()
+	if _, err := stor.PutXorb(ctx, xorbHash, bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(base, filepath.FromSlash(storage.ObjectKey("xorbs", xorbHash.String())))
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	return xorbHash
+}
+
+// testWait bounds a wait on an ingest so a hang fails the test before the binary's deadline.
+func testWait(t *testing.T) time.Duration {
+	if deadline, ok := t.Deadline(); ok {
+		return min(10*time.Minute, time.Until(deadline)*9/10)
+	}
+	return 10 * time.Minute
+}
+
+// inFlightFixture is a GC handler over local storage, given its GC and the pin table its spool pins into, and a mirror, wired as xetd does, while one writer's ingest holds its shard at a gate.
+type inFlightFixture struct {
+	handler  *Handler
+	table    *pins.Table[xet.XorbHash]
+	stor     *local.Storage
+	base     string // the local storage's root
+	queue    *spool.Spool
+	writer   *spool.Item
+	xorb     xet.XorbHash  // the ingest's one xorb, stored before its shard reached the gate
+	release  func()        // lets the held PutShard through
+	finished chan struct{} // closed once the writer's Finish returned
+}
+
+// newInFlightFixture builds an inFlightFixture whose writer spooled 1 MiB and is finishing; with refuse set, the released PutShard fails with it.
+func newInFlightFixture(t *testing.T, refuse error) *inFlightFixture {
+	t.Helper()
+	base := t.TempDir()
+	stor, err := local.NewStorage(local.WithBasePath(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc := storage.NewGC(stor)
+	table := pins.New[xet.XorbHash]()
+	gate := &gateStorage{Storage: stor, entered: make(chan struct{}, 1), release: make(chan struct{}), refuse: refuse}
+	cacheDir := t.TempDir()
+	queue, err := spool.NewSpool(filepath.Join(cacheDir, "spool"), gate, spool.WithPins(table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mir, err := mirror.NewMirror(mirror.WithStorage(stor), mirror.WithCacheDir(cacheDir), mirror.WithSpool(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(stor), WithGC(gc), WithPins(table), WithMirror(mir), WithSpool(queue))
+
+	data := make([]byte, 1<<20)
+	_, _ = rand.NewChaCha8([32]byte{2}).Read(data)
+	writer, err := queue.Accept(context.Background(), spool.Source{Origin: "https://hub.example", Key: "/org/repo/resolve/main/model.bin", ETag: "etag", Size: int64(len(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(writer.Release)
+	release := sync.OnceFunc(func() { close(gate.release) })
+	t.Cleanup(release) // runs first: writer.Release awaits the held ingest
+	if !writer.Writer() {
+		t.Fatal("Accept of a new source returned a follower, want the writer")
+	}
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		writer.Finish(context.Background(), nil)
+	}()
+	wait := testWait(t)
+	select {
+	case <-gate.entered:
+	case <-finished:
+		_, err := queue.Wait(context.Background(), writer)
+		t.Fatalf("the ingest ended before its PutShard: %v", err)
+	case <-time.After(wait):
+		t.Fatalf("the ingest reached no PutShard within %v", wait)
+	}
+	gate.mu.Lock()
+	xorbs := slices.Clone(gate.xorbs)
+	gate.mu.Unlock()
+	if len(xorbs) != 1 {
+		t.Fatalf("the ingest stored xorbs %v, want one xorb for its 1 MiB", xorbs)
+	}
+	return &inFlightFixture{
+		handler:  handler,
+		table:    table,
+		stor:     stor,
+		base:     base,
+		queue:    queue,
+		writer:   writer,
+		xorb:     xorbs[0],
+		release:  release,
+		finished: finished,
+	}
+}
+
+// join waits for the writer's Finish, which returns once the released PutShard did.
+func (f *inFlightFixture) join(t *testing.T) {
+	t.Helper()
+	wait := testWait(t)
+	select {
+	case <-f.finished:
+	case <-time.After(wait):
+		t.Fatalf("the writer's Finish did not return within %v", wait)
+	}
+}
+
+// gateStorage records each stored PutXorb's xorb and holds every PutShard, ignoring ctx, until release closes; a set refuse then fails it instead of storing.
+type gateStorage struct {
+	*local.Storage
+	entered chan struct{} // signaled as a PutShard reaches the gate
+	release chan struct{}
+	refuse  error
+
+	mu    sync.Mutex
+	xorbs []xet.XorbHash
+}
+
+func (g *gateStorage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+	inserted, err := g.Storage.PutXorb(ctx, xorbHash, r)
+	if err == nil {
+		g.mu.Lock()
+		g.xorbs = append(g.xorbs, xorbHash)
+		g.mu.Unlock()
+	}
+	return inserted, err
+}
+
+func (g *gateStorage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	if g.refuse != nil {
+		return false, g.refuse
+	}
+	return g.Storage.PutShard(ctx, sh)
+}
+
+// TestGCSweepEndpointSparesInFlightIngest: grace=0 leaves the ingest's pin as its young xorb's only shield.
+func TestGCSweepEndpointSparesInFlightIngest(t *testing.T) {
+	ctx := context.Background()
+	f := newInFlightFixture(t, nil)
+
+	rec := httptest.NewRecorder()
+	f.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if keys := responseKeys(t, rec); !slices.Equal(keys, []string{"done", "mirror", "spools", "storage"}) {
+		t.Fatalf("sweep keys = %v, want done, storage, spools and mirror", keys)
+	}
+	result := decodeSweep(t, rec)
+	if len(result.SweptXorbs) != 0 {
+		t.Fatalf("grace=0 sweep during an in-flight ingest swept xorbs %+v, want none: the ingest pins its xorb in the table given WithPins", result.SweptXorbs)
+	}
+	if result.SkippedPinned < 1 {
+		t.Fatalf("skipped_pinned = %d, want the in-flight ingest's xorb counted", result.SkippedPinned)
+	}
+	if ok, err := f.stor.HasXorb(ctx, f.xorb); err != nil || !ok {
+		t.Fatalf("HasXorb(in-flight ingest's xorb) = %v, %v; want true", ok, err)
+	}
+}
+
+// TestGCSweepEndpointDryRunSparesInFlightIngest: a grace=0 dry run reaches the same verdict, listing nothing an in-flight ingest pinned.
+func TestGCSweepEndpointDryRunSparesInFlightIngest(t *testing.T) {
+	f := newInFlightFixture(t, nil)
+
+	got := sweepRequest(t, f.handler, "?dry_run=true&grace=0").Storage
+	if got == nil || !got.DryRun {
+		t.Fatalf("storage pass = %+v, want a dry run", got)
+	}
+	if len(got.SweptShards) != 0 || len(got.SweptXorbs) != 0 {
+		t.Fatalf("grace=0 dry run during an in-flight ingest lists shards %+v and xorbs %+v, want none: dry runs spare pinned xorbs too", got.SweptShards, got.SweptXorbs)
+	}
+	if got.SkippedPinned < 1 {
+		t.Fatalf("dry-run skipped_pinned = %d, want the in-flight ingest's xorb counted", got.SkippedPinned)
+	}
+}
+
+// TestGCSweepEndpointSweepsAfterIngestEnds: an ended ingest's xorb is pinned no longer: its landed shard keeps it, while after a refused shard grace=0 reclaims it.
+func TestGCSweepEndpointSweepsAfterIngestEnds(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("shard landed", func(t *testing.T) {
+		f := newInFlightFixture(t, nil)
+		if !f.table.Pinned(f.xorb) {
+			t.Errorf("xorb %s unpinned while the ingest's shard is pending, want it pinned in the spool's table", f.xorb)
+		}
+		f.release()
+		f.join(t)
+		if res, err := f.queue.Wait(ctx, f.writer); err != nil || res.Size != 1<<20 {
+			t.Fatalf("Wait() = %+v, %v; want the 1 MiB stored", res, err)
+		}
+		if f.table.Pinned(f.xorb) {
+			t.Fatalf("xorb %s still pinned after the ingest ended", f.xorb)
+		}
+		got := sweepRequest(t, f.handler, "?grace=0").Storage
+		if got == nil || len(got.SweptXorbs) != 0 || got.SkippedPinned != 0 {
+			t.Fatalf("grace=0 sweep after the shard landed = %+v, want no xorb swept or skipped as pinned: the shard references it", got)
+		}
+		if ok, err := f.stor.HasXorb(ctx, f.xorb); err != nil || !ok {
+			t.Fatalf("HasXorb(the stored file's xorb) = %v, %v; want true", ok, err)
+		}
+	})
+
+	t.Run("shard refused", func(t *testing.T) {
+		f := newInFlightFixture(t, errors.New("put shard: refused"))
+		if !f.table.Pinned(f.xorb) {
+			t.Errorf("xorb %s unpinned while the ingest's shard is pending, want it pinned in the spool's table", f.xorb)
+		}
+		f.release()
+		f.join(t)
+		if _, err := f.queue.Wait(ctx, f.writer); err == nil || !strings.Contains(err.Error(), "put shard: refused") {
+			t.Fatalf("Wait() = %v, want the refused shard's error", err)
+		}
+		got := sweepRequest(t, f.handler, "?grace=0").Storage
+		if got == nil || len(got.SweptXorbs) != 1 || got.SweptXorbs[0].Hash != f.xorb.String() {
+			t.Fatalf("grace=0 sweep after the shard was refused = %+v, want exactly the once-pinned xorb %s", got, f.xorb)
+		}
+		if ok, err := f.stor.HasXorb(ctx, f.xorb); err != nil || ok {
+			t.Fatalf("HasXorb(the once-pinned xorb) after the sweep = %v, %v; want false", ok, err)
+		}
+	})
+}
+
+// TestGCSweepEndpointSweepsUnpinnedOrphanDuringIngest: an in-flight ingest shields only the xorbs it pinned, so grace=0 sweeps a young orphan beside it while the pinned one stays.
+func TestGCSweepEndpointSweepsUnpinnedOrphanDuringIngest(t *testing.T) {
+	ctx := context.Background()
+	f := newInFlightFixture(t, nil)
+	orphan := putTestXorb(t, ctx, f.stor, f.base, []byte("young orphan no ingest pinned"), time.Now())
+
+	got := sweepRequest(t, f.handler, "?grace=0").Storage
+	if got == nil {
+		t.Fatal("sweep response carries no storage pass")
+	}
+	var swept []string
+	for _, x := range got.SweptXorbs {
+		swept = append(swept, x.Hash)
+	}
+	if !slices.Equal(swept, []string{orphan.String()}) {
+		t.Fatalf("grace=0 sweep during an in-flight ingest swept xorbs %v, want only the unpinned orphan %s: an ingest widens no grace", swept, orphan)
+	}
+	if ok, err := f.stor.HasXorb(ctx, orphan); err != nil || ok {
+		t.Fatalf("HasXorb(unpinned orphan) after the sweep = %v, %v; want false", ok, err)
+	}
+	if ok, err := f.stor.HasXorb(ctx, f.xorb); err != nil || !ok {
+		t.Fatalf("HasXorb(in-flight ingest's xorb) after the sweep = %v, %v; want true", ok, err)
+	}
+}
+
+// TestGCSweepEndpointHonorsPins: a pin in the table given WithPins holds a xorb of any age, though the handler builds its own GC.
+func TestGCSweepEndpointHonorsPins(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	stor, err := local.NewStorage(local.WithBasePath(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := pins.New[xet.XorbHash]()
+	handler := NewHandler(WithStorage(stor), WithPins(table))
+	pinned := putTestXorb(t, ctx, stor, base, []byte("xorb pinned in the table given WithPins"), time.Now().Add(-48*time.Hour))
+	unpin := table.Pin(pinned)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/internal/gc?grace=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sweep status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var raw struct {
+		Storage map[string]json.RawMessage `json:"storage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeSweep(t, rec); len(got.SweptXorbs) != 0 {
+		t.Fatalf("grace=0 sweep swept xorbs %+v, want none: the xorb is pinned in the table given WithPins", got.SweptXorbs)
+	}
+	if ok, err := stor.HasXorb(ctx, pinned); err != nil || !ok {
+		t.Fatalf("HasXorb(pinned xorb) after the sweep = %v, %v; want true", ok, err)
+	}
+	if got := string(raw.Storage["skipped_pinned"]); got != "1" {
+		t.Fatalf("storage skipped_pinned = %q, want 1", got)
+	}
+
+	unpin()
+	got := sweepRequest(t, handler, "?grace=0").Storage
+	if got == nil || len(got.SweptXorbs) != 1 || got.SweptXorbs[0].Hash != pinned.String() || got.SkippedPinned != 0 {
+		t.Fatalf("grace=0 sweep once unpinned = %+v, want exactly xorb %s swept", got, pinned)
+	}
+	if ok, err := stor.HasXorb(ctx, pinned); err != nil || ok {
+		t.Fatalf("HasXorb(unpinned xorb) after the sweep = %v, %v; want false", ok, err)
+	}
+}
+
+func TestGCSweepEndpointWithoutPinsSweepsPinnedXorb(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	stor, err := local.NewStorage(local.WithBasePath(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(WithStorage(stor))
+	pinned := putTestXorb(t, ctx, stor, base, []byte("xorb pinned in a table the handler never received"), time.Now().Add(-48*time.Hour))
+	table := pins.New[xet.XorbHash]()
+	table.Pin(pinned)
+
+	got := sweepRequest(t, handler, "?grace=0").Storage
+	if got == nil || len(got.SweptXorbs) != 1 || got.SweptXorbs[0].Hash != pinned.String() || got.SkippedPinned != 0 {
+		t.Fatalf("grace=0 sweep without WithPins = %+v, want exactly xorb %s swept and skipped_pinned 0: pins protect only where passed", got, pinned)
+	}
+	if ok, err := stor.HasXorb(ctx, pinned); err != nil || ok {
+		t.Fatalf("HasXorb(xorb pinned in a table the handler never received) after the sweep = %v, %v; want false", ok, err)
 	}
 }
