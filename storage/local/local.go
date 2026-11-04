@@ -213,8 +213,7 @@ func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 func (fs *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	xorbPath := fs.objectPath("xorbs", xorbHash.String())
 
-	// Check if xorb already exists. Dedup hits leave the stored object,
-	// including its mod time, untouched.
+	// A dedup hit leaves the stored object untouched.
 	if _, err := os.Stat(xorbPath); err == nil {
 		return false, nil // Already exists
 	}

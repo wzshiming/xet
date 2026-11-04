@@ -180,9 +180,9 @@ func probeErr(pr *probeResult) error {
 }
 
 // runTask executes one ingestion end to end on a background context carrying
-// the task's pinned credential; client disconnects never cancel it. The
-// writer fetches into its Item and finishes it; every task then waits for
-// the flight's result and publishes it under its key.
+// the task's pinned credential; client disconnects never cancel it. The writer
+// fetches into its Item and finishes it; every task then waits for the flight's
+// result and publishes it under its key; the writer holds its slot throughout.
 func (m *Mirror) runTask(t *task) {
 	ctx := withUpstreamAuth(context.Background(), t.origin, t.token)
 	defer close(t.done) // the entry is published by then, on every path

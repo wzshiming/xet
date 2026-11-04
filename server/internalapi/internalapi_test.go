@@ -1291,7 +1291,7 @@ func TestGCSweepEndpointBudgetSpansPasses(t *testing.T) {
 	}
 }
 
-// putTestXorb stores one unreferenced single-chunk xorb; mtime from Go's clock, which coarse filesystem clocks can trail.
+// putTestXorb stores content as one single-chunk xorb no shard references, its mtime set by Go's clock, which a coarse filesystem clock may trail.
 func putTestXorb(t *testing.T, ctx context.Context, stor storage.Storage, base string, content []byte, mtime time.Time) xet.XorbHash {
 	t.Helper()
 	var encoded bytes.Buffer
@@ -1386,10 +1386,10 @@ func newInFlightFixture(t *testing.T, refuse error) *inFlightFixture {
 		t.Fatalf("the ingest reached no PutShard within %v", wait)
 	}
 	gate.mu.Lock()
-	xorbs := slices.Clone(gate.xorbs)
+	puts := slices.Clone(gate.puts)
 	gate.mu.Unlock()
-	if len(xorbs) != 1 {
-		t.Fatalf("the ingest stored xorbs %v, want one xorb for its 1 MiB", xorbs)
+	if len(puts) != 1 {
+		t.Fatalf("the ingest's PutXorb outcomes = %+v, want one xorb for its 1 MiB", puts)
 	}
 	return &inFlightFixture{
 		handler:  handler,
@@ -1398,7 +1398,7 @@ func newInFlightFixture(t *testing.T, refuse error) *inFlightFixture {
 		base:     base,
 		queue:    queue,
 		writer:   writer,
-		xorb:     xorbs[0],
+		xorb:     puts[0].hash,
 		release:  release,
 		finished: finished,
 	}
@@ -1415,40 +1415,7 @@ func (f *inFlightFixture) join(t *testing.T) {
 	}
 }
 
-// gateStorage records each stored PutXorb's xorb and holds every PutShard, ignoring ctx, until release closes; a set refuse then fails it instead of storing.
-type gateStorage struct {
-	*local.Storage
-	entered chan struct{} // signaled as a PutShard reaches the gate
-	release chan struct{}
-	refuse  error
-
-	mu    sync.Mutex
-	xorbs []xet.XorbHash
-}
-
-func (g *gateStorage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
-	inserted, err := g.Storage.PutXorb(ctx, xorbHash, r)
-	if err == nil {
-		g.mu.Lock()
-		g.xorbs = append(g.xorbs, xorbHash)
-		g.mu.Unlock()
-	}
-	return inserted, err
-}
-
-func (g *gateStorage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
-	select {
-	case g.entered <- struct{}{}:
-	default:
-	}
-	<-g.release
-	if g.refuse != nil {
-		return false, g.refuse
-	}
-	return g.Storage.PutShard(ctx, sh)
-}
-
-// TestGCSweepEndpointSparesInFlightIngest: grace=0 leaves the ingest's pin as its young xorb's only shield.
+// TestGCSweepEndpointSparesInFlightIngest: a grace=0 sweep keeps the xorb an in-flight ingest stored while its shard is pending, counted as skipped_pinned.
 func TestGCSweepEndpointSparesInFlightIngest(t *testing.T) {
 	ctx := context.Background()
 	f := newInFlightFixture(t, nil)
@@ -1557,6 +1524,167 @@ func TestGCSweepEndpointSweepsUnpinnedOrphanDuringIngest(t *testing.T) {
 	}
 	if ok, err := f.stor.HasXorb(ctx, f.xorb); err != nil || !ok {
 		t.Fatalf("HasXorb(in-flight ingest's xorb) after the sweep = %v, %v; want true", ok, err)
+	}
+}
+
+// failingShardStorage refuses every shard, as an ingest that failed before its shard landed.
+type failingShardStorage struct {
+	storage.Storage
+}
+
+func (failingShardStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
+	return false, errors.New("put shard: refused")
+}
+
+// xorbPut is the outcome of one PutXorb a gateStorage stored.
+type xorbPut struct {
+	hash     xet.XorbHash
+	inserted bool
+}
+
+// gateStorage records each stored PutXorb's outcome and holds every PutShard, ignoring ctx, until release closes; a set refuse then fails it instead of storing.
+type gateStorage struct {
+	*local.Storage
+	entered chan struct{} // signaled as a PutShard reaches the gate
+	release chan struct{}
+	refuse  error
+
+	mu   sync.Mutex
+	puts []xorbPut
+}
+
+func (g *gateStorage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+	inserted, err := g.Storage.PutXorb(ctx, xorbHash, r)
+	if err == nil {
+		g.mu.Lock()
+		g.puts = append(g.puts, xorbPut{xorbHash, inserted})
+		g.mu.Unlock()
+	}
+	return inserted, err
+}
+
+func (g *gateStorage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	if g.refuse != nil {
+		return false, g.refuse
+	}
+	return g.Storage.PutShard(ctx, sh)
+}
+
+// TestGCSweepEndpointKeepsReputXorbOfRetry: the xorb a failed attempt left aged survives a sweep once a retry's ingest re-put it, while the retry's shard is pending.
+func TestGCSweepEndpointKeepsReputXorbOfRetry(t *testing.T) {
+	for _, tc := range []struct{ name, query string }{
+		{"default", ""},
+		{"grace=0", "?grace=0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			base := t.TempDir()
+			stor, err := local.NewStorage(local.WithBasePath(base))
+			if err != nil {
+				t.Fatal(err)
+			}
+			gate := &gateStorage{Storage: stor, entered: make(chan struct{}, 1), release: make(chan struct{})}
+			release := sync.OnceFunc(func() { close(gate.release) })
+			gc := storage.NewGC(stor)
+			table := pins.New[xet.XorbHash]()
+			queue, err := spool.NewSpool(filepath.Join(t.TempDir(), "spool"), gate, spool.WithPins(table))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := NewHandler(WithStorage(stor), WithGC(gc), WithPins(table), WithSpool(queue))
+			data := make([]byte, 1<<20)
+			_, _ = rand.NewChaCha8([32]byte{1}).Read(data)
+
+			if _, err := storage.PutFile(ctx, failingShardStorage{Storage: stor}, bytes.NewReader(data)); err == nil {
+				t.Fatal("PutFile() succeeded although its shard was refused")
+			}
+			var stored []string
+			if err := stor.WalkXorbs(ctx, func(hash string, _ int64, _ time.Time) error {
+				stored = append(stored, hash)
+				return nil
+			}); err != nil || len(stored) != 1 {
+				t.Fatalf("xorbs after the failed attempt = %v, %v; want exactly one", stored, err)
+			}
+			orphan, err := xet.ParseXorbHash(stored[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			aged := time.Now().Add(-2 * time.Hour)
+			if err := os.Chtimes(filepath.Join(base, filepath.FromSlash(storage.ObjectKey("xorbs", orphan.String()))), aged, aged); err != nil {
+				t.Fatal(err)
+			}
+
+			writer, err := queue.Accept(ctx, spool.Source{Origin: "https://hub.example", Key: "/org/repo/resolve/main/model.bin", ETag: "etag", Size: int64(len(data))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(writer.Release)
+			t.Cleanup(release) // runs first: writer.Release waits for the held ingest
+			if _, err := writer.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				writer.Finish(ctx, nil)
+			}()
+			wait := testWait(t)
+			bounded, cancel := context.WithTimeout(ctx, wait)
+			defer cancel()
+			select {
+			case <-gate.entered:
+			case <-finished:
+				_, err := queue.Wait(bounded, writer)
+				t.Fatalf("retry's ingest ended before its PutShard: %v", err)
+			case <-time.After(wait):
+				t.Fatalf("retry's ingest reached no PutShard within %v", wait)
+			}
+			gate.mu.Lock()
+			puts := slices.Clone(gate.puts)
+			gate.mu.Unlock()
+			if want := []xorbPut{{orphan, false}}; !slices.Equal(puts, want) {
+				t.Fatalf("retry's PutXorb outcomes = %+v, want %+v: the retry re-puts the stored xorb", puts, want)
+			}
+
+			got := sweepRequest(t, handler, tc.query).Storage
+			if got == nil {
+				t.Fatal("sweep response carries no storage pass")
+			}
+			if len(got.SweptXorbs) != 0 {
+				t.Fatalf("sweep %q while the retry's shard is pending swept xorbs %+v, want none: the retry's ingest pins the xorb it re-put", tc.query, got.SweptXorbs)
+			}
+			if got.SkippedPinned < 1 {
+				t.Fatalf("skipped_pinned = %d, want the re-put xorb counted", got.SkippedPinned)
+			}
+			if ok, err := stor.HasXorb(ctx, orphan); err != nil || !ok {
+				t.Fatalf("HasXorb(re-put xorb) after the sweep = %v, %v; want true", ok, err)
+			}
+
+			release()
+			res, err := queue.Wait(bounded, writer)
+			if err != nil || res.Size != int64(len(data)) {
+				t.Fatalf("retry's Wait() = %+v, %v; want its %d bytes stored", res, err, len(data))
+			}
+			select {
+			case <-finished:
+			case <-bounded.Done():
+				t.Fatalf("retry's Finish did not return within %v", wait)
+			}
+			rc, err := stor.GetReconstructedFile(ctx, sha256.Sum256(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, err := io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil || !bytes.Equal(content, data) {
+				t.Fatalf("reconstructed %d bytes, %v; want the %d the retry stored", len(content), err, len(data))
+			}
+		})
 	}
 }
 

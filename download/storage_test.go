@@ -60,10 +60,11 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 	if _, err := storage.PutFile(ctx, st, bytes.NewReader(first)); err != nil {
 		t.Fatal(err)
 	}
-	fileHash, err := storage.PutFile(ctx, st, bytes.NewReader(second))
+	stored, err := storage.PutFile(ctx, st, bytes.NewReader(second))
 	if err != nil {
 		t.Fatal(err)
 	}
+	fileHash := stored.FileHash
 	sh, err := st.GetShard(ctx, fileHash)
 	if err != nil {
 		t.Fatal(err)

@@ -211,6 +211,7 @@ func WithRevalidateInterval(d time.Duration) Option {
 }
 
 // WithMaxConcurrentIngests limits active ingests; nonpositive values use 16.
+// It bounds writers from download to publish; an adopted leftover is chunked into storage without a slot.
 func WithMaxConcurrentIngests(n int) Option {
 	return func(m *Mirror) { m.maxIngests = n }
 }
