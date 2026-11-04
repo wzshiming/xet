@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -417,4 +418,80 @@ func TestMergeConcurrentReaders(t *testing.T) {
 		t.Fatalf("got entries %v, want single %q", names, cacheFileName(0, 4, 0, 200))
 	}
 	verifyChunks(t, dir, testCacheHash, want)
+}
+
+func TestMergeSkipsEntryLockedByStreamingWrite(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	m.mergeQuiet = time.Hour
+	hash := testXorbHash(0xf1)
+	writeRangeEntry(t, m, hash.String(), 0, 2, 0, 100, []string{"aaa", "bbb"})
+	writeRangeEntry(t, m, hash.String(), 2, 4, 100, 200, []string{"ccc", "ddd"})
+
+	// A download streams the very range the merge would write, holding its
+	// entry lock until the stream ends.
+	w := m.newWriter(1)
+	e := mustBegin(t, w, cacheKey{Hash: hash, ChunkStart: 0, ChunkEnd: 4, ByteEnd: 200}, func() {})
+	e.advance([]byte("aaa"))
+
+	passed := make(chan struct{})
+	go func() {
+		defer close(passed)
+		if err := mergeHashDir(m, hash.String()); err != nil {
+			t.Error(err)
+		}
+	}()
+	if !within(t, "a merge pass on an entry locked by a streaming write", passed) {
+		t.FailNow()
+	}
+	unmerged := []string{cacheFileName(0, 2, 0, 100), cacheFileName(0, 4, 0, 200), cacheFileName(2, 4, 100, 200)}
+	if names := listEntryNames(t, dir, hash.String()); !slices.Equal(names, unmerged) {
+		t.Fatalf("got entries %v, want the sources and the streamed entry %v", names, unmerged)
+	}
+
+	e.abort()
+	w.wait()
+	if err := mergeHashDir(m, hash.String()); err != nil {
+		t.Fatal(err)
+	}
+	if names, want := listEntryNames(t, dir, hash.String()), []string{cacheFileName(0, 4, 0, 200)}; !slices.Equal(names, want) {
+		t.Fatalf("got entries %v after the stream ended, want %v", names, want)
+	}
+	verifyChunks(t, dir, hash.String(), []string{"aaa", "bbb", "ccc", "ddd"})
+}
+
+func TestMergeWorkerRetriesEntryLockedByStreamingWrite(t *testing.T) {
+	dir := t.TempDir()
+	m := NewCacheManager(dir, 0)
+	m.mergeQuiet = 10 * time.Millisecond
+	streamed, other := testXorbHash(0xf2), testXorbHash(0xf3)
+
+	// A download streams the range a merge of streamed's entries would write;
+	// its hint comes first, so the worker meets the held lock before other.
+	w := m.newWriter(1)
+	e := mustBegin(t, w, cacheKey{Hash: streamed, ChunkStart: 0, ChunkEnd: 4, ByteEnd: 200}, func() {})
+	e.advance([]byte("aaa"))
+	for _, hash := range []string{streamed.String(), other.String()} {
+		writeRangeEntry(t, m, hash, 0, 2, 0, 100, []string{"aaa", "bbb"})
+		writeRangeEntry(t, m, hash, 2, 4, 100, 200, []string{"ccc", "ddd"})
+	}
+
+	merged := []string{cacheFileName(0, 4, 0, 200)}
+	awaitMerged := func(hash, what string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for names := listEntryNames(t, dir, hash); !slices.Equal(names, merged); names = listEntryNames(t, dir, hash) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s, still have %v", what, names)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	awaitMerged(other.String(), "worker did not compact another hash while a stream held a merge target")
+
+	// Ending the stream unsealed hints nothing, so only a retry merges.
+	e.abort()
+	w.wait()
+	awaitMerged(streamed.String(), "worker did not retry the merge after the stream ended")
+	verifyChunks(t, dir, streamed.String(), []string{"aaa", "bbb", "ccc", "ddd"})
 }

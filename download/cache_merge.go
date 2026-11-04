@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -42,8 +43,9 @@ func (r *cachedChunkReader) Read(p []byte) (int, error) {
 // mergeHashDir compacts the cache directory of one xorb hash: runs of sealed
 // entries whose chunk ranges touch or overlap are rewritten as one covering
 // entry and the now-redundant sources are unlinked. Entries vanishing
-// mid-pass are left to normal eviction; sources kept because they are in use
-// or locked elsewhere re-arm the merge hint so a later pass retries.
+// mid-pass are left to normal eviction; a run whose covering entry another
+// writer holds, and sources kept because they are in use or locked elsewhere,
+// re-arm the merge hint so a later pass retries without waiting on a lock.
 func mergeHashDir(m *CacheManager, hash string) error {
 	if len(hash) < minCacheHashLen {
 		return nil
@@ -108,8 +110,9 @@ func mergeHashDir(m *CacheManager, hash string) error {
 	}
 	if retry {
 		// Readers may pin a source across this pass and never hint again
-		// once the covering entry serves them; retry after another quiet
-		// period so the directory still converges to one entry.
+		// once the covering entry serves them, and a writer holding the
+		// covering entry may end without sealing it; retry after another
+		// quiet period so the directory still converges to one entry.
 		m.noteMergeCandidate(hash)
 	}
 	return firstErr
@@ -118,7 +121,8 @@ func mergeHashDir(m *CacheManager, hash string) error {
 // mergeRun replaces the entries in run with one entry covering
 // [chunkStart, chunkEnd), reusing an existing covering entry when present.
 // kept reports that a redundant source had to be left behind because it is
-// still in use or locked elsewhere.
+// still in use or locked elsewhere, or the whole run because another writer
+// holds the covering entry.
 func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, chunkEnd uint32) (kept bool, err error) {
 	bytesStart := run[0].bytesStart
 	bytesEnd := run[0].bytesEnd
@@ -132,6 +136,11 @@ func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, ch
 	}
 	if covering == "" {
 		covering, err = writeMergedEntry(m, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+		if errors.Is(err, context.Canceled) {
+			// Another writer, such as a download streaming this range, holds
+			// the entry; leave the whole run to a later pass.
+			return true, nil
+		}
 		if err != nil || covering == "" {
 			return false, err
 		}
@@ -149,16 +158,18 @@ func mergeRun(m *CacheManager, hash string, run []mergeCandidate, chunkStart, ch
 
 // writeMergedEntry rewrites the already-cached chunks [chunkStart, chunkEnd)
 // as one sealed entry and returns its path, or "" when the range can no
-// longer be assembled because a source was evicted mid-pass.
+// longer be assembled because a source was evicted mid-pass. It does not wait
+// for the entry lock: while another writer holds it, it fails with an error
+// wrapping context.Canceled.
 func writeMergedEntry(m *CacheManager, hash string, chunkStart, chunkEnd uint32, bytesStart, bytesEnd int64) (string, error) {
-	lockFile, err := lockChunkCache(context.Background(), m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
+	lockFile, err := lockChunkCache(lockNoWait, m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 	if err != nil {
 		return "", err
 	}
 	path := cacheFilePath(m.dir, hash, chunkStart, chunkEnd, bytesStart, bytesEnd)
 
-	// A contender may have sealed the same merged entry while this one
-	// waited on the lock.
+	// A contender may have sealed the same merged entry since the directory
+	// was listed.
 	if info, statErr := os.Stat(path); statErr == nil && isCompleteCacheFile(path, chunkStart, chunkEnd, info.Size()) {
 		flock.Unlock(lockFile) //nolint:errcheck
 		lockFile.Close()
