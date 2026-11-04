@@ -162,10 +162,11 @@ type Mirror struct {
 	ingestSlots        chan struct{}
 	transport          http.RoundTripper
 
-	probeClient *http.Client  // does not follow redirects; used for metadata probes
-	fetchClient *http.Client  // follows redirects; body drops resume via httpseek
-	hubClient   *http.Client  // hub and CAS requests of the per-download hf clients; hf.NewClient adds the no-redirect and idle guards
-	cache       *client.Cache // chunk cache shared by the per-download xet clients
+	probeClient *http.Client           // does not follow redirects; used for metadata probes
+	fetchClient *http.Client           // follows redirects; body drops resume via httpseek
+	hubClient   *http.Client           // hub and CAS requests of the per-download hf clients; hf.NewClient adds the no-redirect and idle guards
+	cache       *client.Cache          // chunk cache shared by the per-download xet clients
+	budget      *download.MemoryBudget // memory budget shared by the per-download xet clients
 	clientOpts  []client.Options
 	spool       *spool.Spool // the downloads in flight and their spools; shares, verifies and ingests them into storage
 
@@ -197,7 +198,7 @@ func WithSpool(s *spool.Spool) Option {
 	return func(m *Mirror) { m.spool = s }
 }
 
-// WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache and upstream provider itself (WithCache in opts replaces the mirror's cache).
+// WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache, memory budget and upstream provider itself (WithCache or WithMemoryBudget in opts replaces the mirror's).
 func WithClientOptions(opts ...client.Options) Option {
 	return func(m *Mirror) { m.clientOpts = opts }
 }
@@ -277,6 +278,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 
 	m.hubClient = &http.Client{Transport: m.transport}
 	m.cache = client.NewCache(m.cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)
+	m.budget = download.NewMemoryBudget(download.DefaultMemorySizes())
 
 	if m.spool == nil {
 		sp, err := spool.NewSpool(filepath.Join(m.cacheDir, "spool"), m.storage)
@@ -289,7 +291,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	return m, nil
 }
 
-// newClient binds a xet client to repo with token for one download: the mirror's transport and cache, the caller's options, and the repository's token endpoints bound last.
+// newClient binds a xet client to repo with token for one download: the mirror's transport, cache and memory budget, the caller's options, and the repository's token endpoints bound last.
 func (m *Mirror) newClient(repo hf.Repo, token string) (*hf.Client, error) {
-	return hf.NewClient(repo, hf.WithHTTPClient(m.hubClient), hf.WithToken(token), hf.WithClientOptions(append([]client.Options{client.WithCache(m.cache)}, m.clientOpts...)...))
+	return hf.NewClient(repo, hf.WithHTTPClient(m.hubClient), hf.WithToken(token), hf.WithClientOptions(append([]client.Options{client.WithCache(m.cache), client.WithMemoryBudget(m.budget)}, m.clientOpts...)...))
 }
