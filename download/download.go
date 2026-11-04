@@ -69,9 +69,14 @@ type fileVerifier struct {
 	sizes    []uint64
 }
 
-func (v *fileVerifier) add(chunk []byte) {
-	v.hashes = append(v.hashes, xet.ComputeChunkHash(chunk))
-	v.sizes = append(v.sizes, uint64(len(chunk)))
+// add records one chunk occurrence, hashing data only when no decoder did.
+func (v *fileVerifier) add(m chunkRef, data []byte) {
+	hash := m.hash
+	if !m.hashed {
+		hash = xet.ComputeChunkHash(data)
+	}
+	v.hashes = append(v.hashes, hash)
+	v.sizes = append(v.sizes, uint64(len(data)))
 }
 
 func (v *fileVerifier) verify() error {

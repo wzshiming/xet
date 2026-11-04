@@ -116,7 +116,7 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 		}
 
 		// Get chunk on demand by index
-		size, chunkErr := r.currentCache.Chunk(r.chunkIdx, buf[:])
+		ref, chunkErr := r.currentCache.readChunk(r.chunkIdx, buf[:])
 		if chunkErr != nil {
 			r.err = chunkErr
 			r.cleanup()
@@ -126,11 +126,12 @@ func (r *ReaderV1) Read(p []byte) (n int, err error) {
 			return 0, chunkErr
 		}
 
+		size := int64(ref.size)
 		data := buf[:size]
 
-		// A chunk is re-read when Read returns mid-chunk; hash it only on its first visit.
+		// A chunk is re-read when Read returns mid-chunk; verify it only on its first visit.
 		if r.verifier != nil && r.chunkOffset == 0 {
-			r.verifier.add(data)
+			r.verifier.add(ref, data)
 		}
 
 		// Apply OffsetIntoFirstRange skip; it may span multiple leading chunks
