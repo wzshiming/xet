@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
@@ -40,7 +41,6 @@ type termReader struct {
 	concurrency int
 	started     bool // the first Read or WriteTo started the dispatcher
 	detach      func()
-	progress    progress.ProgressFunc
 	verify      bool
 	admitted    chan struct{}  // one token per term the dispatcher admitted, in order
 	workers     sync.WaitGroup // the dispatcher and the fetches
@@ -74,7 +74,8 @@ type rangeFetch struct {
 	last       int    // index of the last term the fetch serves
 	started    bool   // the dispatcher started the fetch
 
-	delivered chan struct{} // closed once its last term is delivered
+	progress  *rangeProgress // shared by the fetches of the range; nil without WithProgressFunc
+	delivered chan struct{}  // closed once its last term is delivered
 
 	done    chan struct{}   // closed once the fields below are set
 	data    []byte          // decoded chunks in order
@@ -114,19 +115,32 @@ func checkFetchRange(term *Term, chunks ChunkRange, span ByteRange) error {
 	return nil
 }
 
+// rangeProgress reports the bytes of a range's fetches under the range's
+// name, counting on from one fetch to the next.
+type rangeProgress struct {
+	report  progress.ProgressFunc
+	name    string
+	total   int64 // the range's length times the fetches planned for it
+	current atomic.Int64
+}
+
+// add reports n more bytes of the range; it does nothing on a nil rangeProgress.
+func (p *rangeProgress) add(n int64) {
+	if p == nil {
+		return
+	}
+	p.report(p.name, p.current.Add(n), p.total)
+}
+
 type progressReader struct {
-	r            io.Reader
-	name         string
-	current      int64
-	total        int64
-	progressFunc progress.ProgressFunc
+	r        io.Reader
+	progress *rangeProgress
 }
 
 func (r *progressReader) Read(p []byte) (int, error) {
 	n, err := r.r.Read(p)
-	if n > 0 && r.progressFunc != nil {
-		r.current += int64(n)
-		r.progressFunc(r.name, r.current, r.total)
+	if n > 0 {
+		r.progress.add(int64(n))
 	}
 	return n, err
 }
@@ -168,19 +182,29 @@ func newTermReader(ctx context.Context, client ClientAdapter, terms []Term, offs
 		budget:      budget,
 		concurrency: concurrency,
 		detach:      func() {},
-		progress:    o.progressFunc,
 		verify:      verifier != nil,
 		admitted:    make(chan struct{}, len(terms)),
 		failed:      make(chan struct{}),
 		verifier:    verifier,
 	}
-	if r.progress != nil {
-		reported := make(map[fetchKey]bool, len(fetches))
-		for _, f := range fetches {
-			if !reported[f.key] {
-				reported[f.key] = true
-				r.progress(f.key.String(), 0, f.key.Size())
+	if o.progressFunc != nil {
+		ranges := make(map[fetchKey]*rangeProgress)
+		var order []*rangeProgress
+		for i, f := range fetches {
+			p := ranges[f.key]
+			if p == nil {
+				p = &rangeProgress{report: o.progressFunc, name: f.key.String()}
+				ranges[f.key] = p
+				order = append(order, p)
 			}
+			// A fetch has one last term, so this counts each fetch of the range once.
+			if f.last == i {
+				p.total += f.key.Size()
+			}
+			f.progress = p
+		}
+		for _, p := range order {
+			p.report(p.name, 0, p.total)
 		}
 	}
 	return r, nil
@@ -379,9 +403,7 @@ func (r *termReader) readCached(f *rangeFetch, c *cachedChunks) error {
 			}
 		}
 	}
-	if r.progress != nil {
-		r.progress(f.key.String(), f.key.Size(), f.key.Size())
-	}
+	f.progress.add(f.key.Size())
 	return nil
 }
 
@@ -401,13 +423,8 @@ func (r *termReader) download(f *rangeFetch) error {
 	defer stop()
 
 	var body io.Reader = rc
-	if r.progress != nil {
-		body = &progressReader{
-			r:            rc,
-			name:         f.key.String(),
-			total:        f.key.Size(),
-			progressFunc: r.progress,
-		}
+	if f.progress != nil {
+		body = &progressReader{r: rc, progress: f.progress}
 	}
 	var entry *entryWrite
 	if f.cacheable {

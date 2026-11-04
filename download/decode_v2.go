@@ -82,7 +82,9 @@ func selectFetchInfoV2(reconstruction *ReconstructionResponseV2, term *Term) (*X
 }
 
 // ExpectedTransferBytesV2 computes the total compressed bytes that will be transferred
-// over the network when reconstructing a V2 file. Deduplicated ranges are counted once.
+// over the network when reconstructing a V2 file. Deduplicated ranges are counted once,
+// and a range a reader fetches again beyond its window (see WithConcurrency) is not
+// counted again.
 func ExpectedTransferBytesV2(reconstruction *ReconstructionResponseV2) int64 {
 	tasks, err := planReaderV2(reconstruction)
 	if err != nil {

@@ -59,10 +59,12 @@ func WithMemoryBudget(budget *MemoryBudget) Option {
 }
 
 // WithProgressFunc sets a callback to receive download progress updates.
-// name identifies one fetched xorb range in the callback, and total, its
-// length in bytes, is reported before any range is fetched. current counts the
-// response body bytes as they arrive, so it ends at total; a range served from
-// the cache reports total at once.
+// name identifies one xorb range in the callback, and total, its length in
+// bytes times the fetches of it, is reported before any range is fetched; a
+// range read again beyond the window is fetched again (see WithConcurrency).
+// current counts the response body bytes as they arrive, on from one fetch of
+// the range to the next, so it never decreases and ends at total; a fetch
+// served from the cache counts the range's length at once.
 func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc

@@ -475,6 +475,90 @@ func TestTermReaderRefetchesRangeBeyondWindow(t *testing.T) {
 	}
 }
 
+// TestTermReaderReportsRefetchesCumulatively reads a range again beyond the
+// window, so the reader fetches it twice: its progress counts on from the
+// first fetch under the same name, never decreasing, to a total of both
+// fetches.
+func TestTermReaderReportsRefetchesCumulatively(t *testing.T) {
+	x := newFixtureXorb(t, 0x44, randomChunks(45, 2, 1000))
+	a, b := ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 1, End: 2}
+	terms := []fixtureTerm{{a, a}, {b, b}, {a, a}}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			var mu sync.Mutex
+			reports := map[string][][2]int64{}
+			progress := func(name string, current, total int64) {
+				mu.Lock()
+				defer mu.Unlock()
+				reports[name] = append(reports[name], [2]int64{current, total})
+			}
+			client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
+			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithConcurrency(1), WithProgressFunc(progress))
+			if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, x.file(terms)) {
+				t.Fatalf("read %d bytes, %v", len(got), err)
+			}
+			if n := client.gets.Load(); n != 3 {
+				t.Fatalf("%d GETs, want range a fetched twice: 3", n)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, rg := range []struct {
+				chunks  ChunkRange
+				fetches int64
+			}{{a, 2}, {b, 1}} {
+				span := x.span(rg.chunks)
+				key := fetchKey{Hash: x.hash, Start: span.Start, End: span.End}
+				total := rg.fetches * key.Size()
+				got := reports[key.String()]
+				if len(got) == 0 || got[0] != [2]int64{0, total} || got[len(got)-1] != [2]int64{total, total} {
+					t.Fatalf("%s reports %v, want them to go from {0 %d} to {%d %d}", key, got, total, total, total)
+				}
+				for i := 1; i < len(got); i++ {
+					if got[i][0] < got[i-1][0] || got[i][1] != total {
+						t.Fatalf("%s reports %v, want current never to decrease and total to stay %d", key, got, total)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestTermReaderReportsCachedRangeComplete serves a range from the cache: its
+// progress reports the whole range done although nothing is downloaded.
+func TestTermReaderReportsCachedRangeComplete(t *testing.T) {
+	chunks := randomChunks(46, 2, 1000)
+	x := newFixtureXorb(t, 0x45, chunks)
+	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 2}, ChunkRange{Start: 0, End: 2}}}
+	span := x.span(terms[0].fetch)
+	key := fetchKey{Hash: x.hash, Start: span.Start, End: span.End}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			writeRangeEntry(t, NewCacheManager(dir, 0), x.hash, 0, 2, span.Start, span.End, []string{string(chunks[0]), string(chunks[1])})
+			var mu sync.Mutex
+			last := map[string][2]int64{}
+			progress := func(name string, current, total int64) {
+				mu.Lock()
+				defer mu.Unlock()
+				last[name] = [2]int64{current, total}
+			}
+			refusing := &refusingClient{}
+			r := openTermReader(t, version, context.Background(), refusing, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)), WithProgressFunc(progress))
+			if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, x.file(terms)) {
+				t.Fatalf("read %d bytes, %v", len(got), err)
+			}
+			if n := refusing.calls.Load(); n != 0 {
+				t.Fatalf("%d GETs, want the range from the cache", n)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if got, want := last[key.String()], [2]int64{key.Size(), key.Size()}; len(last) != 1 || got != want {
+				t.Fatalf("last reports %v, want %s at %v", last, key, want)
+			}
+		})
+	}
+}
+
 // TestTermReaderCreatesNoFiles pins that terms stay in memory: a download
 // larger than its budget creates no file in the temporary directory, and with
 // a cache files only in the cache directory.
