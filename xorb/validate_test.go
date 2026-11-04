@@ -175,8 +175,8 @@ func TestValidateRejectsChunkSizeNotMatchingPayload(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := Validate(bytes.NewReader(tt.data), forged)
-			if err == nil || !strings.Contains(err.Error(), "chunk size mismatch") {
-				t.Fatalf("Validate() error = %v, want chunk size mismatch", err)
+			if err == nil || !strings.Contains(err.Error(), "decompressed size mismatch") {
+				t.Fatalf("Validate() error = %v, want decompressed size mismatch", err)
 			}
 		})
 	}

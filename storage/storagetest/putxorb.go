@@ -54,8 +54,8 @@ func testPutXorbRejectsForgedChunkSizes(t *testing.T, b Backend) {
 	}
 	forged := xet.ComputeXorbHash(hashes, sizes)
 
-	if _, err := st.PutXorb(ctx, forged, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "chunk size mismatch") {
-		t.Fatalf("PutXorb(forged sizes) error = %v, want chunk size mismatch", err)
+	if _, err := st.PutXorb(ctx, forged, bytes.NewReader(encoded)); err == nil || !strings.Contains(err.Error(), "decompressed size mismatch") {
+		t.Fatalf("PutXorb(forged sizes) error = %v, want decompressed size mismatch", err)
 	}
 	if ok, err := st.HasXorb(ctx, forged); err != nil || ok {
 		t.Fatalf("HasXorb(forged) = %v, %v; want absent", ok, err)

@@ -32,7 +32,7 @@ func TestLZ4CompressionDecompression(t *testing.T) {
 			}
 
 			// Decompress
-			decompressed, err := decompressLZ4(nil, compressed, size)
+			decompressed, err := decompressLZ4(make([]byte, 0, size+1), compressed, size)
 			if err != nil {
 				t.Fatalf("Decompression failed: %v", err)
 			}
@@ -81,7 +81,7 @@ func TestByteGrouping4Compression(t *testing.T) {
 			}
 
 			// Decompress
-			decompressed, err := decompressByteGrouping4LZ4(nil, compressed, size)
+			decompressed, err := decompressByteGrouping4LZ4(make([]byte, 0, size), compressed, size)
 			if err != nil {
 				t.Fatalf("Decompression failed: %v", err)
 			}
@@ -111,14 +111,20 @@ func TestByteGrouping4Transform(t *testing.T) {
 	for i, data := range testData {
 		t.Run(string(rune(i)), func(t *testing.T) {
 			// Apply transform
-			transformed := applyByteGrouping4(nil, data)
+			transformed, err := applyByteGrouping4(make([]byte, 0, len(data)), data)
+			if err != nil {
+				t.Fatalf("Transform failed: %v", err)
+			}
 
 			if len(transformed) != len(data) {
 				t.Errorf("Transform changed size: got %d, expected %d", len(transformed), len(data))
 			}
 
 			// Reverse transform
-			reversed := reverseByteGrouping4(nil, transformed)
+			reversed, err := reverseByteGrouping4(make([]byte, 0, len(data)), transformed)
+			if err != nil {
+				t.Fatalf("Reverse transform failed: %v", err)
+			}
 
 			if len(reversed) != len(data) {
 				t.Errorf("Reverse changed size: got %d, expected %d", len(reversed), len(data))
@@ -162,9 +168,9 @@ func TestSelectBestCompression(t *testing.T) {
 			case CompressionNone:
 				decompressed = compressed
 			case CompressionLZ4:
-				decompressed, err = decompressLZ4(nil, compressed, len(tc.data))
+				decompressed, err = decompressLZ4(make([]byte, 0, len(tc.data)+1), compressed, len(tc.data))
 			case CompressionByteGrouping4:
-				decompressed, err = decompressByteGrouping4LZ4(nil, compressed, len(tc.data))
+				decompressed, err = decompressByteGrouping4LZ4(make([]byte, 0, len(tc.data)), compressed, len(tc.data))
 			default:
 				t.Fatalf("Unknown compression type: %d", compressionType)
 			}
@@ -191,6 +197,7 @@ func TestCompressLZ4WritesXetCoreFrames(t *testing.T) {
 		{"bg4", compressByteGrouping4LZ4, decompressByteGrouping4LZ4},
 	}
 	// BD bits 4-6 hold the block maximum size id: 4 = 64 KB, 5 = 256 KB, 7 = 4 MB.
+	// bg4 inputs must fit the pooled chunk buffer its transform writes into.
 	sizes := []struct {
 		n       int
 		bd      byte
@@ -201,7 +208,7 @@ func TestCompressLZ4WritesXetCoreFrames(t *testing.T) {
 		{64 << 10, 0x40, false},
 		{64<<10 + 1, 0x50, false},
 		{xet.MaxChunkSize, 0x50, false},
-		{256 << 10, 0x50, false},
+		{256 << 10, 0x50, true},
 		{256<<10 + 1, 0x70, true},
 	}
 	// Rounds over all sizes make later calls reuse pooled writers, also after other block sizes.
@@ -226,7 +233,7 @@ func TestCompressLZ4WritesXetCoreFrames(t *testing.T) {
 					if end := frame[len(frame)-4:]; !bytes.Equal(end, []byte{0, 0, 0, 0}) {
 						t.Errorf("frame ends with %x, want the end mark 00000000 and no content checksum", end)
 					}
-					if got, err := c.decompress(nil, frame, size.n); err != nil || !bytes.Equal(got, data) {
+					if got, err := c.decompress(make([]byte, 0, size.n+1), frame, size.n); err != nil || !bytes.Equal(got, data) {
 						t.Errorf("round trip = %d bytes, %v; want the %d-byte input", len(got), err, size.n)
 					}
 				})
@@ -249,7 +256,7 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Decompress and verify
-		decompressed, err := decompressLZ4(nil, result, len(data))
+		decompressed, err := decompressLZ4(make([]byte, 0, len(data)+1), result, len(data))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -264,7 +271,7 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Reuse a buffer across multiple decompressions
-		var buf []byte
+		buf := make([]byte, 0, len(data)+1)
 		for range 3 {
 			buf, err = decompressLZ4(buf[:0], compressed, len(data))
 			if err != nil {
@@ -277,28 +284,35 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 	})
 
 	t.Run("byteGrouping4_roundtrip_reuse", func(t *testing.T) {
-		var transformBuf, reverseBuf []byte
+		transformBuf := make([]byte, 0, len(data))
+		reverseBuf := make([]byte, 0, len(data))
 		for range 3 {
-			transformBuf = applyByteGrouping4(transformBuf[:0], data)
-			reverseBuf = reverseByteGrouping4(reverseBuf[:0], transformBuf)
+			var err error
+			if transformBuf, err = applyByteGrouping4(transformBuf[:0], data); err != nil {
+				t.Fatal(err)
+			}
+			if reverseBuf, err = reverseByteGrouping4(reverseBuf[:0], transformBuf); err != nil {
+				t.Fatal(err)
+			}
 			if !bytes.Equal(data, reverseBuf) {
 				t.Error("Round-trip with buffer reuse failed")
 			}
 		}
 	})
 
-	t.Run("decompressChunk_reuse", func(t *testing.T) {
+	t.Run("DecodeChunk_reuse", func(t *testing.T) {
 		compressed, ct, err := selectBestCompression(nil, data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var buf []byte
+		h := ChunkHeader{CompressedSize: uint32(len(compressed)), UncompressedSize: uint32(len(data)), Compression: ct}
+		buf := make([]byte, len(data)+1)
 		for range 3 {
-			buf, err = decompressChunk(buf[:0], compressed, ct, len(data))
+			got, err := DecodeChunk(buf, h, compressed)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(data, buf) {
+			if !bytes.Equal(data, got) {
 				t.Error("Decompressed data doesn't match original")
 			}
 		}
@@ -314,6 +328,53 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestCodecsRejectDstWithoutSpareCapacity: a dst one byte short fails untouched; an exact one is filled in place.
+func TestCodecsRejectDstWithoutSpareCapacity(t *testing.T) {
+	data := payloadForTest(4099, 12)
+	lz4Frame, err := compressLZ4(nil, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bg4Frame, err := compressByteGrouping4LZ4(nil, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := []byte{0xde, 0xad, 0xbe, 0xef, 0x01}
+	for _, c := range []struct {
+		name string
+		need int
+		run  func(dst []byte) ([]byte, error)
+	}{
+		{"decompressLZ4", len(data) + 1, func(dst []byte) ([]byte, error) { return decompressLZ4(dst, lz4Frame, len(data)) }},
+		{"decompressByteGrouping4LZ4", len(data), func(dst []byte) ([]byte, error) { return decompressByteGrouping4LZ4(dst, bg4Frame, len(data)) }},
+		{"applyByteGrouping4", len(data), func(dst []byte) ([]byte, error) { return applyByteGrouping4(dst, data) }},
+		{"reverseByteGrouping4", len(data), func(dst []byte) ([]byte, error) { return reverseByteGrouping4(dst, data) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			short := append(make([]byte, 0, len(prefix)+c.need-1), prefix...)
+			full := short[:cap(short)]
+			for i := len(prefix); i < len(full); i++ {
+				full[i] = 0xA5
+			}
+			before := bytes.Clone(full)
+			got, err := c.run(short)
+			want := fmt.Sprintf("output buffer too small: need capacity %d, have %d", len(prefix)+c.need, len(prefix)+c.need-1)
+			if err == nil || err.Error() != want || !bytes.Equal(got, prefix) {
+				t.Errorf("%s(dst with %d spare bytes) = %d bytes, %v; want dst unchanged and %q", c.name, c.need-1, len(got), err, want)
+			}
+			if !bytes.Equal(full, before) {
+				t.Errorf("failed %s(dst with %d spare bytes) wrote into dst", c.name, c.need-1)
+			}
+
+			exact := append(make([]byte, 0, len(prefix)+c.need), prefix...)
+			got, err = c.run(exact)
+			if err != nil || &got[0] != &exact[0] || !bytes.Equal(got[:len(prefix)], prefix) {
+				t.Errorf("%s(dst with %d spare bytes) = %d bytes, %v; want the output appended to dst in place", c.name, c.need, len(got), err)
+			}
+		})
+	}
 }
 
 func BenchmarkCompressLZ4(b *testing.B) {
@@ -344,7 +405,7 @@ func BenchmarkDecompressLZ4(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
-	var buf []byte
+	buf := make([]byte, 0, len(data)+1)
 	for b.Loop() {
 		buf, err = decompressLZ4(buf[:0], compressed, len(data))
 		if err != nil {

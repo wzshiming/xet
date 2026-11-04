@@ -5,32 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/wzshiming/xet/internal/pool"
 )
-
-// decompressChunk decompresses a chunk using the specified compression type.
-// The result is appended to dst; pass nil to allocate a new slice.
-// For CompressionNone with nil dst, data is returned directly without copying;
-// the caller must not modify the returned slice as it aliases the input.
-func decompressChunk(dst, data []byte, compressionType CompressionType, uncompressedSize int) ([]byte, error) {
-	switch compressionType {
-	case CompressionNone:
-		if dst == nil {
-			return data, nil
-		}
-		return append(dst, data...), nil
-	case CompressionLZ4:
-		return decompressLZ4(dst, data, uncompressedSize)
-	case CompressionByteGrouping4:
-		return decompressByteGrouping4LZ4(dst, data, uncompressedSize)
-	default:
-		return dst, fmt.Errorf("unsupported compression type: %d", compressionType)
-	}
-}
 
 // compressLZ4 compresses data using LZ4 Frame format.
 // The result is appended to dst; pass nil to allocate a new slice.
@@ -63,11 +42,14 @@ func compressLZ4(dst, data []byte) ([]byte, error) {
 }
 
 // decompressLZ4 decompresses LZ4 Frame format data.
-// The result is appended to dst; pass nil to allocate a new slice.
+// The result is appended to dst, whose spare capacity must hold uncompressedSize bytes plus a scratch byte.
 func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	off := len(dst)
 	// The spare byte makes the reader consume the frame's end mark, catching over-long frames, trailing bytes and a bad content checksum when the frame declares one.
-	dst = slices.Grow(dst, uncompressedSize+1)[:off+uncompressedSize+1]
+	if cap(dst)-off < uncompressedSize+1 {
+		return dst, fmt.Errorf("output buffer too small: need capacity %d, have %d", off+uncompressedSize+1, cap(dst))
+	}
+	dst = dst[:off+uncompressedSize+1]
 
 	fr := lz4ReaderPool.Get().(*lz4FrameReader)
 	fr.src.Reset(data)
@@ -92,16 +74,19 @@ func decompressLZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 }
 
 // compressByteGrouping4LZ4 applies ByteGrouping4 transform then LZ4 compression.
-// The result is appended to dst; pass nil to allocate a new slice.
+// The result is appended to dst; pass nil to allocate a new slice. data must fit in a pooled chunk buffer.
 func compressByteGrouping4LZ4(dst, data []byte) ([]byte, error) {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
-	transformed := applyByteGrouping4(tmp[:0], data)
+	transformed, err := applyByteGrouping4(tmp[:0], data)
+	if err != nil {
+		return dst, err
+	}
 	return compressLZ4(dst, transformed)
 }
 
 // decompressByteGrouping4LZ4 decompresses LZ4 then reverses ByteGrouping4 transform.
-// The result is appended to dst; pass nil to allocate a new slice.
+// The result is appended to dst, whose spare capacity must hold uncompressedSize bytes.
 func decompressByteGrouping4LZ4(dst, data []byte, uncompressedSize int) ([]byte, error) {
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
@@ -109,20 +94,23 @@ func decompressByteGrouping4LZ4(dst, data []byte, uncompressedSize int) ([]byte,
 	if err != nil {
 		return dst, err
 	}
-	return reverseByteGrouping4(dst, decompressed), nil
+	return reverseByteGrouping4(dst, decompressed)
 }
 
 // applyByteGrouping4 reorganizes bytes by position within 4-byte groups.
 // Original: [A0 A1 A2 A3 | B0 B1 B2 B3 | ...]
 // Grouped: [A0 B0 C0 ... | A1 B1 C1 ... | A2 B2 C2 ... | A3 B3 C3 ...]
-// The result is appended to dst; pass nil to allocate a new slice.
-func applyByteGrouping4(dst, data []byte) []byte {
+// The result is appended to dst, whose spare capacity must hold len(data) bytes.
+func applyByteGrouping4(dst, data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return dst
+		return dst, nil
 	}
 
 	off := len(dst)
-	dst = slices.Grow(dst, len(data))[:off+len(data)]
+	if cap(dst)-off < len(data) {
+		return dst, fmt.Errorf("output buffer too small: need capacity %d, have %d", off+len(data), cap(dst))
+	}
+	dst = dst[:off+len(data)]
 	result := dst[off:]
 
 	writePos := 0
@@ -139,18 +127,21 @@ func applyByteGrouping4(dst, data []byte) []byte {
 		}
 	}
 
-	return dst
+	return dst, nil
 }
 
 // reverseByteGrouping4 reverses the ByteGrouping4 transform.
-// The result is appended to dst; pass nil to allocate a new slice.
-func reverseByteGrouping4(dst, data []byte) []byte {
+// The result is appended to dst, whose spare capacity must hold len(data) bytes.
+func reverseByteGrouping4(dst, data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return dst
+		return dst, nil
 	}
 
 	off := len(dst)
-	dst = slices.Grow(dst, len(data))[:off+len(data)]
+	if cap(dst)-off < len(data) {
+		return dst, fmt.Errorf("output buffer too small: need capacity %d, have %d", off+len(data), cap(dst))
+	}
+	dst = dst[:off+len(data)]
 	result := dst[off:]
 
 	// Plane k holds byte k of every group; planes below len%4 also hold one byte of the partial group.
@@ -173,7 +164,7 @@ func reverseByteGrouping4(dst, data []byte) []byte {
 		result[4*groups+k] = data[start[k]+groups]
 	}
 
-	return dst
+	return dst, nil
 }
 
 // selectBestCompression tries different compression methods and returns the best one.
