@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"math"
@@ -269,9 +271,10 @@ func TestChunkCacheRejectsEarlyEOF(t *testing.T) {
 	}
 }
 
-// TestChunkCacheDoneKeepsCompletedRange releases a writer that decoded every
-// expected chunk but never read the decoder's trailing EOF: the entry must be
-// sealed and reusable, while a writer one chunk short is still discarded.
+// TestChunkCacheDoneKeepsCompletedRange releases a writer after LoadTo, so
+// LoadAll's finalize never runs: the entry must be sealed and reusable once
+// every expected chunk is decoded, while a writer one chunk short is still
+// discarded.
 func TestChunkCacheDoneKeepsCompletedRange(t *testing.T) {
 	chunks := [][]byte{[]byte("first"), []byte("second")}
 	encoded := buildTestXorb(t, chunks)
@@ -546,6 +549,102 @@ func TestChunkCacheContenderRebuildsAfterWriterFailure(t *testing.T) {
 	}
 	if got := string(buf[:n]); got != "second" {
 		t.Fatalf("got %q, want %q", got, "second")
+	}
+}
+
+// TestChunkCacheServesDecodedChunkDuringLoad stalls the loader in the network
+// read of chunk 1: chunk 0 must be served without waiting for that read, and
+// a reader of chunk 1 must get it once it is decoded, or the read's error.
+func TestChunkCacheServesDecodedChunkDuringLoad(t *testing.T) {
+	chunks := randomChunks(1, 3, 1000)
+	encoded := buildTestXorb(t, chunks)
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail=%v", fail), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &gatedClient{
+				data:    encoded,
+				stallAt: len(buildTestXorb(t, chunks[:1])),
+				release: make(chan struct{}),
+				stalled: make(chan struct{}),
+				closed:  make(chan struct{}),
+			}
+			body, err := client.DownloadXorbWithURL(ctx, "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache, err := newChunkCache(xorb.NewDecoder(body, false), NewCacheManager(t.TempDir(), 0), testCacheHash, 0, 3, 0, int64(len(encoded)-1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cache.LoadTo(0); err != nil {
+				cache.Done()
+				t.Fatal(err)
+			}
+			var loadErr error
+			loaded := make(chan struct{})
+			go func() {
+				defer close(loaded)
+				loadErr = cache.LoadAll()
+			}()
+			defer func() {
+				cancel()
+				<-loaded
+				cache.Done()
+			}()
+			<-client.stalled
+
+			type result struct {
+				data []byte
+				err  error
+			}
+			chunkAsync := func(idx uint32) <-chan result {
+				res := make(chan result, 1)
+				go func() {
+					buf := make([]byte, len(chunks[idx]))
+					n, err := cache.Chunk(idx, buf)
+					res <- result{buf[:n], err}
+				}()
+				return res
+			}
+			select {
+			case got := <-chunkAsync(0):
+				if got.err != nil || !bytes.Equal(got.data, chunks[0]) {
+					t.Fatalf("chunk 0: %d bytes, %v", len(got.data), got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("chunk 0 waited for the network read of chunk 1")
+			}
+
+			waiting := chunkAsync(1)
+			select {
+			case got := <-waiting:
+				t.Fatalf("chunk 1 returned %d bytes, %v before it was decoded", len(got.data), got.err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			if fail {
+				cancel()
+			} else {
+				close(client.release)
+			}
+			select {
+			case got := <-waiting:
+				if fail && !errors.Is(got.err, context.Canceled) {
+					t.Fatalf("chunk 1: %d bytes, %v; want the read's error", len(got.data), got.err)
+				}
+				if !fail && (got.err != nil || !bytes.Equal(got.data, chunks[1])) {
+					t.Fatalf("chunk 1: %d bytes, %v", len(got.data), got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("the reader of chunk 1 was not released")
+			}
+			if !within(t, "LoadAll", loaded) {
+				t.FailNow()
+			}
+			if (loadErr != nil) != fail {
+				t.Fatalf("LoadAll = %v, want failure %v", loadErr, fail)
+			}
+		})
 	}
 }
 

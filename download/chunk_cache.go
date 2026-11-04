@@ -101,13 +101,20 @@ func (r cacheRange) path() string {
 // complete and complete files are never rewritten, only unlinked, so readers
 // adopt them without locking. Writers truncate leftovers of crashed downloads
 // in place; that is safe because readers never adopt incomplete files.
+//
+// One loader at a time reads, decodes and writes chunks under loadMu without
+// holding mut, so readers of decoded chunks never wait for its network reads.
 type chunkCache struct {
 	dec            io.Reader
 	metas          []chunkRef
+	shown          int   // leading metas readers may use
 	writePos       int64 // next write offset in file
 	done           bool
-	readonly       bool // true for read-only cache from openCachedRange
-	mut            sync.Mutex
+	err            error      // first load failure, returned to readers
+	readonly       bool       // true for read-only cache from openCachedRange
+	mut            sync.Mutex // guards metas, shown, done, err, file and files; writers also hold loadMu
+	changed        sync.Cond  // on mut; broadcast when shown, done or err change
+	loadMu         sync.Mutex // serializes the decoder, file writes and Done
 	file           *os.File   // backing file
 	files          []*os.File // additional files for multi-file read path (fileIdx > 0)
 	lockFile       *os.File   // same handle as file while the write lock is held
@@ -259,7 +266,7 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 		return nil, fmt.Errorf("write header: %w", err)
 	}
 
-	return &chunkCache{
+	c := &chunkCache{
 		dec:            dec,
 		file:           f,
 		writePos:       int64(headerSize), // data starts after the header
@@ -268,7 +275,9 @@ func newLockedChunkCache(dec io.Reader, m *CacheManager, hash string, chunkStart
 		hash:           hash,
 		expectedChunks: numChunks,
 		manager:        m,
-	}, nil
+	}
+	c.changed.L = &c.mut
+	return c, nil
 }
 
 func defaultCacheDir(cacheDir string) string {
@@ -431,14 +440,17 @@ func openCachedRange(m *CacheManager, hash string, chunkStart, chunkEnd uint32) 
 		// Several files served one range; schedule their compaction.
 		m.noteMergeCandidate(hash)
 	}
-	return &chunkCache{
+	c := &chunkCache{
 		metas:    allMetas,
+		shown:    len(allMetas),
 		readonly: true,
 		file:     segments[0].file,
 		files:    extraFiles,
 		manager:  m,
 		refPaths: acquired,
-	}, nil
+	}
+	c.changed.L = &c.mut
+	return c, nil
 }
 
 // cacheFileLayout describes where the offset table, data, and checksum
@@ -549,8 +561,8 @@ func readCacheFileMetas(f *os.File, layout cacheFileLayout, fileStart, chunkStar
 	return metas, nil
 }
 
-// Chunk returns the decoded chunk at idx, decoding forward as needed.
-// Already-decoded chunks are served from the backing file.
+// Chunk returns the decoded chunk at idx, waiting while the loader is still
+// decoding toward it. Already-decoded chunks are served from the backing file.
 func (c *chunkCache) Chunk(idx uint32, buf []byte) (int64, error) {
 	m, err := c.readChunk(idx, buf)
 	if err != nil {
@@ -561,14 +573,16 @@ func (c *chunkCache) Chunk(idx uint32, buf []byte) (int64, error) {
 
 // readChunk is Chunk returning the chunk's ref, which carries its decoder hash.
 func (c *chunkCache) readChunk(idx uint32, buf []byte) (chunkRef, error) {
-	if err := c.loadTo(idx); err != nil {
-		return chunkRef{}, fmt.Errorf("load chunk %d: %w", idx, err)
-	}
-
 	c.mut.Lock()
-	if int(idx) >= len(c.metas) {
-		total := len(c.metas)
+	for int(idx) >= c.shown && idx < c.expectedChunks && !c.readonly && !c.done && c.err == nil {
+		c.changed.Wait()
+	}
+	if int(idx) >= c.shown {
+		total, err := c.shown, c.err
 		c.mut.Unlock()
+		if err != nil {
+			return chunkRef{}, fmt.Errorf("load chunk %d: %w", idx, err)
+		}
 		return chunkRef{}, fmt.Errorf("chunk %d out of range (total: %d)", idx, total)
 	}
 	m := c.metas[idx]
@@ -597,13 +611,19 @@ type chunkHasher interface {
 	Chunks() ([]xet.ChunkHash, []uint64)
 }
 
-// load decodes the next chunk and writes it to the backing file.
+// load decodes the next chunk, writes it to the backing file and shows it to
+// readers. The range's last chunk is sealed and then shown only after the
+// decoder's trailing read, so a reader done with the range never closes the
+// response body while that read runs.
 func (c *chunkCache) load() (int, error) {
-	c.mut.Lock()
-	defer c.mut.Unlock()
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
 
 	if c.done || c.readonly {
 		return 0, io.EOF
+	}
+	if c.err != nil {
+		return 0, c.err
 	}
 
 	tmp := pool.GetChunkBuf()
@@ -612,17 +632,17 @@ func (c *chunkCache) load() (int, error) {
 	n, err := c.dec.Read(tmp[:])
 	if err != nil {
 		if err == io.EOF {
+			c.mut.Lock()
 			c.done = true
+			c.changed.Broadcast()
+			c.mut.Unlock()
 			return 0, io.EOF
 		}
-		return 0, err
-	}
-	if c.published {
-		return 0, fmt.Errorf("decoded %d chunks, expected %d", len(c.metas)+1, c.expectedChunks)
+		return 0, c.fail(err)
 	}
 
 	if _, werr := c.file.WriteAt(tmp[:n], c.writePos); werr != nil {
-		return 0, fmt.Errorf("write chunk to file: %w", werr)
+		return 0, c.fail(fmt.Errorf("write chunk to file: %w", werr))
 	}
 	c.crc = crc32.Update(c.crc, crc32.IEEETable, tmp[:n])
 	m := chunkRef{offset: c.writePos, size: int32(n)}
@@ -632,15 +652,50 @@ func (c *chunkCache) load() (int, error) {
 			m.hash, m.hashed = hashes[len(c.metas)], true
 		}
 	}
-	c.metas = append(c.metas, m)
 	c.writePos += int64(n)
-	// Seal now: Done may interrupt the trailing EOF read before finalize runs.
-	if uint32(len(c.metas)) == c.expectedChunks {
-		if err := c.seal(); err != nil {
-			return 0, err
-		}
+
+	c.mut.Lock()
+	c.metas = append(c.metas, m)
+	count := len(c.metas)
+	last := uint32(count) == c.expectedChunks
+	if !last {
+		c.shown = count
+		c.changed.Broadcast()
 	}
-	return len(c.metas), nil
+	c.mut.Unlock()
+	if !last {
+		return count, nil
+	}
+
+	// Seal now: Done may interrupt the trailing EOF read before finalize runs.
+	if err := c.seal(); err != nil {
+		return 0, c.fail(err)
+	}
+	if _, err = c.dec.Read(tmp[:]); err == nil {
+		err = fmt.Errorf("decoded %d chunks, expected %d", count+1, c.expectedChunks)
+	}
+	c.mut.Lock()
+	c.shown = count
+	if err == io.EOF {
+		c.done = true
+	} else {
+		c.err = err
+	}
+	c.changed.Broadcast()
+	c.mut.Unlock()
+	if err != io.EOF {
+		return 0, err
+	}
+	return count, nil
+}
+
+// fail records a load failure for readers and returns it.
+func (c *chunkCache) fail(err error) error {
+	c.mut.Lock()
+	c.err = err
+	c.changed.Broadcast()
+	c.mut.Unlock()
+	return err
 }
 
 // loadTo decodes and caches chunks until index idx is available or the decoder
@@ -648,7 +703,7 @@ func (c *chunkCache) load() (int, error) {
 func (c *chunkCache) loadTo(idx uint32) error {
 	for {
 		c.mut.Lock()
-		curr := len(c.metas)
+		curr := c.shown
 		done := c.done
 		c.mut.Unlock()
 
@@ -686,8 +741,8 @@ func (c *chunkCache) LoadAll() error {
 
 // finalize leaves read-only and already sealed entries unchanged.
 func (c *chunkCache) finalize() error {
-	c.mut.Lock()
-	defer c.mut.Unlock()
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
 
 	if c.readonly || c.published {
 		return nil
@@ -701,7 +756,7 @@ func (c *chunkCache) finalize() error {
 	return c.seal()
 }
 
-// seal publishes the complete entry while the caller holds c.mut.
+// seal publishes the complete entry while the caller holds c.loadMu.
 func (c *chunkCache) seal() error {
 	metas := c.metas
 	file := c.file
@@ -756,8 +811,10 @@ func (c *chunkCache) seal() error {
 // Done marks the decoder as exhausted and releases the backing file(s).
 // The file lock is released automatically when the file is closed.
 func (c *chunkCache) Done() {
+	c.loadMu.Lock()
 	c.mut.Lock()
 	c.done = true
+	c.changed.Broadcast()
 	if c.file != nil && !c.readonly && !c.published {
 		// Discard the unfinished entry while still holding its lock so
 		// waiting contenders find an empty file and rewrite it.
@@ -787,6 +844,7 @@ func (c *chunkCache) Done() {
 		c.manager = nil
 	}
 	c.mut.Unlock()
+	c.loadMu.Unlock()
 	if mgr != nil {
 		// References just dropped, so entries kept alive during the download
 		// become evictable now rather than at the next publish.
