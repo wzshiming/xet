@@ -7,6 +7,9 @@ import (
 
 const maxChunkSize = 131072 + 8 // MaxChunkSize + 8 bytes for compression header
 
+// ChunkBuf is the type of the buffers GetChunkBuf returns.
+type ChunkBuf = [maxChunkSize]byte
+
 // chunkBufPool pools *[MaxChunkSize]byte arrays to avoid large stack/heap allocations
 // in hot paths (encoder, decoder, validate, upload).
 var chunkBufPool = sync.Pool{
