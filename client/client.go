@@ -32,6 +32,8 @@ type Client struct {
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cache         *Cache
+
+	verifyDownloads bool
 }
 
 type Options func(*Client)
@@ -84,6 +86,13 @@ func WithCache(cache *Cache) Options {
 
 // defaultCache is the cache root every client built without WithCache shares.
 var defaultCache = sync.OnceValue(func() *Cache { return NewCache("", download.DefaultCacheSize, upload.DefaultCacheSize) })
+
+// WithVerifyDownloads verifies every full download against its xet file hash by hashing each chunk (BLAKE3); off by default.
+func WithVerifyDownloads() Options {
+	return func(c *Client) {
+		c.verifyDownloads = true
+	}
+}
 
 // WithUpstreamProvider binds the CAS endpoint and token source; without it every CAS request fails.
 func WithUpstreamProvider(provider UpstreamProvider) Options {
