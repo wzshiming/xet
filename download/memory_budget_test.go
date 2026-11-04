@@ -95,6 +95,13 @@ func usedOf(b *MemoryBudget) int64 {
 	return b.used
 }
 
+// attachedOf returns the downloads attached to b.
+func attachedOf(b *MemoryBudget) int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.active
+}
+
 // requireTarget checks that b admits exactly want bytes in all, holding one
 // byte first so that the oversized rule cannot hide the target, and then
 // releases them.

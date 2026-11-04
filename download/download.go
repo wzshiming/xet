@@ -17,18 +17,23 @@ type options struct {
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
 	expectedHash *xet.FileHash
+	budget       *MemoryBudget
 }
 
-// WithCacheManager shares one CacheManager across readers so the capacity
-// bound applies to the whole cache directory. When unset, each reader uses a
-// private manager for the cacheDir passed to its constructor.
+// WithCacheManager makes the reader look each xorb range up in the chunk cache
+// before fetching it and add the ranges it fetches, off the delivery path.
+// Share one CacheManager across readers so the capacity bound applies to the
+// whole cache directory. Without it the reader uses no cache.
 func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
 		o.cache = cache
 	}
 }
 
-// WithConcurrency configures how many xorb ranges are prefetched concurrently.
+// WithConcurrency sets the reader's window: at most concurrency xorb ranges
+// are being fetched or hold terms not yet delivered, as range k+concurrency
+// starts only once range k has delivered its last term. A range read again
+// beyond the window is fetched again, from the cache when it holds the range.
 func WithConcurrency(concurrency int) Option {
 	return func(o *options) {
 		o.concurrency = concurrency
@@ -42,12 +47,24 @@ func WithExpectedFileHash(fileHash xet.FileHash) Option {
 	}
 }
 
+// WithMemoryBudget holds the reader's fetched terms within budget, which
+// readers may share; without it, or with nil, the reader uses its own budget
+// sized by DefaultMemorySizes. The budget bounds the readers sharing it, and
+// WithConcurrency each one: a reader holds at most concurrency × (largest
+// range) bytes, besides ranges still being written to the cache.
+func WithMemoryBudget(budget *MemoryBudget) Option {
+	return func(o *options) {
+		o.budget = budget
+	}
+}
+
 // WithProgressFunc sets a callback to receive download progress updates.
-// name identifies this download in the callback (e.g. file hash string).
-// total is computed upfront from the reconstruction plan so the caller always
-// knows the expected transfer size before any xorb is fetched.
-// progress is reported only when individual fetch entries complete successfully,
-// so retries do not inflate the reported current value.
+// name identifies one xorb range in the callback, and total, its length in
+// bytes times the fetches of it, is reported before any range is fetched; a
+// range read again beyond the window is fetched again (see WithConcurrency).
+// current counts the response body bytes as they arrive, on from one fetch of
+// the range to the next, so it never decreases and ends at total; a fetch
+// served from the cache counts the range's length at once.
 func WithProgressFunc(progressFunc progress.ProgressFunc) Option {
 	return func(o *options) {
 		o.progressFunc = progressFunc
@@ -71,14 +88,16 @@ type fileVerifier struct {
 	sizes    []uint64
 }
 
-// add records one chunk occurrence, hashing data only when no decoder did.
-func (v *fileVerifier) add(m chunkRef, data []byte) {
-	hash := m.hash
-	if !m.hashed {
-		hash = xet.ComputeChunkHash(data)
+// computeChunkHash is xet.ComputeChunkHash; tests count its calls.
+var computeChunkHash = xet.ComputeChunkHash
+
+// addChunks records the chunks of one term occurrence: hashes[i] is the hash
+// of a chunk of offsets[i+1]-offsets[i] bytes.
+func (v *fileVerifier) addChunks(hashes []xet.ChunkHash, offsets []int64) {
+	for i, hash := range hashes {
+		v.hashes = append(v.hashes, hash)
+		v.sizes = append(v.sizes, uint64(offsets[i+1]-offsets[i]))
 	}
-	v.hashes = append(v.hashes, hash)
-	v.sizes = append(v.sizes, uint64(len(data)))
 }
 
 func (v *fileVerifier) verify() error {
@@ -88,16 +107,16 @@ func (v *fileVerifier) verify() error {
 	return nil
 }
 
-// writeChunk writes chunk to w with one Write and checks the result as io.Copy does.
-func writeChunk(w io.Writer, chunk []byte) (int, error) {
-	n, err := w.Write(chunk)
-	if n < 0 || n > len(chunk) {
+// writeTerm writes term to w with one Write and checks the result as io.Copy does.
+func writeTerm(w io.Writer, term []byte) (int, error) {
+	n, err := w.Write(term)
+	if n < 0 || n > len(term) {
 		n = 0
 		if err == nil {
 			err = errors.New("invalid write result")
 		}
 	}
-	if n < len(chunk) && err == nil {
+	if n < len(term) && err == nil {
 		err = io.ErrShortWrite
 	}
 	return n, err

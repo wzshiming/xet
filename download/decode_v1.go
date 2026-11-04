@@ -4,255 +4,44 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
-
-	"github.com/wzshiming/xet/internal/pool"
 )
 
-// ReaderV1 implements io.Reader and io.WriterTo for V1 reconstruction
+// ReaderV1 implements io.Reader and io.WriterTo for V1 reconstruction.
 type ReaderV1 struct {
-	client         ClientAdapter
-	ctx            context.Context
-	reconstruction *ReconstructionResponseV1
-	skipBytes      int64
-	termFetches    []selectedFetch
-	prefetcher     *prefetcher
-	verifier       *fileVerifier
-
-	// State for reading
-	termIdx      int
-	chunkIdx     uint32         // next chunk to read from currentCache
-	buf          *pool.ChunkBuf // pooled; holds the last chunk read
-	chunk        []byte         // unread rest of the chunk in buf
-	currentTerm  *Term
-	currentCache *chunkCache
-	localStart   uint32 // Local chunk index start (relative to downloaded xorb)
-	localEnd     uint32 // Local chunk index end (relative to downloaded xorb)
-	err          error
+	*termReader
 }
 
-// NewReaderV1 creates a new V1 reconstruction reader.
+// NewReaderV1 creates a new V1 reconstruction reader. It fetches nothing and
+// takes no memory budget before its first Read or WriteTo; Close stops it.
 func NewReaderV1(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV1, opts ...Option) (io.ReadCloser, error) {
-	options := &options{}
-	for _, opt := range opts {
-		opt(options)
-	}
-
-	cache := options.cache
-	if cache == nil {
-		return nil, fmt.Errorf("no cache manager provided")
-	}
-	verifier, err := newFileVerifier(options, reconstruction.OffsetIntoFirstRange)
-	if err != nil {
-		return nil, err
-	}
-	// Adopt pre-existing entries and clean up orphaned partial files before
-	// the download starts; only the manager's first prepare walks the cache
-	// directory.
-	cache.prepare()
-
-	termFetches, tasks, err := planReaderV1(reconstruction)
+	tasks, err := planReaderV1(reconstruction)
 	if err != nil {
 		return nil, fmt.Errorf("plan reader: %w", err)
 	}
-
-	prefetcher, err := newPrefetcher(ctx, client, termFetches, tasks, cache, options)
+	r, err := newTermReader(ctx, client, reconstruction.Terms, reconstruction.OffsetIntoFirstRange, tasks, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("initialize prefetcher: %w", err)
+		return nil, err
 	}
-
-	return &ReaderV1{
-		client:         client,
-		ctx:            ctx,
-		reconstruction: reconstruction,
-		skipBytes:      reconstruction.OffsetIntoFirstRange,
-		termFetches:    termFetches,
-		prefetcher:     prefetcher,
-		verifier:       verifier,
-	}, nil
+	return &ReaderV1{r}, nil
 }
 
-func (r *ReaderV1) Read(p []byte) (n int, err error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
-	for n < len(p) {
-		if err := r.fill(); err != nil {
-			if n > 0 && err != io.EOF {
-				return n, nil
-			}
-			return n, err
-		}
-		copied := copy(p[n:], r.chunk)
-		r.chunk = r.chunk[copied:]
-		n += copied
-	}
-
-	return n, nil
-}
-
-// WriteTo implements io.WriterTo, writing each remaining chunk with one Write.
-func (r *ReaderV1) WriteTo(w io.Writer) (n int64, err error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
-	for {
-		if err := r.fill(); err != nil {
-			if err == io.EOF {
-				return n, nil
-			}
-			return n, err
-		}
-		written, err := writeChunk(w, r.chunk)
-		r.chunk = r.chunk[written:]
-		n += int64(written)
-		if err != nil {
-			return n, err
-		}
-	}
-}
-
-// fill reads the next chunk into buf once chunk is drained; errors other than io.EOF stick.
-func (r *ReaderV1) fill() error {
-	for len(r.chunk) == 0 {
-		// Check if we're done with all terms
-		if r.termIdx >= len(r.reconstruction.Terms) {
-			if r.verifier != nil {
-				if err := r.verifier.verify(); err != nil {
-					r.err = err
-					r.cleanup()
-					return err
-				}
-			}
-			r.cleanup()
-			return io.EOF
-		}
-
-		// Load next term if needed
-		if r.currentTerm == nil {
-			if err := r.loadTerm(); err != nil {
-				r.err = err
-				r.cleanup()
-				return err
-			}
-		}
-
-		// Check if we're done with current term's chunks
-		if r.chunkIdx >= r.localEnd {
-			r.finishCurrentTerm()
-			continue
-		}
-
-		// Get chunk on demand by index
-		if r.buf == nil {
-			r.buf = pool.GetChunkBuf()
-		}
-		ref, err := r.currentCache.readChunk(r.chunkIdx, r.buf[:])
-		if err != nil {
-			r.err = err
-			r.cleanup()
-			return err
-		}
-		r.chunkIdx++
-		size := int64(ref.size)
-		data := r.buf[:size]
-
-		if r.verifier != nil {
-			r.verifier.add(ref, data)
-		}
-
-		// Apply OffsetIntoFirstRange skip; it may span multiple leading chunks
-		if r.termIdx == 0 && r.skipBytes > 0 {
-			skip := min(r.skipBytes, size)
-			r.skipBytes -= skip
-			data = data[skip:]
-		}
-		r.chunk = data
-	}
-	return nil
-}
-
-// cleanup closes the prefetcher, which owns and releases all caches, and returns buf to the pool.
-func (r *ReaderV1) cleanup() {
-	if r.prefetcher != nil {
-		r.prefetcher.Close()
-	}
-	if r.buf != nil {
-		pool.PutChunkBuf(r.buf)
-	}
-	r.prefetcher = nil
-	r.currentCache = nil
-	r.currentTerm = nil
-	r.buf = nil
-	r.chunk = nil
-}
-
-// Close releases the prefetcher and all cache references held by the reader.
-// It is safe to call multiple times and after Read has returned io.EOF.
-func (r *ReaderV1) Close() error {
-	r.cleanup()
-	if r.err == nil {
-		r.err = fs.ErrClosed
-	}
-	return nil
-}
-
-// finishCurrentTerm advances to the next reconstruction term.
-func (r *ReaderV1) finishCurrentTerm() {
-	if r.currentTerm == nil {
-		return
-	}
-
-	r.currentTerm = nil
-	r.termIdx++
-}
-
-func (r *ReaderV1) loadTerm() error {
-	term := &r.reconstruction.Terms[r.termIdx]
-	r.currentTerm = term
-
-	selected := r.termFetches[r.termIdx]
-	cache, err := r.prefetcher.Get(selected.key)
-	if err != nil {
-		return fmt.Errorf("download xorb: %w", err)
-	}
-
-	localStart := term.Range.Start - selected.chunkStart
-	localEnd := term.Range.End - selected.chunkStart
-
-	r.currentCache = cache
-	r.localStart = localStart
-	r.localEnd = localEnd
-	r.chunkIdx = localStart
-
-	return nil
-}
-
-func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []fetchTask, error) {
-	selected := make([]selectedFetch, len(reconstruction.Terms))
+func planReaderV1(reconstruction *ReconstructionResponseV1) ([]fetchTask, error) {
 	tasks := make([]fetchTask, 0, len(reconstruction.Terms))
 	for i := range reconstruction.Terms {
 		term := &reconstruction.Terms[i]
 		fetchInfo, err := selectFetchInfoV1(reconstruction, term)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if err := checkFetchRange(term, fetchInfo.Range, fetchInfo.URLRange); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		key := fetchKey{
 			Hash:  term.Hash,
 			Start: fetchInfo.URLRange.Start,
 			End:   fetchInfo.URLRange.End,
-		}
-		selected[i] = selectedFetch{
-			key:        key,
-			chunkStart: fetchInfo.Range.Start,
-			chunkEnd:   fetchInfo.Range.End,
 		}
 		tasks = append(tasks, fetchTask{
 			key:        key,
@@ -261,7 +50,7 @@ func planReaderV1(reconstruction *ReconstructionResponseV1) ([]selectedFetch, []
 			chunkEnd:   fetchInfo.Range.End,
 		})
 	}
-	return selected, tasks, nil
+	return tasks, nil
 }
 
 func selectFetchInfoV1(reconstruction *ReconstructionResponseV1, term *Term) (*FetchInfoEntry, error) {
@@ -287,9 +76,11 @@ func selectFetchInfoV1(reconstruction *ReconstructionResponseV1, term *Term) (*F
 }
 
 // ExpectedTransferBytesV1 computes the total compressed bytes that will be transferred
-// over the network when reconstructing a V1 file. Deduplicated ranges are counted once.
+// over the network when reconstructing a V1 file. Deduplicated ranges are counted once,
+// and a range a reader fetches again beyond its window (see WithConcurrency) is not
+// counted again.
 func ExpectedTransferBytesV1(reconstruction *ReconstructionResponseV1) int64 {
-	_, tasks, err := planReaderV1(reconstruction)
+	tasks, err := planReaderV1(reconstruction)
 	if err != nil {
 		return 0
 	}
