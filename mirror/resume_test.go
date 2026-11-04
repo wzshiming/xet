@@ -220,6 +220,8 @@ func TestIngestFollowerRejectsSizeLearnedFromLeader(t *testing.T) {
 		t.Fatalf("honest follower's second half: %v", err)
 	}
 	awaitClosed(t, c.Stream.t.done, "honest follower")
+	// Each task publishes its own entry once the shared flight ends.
+	awaitClosed(t, a.Stream.t.done, "leader")
 	leader, err := m.Resolve(ctx, "org/repo", "main", "a.bin")
 	if err != nil || leader.Entry == nil {
 		t.Fatalf("a.bin after the ingest = %+v, %v; want the ready entry", leader, err)

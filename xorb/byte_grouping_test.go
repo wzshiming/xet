@@ -3,18 +3,17 @@ package xorb
 import (
 	"bytes"
 	"math/rand/v2"
-	"slices"
 	"testing"
 )
 
-// reverseByteGrouping4Reference is reverseByteGrouping4 as of c4bc4eb, kept to pin its rewrite.
+// reverseByteGrouping4Reference is reverseByteGrouping4 as of c4bc4eb, kept to pin its rewrite; dst's spare capacity must hold data.
 func reverseByteGrouping4Reference(dst, data []byte) []byte {
 	if len(data) == 0 {
 		return dst
 	}
 
 	off := len(dst)
-	dst = slices.Grow(dst, len(data))[:off+len(data)]
+	dst = dst[:off+len(data)]
 	result := dst[off:]
 
 	numFullGroups := len(data) / 4
@@ -48,14 +47,10 @@ func TestReverseByteGrouping4MatchesReference(t *testing.T) {
 	for n := range 1026 {
 		data := make([]byte, n)
 		rng.Read(data)
-		want := reverseByteGrouping4Reference(slices.Clip(bytes.Clone(prefix)), data)
-		for _, dst := range [][]byte{
-			slices.Clip(bytes.Clone(prefix)),
-			append(make([]byte, 0, len(prefix)+n), prefix...),
-		} {
-			if got := reverseByteGrouping4(dst, data); !bytes.Equal(got, want) {
-				t.Fatalf("reverseByteGrouping4(%d-byte prefix with cap %d, %d random bytes) differs from the reference", len(prefix), cap(dst), n)
-			}
+		want := reverseByteGrouping4Reference(append(make([]byte, 0, len(prefix)+n), prefix...), data)
+		dst := append(make([]byte, 0, len(prefix)+n), prefix...)
+		if got, err := reverseByteGrouping4(dst, data); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("reverseByteGrouping4(%d-byte prefix with cap %d, %d random bytes) error = %v, or its result differs from the reference", len(prefix), cap(dst), n, err)
 		}
 	}
 }

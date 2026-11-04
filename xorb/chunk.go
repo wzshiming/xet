@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/wzshiming/xet"
-	"github.com/wzshiming/xet/internal/pool"
 )
 
 // ChunkHeaderSize is the size of the header that precedes each chunk's compressed data.
@@ -55,11 +54,11 @@ func ParseChunkHeader(b []byte) (ChunkHeader, error) {
 // DecodeChunk decompresses body, the compressed data described by h. A
 // CompressionNone result is body itself; dst is ignored and may be nil. An LZ4
 // or ByteGrouping4 result is dst[:h.UncompressedSize], so dst must be at least
-// that long. LZ4 decodes straight into dst when cap(dst) > h.UncompressedSize.
-// The spare byte makes the reader consume the frame's end mark and is scratch
-// that may be written even on success; nothing past it is ever written. On
-// failure DecodeChunk returns nil and writes nothing into dst, except partial
-// output from a direct decode. It is safe for concurrent use.
+// that long; LZ4 also needs cap(dst) > h.UncompressedSize. The spare byte makes
+// the reader consume the frame's end mark and is scratch that may be written
+// even on success; nothing past it is ever written. On failure DecodeChunk
+// returns nil and writes nothing into dst, except partial output from decoding
+// an LZ4 frame. It is safe for concurrent use.
 func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 	if len(body) != int(h.CompressedSize) {
 		return nil, fmt.Errorf("chunk body size mismatch: header declares %d bytes, have %d", h.CompressedSize, len(body))
@@ -72,32 +71,23 @@ func DecodeChunk(dst []byte, h ChunkHeader, body []byte) ([]byte, error) {
 	}
 	size := int(h.UncompressedSize)
 
+	var out []byte
+	var err error
 	switch h.Compression {
 	case CompressionNone:
 		if len(body) != size {
 			return nil, fmt.Errorf("decompressed size mismatch: got %d, expected %d", len(body), size)
 		}
 		return body, nil
-	case CompressionLZ4, CompressionByteGrouping4:
-		direct := h.Compression == CompressionLZ4 && cap(dst) > size
-		buf := dst
-		if !direct {
-			tmp := pool.GetChunkBuf()
-			defer pool.PutChunkBuf(tmp)
-			buf = tmp[:]
-		}
-		buf, err := decompressLZ4(buf[:0], body, size)
-		if err != nil {
-			return nil, err
-		}
-		if h.Compression == CompressionByteGrouping4 {
-			return reverseByteGrouping4(dst[:0], buf), nil
-		}
-		if !direct {
-			copy(dst, buf)
-		}
-		return dst[:size], nil
+	case CompressionLZ4:
+		out, err = decompressLZ4(dst[:0], body, size)
+	case CompressionByteGrouping4:
+		out, err = decompressByteGrouping4LZ4(dst[:0], body, size)
 	default:
 		return nil, fmt.Errorf("unsupported compression type: %d", h.Compression)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

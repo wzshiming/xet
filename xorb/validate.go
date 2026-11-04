@@ -25,7 +25,6 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 	var headerBuf [8]byte
 	var chunkHashes []xet.ChunkHash
 	var chunkSizes []uint64
-	uncompressedBuf := out[:0]
 	var packedEndOffset uint64   // cumulative compressed bytes (header + data) per chunk
 	var unpackedEndOffset uint64 // cumulative uncompressed bytes per chunk
 
@@ -53,7 +52,7 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		if err != nil {
 			return err
 		}
-		compressedSize, ct, uncompressedSize := header.CompressedSize, header.Compression, header.UncompressedSize
+		compressedSize, uncompressedSize := header.CompressedSize, header.UncompressedSize
 		if compressedSize > uint32(len(tmp)) {
 			return fmt.Errorf("invalid compressed chunk size: %d exceeds maximum %d", compressedSize, len(tmp))
 		}
@@ -67,14 +66,11 @@ func Validate(r io.Reader, xorbHash xet.XorbHash) error {
 		if _, err := io.ReadFull(r, tmp[:compressedSize]); err != nil {
 			return fmt.Errorf("failed to read compressed chunk data: %w", err)
 		}
-		uncompressedBuf, err = decompressChunk(uncompressedBuf[:0], tmp[:compressedSize], ct, int(uncompressedSize))
+		data, err := DecodeChunk(out[:], header, tmp[:compressedSize])
 		if err != nil {
 			return fmt.Errorf("decompress chunk: %w", err)
 		}
-		if len(uncompressedBuf) != int(uncompressedSize) {
-			return fmt.Errorf("chunk size mismatch: header declares %d, payload has %d", uncompressedSize, len(uncompressedBuf))
-		}
-		h := xet.ComputeChunkHash(uncompressedBuf)
+		h := xet.ComputeChunkHash(data)
 		chunkHashes = append(chunkHashes, h)
 		chunkSizes = append(chunkSizes, uint64(uncompressedSize))
 		packedEndOffset += 8 + uint64(compressedSize)
