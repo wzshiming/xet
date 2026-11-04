@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -48,6 +49,9 @@ var shapes = []shape{
 	{"64MiB", 1, xet.MaxXorbSize / chunkSize},
 	{"256MiB", 4, xet.MaxXorbSize / chunkSize},
 }
+
+// classes are the storage classes plus bf16 model weights.
+var classes = append(slices.Clone(storagetest.ChunkClasses), storagetest.ChunkClassBF16)
 
 // paths are the routes a fixture serves its file on, by its SHA-256 hex.
 var paths = []struct{ name, route string }{
@@ -112,6 +116,9 @@ func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 	}
 	f := storagetest.PutXorbFile(tb, tb.Context(), st, c.Xorbs(s.xorbs, s.chunksPerXorb, chunkSize))
 	storagetest.AssertFileCompression(tb, tb.Context(), st, f, c.Compression)
+	if c.Name == storagetest.ChunkClassBF16.Name {
+		storagetest.AssertFileStoredRatio(tb, tb.Context(), st, f, 0.85, 0.92)
+	}
 	plain := filepath.Join(dir, "plain")
 	if err := os.WriteFile(plain, f.Content, 0o644); err != nil {
 		tb.Fatal(err)
@@ -163,7 +170,7 @@ func (w *countWriter) Write(p []byte) (int, error) {
 // TestServe checks that both paths serve every class's 1 MiB file whole.
 func TestServe(t *testing.T) {
 	buf := make([]byte, drainBufSize)
-	for _, c := range storagetest.ChunkClasses {
+	for _, c := range classes {
 		t.Run("class="+c.Name, func(t *testing.T) {
 			fx := fixtureFor(t, shapes[0], c)
 			for _, p := range paths {
@@ -177,7 +184,7 @@ func TestServe(t *testing.T) {
 func BenchmarkServe(b *testing.B) {
 	for _, s := range shapes {
 		b.Run("size="+s.name, func(b *testing.B) {
-			for _, c := range storagetest.ChunkClasses {
+			for _, c := range classes {
 				b.Run("class="+c.Name, func(b *testing.B) {
 					fx := fixtureFor(b, s, c)
 					for _, p := range paths {
