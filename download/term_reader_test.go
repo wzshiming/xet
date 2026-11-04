@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/wzshiming/xet"
@@ -326,9 +327,45 @@ func TestTermReaderWithoutCache(t *testing.T) {
 	}
 }
 
+// TestTermReaderStartsOnFirstRead pins the lazy start: a new reader issues no
+// GET and neither attaches to nor acquires its budget until its first Read,
+// which starts the fetches.
+func TestTermReaderStartsOnFirstRead(t *testing.T) {
+	x := newFixtureXorb(t, 0x3e, randomChunks(40, 2, 1000))
+	terms := []fixtureTerm{
+		{ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 0, End: 1}},
+		{ChunkRange{Start: 1, End: 2}, ChunkRange{Start: 1, End: 2}},
+	}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				budget := budgetWithTarget(1 << 20)
+				client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
+				r := openTermReader(t, version, t.Context(), client, x, 0, terms, WithMemoryBudget(budget))
+				synctest.Wait()
+				if n, used, attached := client.gets.Load(), usedOf(budget), attachedOf(budget); n != 0 || used != 0 || attached != 0 {
+					t.Fatalf("before the first Read: %d GETs, %d bytes used, %d downloads attached; want none", n, used, attached)
+				}
+				head := make([]byte, 1)
+				if _, err := io.ReadFull(r, head); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if n, attached := client.gets.Load(), attachedOf(budget); n != 2 || attached != 1 {
+					t.Fatalf("after the first Read: %d GETs, %d downloads attached; want 2 GETs, 1 attached", n, attached)
+				}
+				rest, err := io.ReadAll(r)
+				if got, want := append(head, rest...), x.file(terms); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("read %d bytes, %v; want %d bytes", len(got), err, len(want))
+				}
+			})
+		})
+	}
+}
+
 // TestTermReaderWaitsForBudget pins the back-pressure: with a budget for two
-// terms and nothing read, exactly two range GETs start, and the third starts
-// only once the first term is read completely.
+// terms, reading part of the first term starts exactly two range GETs, and
+// the third starts only once the first term is read completely.
 func TestTermReaderWaitsForBudget(t *testing.T) {
 	x := newFixtureXorb(t, 0x32, randomChunks(32, 3, 1000))
 	terms := []fixtureTerm{
@@ -341,14 +378,12 @@ func TestTermReaderWaitsForBudget(t *testing.T) {
 			budget := budgetWithTarget(2000)
 			client := &countingClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}}
 			r := openTermReader(t, version, t.Context(), client, x, 0, terms, WithConcurrency(8), WithMemoryBudget(budget))
-			awaitQueued(t, budget, 1)
-			awaitGets(t, client, 2)
-
 			head := make([]byte, 999)
 			if _, err := io.ReadFull(r, head); err != nil {
 				t.Fatal(err)
 			}
 			awaitQueued(t, budget, 1)
+			awaitGets(t, client, 2)
 			if n, used := client.gets.Load(), usedOf(budget); n != 2 || used != 2000 {
 				t.Fatalf("after reading all but a byte of the first term: %d GETs, %d bytes used; want 2 GETs, 2000 bytes", n, used)
 			}
@@ -641,6 +676,7 @@ func TestTermReaderCloseAbortsStalledDownload(t *testing.T) {
 					closed:    make(chan struct{}),
 				}
 				r := openTermReader(t, version, ctx, client, x, 0, terms, WithConcurrency(1), WithCacheManager(m), WithMemoryBudget(budget))
+				r.start() // fetch without a Read, which must not run alongside Close
 				if !within(t, "the stall", client.stalled) {
 					t.FailNow()
 				}
@@ -766,6 +802,7 @@ func TestTermReaderVerifiesWithFetchHashes(t *testing.T) {
 		t.Run(version, func(t *testing.T) {
 			client := &heldClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}, release: make(chan struct{})}
 			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithExpectedFileHash(fileHash))
+			r.start()
 			f := r.fetches[0]
 			close(client.release)
 			if !within(t, "the fetch", f.done) {
@@ -870,6 +907,7 @@ func TestTermReaderDeliversAfterTrailingRead(t *testing.T) {
 			dir := t.TempDir()
 			client := &gatedClient{data: x.encoded, stallAt: end, release: make(chan struct{}), stalled: make(chan struct{}), closed: make(chan struct{})}
 			r := openTermReader(t, version, context.Background(), client, x, 0, first, WithCacheManager(NewCacheManager(dir, 0)))
+			r.start() // fetch without a Read, which must not run alongside Close
 			if !within(t, "the stall", client.stalled) {
 				t.FailNow()
 			}

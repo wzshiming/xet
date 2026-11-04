@@ -12,8 +12,8 @@ type ReaderV2 struct {
 	*termReader
 }
 
-// NewReaderV2 creates a new V2 reconstruction reader. It starts fetching at
-// once; Close stops it.
+// NewReaderV2 creates a new V2 reconstruction reader. It fetches nothing and
+// takes no memory budget before its first Read or WriteTo; Close stops it.
 func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
 	tasks, err := planReaderV2(reconstruction)
 	if err != nil {
