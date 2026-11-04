@@ -452,29 +452,13 @@ func TestReaderVerifiesWithDecoderChunkHashes(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Tamper only once the whole range is decoded.
-				var kept bool
-				switch src := src.(type) {
-				case *chunkCache:
-					if _, err := src.readChunk(2, make([]byte, 1000)); err != nil {
-						t.Fatal(err)
-					}
-					src.mut.Lock()
-					kept = src.metas[1].hashed
-					src.metas[1].hash[0] ^= 0xff
-					src.mut.Unlock()
-				case *memoryRange:
-					src.mu.Lock()
-					for len(src.chunks) < 3 {
-						src.more.Wait()
-					}
-					kept = src.chunks[1].ref.hashed
-					src.chunks[1].ref.hash[0] ^= 0xff
-					src.mu.Unlock()
+				fr := src.(*fetchedRange)
+				fr.store.mu.Lock()
+				for fr.shown < 3 {
+					fr.more.Wait()
 				}
-				if !kept {
-					t.Fatal("decoded chunk 1 kept no decoder hash")
-				}
-
+				fr.chunks[1].hash[0] ^= 0xff
+				fr.store.mu.Unlock()
 				got, err := io.ReadAll(r)
 				if err == nil || !strings.Contains(err.Error(), "file hash mismatch") {
 					t.Fatalf("err = %v, want the corrupted kept hash to fail verification", err)

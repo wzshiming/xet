@@ -698,8 +698,8 @@ func TestPrefetcherLocksBeforeNetworkRequest(t *testing.T) {
 	entry2 := &prefetchEntry{task: task, ready: make(chan struct{})}
 	// Separate managers over the same directory simulate two processes.
 	dir := t.TempDir()
-	p1 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
-	p2 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0)}
+	p1 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0), store: newChunkStore(0)}
+	p2 := &prefetcher{ctx: context.Background(), client: client, cache: NewCacheManager(dir, 0), store: newChunkStore(0)}
 
 	done1 := make(chan struct{})
 	done2 := make(chan struct{})

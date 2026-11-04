@@ -212,6 +212,74 @@ func TestDecoderKeepsErrorTexts(t *testing.T) {
 	}
 }
 
+// TestDecoderSkip skips every other chunk: the chunks read in between decode
+// as usual, Chunks lists only them, and a footer can no longer be checked.
+func TestDecoderSkip(t *testing.T) {
+	chunks, modes, _ := decoderModesForTest(t)
+	for _, mode := range modes {
+		t.Run(mode.name, func(t *testing.T) {
+			d := NewDecoder(bytes.NewReader(mode.data), mode.withFooter)
+			buf := make([]byte, xet.MaxChunkSize)
+			var read [][]byte
+			for i, c := range chunks {
+				if i%2 == 0 {
+					if err := d.Skip(); err != nil {
+						t.Fatalf("Skip() of chunk %d = %v", i, err)
+					}
+					continue
+				}
+				if n, err := d.Read(buf); err != nil || !bytes.Equal(buf[:n], c) {
+					t.Fatalf("Read() of chunk %d = %d bytes, %v; want its %d bytes", i, n, err, len(c))
+				}
+				read = append(read, c)
+			}
+			hashes, sizes := d.Chunks()
+			if len(hashes) != len(read) || len(sizes) != len(read) {
+				t.Fatalf("Chunks() = %d hashes and %d sizes, want %d of each", len(hashes), len(sizes), len(read))
+			}
+			for i, c := range read {
+				if hashes[i] != xet.ComputeChunkHash(c) || sizes[i] != uint64(len(c)) {
+					t.Fatalf("Chunks()[%d] = %s/%d, want %s/%d", i, hashes[i], sizes[i], xet.ComputeChunkHash(c), len(c))
+				}
+			}
+			err := d.Skip()
+			if mode.withFooter {
+				if want := fmt.Sprintf("validate footer: %d chunks were skipped", len(chunks)-len(read)); err == nil || err.Error() != want {
+					t.Fatalf("Skip() at the footer = %v, want %q", err, want)
+				}
+			} else if err != io.EOF {
+				t.Fatalf("Skip() at the end = %v, want io.EOF", err)
+			}
+		})
+	}
+
+	oneByteChunk := []byte{0, 1, 0, 0, byte(CompressionNone), 1, 0, 0, 'x'}
+	for _, tt := range []struct {
+		name   string
+		stream []byte
+		want   string
+	}{
+		// Skip never decompresses, so an unknown compression passes.
+		{"unknown_compression", []byte{0, 1, 0, 0, 3, 1, 0, 0, 'x'}, "EOF"},
+		{"truncated_chunk_data", []byte{0, 5, 0, 0, 0, 5, 0, 0, 'a', 'b', 'c'}, "failed to read chunk data: unexpected EOF"},
+		{"compressed_above_buffer", []byte{0, 0, 0, 3, 0, 1, 0, 0}, fmt.Sprintf("input buffer too small for compressed chunk: need %d bytes, have %d", 3<<16, xet.MaxChunkSize+8)},
+		{"chunk_count_above_maximum", bytes.Repeat(oneByteChunk, xet.MaxChunksPerXorb+1), fmt.Sprintf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDecoder(bytes.NewReader(tt.stream), false)
+			var err error
+			for range xet.MaxChunksPerXorb + 2 {
+				if err = d.Skip(); err != nil {
+					break
+				}
+			}
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("Skip() ended with %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecoderRejectsNoneChunkSizeMismatch(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

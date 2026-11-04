@@ -642,18 +642,16 @@ func (c *chunkCache) load() (int, error) {
 		return 0, c.fail(err)
 	}
 
-	if _, werr := c.file.WriteAt(tmp[:n], c.writePos); werr != nil {
-		return 0, c.fail(fmt.Errorf("write chunk to file: %w", werr))
+	m, err := c.write(tmp[:n])
+	if err != nil {
+		return 0, c.fail(err)
 	}
-	c.crc = crc32.Update(c.crc, crc32.IEEETable, tmp[:n])
-	m := chunkRef{offset: c.writePos, size: int32(n)}
 	if d, ok := c.dec.(chunkHasher); ok {
 		// Its hashes line up with metas only if every chunk it decoded was stored.
 		if hashes, _ := d.Chunks(); len(hashes) == len(c.metas)+1 {
 			m.hash, m.hashed = hashes[len(c.metas)], true
 		}
 	}
-	c.writePos += int64(n)
 
 	c.mut.Lock()
 	c.metas = append(c.metas, m)
@@ -688,6 +686,37 @@ func (c *chunkCache) load() (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// write appends data to the entry file and to its checksum; the caller holds
+// c.loadMu.
+func (c *chunkCache) write(data []byte) (chunkRef, error) {
+	if _, err := c.file.WriteAt(data, c.writePos); err != nil {
+		return chunkRef{}, fmt.Errorf("write chunk to file: %w", err)
+	}
+	c.crc = crc32.Update(c.crc, crc32.IEEETable, data)
+	m := chunkRef{offset: c.writePos, size: int32(len(data))}
+	c.writePos += int64(len(data))
+	return m, nil
+}
+
+// push appends the next chunk to a writer its caller decodes for, in place of
+// a decoder, and returns the chunk's offset in the entry file. finalize seals
+// the entry once every chunk is pushed.
+func (c *chunkCache) push(data []byte) (int64, error) {
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+	if c.done || c.published || c.file == nil {
+		return 0, fmt.Errorf("cache file is closed")
+	}
+	m, err := c.write(data)
+	if err != nil {
+		return 0, err
+	}
+	c.mut.Lock()
+	c.metas = append(c.metas, m)
+	c.mut.Unlock()
+	return m.offset, nil
 }
 
 // fail records a load failure for readers and returns it.

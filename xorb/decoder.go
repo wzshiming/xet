@@ -20,6 +20,7 @@ type Decoder struct {
 	chunkHashes []xet.ChunkHash
 	chunkSizes  []uint64
 	rawSize     uint64
+	skipped     int // chunks passed over by Skip
 
 	done     bool
 	xorbHash *xet.XorbHash
@@ -36,6 +37,18 @@ func NewDecoder(r io.Reader, withFooter bool) *Decoder {
 // Decode reads and returns the next chunk's uncompressed data.
 // Returns io.EOF when all chunks have been consumed.
 func (d *Decoder) Read(p []byte) (int, error) {
+	return d.next(p, true)
+}
+
+// Skip passes over the next chunk without decompressing or hashing it, so
+// Chunks leaves it out and the xorb hash can no longer be computed or checked
+// against a footer. Returns io.EOF when all chunks have been consumed.
+func (d *Decoder) Skip() error {
+	_, err := d.next(nil, false)
+	return err
+}
+
+func (d *Decoder) next(p []byte, decode bool) (int, error) {
 	if d.err != nil {
 		return 0, d.err
 	}
@@ -68,6 +81,10 @@ func (d *Decoder) Read(p []byte) (int, error) {
 			d.done = true
 			return 0, io.EOF
 		}
+		if d.skipped > 0 {
+			d.err = fmt.Errorf("validate footer: %d chunks were skipped", d.skipped)
+			return 0, d.err
+		}
 
 		tmp := pool.GetChunkBuf()
 		defer pool.PutChunkBuf(tmp)
@@ -86,11 +103,17 @@ func (d *Decoder) Read(p []byte) (int, error) {
 		d.err = err
 		return 0, d.err
 	}
+	if !decode {
+		// Read the body into a pooled buffer, bounded as Read with one would be.
+		tmp := pool.GetChunkBuf()
+		defer pool.PutChunkBuf(tmp)
+		p = tmp[:]
+	}
 	if header.CompressedSize > uint32(len(p)) {
 		d.err = fmt.Errorf("input buffer too small for compressed chunk: need %d bytes, have %d", header.CompressedSize, len(p))
 		return 0, d.err
 	}
-	if len(d.chunkHashes) >= xet.MaxChunksPerXorb {
+	if len(d.chunkHashes)+d.skipped >= xet.MaxChunksPerXorb {
 		d.err = fmt.Errorf("chunk count exceeds maximum %d", xet.MaxChunksPerXorb)
 		return 0, d.err
 	}
@@ -103,6 +126,11 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	if _, err := io.ReadFull(d.r, body); err != nil {
 		d.err = fmt.Errorf("failed to read chunk data: %w", err)
 		return 0, d.err
+	}
+	if !decode {
+		d.skipped++
+		d.rawSize += uint64(header.UncompressedSize)
+		return 0, nil
 	}
 
 	tmp := pool.GetChunkBuf()

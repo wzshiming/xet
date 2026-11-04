@@ -6,6 +6,8 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
+	"slices"
 	"sort"
 	"sync"
 
@@ -50,9 +52,9 @@ func checkFetchRange(term *Term, chunks ChunkRange, span ByteRange) error {
 	return nil
 }
 
-// chunkSource serves the decoded chunks of one fetched xorb range, indexed
-// from the start of the range: a *chunkCache, or a *memoryRange when there is
-// no on-disk cache.
+// chunkSource serves the decoded chunks of one xorb range, indexed from the
+// start of the range: a *fetchedRange for a range being fetched, or a
+// *chunkCache for one found in the cache.
 type chunkSource interface {
 	readChunk(idx uint32, buf []byte) (chunkRef, error)
 	Done()
@@ -65,9 +67,8 @@ type prefetchEntry struct {
 	ready chan struct{}
 	once  sync.Once
 
-	lastTerm  int     // index of the last term reading the range
-	reads     []int32 // per chunk of the range, how many terms read it; set without a cache
-	requested bool    // the reader asked for the range; touched by the reader only
+	terms     []int // indices of the terms reading the range, ascending
+	requested bool  // the reader asked for the range; touched by the reader only
 }
 
 type prefetcher struct {
@@ -76,9 +77,11 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	cache        *CacheManager  // nil serves decoded ranges from memory ranges instead
-	budget       *memoryBudget  // shared by the memory ranges; nil without a limit
-	workers      sync.WaitGroup // feeder and worker goroutines started by start
+	cache        *CacheManager   // nil keeps fetched ranges out of any cache
+	store        *chunkStore     // holds the chunks of the fetched ranges
+	terms        []selectedFetch // the reader's terms, in reading order
+	termBase     []int64         // per term, the chunks the terms before it read
+	workers      sync.WaitGroup  // feeder and worker goroutines started by start
 
 	// Without a cache the feeder dispatches each range for one window token.
 	// The reader's first request grants lookahead+1 tokens and each request
@@ -129,16 +132,7 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 	}
 	for i, selected := range termFetches {
 		entry := entries[selected.key]
-		entry.lastTerm = i
-		if cache != nil {
-			continue
-		}
-		if entry.reads == nil {
-			entry.reads = make([]int32, selected.chunkEnd-selected.chunkStart)
-		}
-		for c := selected.term.Start; c < selected.term.End; c++ {
-			entry.reads[c-selected.chunkStart]++
-		}
+		entry.terms = append(entry.terms, i)
 	}
 
 	if len(items) == 0 {
@@ -160,9 +154,14 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries:      entries,
 		progressFunc: opts.progressFunc,
 		cache:        cache,
+		store:        newChunkStore(opts.memoryLimit),
+		terms:        termFetches,
+		termBase:     make([]int64, len(termFetches)),
 	}
-	if cache == nil {
-		p.budget = newMemoryBudget(opts.memoryLimit)
+	var read int64
+	for i, selected := range termFetches {
+		p.termBase[i] = read
+		read += int64(selected.term.End - selected.term.Start)
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -256,16 +255,13 @@ func orderEntry(entries []*prefetchEntry, termOrder map[fetchKey]int) {
 }
 
 func (p *prefetcher) runJob(entry *prefetchEntry) {
-	var cache *chunkCache
-	var err error
 	key := entry.task.key
-
-	if err = p.ctx.Err(); err != nil {
+	if err := p.ctx.Err(); err != nil {
 		p.failEntry(entry, err)
 		return
 	}
 	if p.cache == nil {
-		p.fetchToMemory(entry)
+		p.fetch(entry, nil)
 		return
 	}
 	lockFile, err := lockChunkCache(p.ctx, p.cache.dir, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End)
@@ -273,65 +269,85 @@ func (p *prefetcher) runJob(entry *prefetchEntry) {
 		p.failEntry(entry, err)
 		return
 	}
-	releaseLock := true
-	defer func() {
-		if releaseLock {
+	// Another process may have populated the cache while this worker waited.
+	cache, err := openCachedRange(p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
+	if err != nil || cache != nil {
+		flock.Unlock(lockFile) //nolint:errcheck
+		lockFile.Close()
+		if err != nil {
+			p.failEntry(entry, err)
+		} else {
+			p.publishEntry(entry, cache)
+		}
+		return
+	}
+	p.fetch(entry, lockFile)
+}
+
+// fetch decodes entry's range into a fetched range, published before the
+// first chunk so the reader consumes chunks while they arrive. Given the
+// locked file of the range's cache entry, fetch owns it and writes the entry.
+func (p *prefetcher) fetch(entry *prefetchEntry, lockFile *os.File) {
+	key := entry.task.key
+	unlock := func() {
+		if lockFile != nil {
 			flock.Unlock(lockFile) //nolint:errcheck
 			lockFile.Close()
 		}
-	}()
-
-	// Another process may have populated the cache while this worker waited.
-	cache, err = openCachedRange(p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd)
-	if err != nil {
-		p.failEntry(entry, err)
-		return
 	}
-	if cache != nil {
-		p.publishEntry(entry, cache)
-		return
-	}
-
 	dec, closeBody, err := p.openRange(entry)
 	if err != nil {
+		unlock()
 		p.failEntry(entry, err)
 		return
 	}
 	defer closeBody()
 
-	cache, err = newLockedChunkCache(dec, p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
-	if err != nil {
-		p.failEntry(entry, err)
-		return
+	var cache *chunkCache
+	if lockFile != nil {
+		cache, err = newLockedChunkCache(nil, p.cache, key.Hash, entry.task.chunkStart, entry.task.chunkEnd, key.Start, key.End, lockFile)
+		if err != nil {
+			unlock()
+			p.failEntry(entry, err)
+			return
+		}
 	}
-	releaseLock = false // cache.Done owns the lock from this point.
-
-	err = cache.LoadTo(0)
-	if err != nil {
-		cache.Done()
-		p.failEntry(entry, err)
-		return
-	}
-	p.publishEntry(entry, cache)
-	if err := cache.LoadAll(); err != nil {
-		// The published result stays; consumers see the failure through the closed cache.
-		cache.Done()
-	}
-}
-
-// fetchToMemory decodes entry's range into memory, publishing it before the
-// first chunk so the reader consumes chunks while they arrive.
-func (p *prefetcher) fetchToMemory(entry *prefetchEntry) {
-	dec, closeBody, err := p.openRange(entry)
-	if err != nil {
-		p.failEntry(entry, err)
-		return
-	}
-	defer closeBody()
-
-	r := newMemoryRange(entry.reads, p.budget)
+	r := newFetchedRange(p.store, p.chunkUses(entry), cache)
 	p.publishEntry(entry, r)
 	r.fill(dec)
+}
+
+// chunkUses lists for each chunk of entry's range the positions of its reads
+// in reading order, where a position counts the chunk reads before it.
+func (p *prefetcher) chunkUses(entry *prefetchEntry) [][]int64 {
+	n := int(entry.task.chunkEnd - entry.task.chunkStart)
+	each := func(visit func(i int, pos int64)) {
+		for _, t := range entry.terms {
+			selected := p.terms[t]
+			for c := selected.term.Start; c < selected.term.End; c++ {
+				if i := int(c) - int(selected.chunkStart); i >= 0 && i < n {
+					visit(i, p.termBase[t]+int64(c-selected.term.Start))
+				}
+			}
+		}
+	}
+	// Lay the positions out chunk by chunk in one slice.
+	ends := make([]int, n+1)
+	each(func(i int, _ int64) { ends[i+1]++ })
+	for i := range n {
+		ends[i+1] += ends[i]
+	}
+	all := make([]int64, ends[n])
+	next := slices.Clone(ends[:n])
+	each(func(i int, pos int64) {
+		all[next[i]] = pos
+		next[i]++
+	})
+	uses := make([][]int64, n)
+	for i := range uses {
+		uses[i] = all[ends[i]:ends[i+1]:ends[i+1]]
+	}
+	return uses
 }
 
 // openRange requests entry's byte range and returns its chunk decoder.
@@ -405,7 +421,7 @@ func (p *prefetcher) Close() {
 }
 
 // Get returns the source for key, blocking until its fetch task publishes it:
-// a cache after its first chunk, a memory range once the response arrives.
+// a fetched range once the response arrives, or a cached range.
 // The prefetcher retains ownership of the returned source.
 func (p *prefetcher) Get(key fetchKey) (chunkSource, error) {
 	entry, ok := p.entries[key]
@@ -432,13 +448,11 @@ func (p *prefetcher) Get(key fetchKey) (chunkSource, error) {
 	return entry.cache, nil
 }
 
-// finishTerm tells p the reader is done with term termIdx, which read key.
-// Without a cache the range's memory is released once no later term reads it.
+// finishTerm tells p the reader is done with term termIdx, which read key; a
+// range is released once no later term reads it.
 func (p *prefetcher) finishTerm(key fetchKey, termIdx int) {
-	if p.cache != nil {
-		return
-	}
-	if entry := p.entries[key]; entry.lastTerm == termIdx {
+	entry := p.entries[key]
+	if terms := entry.terms; terms[len(terms)-1] == termIdx {
 		entry.cache.Done()
 	}
 }

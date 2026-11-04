@@ -20,27 +20,27 @@ type options struct {
 	expectedHash *xet.FileHash
 }
 
-// WithCacheManager decodes fetched xorb ranges into cache's directory, where
+// WithCacheManager stores fetched xorb ranges in cache's directory, where
 // later readers reuse them; share one CacheManager across readers so the
 // capacity bound applies to the whole cache directory. Without it, or with
 // nil, a reader starts fetching on its first Read, fetches at most
-// WithConcurrency ranges ahead of the one being read, and keeps each decoded
-// chunk only until the last term reading it has read it: in memory up to
-// WithMemoryLimit, past it in a temporary file, and once WriteTo has written
-// it to an *os.File, in that file.
+// WithConcurrency ranges ahead of the one being read, and skips decoding
+// chunks no term reads. Either way a reader keeps each decoded chunk only
+// until the last term reading it has read it, within WithMemoryLimit.
 func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
 		o.cache = cache
 	}
 }
 
-// DefaultMemoryLimit is how many decoded bytes a reader without a cache
-// manager holds in memory unless WithMemoryLimit sets another bound.
+// DefaultMemoryLimit is how many decoded bytes a reader holds in memory
+// unless WithMemoryLimit sets another bound.
 const DefaultMemoryLimit int64 = 64 << 20
 
-// WithMemoryLimit bounds the decoded bytes a reader without a cache manager
-// holds in memory; chunks past it wait in temporary files. Zero or negative
-// keeps every chunk in memory.
+// WithMemoryLimit bounds the decoded bytes a reader holds in memory. Past it,
+// chunks leave memory, first those a file also holds, the cache entry or the
+// *os.File WriteTo wrote them to, then those read again furthest ahead, which
+// wait in a temporary file. Zero or negative keeps every chunk in memory.
 func WithMemoryLimit(limit int64) Option {
 	return func(o *options) {
 		o.memoryLimit = limit

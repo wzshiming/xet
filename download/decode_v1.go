@@ -115,7 +115,7 @@ func (r *ReaderV1) WriteTo(w io.Writer) (n int64, err error) {
 			return n, err
 		}
 		if r.reread != nil {
-			moveWritten(r.reread, r.rereadIdx, w, int64(written))
+			noteWritten(r.reread, r.rereadIdx, w, int64(written))
 			r.reread = nil
 		}
 	}
