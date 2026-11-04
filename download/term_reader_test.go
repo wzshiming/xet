@@ -581,6 +581,31 @@ func TestTermReaderCachesRanges(t *testing.T) {
 	}
 }
 
+// TestTermReaderFinishesCacheWritesAtEOF pins that a reader read to its end
+// returns io.EOF only once its cache writes are over, however slow, as
+// DownloadFiles readers are not closed after EOF.
+func TestTermReaderFinishesCacheWritesAtEOF(t *testing.T) {
+	x := newFixtureXorb(t, 0x3d, randomChunks(39, 3, 1000))
+	terms := []fixtureTerm{{ChunkRange{Start: 0, End: 3}, ChunkRange{Start: 0, End: 3}}}
+	for _, version := range readerVersions {
+		t.Run(version, func(t *testing.T) {
+			dir := t.TempDir()
+			client := &heldClient{fakeClientAdapter: fakeClientAdapter{data: x.encoded}, release: make(chan struct{})}
+			r := openTermReader(t, version, context.Background(), client, x, 0, terms, WithCacheManager(NewCacheManager(dir, 0)))
+			r.writer.beforeWrite = func() { time.Sleep(100 * time.Millisecond) }
+			close(client.release)
+			if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, x.file(terms)) {
+				t.Fatalf("read %d bytes, %v", len(got), err)
+			}
+			if c, err := NewCacheManager(dir, 0).lookup(t.Context(), testXorbHash(0x3d), 0, 3); c == nil || err != nil {
+				t.Fatalf("lookup after EOF = %v, %v; want the range cached", c, err)
+			} else {
+				c.release()
+			}
+		})
+	}
+}
+
 // stallFixture is one xorb of three compressible chunks read as terms [0,2)
 // and [2,3), each with its own range, and the packed end of its first chunk.
 func stallFixture(t *testing.T) (*fixtureXorb, []fixtureTerm, int) {

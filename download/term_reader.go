@@ -603,6 +603,8 @@ func (r *termReader) advance() error {
 	r.eof = true
 	r.cancel()
 	r.detach()
+	// A reader read to its end need not be closed, so its cache writes end here.
+	r.writer.wait()
 	return io.EOF
 }
 
