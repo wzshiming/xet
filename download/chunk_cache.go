@@ -26,6 +26,7 @@ type chunkRef struct {
 	fileIdx int           // index into chunkCache.files; 0 means chunkCache.file
 	hash    xet.ChunkHash // the decoder's hash of the chunk, valid when hashed
 	hashed  bool          // unset for adopted chunks, which no decoder here has seen
+	again   bool          // a later term reads the chunk again; set by memory ranges
 }
 
 type cacheRange struct {

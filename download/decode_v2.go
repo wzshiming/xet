@@ -25,6 +25,8 @@ type ReaderV2 struct {
 	chunkIdx     uint32         // next chunk to read from currentCache
 	buf          *pool.ChunkBuf // pooled; holds the last chunk read
 	chunk        []byte         // unread rest of the chunk in buf
+	reread       chunkSource    // set while buf holds a whole chunk a later term reads again
+	rereadIdx    uint32
 	currentTerm  *Term
 	currentCache chunkSource
 	localStart   uint32
@@ -34,7 +36,7 @@ type ReaderV2 struct {
 
 // NewReaderV2 creates a new V2 reconstruction reader.
 func NewReaderV2(ctx context.Context, client ClientAdapter, reconstruction *ReconstructionResponseV2, opts ...Option) (io.ReadCloser, error) {
-	options := &options{}
+	options := &options{memoryLimit: DefaultMemoryLimit}
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -83,6 +85,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 			}
 			return n, err
 		}
+		r.reread = nil
 		copied := copy(p[n:], r.chunk)
 		r.chunk = r.chunk[copied:]
 		n += copied
@@ -108,7 +111,12 @@ func (r *ReaderV2) WriteTo(w io.Writer) (n int64, err error) {
 		r.chunk = r.chunk[written:]
 		n += int64(written)
 		if err != nil {
+			r.reread = nil
 			return n, err
+		}
+		if r.reread != nil {
+			moveWritten(r.reread, r.rereadIdx, w, int64(written))
+			r.reread = nil
 		}
 	}
 }
@@ -154,6 +162,10 @@ func (r *ReaderV2) fill() error {
 			r.cleanup()
 			return err
 		}
+		r.reread = nil
+		if ref.again && !(r.termIdx == 0 && r.skipBytes > 0) {
+			r.reread, r.rereadIdx = r.currentCache, r.chunkIdx
+		}
 		r.chunkIdx++
 		size := int64(ref.size)
 		data := r.buf[:size]
@@ -183,6 +195,7 @@ func (r *ReaderV2) cleanup() {
 	}
 	r.prefetcher = nil
 	r.currentCache = nil
+	r.reread = nil
 	r.currentTerm = nil
 	r.buf = nil
 	r.chunk = nil
@@ -253,6 +266,7 @@ func planReaderV2(reconstruction *ReconstructionResponseV2) ([]selectedFetch, []
 			key:        key,
 			chunkStart: rg.Chunks.Start,
 			chunkEnd:   rg.Chunks.End,
+			term:       term.Range,
 		}
 		tasks = append(tasks, fetchTask{
 			key:        key,

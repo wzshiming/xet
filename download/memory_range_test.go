@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -138,8 +139,8 @@ func TestReadersWithoutCache(t *testing.T) {
 }
 
 // TestReaderWithoutCacheReleasesRangeAfterItsLastTerm reads the revisiting
-// terms one at a time: a range stays in memory while a later term still
-// reads it and is dropped once the reader moves past its last term.
+// terms one at a time: a chunk is held while a later term still reads it, and
+// a range is released once the reader moves past its last term.
 func TestReaderWithoutCacheReleasesRangeAfterItsLastTerm(t *testing.T) {
 	encoded, want, _, keys, readers := revisitReaders(t, 1)
 	for name, newReader := range readers {
@@ -156,18 +157,29 @@ func TestReaderWithoutCacheReleasesRangeAfterItsLastTerm(t *testing.T) {
 				defer m.mu.Unlock()
 				return errors.Is(m.err, fs.ErrClosed)
 			}
+			held := func(key fetchKey) []bool {
+				m := p.entries[key].cache.(*memoryRange)
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				var held []bool
+				for _, c := range m.chunks {
+					held = append(held, c.data != nil || c.file != nil)
+				}
+				return held
+			}
 
 			// A term is finished by the Read after its last byte, so each step
 			// reads the next term and checks the ranges of the terms before it.
 			steps := []struct {
 				end      int
 				released []bool // A, B, C; nil for ranges no term has read yet
+				aHeld    []bool // A's chunks 0 and 1, read again by terms 5 and 2
 			}{
-				{3000, []bool{false, false}},        // terms 0 (A) and 1 (B)
-				{4000, []bool{false, false}},        // term 2 (A)
-				{6000, []bool{false, false, false}}, // term 3 (C)
-				{7000, []bool{false, false, true}},  // term 4 (B); C read last by term 3
-				{8000, []bool{false, true, true}},   // term 5 (A); B read last by term 4
+				{3000, []bool{false, false}, []bool{true, true}},         // terms 0 (A) and 1 (B)
+				{4000, []bool{false, false}, []bool{true, false}},        // term 2 (A)
+				{6000, []bool{false, false, false}, []bool{true, false}}, // term 3 (C)
+				{7000, []bool{false, false, true}, []bool{true, false}},  // term 4 (B); C read last by term 3
+				{8000, []bool{false, true, true}, []bool{false, false}},  // term 5 (A); B read last by term 4
 			}
 			read := 0
 			for _, step := range steps {
@@ -181,6 +193,9 @@ func TestReaderWithoutCacheReleasesRangeAfterItsLastTerm(t *testing.T) {
 						t.Fatalf("after %d bytes: range %c released = %v, want %v", read, 'A'+i, got, wantReleased)
 					}
 				}
+				if got := held(keys[0]); !slices.Equal(got, step.aHeld) {
+					t.Fatalf("after %d bytes: A's chunks held = %v, want %v", read, got, step.aHeld)
+				}
 			}
 			if n, err := r.Read(make([]byte, 1)); n != 0 || err != io.EOF {
 				t.Fatalf("Read at the end = %d, %v; want EOF", n, err)
@@ -191,6 +206,190 @@ func TestReaderWithoutCacheReleasesRangeAfterItsLastTerm(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestReaderWithoutCacheMemoryLimit reads the revisiting terms under memory
+// limits that spill none, some or all chunks, through Read and through
+// WriteTo into a buffer and into a file: the output verifies, the budget is
+// whole again at EOF, and no spill file outlives the reader.
+func TestReaderWithoutCacheMemoryLimit(t *testing.T) {
+	encoded, want, fileHash, _, readers := revisitReaders(t, 1)
+	outDir := t.TempDir()
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	sinks := map[string]func(t *testing.T, r io.Reader) []byte{
+		"Read": func(t *testing.T, r io.Reader) []byte {
+			got, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return got
+		},
+		"WriteTo buffer": func(t *testing.T, r io.Reader) []byte {
+			var buf bytes.Buffer
+			if _, err := r.(io.WriterTo).WriteTo(&buf); err != nil {
+				t.Fatal(err)
+			}
+			return buf.Bytes()
+		},
+		"WriteTo file": func(t *testing.T, r io.Reader) []byte {
+			f, err := os.CreateTemp(outDir, "out")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if _, err := r.(io.WriterTo).WriteTo(f); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(f.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return got
+		},
+	}
+	for name, newReader := range readers {
+		for sinkName, sink := range sinks {
+			for _, limit := range []int64{0, 1, 2500} {
+				t.Run(fmt.Sprintf("%s/%s/limit=%d", name, sinkName, limit), func(t *testing.T) {
+					r, err := newReader(t.Context(), &fakeClientAdapter{data: encoded}, 0, WithMemoryLimit(limit), WithConcurrency(2), WithExpectedFileHash(fileHash))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer r.Close()
+					p := readerPrefetcher(t, r)
+					if got := sink(t, r); !bytes.Equal(got, want) {
+						t.Fatalf("got %d bytes, want %d", len(got), len(want))
+					}
+					if limit <= 0 {
+						if p.budget != nil {
+							t.Fatal("unlimited reader has a budget")
+						}
+					} else if left := p.budget.left.Load(); left != limit {
+						t.Fatalf("budget left at EOF = %d, want %d", left, limit)
+					}
+					if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+						t.Fatalf("spill files left behind: %v, %v", entries, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+// holdClient serves like fakeClientAdapter but holds the request for one
+// byte range until release is closed.
+type holdClient struct {
+	fakeClientAdapter
+	hold    string // Range header to hold
+	release chan struct{}
+}
+
+func (c *holdClient) DownloadXorbWithURL(ctx context.Context, url string, header http.Header) (io.ReadCloser, error) {
+	if header.Get("Range") == c.hold {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.fakeClientAdapter.DownloadXorbWithURL(ctx, url, header)
+}
+
+// TestReaderWithoutCacheRereadsFromOutputFile has WriteTo write the revisiting
+// terms into a file while range C is held back: by then the first terms are
+// in the file, and A's chunk 0, which term 5 reads again, must be read back
+// from it rather than held, unless the file cannot be read; a changed file is
+// rejected instead of copied.
+func TestReaderWithoutCacheRereadsFromOutputFile(t *testing.T) {
+	encoded, want, fileHash, keys, readers := revisitReaders(t, 1)
+	cases := []struct {
+		name    string
+		flag    int
+		change  bool
+		wantIn  string // where A's chunk 0 waits for term 5
+		wantErr string
+	}{
+		{"read back", os.O_RDWR, false, "output", ""},
+		{"changed", os.O_RDWR, true, "output", "no longer holds it"},
+		{"write-only", os.O_WRONLY, false, "memory", ""},
+	}
+	for name, newReader := range readers {
+		for _, tc := range cases {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "out")
+				out, err := os.OpenFile(path, tc.flag|os.O_CREATE, 0o644)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer out.Close()
+				client := &holdClient{
+					fakeClientAdapter: fakeClientAdapter{data: encoded},
+					hold:              fmt.Sprintf("bytes=%d-%d", keys[2].Start, keys[2].End),
+					release:           make(chan struct{}),
+				}
+				r, err := newReader(t.Context(), client, 0, WithConcurrency(2), WithMemoryLimit(0), WithExpectedFileHash(fileHash))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				entry := readerPrefetcher(t, r).entries[keys[0]]
+
+				done := make(chan error, 1)
+				go func() {
+					_, err := r.(io.WriterTo).WriteTo(out)
+					done <- err
+				}()
+				// Terms 0 to 2 fill 4000 bytes; term 3 waits for C.
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					if info, err := os.Stat(path); err == nil && info.Size() == 4000 {
+						break
+					}
+					if time.Now().After(deadline) {
+						close(client.release)
+						t.Fatal("WriteTo did not reach range C")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				<-entry.ready
+				m := entry.cache.(*memoryRange)
+				m.mu.Lock()
+				c := m.chunks[0]
+				m.mu.Unlock()
+				in := "memory"
+				if c.data == nil {
+					in = "output"
+					if c.file != out || c.off != 0 {
+						t.Errorf("chunk 0 at %v:%d, want the output file at 0", c.file, c.off)
+					}
+				}
+				if in != tc.wantIn {
+					t.Errorf("A's chunk 0 waits in %s, want %s", in, tc.wantIn)
+				}
+				if tc.change {
+					if _, err := out.WriteAt([]byte{^want[0]}, 0); err != nil {
+						t.Fatal(err)
+					}
+				}
+				close(client.release)
+
+				err = <-done
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("WriteTo err = %v, want %q", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("output has %d bytes, %v; want %d", len(got), err, len(want))
+				}
+			})
+		}
 	}
 }
 
@@ -392,10 +591,11 @@ func TestReaderWithoutCacheFinishesBodyBeforeLastChunk(t *testing.T) {
 func TestMemoryRange(t *testing.T) {
 	chunks := [][]byte{[]byte("first chunk"), []byte("second chunk")}
 	encoded := buildTestXorb(t, chunks)
+	once := func(n int) []int32 { return slices.Repeat([]int32{1}, n) }
 	cases := []struct {
 		name     string
 		data     []byte
-		expected uint32
+		expected int
 		served   int    // leading chunks that must be served
 		wantErr  string // error for chunk index served
 	}{
@@ -406,7 +606,7 @@ func TestMemoryRange(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newMemoryRange(tc.expected)
+			r := newMemoryRange(once(tc.expected), nil)
 			r.fill(xorb.NewDecoder(bytes.NewReader(tc.data), false))
 			buf := make([]byte, 64)
 			for i := range tc.served {
@@ -428,9 +628,123 @@ func TestMemoryRange(t *testing.T) {
 		})
 	}
 
+	// read checks chunk i is served from where wantIn says, then reads it.
+	read := func(t *testing.T, r *memoryRange, i int, wantIn string, again bool) {
+		t.Helper()
+		r.mu.Lock()
+		c := r.chunks[i]
+		r.mu.Unlock()
+		in := "nowhere"
+		switch {
+		case c.data != nil:
+			in = "memory"
+		case c.file != nil && c.file == r.spill:
+			in = "spill"
+		case c.file != nil:
+			in = "output"
+		}
+		if in != wantIn {
+			t.Fatalf("chunk %d is in %s, want %s", i, in, wantIn)
+		}
+		buf := make([]byte, 64)
+		ref, err := r.readChunk(uint32(i), buf)
+		if err != nil || !bytes.Equal(buf[:ref.size], chunks[i]) || ref.again != again {
+			t.Fatalf("chunk %d = %q, again %v, %v; want %q, again %v", i, buf[:ref.size], ref.again, err, chunks[i], again)
+		}
+	}
+
+	t.Run("each chunk until its last read", func(t *testing.T) {
+		budget := newMemoryBudget(100)
+		r := newMemoryRange([]int32{0, 2}, budget)
+		r.fill(xorb.NewDecoder(bytes.NewReader(encoded), false))
+		if _, err := r.readChunk(0, make([]byte, 64)); err == nil || !strings.Contains(err.Error(), "no read left") {
+			t.Fatalf("chunk no term reads: err = %v, want no read left", err)
+		}
+		read(t, r, 1, "memory", true)
+		read(t, r, 1, "memory", false)
+		if left := budget.left.Load(); left != 100 {
+			t.Fatalf("budget left after the last read = %d, want 100", left)
+		}
+		if _, err := r.readChunk(1, make([]byte, 64)); err == nil || !strings.Contains(err.Error(), "no read left") {
+			t.Fatalf("read past the last: err = %v, want no read left", err)
+		}
+	})
+
+	t.Run("spills past the budget", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("TMPDIR", tmp)
+		budget := newMemoryBudget(int64(len(chunks[0])))
+		r := newMemoryRange(once(2), budget)
+		r.fill(xorb.NewDecoder(bytes.NewReader(encoded), false))
+		read(t, r, 0, "memory", false)
+		read(t, r, 1, "spill", false)
+		r.Done()
+		if left := budget.left.Load(); left != int64(len(chunks[0])) {
+			t.Fatalf("budget left = %d, want %d", left, len(chunks[0]))
+		}
+		if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+			t.Fatalf("spill files left behind: %v, %v", entries, err)
+		}
+	})
+
+	t.Run("holds chunks the spill file cannot take", func(t *testing.T) {
+		t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+		budget := newMemoryBudget(1)
+		r := newMemoryRange(once(2), budget)
+		r.fill(xorb.NewDecoder(bytes.NewReader(encoded), false))
+		read(t, r, 0, "memory", false)
+		read(t, r, 1, "memory", false)
+		if left := budget.left.Load(); left != 1 {
+			t.Fatalf("budget left = %d, want 1", left)
+		}
+	})
+
+	t.Run("moves a written chunk to the output file", func(t *testing.T) {
+		out, err := os.Create(filepath.Join(t.TempDir(), "out"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Close()
+		budget := newMemoryBudget(100)
+		r := newMemoryRange([]int32{1, 3}, budget)
+		r.fill(xorb.NewDecoder(bytes.NewReader(encoded), false))
+		read(t, r, 1, "memory", true)
+		if _, err := out.Write(append([]byte("prefix"), chunks[1]...)); err != nil {
+			t.Fatal(err)
+		}
+		moveWritten(r, 1, out, int64(len(chunks[1])))
+		if left := budget.left.Load(); left != 100-int64(len(chunks[0])) {
+			t.Fatalf("budget left = %d; want chunk 1 given back", left)
+		}
+		read(t, r, 1, "output", true)
+
+		if _, err := out.WriteAt([]byte("X"), int64(len("prefix"))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.readChunk(1, make([]byte, 64)); err == nil || !strings.Contains(err.Error(), "no longer holds it") {
+			t.Fatalf("read of a changed output file: err = %v, want it rejected", err)
+		}
+	})
+
+	t.Run("keeps a chunk written to a file it cannot read", func(t *testing.T) {
+		out, err := os.OpenFile(filepath.Join(t.TempDir(), "out"), os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer out.Close()
+		r := newMemoryRange([]int32{2, 0}, nil)
+		r.fill(xorb.NewDecoder(bytes.NewReader(encoded), false))
+		read(t, r, 0, "memory", true)
+		if _, err := out.Write(chunks[0]); err != nil {
+			t.Fatal(err)
+		}
+		moveWritten(r, 0, out, int64(len(chunks[0])))
+		read(t, r, 0, "memory", false)
+	})
+
 	t.Run("Done wakes a waiting reader and stops the worker", func(t *testing.T) {
 		pr, pw := io.Pipe()
-		r := newMemoryRange(1)
+		r := newMemoryRange(once(1), nil)
 		filled := make(chan struct{})
 		go func() {
 			defer close(filled)

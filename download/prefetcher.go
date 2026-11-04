@@ -39,6 +39,7 @@ type selectedFetch struct {
 	key        fetchKey
 	chunkStart uint32
 	chunkEnd   uint32
+	term       ChunkRange // the chunks the term reads, within [chunkStart, chunkEnd)
 }
 
 // checkFetchRange rejects server-supplied ranges before any cache file is sized from them.
@@ -64,8 +65,9 @@ type prefetchEntry struct {
 	ready chan struct{}
 	once  sync.Once
 
-	lastTerm  int  // index of the last term reading the range
-	requested bool // the reader asked for the range; touched by the reader only
+	lastTerm  int     // index of the last term reading the range
+	reads     []int32 // per chunk of the range, how many terms read it; set without a cache
+	requested bool    // the reader asked for the range; touched by the reader only
 }
 
 type prefetcher struct {
@@ -74,7 +76,8 @@ type prefetcher struct {
 	client       ClientAdapter
 	entries      map[fetchKey]*prefetchEntry
 	progressFunc progress.ProgressFunc
-	cache        *CacheManager  // nil keeps decoded ranges in memory instead
+	cache        *CacheManager  // nil serves decoded ranges from memory ranges instead
+	budget       *memoryBudget  // shared by the memory ranges; nil without a limit
 	workers      sync.WaitGroup // feeder and worker goroutines started by start
 
 	// Without a cache the feeder dispatches each range for one window token.
@@ -125,7 +128,17 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		items = append(items, item)
 	}
 	for i, selected := range termFetches {
-		entries[selected.key].lastTerm = i
+		entry := entries[selected.key]
+		entry.lastTerm = i
+		if cache != nil {
+			continue
+		}
+		if entry.reads == nil {
+			entry.reads = make([]int32, selected.chunkEnd-selected.chunkStart)
+		}
+		for c := selected.term.Start; c < selected.term.End; c++ {
+			entry.reads[c-selected.chunkStart]++
+		}
 	}
 
 	if len(items) == 0 {
@@ -147,6 +160,9 @@ func newPrefetcher(ctx context.Context, client ClientAdapter, termFetches []sele
 		entries:      entries,
 		progressFunc: opts.progressFunc,
 		cache:        cache,
+	}
+	if cache == nil {
+		p.budget = newMemoryBudget(opts.memoryLimit)
 	}
 
 	if err := p.start(items, opts.concurrency); err != nil {
@@ -313,7 +329,7 @@ func (p *prefetcher) fetchToMemory(entry *prefetchEntry) {
 	}
 	defer closeBody()
 
-	r := newMemoryRange(entry.task.chunkEnd - entry.task.chunkStart)
+	r := newMemoryRange(entry.reads, p.budget)
 	p.publishEntry(entry, r)
 	r.fill(dec)
 }

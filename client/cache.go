@@ -13,8 +13,9 @@ import (
 // <root>/download holds decoded chunks, <root>/upload holds upload staging
 // and cached chunk locations.
 type Cache struct {
-	// Download caches decoded chunks; with nil, downloads keep each decoded
-	// range in memory only while they still read it and write nothing to disk.
+	// Download caches decoded chunks; with nil, a download keeps each chunk
+	// only until its last use, in memory up to download.DefaultMemoryLimit and
+	// in temporary files past it.
 	Download *download.CacheManager
 	Upload   *upload.CacheManager
 }

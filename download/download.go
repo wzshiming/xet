@@ -16,18 +16,34 @@ type options struct {
 	concurrency  int
 	progressFunc progress.ProgressFunc
 	cache        *CacheManager
+	memoryLimit  int64
 	expectedHash *xet.FileHash
 }
 
 // WithCacheManager decodes fetched xorb ranges into cache's directory, where
 // later readers reuse them; share one CacheManager across readers so the
 // capacity bound applies to the whole cache directory. Without it, or with
-// nil, a reader writes nothing to disk: it starts fetching on its first Read,
-// keeps each decoded range in memory until the last term reading it is read,
-// and fetches at most WithConcurrency ranges ahead of the one being read.
+// nil, a reader starts fetching on its first Read, fetches at most
+// WithConcurrency ranges ahead of the one being read, and keeps each decoded
+// chunk only until the last term reading it has read it: in memory up to
+// WithMemoryLimit, past it in a temporary file, and once WriteTo has written
+// it to an *os.File, in that file.
 func WithCacheManager(cache *CacheManager) Option {
 	return func(o *options) {
 		o.cache = cache
+	}
+}
+
+// DefaultMemoryLimit is how many decoded bytes a reader without a cache
+// manager holds in memory unless WithMemoryLimit sets another bound.
+const DefaultMemoryLimit int64 = 64 << 20
+
+// WithMemoryLimit bounds the decoded bytes a reader without a cache manager
+// holds in memory; chunks past it wait in temporary files. Zero or negative
+// keeps every chunk in memory.
+func WithMemoryLimit(limit int64) Option {
+	return func(o *options) {
+		o.memoryLimit = limit
 	}
 }
 
