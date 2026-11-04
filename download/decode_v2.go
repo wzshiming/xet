@@ -10,7 +10,7 @@ import (
 	"github.com/wzshiming/xet/internal/pool"
 )
 
-// ReaderV2 implements io.Reader for V2 reconstruction
+// ReaderV2 implements io.Reader and io.WriterTo for V2 reconstruction
 type ReaderV2 struct {
 	client         ClientAdapter
 	ctx            context.Context
@@ -22,8 +22,9 @@ type ReaderV2 struct {
 
 	// State for reading
 	termIdx      int
-	chunkIdx     uint32
-	chunkOffset  int
+	chunkIdx     uint32         // next chunk to read from currentCache
+	buf          *pool.ChunkBuf // pooled; holds the last chunk read
+	chunk        []byte         // unread rest of the chunk in buf
 	currentTerm  *Term
 	currentCache chunkSource
 	localStart   uint32
@@ -75,24 +76,57 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		return 0, r.err
 	}
 
-	buf := pool.GetChunkBuf()
-	defer pool.PutChunkBuf(buf)
-
 	for n < len(p) {
+		if err := r.fill(); err != nil {
+			if n > 0 && err != io.EOF {
+				return n, nil
+			}
+			return n, err
+		}
+		copied := copy(p[n:], r.chunk)
+		r.chunk = r.chunk[copied:]
+		n += copied
+	}
+
+	return n, nil
+}
+
+// WriteTo implements io.WriterTo, writing each remaining chunk with one Write.
+func (r *ReaderV2) WriteTo(w io.Writer) (n int64, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	for {
+		if err := r.fill(); err != nil {
+			if err == io.EOF {
+				return n, nil
+			}
+			return n, err
+		}
+		written, err := writeChunk(w, r.chunk)
+		r.chunk = r.chunk[written:]
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+	}
+}
+
+// fill reads the next chunk into buf once chunk is drained; errors other than io.EOF stick.
+func (r *ReaderV2) fill() error {
+	for len(r.chunk) == 0 {
 		// Check if we're done with all terms
 		if r.termIdx >= len(r.reconstruction.Terms) {
 			if r.verifier != nil {
 				if err := r.verifier.verify(); err != nil {
 					r.err = err
 					r.cleanup()
-					if n > 0 {
-						return n, nil
-					}
-					return 0, err
+					return err
 				}
 			}
 			r.cleanup()
-			return n, io.EOF
+			return io.EOF
 		}
 
 		// Load next term if needed
@@ -100,10 +134,7 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 			if err := r.loadTerm(); err != nil {
 				r.err = err
 				r.cleanup()
-				if n > 0 {
-					return n, nil
-				}
-				return 0, err
+				return err
 			}
 		}
 
@@ -114,64 +145,47 @@ func (r *ReaderV2) Read(p []byte) (n int, err error) {
 		}
 
 		// Get chunk on demand by index
-		ref, chunkErr := r.currentCache.readChunk(r.chunkIdx, buf[:])
-		if chunkErr != nil {
-			r.err = chunkErr
-			r.cleanup()
-			if n > 0 {
-				return n, nil
-			}
-			return 0, chunkErr
+		if r.buf == nil {
+			r.buf = pool.GetChunkBuf()
 		}
-
+		ref, err := r.currentCache.readChunk(r.chunkIdx, r.buf[:])
+		if err != nil {
+			r.err = err
+			r.cleanup()
+			return err
+		}
+		r.chunkIdx++
 		size := int64(ref.size)
-		data := buf[:size]
+		data := r.buf[:size]
 
-		// A chunk is re-read when Read returns mid-chunk; verify it only on its first visit.
-		if r.verifier != nil && r.chunkOffset == 0 {
+		if r.verifier != nil {
 			r.verifier.add(ref, data)
 		}
 
 		// Apply OffsetIntoFirstRange skip; it may span multiple leading chunks
 		if r.termIdx == 0 && r.skipBytes > 0 {
-			if r.skipBytes >= size {
-				r.skipBytes -= size
-				r.chunkIdx++
-				r.chunkOffset = 0
-				continue
-			}
-			// Fold into chunkOffset so re-reading this chunk stays aligned
-			r.chunkOffset = int(r.skipBytes)
-			r.skipBytes = 0
+			skip := min(r.skipBytes, size)
+			r.skipBytes -= skip
+			data = data[skip:]
 		}
-
-		// Copy data from current position
-		if r.chunkOffset < len(data) {
-			copied := copy(p[n:], data[r.chunkOffset:])
-			n += copied
-			r.chunkOffset += copied
-
-			if r.chunkOffset >= len(data) {
-				r.chunkIdx++
-				r.chunkOffset = 0
-			}
-		} else {
-			r.chunkIdx++
-			r.chunkOffset = 0
-		}
+		r.chunk = data
 	}
-
-	return n, nil
+	return nil
 }
 
-// cleanup closes the prefetcher, which owns and releases all caches.
+// cleanup closes the prefetcher, which owns and releases all caches, and returns buf to the pool.
 func (r *ReaderV2) cleanup() {
 	if r.prefetcher != nil {
 		r.prefetcher.Close()
 	}
+	if r.buf != nil {
+		pool.PutChunkBuf(r.buf)
+	}
 	r.prefetcher = nil
 	r.currentCache = nil
 	r.currentTerm = nil
+	r.buf = nil
+	r.chunk = nil
 }
 
 // Close releases the prefetcher and all cache references held by the reader.
@@ -212,7 +226,6 @@ func (r *ReaderV2) loadTerm() error {
 	r.localStart = localStart
 	r.localEnd = localEnd
 	r.chunkIdx = localStart
-	r.chunkOffset = 0
 
 	return nil
 }

@@ -1,7 +1,9 @@
 package download
 
 import (
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/progress"
@@ -87,4 +89,19 @@ func (v *fileVerifier) verify() error {
 		return fmt.Errorf("file hash mismatch: expected %s, got %s", v.expected, got)
 	}
 	return nil
+}
+
+// writeChunk writes chunk to w with one Write and checks the result as io.Copy does.
+func writeChunk(w io.Writer, chunk []byte) (int, error) {
+	n, err := w.Write(chunk)
+	if n < 0 || n > len(chunk) {
+		n = 0
+		if err == nil {
+			err = errors.New("invalid write result")
+		}
+	}
+	if n < len(chunk) && err == nil {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }

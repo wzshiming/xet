@@ -484,6 +484,194 @@ func TestReaderVerifiesWithDecoderChunkHashes(t *testing.T) {
 	}
 }
 
+// recordingWriter records the size of every Write. Past limit bytes it takes
+// nothing more and fails with err, or writes short when err is nil.
+type recordingWriter struct {
+	data  []byte
+	sizes []int
+	limit int
+	err   error
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.sizes = append(w.sizes, len(p))
+	n := min(len(p), w.limit-len(w.data))
+	w.data = append(w.data, p[:n]...)
+	if n < len(p) {
+		return n, w.err
+	}
+	return n, nil
+}
+
+// TestReaderWriteTo pins io.WriterTo on both readers: io.Copy writes each
+// chunk occurrence with one Write, the first taking the rest of the chunk the
+// copy starts in, and returns file hash mismatches and the writer's errors;
+// after a failed Write, reading resumes where the writer stopped.
+func TestReaderWriteTo(t *testing.T) {
+	sizes := []int{1000, 1500, 700}
+	rng := rand.New(rand.NewSource(1))
+	chunks := make([][]byte, len(sizes))
+	for i, size := range sizes {
+		chunks[i] = make([]byte, size)
+		rng.Read(chunks[i])
+	}
+	encoded := buildTestXorb(t, chunks)
+	hashes := chunkHashes(chunks)
+
+	terms := []Term{
+		{Hash: testCacheHash, Range: ChunkRange{Start: 0, End: 2}},
+		{Hash: testCacheHash, Range: ChunkRange{Start: 1, End: 3}},
+		{Hash: testCacheHash, Range: ChunkRange{Start: 0, End: 1}},
+	}
+	var full []byte
+	var occurrences []int
+	var fileHashes []xet.ChunkHash
+	var fileSizes []uint64
+	for _, term := range terms {
+		for i := term.Range.Start; i < term.Range.End; i++ {
+			full = append(full, chunks[i]...)
+			occurrences = append(occurrences, sizes[i])
+			fileHashes = append(fileHashes, hashes[i])
+			fileSizes = append(fileSizes, uint64(sizes[i]))
+		}
+	}
+	fileHash := xet.ComputeFileHash(fileHashes, fileSizes)
+
+	fetch := ChunkRange{Start: 0, End: uint32(len(chunks))}
+	span := ByteRange{Start: 0, End: int64(len(encoded) - 1)}
+	readers := map[string]func(offset int64, opts ...Option) (io.ReadCloser, error){
+		"v1": func(offset int64, opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV1(context.Background(), &fakeClientAdapter{data: encoded}, &ReconstructionResponseV1{
+				OffsetIntoFirstRange: offset,
+				Terms:                terms,
+				FetchInfo:            map[string][]FetchInfoEntry{testCacheHash: {{Range: fetch, URL: "test://xorb", URLRange: span}}},
+			}, opts...)
+		},
+		"v2": func(offset int64, opts ...Option) (io.ReadCloser, error) {
+			return NewReaderV2(context.Background(), &fakeClientAdapter{data: encoded}, &ReconstructionResponseV2{
+				OffsetIntoFirstRange: offset,
+				Terms:                terms,
+				Xorbs:                map[string][]XorbMultiRangeFetch{testCacheHash: {{URL: "test://xorb", Ranges: []XorbRangeDescriptor{{Chunks: fetch, Bytes: span}}}}},
+			}, opts...)
+		},
+	}
+
+	for name, newReader := range readers {
+		open := func(t *testing.T, offset int, opts ...Option) io.ReadCloser {
+			t.Helper()
+			r, err := newReader(int64(offset), append(opts, WithCacheManager(NewCacheManager(t.TempDir(), 0)))...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { r.Close() })
+			return r
+		}
+
+		for _, test := range []struct {
+			name         string
+			offset, read int // OffsetIntoFirstRange; bytes taken with Read before io.Copy
+		}{
+			{"whole file", 0, 0},
+			{"after a partial Read", 0, 500},
+			{"offset into first range", 1300, 0},
+		} {
+			t.Run(name+"/"+test.name, func(t *testing.T) {
+				var opts []Option
+				if test.offset == 0 {
+					opts = append(opts, WithExpectedFileHash(fileHash))
+				}
+				r := open(t, test.offset, opts...)
+				head := make([]byte, test.read)
+				if _, err := io.ReadFull(r, head); err != nil {
+					t.Fatal(err)
+				}
+				w := &recordingWriter{limit: math.MaxInt}
+				n, err := io.Copy(w, r)
+				if got := append(head, w.data...); err != nil || n != int64(len(w.data)) || !bytes.Equal(got, full[test.offset:]) {
+					t.Fatalf("io.Copy = %d, %v; got %d bytes in all, want %d", n, err, len(got), len(full)-test.offset)
+				}
+				var want []int
+				skip := test.offset + test.read
+				for _, size := range occurrences {
+					if skip >= size {
+						skip -= size
+						continue
+					}
+					want = append(want, size-skip)
+					skip = 0
+				}
+				if !slices.Equal(w.sizes, want) {
+					t.Fatalf("Write sizes %v, want one Write per chunk: %v", w.sizes, want)
+				}
+			})
+		}
+
+		t.Run(name+"/hash mismatch", func(t *testing.T) {
+			r := open(t, 0, WithExpectedFileHash(xet.FileHash{}))
+			n, err := io.Copy(&recordingWriter{limit: math.MaxInt}, r)
+			if err == nil || !strings.Contains(err.Error(), "file hash mismatch") || n != int64(len(full)) {
+				t.Fatalf("io.Copy = %d, %v; want %d bytes and a file hash mismatch", n, err, len(full))
+			}
+		})
+
+		errWrite := errors.New("write failed")
+		for _, test := range []struct {
+			name  string
+			limit int
+			err   error
+		}{
+			{"write error at a chunk end", 1000, errWrite},
+			{"write error mid-chunk", 1700, errWrite},
+			{"short write", 1700, nil},
+		} {
+			t.Run(name+"/"+test.name, func(t *testing.T) {
+				r := open(t, 0, WithExpectedFileHash(fileHash))
+				w := &recordingWriter{limit: test.limit, err: test.err}
+				n, err := io.Copy(w, r)
+				want := test.err
+				if want == nil {
+					want = io.ErrShortWrite
+				}
+				if !errors.Is(err, want) || n != int64(test.limit) {
+					t.Fatalf("io.Copy = %d, %v; want %d, %v", n, err, test.limit, want)
+				}
+				// Each chunk still counts once toward the file hash.
+				rest, err := io.ReadAll(r)
+				if got := append(w.data, rest...); err != nil || !bytes.Equal(got, full) {
+					t.Fatalf("resumed read: got %d bytes in all, %v; want %d", len(got), err, len(full))
+				}
+			})
+		}
+	}
+}
+
+// TestReaderReadsEachChunkOnce pins that Read takes a chunk from the cache
+// once, however small the reads: a change to the cache entry after the first
+// byte is read does not reach the rest of that chunk.
+func TestReaderReadsEachChunkOnce(t *testing.T) {
+	chunk := randomChunks(1, 1, 1000)[0]
+	for name, newReader := range rangeReaders {
+		t.Run(name, func(t *testing.T) {
+			cache := NewCacheManager(t.TempDir(), 0)
+			path := writeRangeEntry(t, cache, testCacheHash, 0, 1, 0, 1023, []string{string(chunk)})
+			r, err := newReader(&refusingClient{}, ChunkRange{Start: 0, End: 1}, ChunkRange{Start: 0, End: 1}, 1023, cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			got := make([]byte, 1)
+			if _, err := io.ReadFull(r, got); err != nil {
+				t.Fatal(err)
+			}
+			corruptDataByte(t, path)
+			rest, err := io.ReadAll(iotest.OneByteReader(r))
+			if got = append(got, rest...); err != nil || !bytes.Equal(got, chunk) {
+				t.Fatalf("got %d bytes, %v; want the chunk as first read", len(got), err)
+			}
+		})
+	}
+}
+
 // recordingStorageAdapter captures what GetXorbURL receives.
 type recordingStorageAdapter struct {
 	ctx context.Context

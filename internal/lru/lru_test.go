@@ -216,9 +216,7 @@ func TestConcurrentAccess(t *testing.T) {
 	c.OnEvicted = func(int, int) {}
 	var wg sync.WaitGroup
 	for g := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range 2000 {
 				k := (g*2000 + i) % 100
 				switch i % 5 {
@@ -234,7 +232,7 @@ func TestConcurrentAccess(t *testing.T) {
 					c.RemoveOldest()
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if n := c.Len(); n > 64 {
