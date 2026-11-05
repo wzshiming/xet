@@ -161,11 +161,12 @@ func TestConcurrentAccess(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
-			if err != nil {
-				t.Error(err)
+			file := sh.FindFileBySHA256(digest)
+			if file == nil {
+				t.Error("FindFileBySHA256: not found")
 				return
 			}
+			rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 			got, err := io.ReadAll(rc)
 			_ = rc.Close()
 			if err != nil || !bytes.Equal(got, contents[i]) {

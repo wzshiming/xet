@@ -405,10 +405,11 @@ func TestIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, sum)
-	if err != nil {
-		t.Fatal(err)
+	file := sh.FindFileBySHA256(sum)
+	if file == nil {
+		t.Fatal("FindFileBySHA256: not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	defer rc.Close()
 	got, err := io.ReadAll(rc)
 	if err != nil {
@@ -484,10 +485,11 @@ func TestSpoolWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, sum)
-	if err != nil {
-		t.Fatal(err)
+	file := sh.FindFileBySHA256(sum)
+	if file == nil {
+		t.Fatal("FindFileBySHA256: not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	got, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(got, data) {

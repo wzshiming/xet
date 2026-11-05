@@ -106,10 +106,11 @@ func readStored(t *testing.T, stor storage.Storage, shaHex string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	content, err := storage.NewReconstructedFile(ctx, stor, sh, digest)
-	if err != nil {
-		t.Fatal(err)
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		t.Fatal("FindFileBySHA256: not found")
 	}
+	content := storage.NewReconstructedFile(ctx, stor, file.Entries)
 	defer content.Close()
 	data, err := io.ReadAll(content)
 	if err != nil {

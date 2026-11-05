@@ -25,10 +25,10 @@ const (
 
 // fixture is what a class keeps of its stored file once the payloads are dropped.
 type fixture struct {
-	st     storage.Storage
-	sh     *shard.Shard
-	digest [32]byte
-	xorbs  []xet.XorbHash
+	st      storage.Storage
+	entries []shard.FileDataSequenceEntry
+	digest  [32]byte
+	xorbs   []xet.XorbHash
 }
 
 // buildFixture stores the class's file on a fresh local store, checks that
@@ -43,14 +43,17 @@ func buildFixture(b *testing.B, c storagetest.ChunkClass) fixture {
 	f := storagetest.PutXorbFile(b, b.Context(), st, c.Xorbs(xorbsPerFile, chunksPerXorb, chunkSize))
 	storagetest.AssertFileCompression(b, b.Context(), st, f, c.Compression)
 	fx := fixture{st: st, digest: storagetest.SHA256Digest(f.SHA256Hex), xorbs: f.XorbHashes}
-	if fx.sh, err = st.GetShardBySHA256(b.Context(), fx.digest); err != nil {
-		b.Fatal(err)
-	}
-
-	rc, err := storage.NewReconstructedFile(b.Context(), st, fx.sh, fx.digest)
+	sh, err := st.GetShardBySHA256(b.Context(), fx.digest)
 	if err != nil {
 		b.Fatal(err)
 	}
+	file := sh.FindFileBySHA256(fx.digest)
+	if file == nil {
+		b.Fatal("FindFileBySHA256: not found")
+	}
+	fx.entries = file.Entries
+
+	rc := storage.NewReconstructedFile(b.Context(), st, fx.entries)
 	defer rc.Close()
 	h := sha256.New()
 	n, err := readLoop32K(io.TeeReader(rc, h), new([readBufSize]byte))
@@ -99,10 +102,7 @@ func packedSize(b *testing.B, st storage.Storage, xorbs []xet.XorbHash) int64 {
 }
 
 func readFile(ctx context.Context, fx fixture, buf *[readBufSize]byte) error {
-	rc, err := storage.NewReconstructedFile(ctx, fx.st, fx.sh, fx.digest)
-	if err != nil {
-		return err
-	}
+	rc := storage.NewReconstructedFile(ctx, fx.st, fx.entries)
 	defer rc.Close()
 	n, err := readLoop32K(rc, buf)
 	if err == nil && n != fileSize {

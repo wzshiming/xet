@@ -93,7 +93,7 @@ func loadFile(t *testing.T, st storage.Storage, f storagetest.File, digest [32]b
 }
 
 func (f storedFile) entries() []shard.FileDataSequenceEntry {
-	return storage.FindFileBySHA256(f.sh, f.digest).Entries
+	return f.sh.FindFileBySHA256(f.digest).Entries
 }
 
 // termStart is the file offset where term i begins.
@@ -107,7 +107,7 @@ func (f storedFile) termStart(i int) int64 {
 
 // withEntries returns f described, in a shard never stored, by entries.
 func (f storedFile) withEntries(entries []shard.FileDataSequenceEntry) storedFile {
-	fb := *storage.FindFileBySHA256(f.sh, f.digest)
+	fb := *f.sh.FindFileBySHA256(f.digest)
 	fb.Entries = entries
 	f.sh = &shard.Shard{Files: []shard.FileBlock{fb}}
 	return f
@@ -449,10 +449,7 @@ func (s *stuckSeeker) Read(p []byte) (int, error) {
 // openFile opens f over st and closes it when the test ends.
 func openFile(t *testing.T, ctx context.Context, st storage.Storage, f storedFile) io.ReadSeekCloser {
 	t.Helper()
-	rc, err := storage.NewReconstructedFile(ctx, st, f.sh, f.digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile: %v", err)
-	}
+	rc := storage.NewReconstructedFile(ctx, st, f.entries())
 	t.Cleanup(func() { rc.Close() })
 	return rc
 }
@@ -598,10 +595,7 @@ func TestReconstructedFileMatchesContent(t *testing.T) {
 						t.Fatalf("no chunk of the fixture is stored as %s", c.Name)
 					}
 					for _, read := range reads {
-						rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
-						if err != nil {
-							t.Fatal(err)
-						}
+						rc := storage.NewReconstructedFile(t.Context(), st, f.entries())
 						got, err := read.read(rc)
 						rc.Close()
 						if err != nil || !bytes.Equal(got, f.Content) {
@@ -762,10 +756,7 @@ func TestReconstructedFileSubRangeTerms(t *testing.T) {
 			st := b.open(t)
 			xorbs := xorbsOf(lz4Class, 2, mixedChunkSizes)
 			f := putSubRangeFile(t, st, xorbs)
-			rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
-			if err != nil {
-				t.Fatal(err)
-			}
+			rc := storage.NewReconstructedFile(t.Context(), st, f.entries())
 			defer rc.Close()
 			if got, err := io.ReadAll(rc); err != nil || !bytes.Equal(got, f.Content) {
 				t.Fatalf("read = %d bytes, %v; want the %d of the terms' chunks", len(got), err, len(f.Content))
@@ -1317,10 +1308,7 @@ func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail 
 		}
 		return &stuckSeeker{ReadSeeker: rs, ctx: ctx, err: fail, blocked: blocked, cancelled: cancelled, release: release}
 	}
-	rc, err := storage.NewReconstructedFile(t.Context(), dec, f.sh, f.digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile: %v", err)
-	}
+	rc := storage.NewReconstructedFile(t.Context(), dec, f.entries())
 	type result struct {
 		got []byte
 		err error
@@ -1366,10 +1354,7 @@ func closeRacesBlockedRead(t *testing.T, st storage.Storage, f storedFile, fail 
 		t.Fatalf("Read racing Close returned %d bytes before %v that differ from the file's", len(r.got), r.err)
 	}
 
-	fresh, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile: %v", err)
-	}
+	fresh := storage.NewReconstructedFile(t.Context(), st, f.entries())
 	defer fresh.Close()
 	if got, err := io.ReadAll(fresh); err != nil || !bytes.Equal(got, f.Content) {
 		t.Fatalf("a fresh reader then read %d bytes, %v; want the %d stored, from a pool no buffer reentered twice or nil", len(got), err, len(f.Content))
@@ -1532,11 +1517,7 @@ func TestReconstructedFileConcurrentReadersAreIndependent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range 4 {
 		wg.Go(func() {
-			rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
-			if err != nil {
-				errs <- err
-				return
-			}
+			rc := storage.NewReconstructedFile(t.Context(), st, f.entries())
 			defer rc.Close()
 			pos := int64(i * len(f.Content) / 4)
 			if _, err := rc.Seek(pos, io.SeekStart); err != nil {

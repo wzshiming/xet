@@ -148,10 +148,11 @@ func testSweepNeedsBothUnlinks(t *testing.T, b Backend) {
 		if err != nil {
 			t.Fatalf("GetShardBySHA256: %v", err)
 		}
-		rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
-		if err != nil {
-			t.Fatalf("NewReconstructedFile: %v", err)
+		file := sh.FindFileBySHA256(digest)
+		if file == nil {
+			t.Fatal("FindFileBySHA256: not found")
 		}
+		rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 		data, err := io.ReadAll(rc)
 		_ = rc.Close()
 		if err != nil || !bytes.Equal(data, f.Content) {
@@ -242,10 +243,11 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, digestA)
-	if err != nil {
-		t.Fatal(err)
+	file := sh.FindFileBySHA256(digestA)
+	if file == nil {
+		t.Fatal("FindFileBySHA256: not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	if _, err := io.ReadAll(rc); err != nil {
 		t.Fatal(err)
 	}
@@ -314,10 +316,11 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if err != nil {
 		t.Fatalf("GetShardBySHA256(fileB): %v", err)
 	}
-	rc, err = storage.NewReconstructedFile(ctx, st, sh, digestB)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile(fileB): %v", err)
+	file = sh.FindFileBySHA256(digestB)
+	if file == nil {
+		t.Fatal("FindFileBySHA256(fileB): not found")
 	}
+	rc = storage.NewReconstructedFile(ctx, st, file.Entries)
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(data, fileB.Content) {
@@ -705,10 +708,11 @@ func testSweepThenReuploadResurrects(t *testing.T, b Backend) {
 	if err != nil {
 		t.Fatalf("GetShardBySHA256 after re-upload: %v", err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile after re-upload: %v", err)
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		t.Fatal("FindFileBySHA256 after re-upload: not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(data, f.Content) {

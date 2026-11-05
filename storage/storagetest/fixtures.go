@@ -257,10 +257,11 @@ func AssertFileIntact(tb testing.TB, ctx context.Context, st storage.Storage, f 
 	if err != nil {
 		tb.Fatalf("GetShardBySHA256: %v", err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
-	if err != nil {
-		tb.Fatalf("NewReconstructedFile: %v", err)
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		tb.Fatal("FindFileBySHA256: not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
 	if err != nil || !bytes.Equal(data, f.Content) {
