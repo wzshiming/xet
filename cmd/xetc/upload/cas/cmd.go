@@ -22,7 +22,7 @@ func NewCommand() *cobra.Command {
 		Short: "Upload a file using the native CAS API",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cli, err := client.NewClient(append(common.Options(concurrency, cacheDir, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
+			cli, err := client.NewClient(append(common.Options(concurrency, cacheDir, false, os.Stderr), client.WithUpstreamProvider(client.StaticUpstreamProvider(baseURL, token)))...)
 			if err != nil {
 				return fmt.Errorf("upload failed: create client: %w", err)
 			}

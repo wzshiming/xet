@@ -459,14 +459,16 @@ func newDownloadFixture(t *testing.T, seeds ...int64) *downloadFixture {
 	return f
 }
 
-// substitute serves different bytes of the same length for file i.
-func (f *downloadFixture) substitute(t *testing.T, i int) {
+// substitute serves different bytes of the same length for file i and returns
+// the file contents they decode to.
+func (f *downloadFixture) substitute(t *testing.T, i int) []byte {
 	t.Helper()
-	encoded, _, _, _ := encodeFixtureXorb(t, int64(100+i))
+	encoded, data, _, _ := encodeFixtureXorb(t, int64(100+i))
 	if len(encoded) != len(f.served[i]) {
 		t.Fatalf("substituted xorb is %d bytes, want %d", len(encoded), len(f.served[i]))
 	}
 	f.served[i] = encoded
+	return data
 }
 
 func (f *downloadFixture) index(fileHash string) int {
@@ -581,9 +583,9 @@ func wantHashMismatch(t *testing.T, err error) {
 	}
 }
 
-// TestDownloadFileVerifiesFileHash pins that whole downloads (including a
-// restart after a rejected resume) are verified against the requested hash,
-// while a true resume keeps appending the suffix unverified.
+// TestDownloadFileVerifiesFileHash pins that with WithVerifyDownloads whole
+// downloads (including a restart after a rejected resume) are verified against
+// the requested hash, while a true resume keeps appending the suffix unverified.
 func TestDownloadFileVerifiesFileHash(t *testing.T) {
 	entryPoints := map[string]func(c *Client, ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error{
 		"v1": (*Client).DownloadFileV1,
@@ -594,7 +596,7 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			run := func(t *testing.T, fx *downloadFixture, prefix []byte) ([]byte, error) {
 				t.Helper()
-				c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+				c, err := NewClient(WithVerifyDownloads(), WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -649,11 +651,12 @@ func TestDownloadFileVerifiesFileHash(t *testing.T) {
 }
 
 // TestDownloadFilesVerifiesFileHash pins per-file verification of batch
-// downloads: a substituted xorb fails only the reader of that file.
+// downloads with WithVerifyDownloads: a substituted xorb fails only the reader
+// of that file.
 func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	fx := newDownloadFixture(t, 1, 2)
 	fx.substitute(t, 1)
-	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+	c, err := NewClient(WithVerifyDownloads(), WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,4 +673,47 @@ func TestDownloadFilesVerifiesFileHash(t *testing.T) {
 	}
 	_, err = io.ReadAll(readers[1])
 	wantHashMismatch(t, err)
+}
+
+// TestDownloadsAreUnverifiedByDefault pins that a client built without
+// WithVerifyDownloads delivers whatever the CAS serves for the requested hash.
+func TestDownloadsAreUnverifiedByDefault(t *testing.T) {
+	ctx := context.Background()
+	newClient := func(t *testing.T, fx *downloadFixture) *Client {
+		t.Helper()
+		c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithUpstreamProvider(StaticUpstreamProvider(fx.srv.URL, "")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	for name, downloadFile := range map[string]func(c *Client, ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error{
+		"v1": (*Client).DownloadFileV1,
+		"v2": (*Client).DownloadFileV2,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := newDownloadFixture(t, 1)
+			want := fx.substitute(t, 0)
+			c := newClient(t, fx)
+			got, err := downloadInto(t, nil, func(w io.WriteSeeker) error {
+				return downloadFile(c, ctx, fx.hashes[0], w)
+			})
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("got %d bytes, err %v; want the %d substituted bytes", len(got), err, len(want))
+			}
+		})
+	}
+	t.Run("batch", func(t *testing.T) {
+		fx := newDownloadFixture(t, 1)
+		want := fx.substitute(t, 0)
+		readers, _, err := newClient(t, fx).DownloadFiles(ctx, fx.hashes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer readers[0].Close()
+		got, err := io.ReadAll(readers[0])
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("got %d bytes, err %v; want the %d substituted bytes", len(got), err, len(want))
+		}
+	})
 }
