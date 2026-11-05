@@ -598,7 +598,7 @@ func TestReconstructedFileMatchesContent(t *testing.T) {
 						t.Fatalf("no chunk of the fixture is stored as %s", c.Name)
 					}
 					for _, read := range reads {
-						rc, err := st.GetReconstructedFile(t.Context(), f.digest)
+						rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -762,7 +762,7 @@ func TestReconstructedFileSubRangeTerms(t *testing.T) {
 			st := b.open(t)
 			xorbs := xorbsOf(lz4Class, 2, mixedChunkSizes)
 			f := putSubRangeFile(t, st, xorbs)
-			rc, err := st.GetReconstructedFile(t.Context(), f.digest)
+			rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1532,7 +1532,7 @@ func TestReconstructedFileConcurrentReadersAreIndependent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range 4 {
 		wg.Go(func() {
-			rc, err := st.GetReconstructedFile(t.Context(), f.digest)
+			rc, err := storage.NewReconstructedFile(t.Context(), st, f.sh, f.digest)
 			if err != nil {
 				errs <- err
 				return

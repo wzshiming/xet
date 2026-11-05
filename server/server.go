@@ -139,7 +139,12 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := s.storage.GetReconstructedFile(r.Context(), digest)
+	sh, err := s.storage.GetShardBySHA256(r.Context(), digest)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	content, err := storage.NewReconstructedFile(r.Context(), s.storage, sh, digest)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return

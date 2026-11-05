@@ -401,7 +401,11 @@ func TestIngest(t *testing.T) {
 	if res.SHA256 != digest || res.Size != int64(len(data)) || res.FileHash == "" {
 		t.Fatalf("Ingest result = %+v, want sha256 %s, size %d and a file hash", res, digest, len(data))
 	}
-	rc, err := st.GetReconstructedFile(ctx, sum)
+	sh, err := st.GetShardBySHA256(ctx, sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := storage.NewReconstructedFile(ctx, st, sh, sum)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +480,11 @@ func TestSpoolWriter(t *testing.T) {
 	if res.SHA256 != digest || res.Size != int64(len(data)) || res.FileHash == "" {
 		t.Fatalf("Wait = %+v, want sha256 %s, size %d and a file hash", res, digest, len(data))
 	}
-	rc, err := st.GetReconstructedFile(ctx, sum)
+	sh, err := st.GetShardBySHA256(ctx, sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := storage.NewReconstructedFile(ctx, st, sh, sum)
 	if err != nil {
 		t.Fatal(err)
 	}

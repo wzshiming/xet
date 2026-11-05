@@ -386,12 +386,9 @@ func (fs *Storage) getShardBySHA256(digest [32]byte) (*shard.Shard, error) {
 	return fs.getShardByHash(shardHash)
 }
 
-func (fs *Storage) GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error) {
-	sh, err := fs.getShardBySHA256(sha256)
-	if err != nil {
-		return nil, fmt.Errorf("get shard by sha256: %w", err)
-	}
-	return storage.NewReconstructedFile(ctx, fs, sh, sha256)
+// GetShardBySHA256 retrieves the shard holding the file with the SHA-256 digest.
+func (fs *Storage) GetShardBySHA256(ctx context.Context, digest [32]byte) (*shard.Shard, error) {
+	return fs.getShardBySHA256(digest)
 }
 
 // GetShardByChunkHash retrieves a shard by chunk hash (for deduplication)

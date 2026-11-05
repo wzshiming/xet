@@ -33,7 +33,7 @@ type Options struct {
 	Token    string // hub token every request must carry; "" leaves the hub open
 	CAS      string // CAS base URL handed out in tokens and reconstruction links
 	Issuer   *auth.Issuer
-	// Storage is the CAS's store: GetFileHashBySHA256 links committed lfsFile oids to xet hashes and GetReconstructedFile backs the CDN redirect; nil knows no file.
+	// Storage is the CAS's store: GetFileHashBySHA256 links committed lfsFile oids to xet hashes and GetShardBySHA256 backs the CDN redirect; nil knows no file.
 	Storage storage.Storage
 	// UploadMode picks a preupload entry's mode from its path, sample and size; nil takes the hub's choice: lfs for binary samples and files of 10 MiB or more, regular otherwise and for empty files.
 	UploadMode func(path string, sample []byte, size int64) string
@@ -403,7 +403,13 @@ func (h *Hub) cdn(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	content, err := h.opts.Storage.GetReconstructedFile(r.Context(), [sha256.Size]byte(digest))
+	sum := [sha256.Size]byte(digest)
+	sh, err := h.opts.Storage.GetShardBySHA256(r.Context(), sum)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	content, err := storage.NewReconstructedFile(r.Context(), h.opts.Storage, sh, sum)
 	if err != nil {
 		http.NotFound(w, r)
 		return

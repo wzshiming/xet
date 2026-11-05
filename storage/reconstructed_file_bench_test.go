@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/storage/storagetest"
@@ -25,6 +26,7 @@ const (
 // fixture is what a class keeps of its stored file once the payloads are dropped.
 type fixture struct {
 	st     storage.Storage
+	sh     *shard.Shard
 	digest [32]byte
 	xorbs  []xet.XorbHash
 }
@@ -41,8 +43,11 @@ func buildFixture(b *testing.B, c storagetest.ChunkClass) fixture {
 	f := storagetest.PutXorbFile(b, b.Context(), st, c.Xorbs(xorbsPerFile, chunksPerXorb, chunkSize))
 	storagetest.AssertFileCompression(b, b.Context(), st, f, c.Compression)
 	fx := fixture{st: st, digest: storagetest.SHA256Digest(f.SHA256Hex), xorbs: f.XorbHashes}
+	if fx.sh, err = st.GetShardBySHA256(b.Context(), fx.digest); err != nil {
+		b.Fatal(err)
+	}
 
-	rc, err := st.GetReconstructedFile(b.Context(), fx.digest)
+	rc, err := storage.NewReconstructedFile(b.Context(), st, fx.sh, fx.digest)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -94,7 +99,7 @@ func packedSize(b *testing.B, st storage.Storage, xorbs []xet.XorbHash) int64 {
 }
 
 func readFile(ctx context.Context, fx fixture, buf *[readBufSize]byte) error {
-	rc, err := fx.st.GetReconstructedFile(ctx, fx.digest)
+	rc, err := storage.NewReconstructedFile(ctx, fx.st, fx.sh, fx.digest)
 	if err != nil {
 		return err
 	}
@@ -157,7 +162,7 @@ func benchmarkCeiling(b *testing.B, fx fixture) {
 }
 
 // BenchmarkReconstructedFile reads a 64 MiB file of 4 xorbs x 256 x 64 KiB
-// chunks through GetReconstructedFile, per compression class.
+// chunks through NewReconstructedFile, per compression class.
 func BenchmarkReconstructedFile(b *testing.B) {
 	for _, c := range storagetest.ChunkClasses {
 		b.Run("class="+c.Name, func(b *testing.B) {

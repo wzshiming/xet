@@ -906,12 +906,9 @@ func (ss *Storage) getShardBySHA256(ctx context.Context, digest [32]byte) (*shar
 	return ss.getShardByHash(ctx, shardHash)
 }
 
-func (ss *Storage) GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error) {
-	sh, err := ss.getShardBySHA256(ctx, sha256)
-	if err != nil {
-		return nil, fmt.Errorf("get shard by sha256: %w", err)
-	}
-	return storage.NewReconstructedFile(ctx, ss, sh, sha256)
+// GetShardBySHA256 retrieves the shard holding the file with the SHA-256 digest.
+func (ss *Storage) GetShardBySHA256(ctx context.Context, digest [32]byte) (*shard.Shard, error) {
+	return ss.getShardBySHA256(ctx, digest)
 }
 
 // GetXorbURL generates a URL for accessing xorb data. By default it is a

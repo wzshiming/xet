@@ -25,6 +25,7 @@ import (
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -345,9 +346,13 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 		t.Fatal("SHA-256 index resolved wrong file hash")
 	}
 
-	f, err := fresh.GetReconstructedFile(ctx, digest)
+	sh, err := fresh.GetShardBySHA256(ctx, digest)
 	if err != nil {
-		t.Fatalf("GetReconstructedFile: %v", err)
+		t.Fatalf("GetShardBySHA256: %v", err)
+	}
+	f, err := storage.NewReconstructedFile(ctx, fresh, sh, digest)
+	if err != nil {
+		t.Fatalf("NewReconstructedFile: %v", err)
 	}
 	defer f.Close()
 	got, err := io.ReadAll(f)
