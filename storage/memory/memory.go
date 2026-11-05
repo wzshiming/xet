@@ -15,7 +15,6 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // object is one immutable stored blob; data is never mutated after insertion.
@@ -164,16 +163,16 @@ func notFound(kind, name string) error {
 	return fmt.Errorf("%s %s: %w", kind, name, iofs.ErrNotExist)
 }
 
-// PutXorb validates the stream into a private copy; dedup hits leave the stored object untouched.
+// PutXorb reads the stream into a private copy; dedup hits leave the stored object untouched.
 func (s *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	if _, exists := s.get("xorbs", xorbHash.String()); exists {
 		return false, nil
 	}
-	var buf bytes.Buffer
-	if err := xorb.Validate(io.TeeReader(r, &buf), xorbHash); err != nil {
-		return false, fmt.Errorf("validate xorb: %w", err)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return false, fmt.Errorf("read xorb: %w", err)
 	}
-	return s.put("xorbs", xorbHash.String(), buf.Bytes(), false), nil
+	return s.put("xorbs", xorbHash.String(), data, false), nil
 }
 
 // GetXorbURL routes through the CAS server's xorb endpoint, absolute when a base URL is set.
@@ -209,32 +208,28 @@ func (s *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) 
 	return offsets, nil
 }
 
-// PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
-func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(sh.Files) > 0
-	for _, file := range sh.Files {
-		if s.indexEntry("index/files", file.FileHash.String()) == "" {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil
-	}
-	if err := storage.PrepareShard(ctx, sh, s); err != nil {
-		return false, err
-	}
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (s *Storage) PutShard(_ context.Context, sh *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(sh)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-	inserted := s.put("shards", shardHash, encoded, false)
-	err = storage.PutShardIndexes(ctx, sh, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		s.put(kind, name, value, false)
-		return nil
-	})
-	return inserted, err
+	return shardHash, s.put("shards", shardHash, encoded, false), nil
+}
+
+// PutFileIndexEntry writes the index/files entry for fileHash unless one exists.
+func (s *Storage) PutFileIndexEntry(_ context.Context, fileHash xet.FileHash, shardHash string) (bool, error) {
+	return s.put("index/files", fileHash.String(), []byte(shardHash), false), nil
+}
+
+// PutChunkIndexEntry writes the index/chunks entry for chunkHash unless one exists.
+func (s *Storage) PutChunkIndexEntry(_ context.Context, chunkHash xet.ChunkHash, shardHash string) (bool, error) {
+	return s.put("index/chunks", chunkHash.String(), []byte(shardHash), false), nil
+}
+
+// PutSHA256IndexEntry writes the index/sha256 entry for digest unless one exists.
+func (s *Storage) PutSHA256IndexEntry(_ context.Context, digest [32]byte, shardHash string) (bool, error) {
+	return s.put("index/sha256", shard.NewSHA256Hash(digest).String(), []byte(shardHash), false), nil
 }
 
 // GetShard retrieves a shard by file hash.
@@ -294,6 +289,11 @@ func (s *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash
 	return s.walkIndex(ctx, "index/files", fn)
 }
 
+// WalkChunkIndex calls fn for every index/chunks entry.
+func (s *Storage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string) error) error {
+	return s.walkIndex(ctx, "index/chunks", fn)
+}
+
 // WalkSHA256Index calls fn for every index/sha256 entry.
 func (s *Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
 	return s.walkIndex(ctx, "index/sha256", fn)
@@ -309,16 +309,14 @@ func (s *Storage) DeleteFileIndexEntry(_ context.Context, fileHash xet.FileHash)
 	return s.delete("index/files", fileHash.String()), nil
 }
 
-// DeleteShard removes a stored shard object.
-func (s *Storage) DeleteShard(_ context.Context, shardHash string) error {
-	s.delete("shards", shardHash)
-	return nil
+// DeleteShard removes a stored shard object, reporting whether it existed.
+func (s *Storage) DeleteShard(_ context.Context, shardHash string) (bool, error) {
+	return s.delete("shards", shardHash), nil
 }
 
-// DeleteXorb removes a stored xorb object.
-func (s *Storage) DeleteXorb(_ context.Context, xorbHash xet.XorbHash) error {
-	s.delete("xorbs", xorbHash.String())
-	return nil
+// DeleteXorb removes a stored xorb object, reporting whether it existed.
+func (s *Storage) DeleteXorb(_ context.Context, xorbHash xet.XorbHash) (bool, error) {
+	return s.delete("xorbs", xorbHash.String()), nil
 }
 
 // GetChunkIndexEntry returns the shard hash recorded for chunkHash, "" when absent.
@@ -326,20 +324,19 @@ func (s *Storage) GetChunkIndexEntry(_ context.Context, chunkHash xet.ChunkHash)
 	return s.indexEntry("index/chunks", chunkHash.String()), nil
 }
 
-// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
-func (s *Storage) DeleteChunkIndexEntry(_ context.Context, chunkHash xet.ChunkHash) error {
-	s.delete("index/chunks", chunkHash.String())
-	return nil
+// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash, reporting whether it existed.
+func (s *Storage) DeleteChunkIndexEntry(_ context.Context, chunkHash xet.ChunkHash) (bool, error) {
+	return s.delete("index/chunks", chunkHash.String()), nil
 }
 
-// GetSHA256IndexEntry returns the shard hash recorded for sha256Hex, "" when absent.
-func (s *Storage) GetSHA256IndexEntry(_ context.Context, sha256Hex string) (string, error) {
-	return s.indexEntry("index/sha256", sha256Hex), nil
+// GetSHA256IndexEntry returns the shard hash recorded for digest, "" when absent.
+func (s *Storage) GetSHA256IndexEntry(_ context.Context, digest [32]byte) (string, error) {
+	return s.indexEntry("index/sha256", shard.NewSHA256Hash(digest).String()), nil
 }
 
 // DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether it existed.
-func (s *Storage) DeleteSHA256IndexEntry(_ context.Context, sha256Hex string) (bool, error) {
-	return s.delete("index/sha256", sha256Hex), nil
+func (s *Storage) DeleteSHA256IndexEntry(_ context.Context, digest [32]byte) (bool, error) {
+	return s.delete("index/sha256", shard.NewSHA256Hash(digest).String()), nil
 }
 
 var _ storage.Storage = (*Storage)(nil)

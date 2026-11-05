@@ -152,7 +152,7 @@ func TestSweepSkipsReuploadCommittedBeforeDelete(t *testing.T) {
 	if got, err := st.GetChunkIndexEntry(ctx, f.ChunkHashes[0]); err != nil || got != f.ShardHash {
 		t.Fatalf("chunk entry = %q, %v; want %q", got, err, f.ShardHash)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, storagetest.SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 		t.Fatalf("sha256 entry = %q, %v; want %q", got, err, f.ShardHash)
 	}
 	storagetest.AssertFileIntact(t, ctx, st, f)

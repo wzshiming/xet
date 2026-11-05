@@ -13,8 +13,6 @@ type Backend struct {
 	Name string
 	// New returns a fresh store.
 	New func(t *testing.T) storage.Storage
-	// SetIndexEntry writes, overwriting any existing value, the index entry kind/name directly on the backend.
-	SetIndexEntry func(t *testing.T, st storage.Storage, kind, name, shardHash string)
 	// PutRawShardObject stores raw bytes as the shard object named hash, bypassing PutShard and its index writes.
 	PutRawShardObject func(t *testing.T, ctx context.Context, st storage.Storage, hash string, raw []byte)
 }
@@ -32,6 +30,16 @@ var cases = []struct {
 	name string
 	run  func(t *testing.T, b Backend)
 }{
+	{"TestIndexPutKeepsExistingEntry", testIndexPutKeepsExistingEntry},
+	{"TestIndexDeleteReportsWhetherEntryExisted", testIndexDeleteReportsWhetherEntryExisted},
+	{"TestIndexPutAfterDeleteWritesNewEntry", testIndexPutAfterDeleteWritesNewEntry},
+	{"TestIndexWalkGivesCurrentEntries", testIndexWalkGivesCurrentEntries},
+	{"TestStoragePutXorbStoresGivenBytes", testStoragePutXorbStoresGivenBytes},
+	{"TestStoragePutXorbKeepsExistingXorb", testStoragePutXorbKeepsExistingXorb},
+	{"TestStoragePutXorbReadErrorStoresNothing", testStoragePutXorbReadErrorStoresNothing},
+	{"TestStoragePutShardNamesShardByEncodeShard", testStoragePutShardNamesShardByEncodeShard},
+	{"TestStoragePutShardWritesNoIndexEntry", testStoragePutShardWritesNoIndexEntry},
+	{"TestObjectDeleteReportsWhetherObjectExisted", testObjectDeleteReportsWhetherObjectExisted},
 	{"TestUnlinkRemovesFileIndexEntry", testUnlinkRemovesFileIndexEntry},
 	{"TestUnlinkSHA256RemovesEntry", testUnlinkSHA256RemovesEntry},
 	{"TestSweepNeedsBothUnlinks", testSweepNeedsBothUnlinks},

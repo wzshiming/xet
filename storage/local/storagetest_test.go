@@ -18,11 +18,6 @@ func TestStorage(t *testing.T) {
 			}
 			return st
 		},
-		SetIndexEntry: func(t *testing.T, st storage.Storage, kind, name, shardHash string) {
-			if err := overwriteIndexFile(st.(*Storage).objectPath(kind, name), []byte(shardHash)); err != nil {
-				t.Fatal(err)
-			}
-		},
 		PutRawShardObject: func(t *testing.T, _ context.Context, st storage.Storage, hash string, raw []byte) {
 			if err := overwriteIndexFile(st.(*Storage).objectPath("shards", hash), raw); err != nil {
 				t.Fatal(err)

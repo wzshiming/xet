@@ -1,6 +1,7 @@
 // Package s3 implements storage.Storage over an S3-compatible object store
-// with the local backend's layout under an optional key prefix. Index entries
-// are overwritten on every write and xorb download URLs are presigned by default.
+// with the local backend's layout under an optional key prefix. Puts and
+// Deletes probe their key with HEAD first instead of writing conditionally,
+// and xorb download URLs are presigned by default.
 // Xorbs are read from mapped whole-object local copies in a bounded cache.
 package s3
 
@@ -28,7 +29,6 @@ import (
 	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -303,46 +303,58 @@ func (ss *Storage) putObject(ctx context.Context, key string, body io.ReadSeeker
 	return err
 }
 
-// putIndexObject writes a small index object. Unlike writeIndexFile it
-// overwrites unconditionally: any shard containing the chunk/file is a valid
-// mapping target, and skipping the existence probe halves the request count.
-func (ss *Storage) putIndexObject(ctx context.Context, key string, value []byte) error {
-	return ss.putObject(ctx, key, bytes.NewReader(value))
+// putObjectIfAbsent calls upload unless HEAD finds an object at key,
+// reporting whether it did; what names the object in a failed HEAD's error.
+// The probe stands in for a conditional write.
+func (ss *Storage) putObjectIfAbsent(ctx context.Context, what, key string, upload func() error) (bool, error) {
+	if _, exists, err := ss.headObject(ctx, key); err != nil {
+		return false, fmt.Errorf("check %s: %w", what, err)
+	} else if exists {
+		return false, nil
+	}
+	if err := upload(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// PutXorb stores an xorb. The stream is validated while being spooled to a
-// temporary file, then uploaded with a known length so the SDK can sign and
-// retry the request.
+// putIndexObject writes shardHash as the index object at key unless one is
+// there, reporting whether it wrote; what names the index in a failed
+// HEAD's error.
+func (ss *Storage) putIndexObject(ctx context.Context, what, key, shardHash string) (bool, error) {
+	return ss.putObjectIfAbsent(ctx, what, key, func() error {
+		return ss.putObject(ctx, key, strings.NewReader(shardHash))
+	})
+}
+
+// PutXorb stores an xorb. The stream is spooled to a temporary file, then
+// uploaded with a known length so the SDK can sign and retry the request.
 func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	key := ss.objectKey("xorbs", xorbHash.String())
 
-	if _, exists, err := ss.headObject(ctx, key); err != nil {
-		return false, fmt.Errorf("check xorb object: %w", err)
-	} else if exists {
-		// Dedup hits leave the stored object, including LastModified, untouched.
-		return false, nil // Already exists
-	}
+	// Dedup hits leave the stored object, including LastModified, untouched.
+	return ss.putObjectIfAbsent(ctx, "xorb object", key, func() error {
+		f, err := os.CreateTemp("", "xet-xorb-*")
+		if err != nil {
+			return fmt.Errorf("create xorb spool file: %w", err)
+		}
+		defer func() {
+			f.Close()
+			os.Remove(f.Name())
+		}()
 
-	f, err := os.CreateTemp("", "xet-xorb-*")
-	if err != nil {
-		return false, fmt.Errorf("create xorb spool file: %w", err)
-	}
-	defer func() {
-		f.Close()
-		os.Remove(f.Name())
-	}()
+		if _, err := io.Copy(f, r); err != nil {
+			return fmt.Errorf("spool xorb: %w", err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("rewind xorb spool file: %w", err)
+		}
 
-	if err := xorb.Validate(io.TeeReader(r, f), xorbHash); err != nil {
-		return false, fmt.Errorf("validate xorb: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return false, fmt.Errorf("rewind xorb spool file: %w", err)
-	}
-
-	if err := ss.putObject(ctx, key, f); err != nil {
-		return false, fmt.Errorf("upload xorb: %w", err)
-	}
-	return true, nil
+		if err := ss.putObject(ctx, key, f); err != nil {
+			return fmt.Errorf("upload xorb: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetXorbReadSeekCloser reads the xorb's mapped local copy, held until Close;
@@ -391,83 +403,56 @@ func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHas
 	return ss.xorbChunkOffsets(xorbHash)
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, error) {
-	if _, exists := ss.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
-	if err != nil {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return exists, nil
-}
-
-// PutShard stores a shard and its file/chunk/sha256 index objects.
-func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := ss.hasFile(ctx, fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, ss); err != nil {
-		return false, err
-	}
-
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-
-	shardKey := ss.objectKey("shards", shardHash)
-	wasInserted := true
-	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
-		return false, fmt.Errorf("check shard object: %w", err)
-	} else if exists {
-		wasInserted = false
-	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded)); err != nil {
-		return false, fmt.Errorf("upload shard: %w", err)
-	}
-
-	// Nothing is cached here, but putIndexObject overwrites entries the caches
-	// may still hold, so each written key is evicted to keep warm reads from
-	// resolving a mapping the store no longer has.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(ctx context.Context, kind, name string, value []byte) error {
-		if err := ss.putIndexObject(ctx, ss.objectKey(kind, name), value); err != nil {
-			return err
+	key := ss.objectKey("shards", shardHash)
+	inserted, err := ss.putObjectIfAbsent(ctx, "shard object", key, func() error {
+		if err := ss.putObject(ctx, key, bytes.NewReader(encoded)); err != nil {
+			return fmt.Errorf("upload shard: %w", err)
 		}
-		ss.evictIndexEntry(kind, name)
 		return nil
 	})
-	return wasInserted, err
+	if err != nil {
+		return "", false, err
+	}
+	return shardHash, inserted, nil
 }
 
-// evictIndexEntry drops the cached mapping for an overwritten index object.
-func (ss *Storage) evictIndexEntry(kind, name string) {
-	switch kind {
-	case "index/chunks":
-		if h, err := xet.ParseChunkHash(name); err == nil {
-			ss.caches.Chunks.Remove(h)
-		}
-	case "index/sha256":
-		ss.evictSHA256(name)
-	case "index/files":
-		if h, err := xet.ParseFileHash(name); err == nil {
-			ss.caches.Files.Remove(h)
-		}
+// PutFileIndexEntry writes the index/files entry for fileHash unless one
+// exists. Nothing is cached on writes, but each Put evicts the key's cached
+// mapping, so warm reads follow the stored entry even after it was deleted
+// behind this instance's back.
+func (ss *Storage) PutFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) (bool, error) {
+	inserted, err := ss.putIndexObject(ctx, "file index", ss.objectKey("index/files", fileHash.String()), shardHash)
+	if err != nil {
+		return false, err
 	}
+	ss.caches.Files.Remove(fileHash)
+	return inserted, nil
+}
+
+// PutChunkIndexEntry writes the index/chunks entry for chunkHash unless one exists, evicting its cached mapping.
+func (ss *Storage) PutChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) (bool, error) {
+	inserted, err := ss.putIndexObject(ctx, "chunk index", ss.objectKey("index/chunks", chunkHash.String()), shardHash)
+	if err != nil {
+		return false, err
+	}
+	ss.caches.Chunks.Remove(chunkHash)
+	return inserted, nil
+}
+
+// PutSHA256IndexEntry writes the index/sha256 entry for digest unless one exists, evicting its cached mapping.
+func (ss *Storage) PutSHA256IndexEntry(ctx context.Context, digest [32]byte, shardHash string) (bool, error) {
+	inserted, err := ss.putIndexObject(ctx, "SHA-256 index", ss.objectKey("index/sha256", hex.EncodeToString(digest[:])), shardHash)
+	if err != nil {
+		return false, err
+	}
+	ss.caches.SHA256.Remove(digest)
+	return inserted, nil
 }
 
 func (ss *Storage) getShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
@@ -523,12 +508,13 @@ func (ss *Storage) GetShardByHash(ctx context.Context, shardHash string) (*shard
 	return s, err
 }
 
-// fileIndexWalkConcurrency bounds parallel index-object reads during walks.
-const fileIndexWalkConcurrency = 4
+// indexWalkConcurrency bounds parallel index-object reads during walks.
+const indexWalkConcurrency = 4
 
-// WalkFileIndex calls fn for every committed index/files entry.
-func (ss *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
-	base := "index/files/"
+// walkIndex calls fn with the name and recorded shard hash of every committed
+// entry under kind; what names the index in errors.
+func (ss *Storage) walkIndex(ctx context.Context, kind, what string, fn func(name, shardHash string) error) error {
+	base := kind + "/"
 	if ss.prefix != "" {
 		base = ss.prefix + "/" + base
 	}
@@ -539,25 +525,25 @@ func (ss *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("list file index: %w", err)
+			return fmt.Errorf("list %s: %w", what, err)
 		}
-		var keys, hashes []string
+		var keys, names []string
 		for _, obj := range page.Contents {
 			key := aws.ToString(obj.Key)
-			fileHash := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
-			if len(fileHash) != 64 {
+			name := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
+			if len(name) != 64 {
 				continue
 			}
-			if _, err := hex.DecodeString(fileHash); err != nil {
+			if _, err := hex.DecodeString(name); err != nil {
 				continue
 			}
 			keys = append(keys, key)
-			hashes = append(hashes, fileHash)
+			names = append(names, name)
 		}
 		// Read the page's index objects in parallel; fn stays sequential.
 		bodies := make([][]byte, len(keys))
 		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(fileIndexWalkConcurrency)
+		g.SetLimit(indexWalkConcurrency)
 		for i, key := range keys {
 			g.Go(func() error {
 				data, err := ss.getObject(gctx, key)
@@ -566,7 +552,7 @@ func (ss *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 					if isS3NotFound(err) {
 						return nil
 					}
-					return fmt.Errorf("read file index %s: %w", key, err)
+					return fmt.Errorf("read %s %s: %w", what, key, err)
 				}
 				bodies[i] = data
 				return nil
@@ -575,16 +561,26 @@ func (ss *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 		if err := g.Wait(); err != nil {
 			return err
 		}
-		for i, fileHash := range hashes {
+		for i, name := range names {
 			if bodies[i] == nil {
 				continue
 			}
-			if err := fn(fileHash, strings.TrimSpace(string(bodies[i]))); err != nil {
+			if err := fn(name, strings.TrimSpace(string(bodies[i]))); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// WalkFileIndex calls fn for every committed index/files entry.
+func (ss *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	return ss.walkIndex(ctx, "index/files", "file index", fn)
+}
+
+// WalkChunkIndex calls fn for every committed index/chunks entry.
+func (ss *Storage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string) error) error {
+	return ss.walkIndex(ctx, "index/chunks", "chunk index", fn)
 }
 
 // walkHashedObjects calls fn for every hash-named object stored under kind,
@@ -640,63 +636,7 @@ func (ss *Storage) Usage(ctx context.Context) (storage.Usage, error) {
 
 // WalkSHA256Index calls fn for every committed index/sha256 entry.
 func (ss *Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
-	base := "index/sha256/"
-	if ss.prefix != "" {
-		base = ss.prefix + "/" + base
-	}
-	paginator := awss3.NewListObjectsV2Paginator(ss.client, &awss3.ListObjectsV2Input{
-		Bucket: aws.String(ss.bucket),
-		Prefix: aws.String(base),
-	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("list SHA-256 index: %w", err)
-		}
-		var keys, hashes []string
-		for _, obj := range page.Contents {
-			key := aws.ToString(obj.Key)
-			sha256Hex := strings.ReplaceAll(strings.TrimPrefix(key, base), "/", "")
-			if len(sha256Hex) != 64 {
-				continue
-			}
-			if _, err := hex.DecodeString(sha256Hex); err != nil {
-				continue
-			}
-			keys = append(keys, key)
-			hashes = append(hashes, sha256Hex)
-		}
-		// Read the page's index objects in parallel; fn stays sequential.
-		bodies := make([][]byte, len(keys))
-		g, gctx := errgroup.WithContext(ctx)
-		g.SetLimit(fileIndexWalkConcurrency)
-		for i, key := range keys {
-			g.Go(func() error {
-				data, err := ss.getObject(gctx, key)
-				if err != nil {
-					// Deleted between list and read: leave the slot nil.
-					if isS3NotFound(err) {
-						return nil
-					}
-					return fmt.Errorf("read SHA-256 index %s: %w", key, err)
-				}
-				bodies[i] = data
-				return nil
-			})
-		}
-		if err := g.Wait(); err != nil {
-			return err
-		}
-		for i, sha256Hex := range hashes {
-			if bodies[i] == nil {
-				continue
-			}
-			if err := fn(sha256Hex, strings.TrimSpace(string(bodies[i]))); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return ss.walkIndex(ctx, "index/sha256", "SHA-256 index", fn)
 }
 
 // deleteObject removes one object; missing keys are not an error.
@@ -711,22 +651,32 @@ func (ss *Storage) deleteObject(ctx context.Context, key string) error {
 	return err
 }
 
+// deleteObjectIfExists deletes key when HEAD finds an object there, reporting
+// whether it did; what names the object in errors.
+func (ss *Storage) deleteObjectIfExists(ctx context.Context, what, key string) (bool, error) {
+	_, exists, err := ss.headObject(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("check %s: %w", what, err)
+	}
+	if !exists {
+		return false, nil
+	}
+	if err := ss.deleteObject(ctx, key); err != nil {
+		return false, fmt.Errorf("delete %s: %w", what, err)
+	}
+	return true, nil
+}
+
 // DeleteFileIndexEntry removes the index/files entry for fileHash, reporting
 // whether it existed.
 func (ss *Storage) DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error) {
-	key := ss.objectKey("index/files", fileHash.String())
-	_, exists, err := ss.headObject(ctx, key)
+	existed, err := ss.deleteObjectIfExists(ctx, "file index", ss.objectKey("index/files", fileHash.String()))
 	if err != nil {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	if exists {
-		if err := ss.deleteObject(ctx, key); err != nil {
-			return false, fmt.Errorf("delete file index: %w", err)
-		}
+		return false, err
 	}
 	// Evicting after the delete narrows but does not close the re-cache window.
 	ss.caches.Files.Remove(fileHash)
-	return exists, nil
+	return existed, nil
 }
 
 // GetFileIndexEntry returns the shard hash recorded for fileHash, or ""
@@ -742,25 +692,20 @@ func (ss *Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash)
 	return strings.TrimSpace(string(data)), nil
 }
 
-// DeleteShard removes a stored shard object.
-func (ss *Storage) DeleteShard(ctx context.Context, shardHash string) error {
-	err := ss.deleteObject(ctx, ss.objectKey("shards", shardHash))
+// DeleteShard removes a stored shard object, reporting whether it existed.
+func (ss *Storage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
+	existed, err := ss.deleteObjectIfExists(ctx, "shard", ss.objectKey("shards", shardHash))
 	ss.caches.Shards.Remove(shardHash)
-	if err != nil {
-		return fmt.Errorf("delete shard: %w", err)
-	}
-	return nil
+	return existed, err
 }
 
-// DeleteXorb removes a stored xorb object; readers already open keep their copy until Close.
-func (ss *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
-	err := ss.deleteObject(ctx, ss.objectKey("xorbs", xorbHash.String()))
+// DeleteXorb removes a stored xorb object, reporting whether it existed;
+// readers already open keep their copy until Close.
+func (ss *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
+	existed, err := ss.deleteObjectIfExists(ctx, "xorb", ss.objectKey("xorbs", xorbHash.String()))
 	ss.xorbCache.Remove(xorbHash)
 	ss.caches.Offsets.Remove(xorbHash)
-	if err != nil {
-		return fmt.Errorf("delete xorb: %w", err)
-	}
-	return nil
+	return existed, err
 }
 
 // GetChunkIndexEntry returns the shard hash recorded for chunkHash, or ""
@@ -776,31 +721,18 @@ func (ss *Storage) GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHa
 	return strings.TrimSpace(string(data)), nil
 }
 
-// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
-func (ss *Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error {
-	err := ss.deleteObject(ctx, ss.objectKey("index/chunks", chunkHash.String()))
+// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash,
+// reporting whether it existed.
+func (ss *Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (bool, error) {
+	existed, err := ss.deleteObjectIfExists(ctx, "chunk index", ss.objectKey("index/chunks", chunkHash.String()))
 	ss.caches.Chunks.Remove(chunkHash)
-	if err != nil {
-		return fmt.Errorf("delete chunk index: %w", err)
-	}
-	return nil
+	return existed, err
 }
 
-// evictSHA256 drops the cached mapping for a hex SHA-256 digest.
-func (ss *Storage) evictSHA256(sha256Hex string) {
-	raw, err := hex.DecodeString(sha256Hex)
-	if err != nil || len(raw) != 32 {
-		return
-	}
-	var digest [32]byte
-	copy(digest[:], raw)
-	ss.caches.SHA256.Remove(digest)
-}
-
-// GetSHA256IndexEntry returns the shard hash recorded for the hex SHA-256
+// GetSHA256IndexEntry returns the shard hash recorded for the SHA-256
 // digest, or "" when the entry is absent, bypassing the cache.
-func (ss *Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error) {
-	data, err := ss.getObject(ctx, ss.objectKey("index/sha256", sha256Hex))
+func (ss *Storage) GetSHA256IndexEntry(ctx context.Context, digest [32]byte) (string, error) {
+	data, err := ss.getObject(ctx, ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
 		if isS3NotFound(err) {
 			return "", nil
@@ -812,20 +744,14 @@ func (ss *Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (s
 
 // DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether
 // it existed.
-func (ss *Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
-	key := ss.objectKey("index/sha256", sha256Hex)
-	_, exists, err := ss.headObject(ctx, key)
+func (ss *Storage) DeleteSHA256IndexEntry(ctx context.Context, digest [32]byte) (bool, error) {
+	existed, err := ss.deleteObjectIfExists(ctx, "SHA-256 index", ss.objectKey("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
-		return false, fmt.Errorf("check SHA-256 index: %w", err)
-	}
-	if exists {
-		if err := ss.deleteObject(ctx, key); err != nil {
-			return false, fmt.Errorf("delete SHA-256 index: %w", err)
-		}
+		return false, err
 	}
 	// Evicting after the delete narrows but does not close the re-cache window.
-	ss.evictSHA256(sha256Hex)
-	return exists, nil
+	ss.caches.SHA256.Remove(digest)
+	return existed, nil
 }
 
 // GetShard retrieves a shard by file hash. The returned error wraps

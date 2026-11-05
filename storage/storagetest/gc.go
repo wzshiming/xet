@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"io"
 	iofs "io/fs"
@@ -54,7 +53,7 @@ func testUnlinkRemovesFileIndexEntry(t *testing.T, b Backend) {
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
 		t.Fatalf("shard should survive unlink: %v", err)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 		t.Fatalf("sha256 entry after unlink = %q, %v; want %q", got, err, f.ShardHash)
 	}
 }
@@ -82,7 +81,7 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 		t.Fatal("UnlinkSHA256 reported the entry missing")
 	}
 
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != "" {
 		t.Fatalf("sha256 entry after unlink = %q, %v; want removed", got, err)
 	}
 	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
@@ -495,18 +494,10 @@ func testSweepDeletesSharedChunkEntry(t *testing.T, b Backend) {
 	for _, f := range []File{f1, f2} {
 		assertChunkIndexEntry(t, ctx, st, f.ChunkHashes[2], "")
 	}
-	// FileStorage keeps the first writer (f1), S3 the last (f2); kill
-	// the owner so the shared-entry deletion runs on both backends.
-	owner, err := st.GetChunkIndexEntry(ctx, f1.ChunkHashes[0])
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The first writer (f1) owns the shared entry; kill it so the
+	// shared-entry deletion runs.
+	assertChunkIndexEntry(t, ctx, st, f1.ChunkHashes[0], f1.ShardHash)
 	dead, live := f1, f2
-	if owner == f2.ShardHash {
-		dead, live = f2, f1
-	} else if owner != f1.ShardHash {
-		t.Fatalf("chunk entry owner = %q, want one of the two shards", owner)
-	}
 	// Warm the chunk cache so the delete must evict it.
 	if _, err := st.GetShardByChunkHash(ctx, f1.ChunkHashes[0]); err != nil {
 		t.Fatal(err)
@@ -558,8 +549,13 @@ func testSweepKeepsChunkEntryOwnedByLiveShard(t *testing.T, b Backend) {
 
 	dead := PutFile(t, ctx, st, [][]byte{shared, SampledChunk(t, "unique to the dead file")})
 	live := PutFile(t, ctx, st, [][]byte{shared, SampledChunk(t, "unique to the live file")})
-	// Backends keep different writers of the shared entry; hand it to the live shard on all.
-	b.SetIndexEntry(t, st, "index/chunks", live.ChunkHashes[0].String(), live.ShardHash)
+	// The dead shard, stored first, owns the shared entry; hand it to the live one.
+	if removed, err := st.DeleteChunkIndexEntry(ctx, live.ChunkHashes[0]); err != nil || !removed {
+		t.Fatalf("DeleteChunkIndexEntry(shared chunk) = %v, %v; want true", removed, err)
+	}
+	if inserted, err := st.PutChunkIndexEntry(ctx, live.ChunkHashes[0], live.ShardHash); err != nil || !inserted {
+		t.Fatalf("PutChunkIndexEntry(shared chunk) = %v, %v; want true", inserted, err)
+	}
 
 	UnlinkFile(t, ctx, st, dead)
 	res, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace})
@@ -616,21 +612,21 @@ func testSweepReportsDanglingFileEntries(t *testing.T, b Backend) {
 	ctx := context.Background()
 	st := b.New(t)
 
-	fileHash := strings.Repeat("ab", 32)
-	b.SetIndexEntry(t, st, "index/files", fileHash, strings.Repeat("cd", 32))
+	fileHash := xet.FileHash{0xab}
+	putFileIndexEntry(t, ctx, st, fileHash, strings.Repeat("cd", 32))
 
 	res, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace})
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if got, want := res.DanglingFileEntries, []string{fileHash}; !slices.Equal(got, want) {
+	if got, want := res.DanglingFileEntries, []string{fileHash.String()}; !slices.Equal(got, want) {
 		t.Fatalf("DanglingFileEntries = %v, want %v", got, want)
 	}
 
 	// The entry is reported, never deleted.
 	found := false
 	if err := st.WalkFileIndex(ctx, func(fh, _ string) error {
-		if fh == fileHash {
+		if fh == fileHash.String() {
 			found = true
 		}
 		return nil
@@ -652,7 +648,7 @@ func testSweepReportsDanglingSHA256Entries(t *testing.T, b Backend) {
 	fA := PutFile(t, ctx, st, [][]byte{[]byte("dangling sha one")})
 	fB := PutFile(t, ctx, st, [][]byte{[]byte("dangling sha two")})
 	for _, f := range []File{fA, fB} {
-		if err := st.DeleteShard(ctx, f.ShardHash); err != nil {
+		if _, err := st.DeleteShard(ctx, f.ShardHash); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -676,7 +672,7 @@ func testSweepReportsDanglingSHA256Entries(t *testing.T, b Backend) {
 
 	// The entries are reported, never deleted.
 	for _, f := range []File{fA, fB} {
-		if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+		if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 			t.Fatalf("sha256 entry %s = %q, %v; want %q", f.SHA256Hex, got, err, f.ShardHash)
 		}
 		if got, err := st.GetFileIndexEntry(ctx, f.FileHash); err != nil || got != f.ShardHash {
@@ -1091,7 +1087,7 @@ func testSweepEmptyFileZeroSHA256Cleanup(t *testing.T, b Backend) {
 	// An empty file: PutShard computes and stores the all-zero
 	// SHA-256 metadata and the shared zero sha256 index entry.
 	f := PutFile(t, ctx, st, nil)
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != f.ShardHash {
 		t.Fatalf("zero sha256 entry = %q, %v; want %q", got, err, f.ShardHash)
 	}
 
@@ -1105,7 +1101,7 @@ func testSweepEmptyFileZeroSHA256Cleanup(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 		t.Fatalf("GetShard after sweep: %v", err)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != f.ShardHash {
 		t.Fatalf("zero sha256 entry after sweep = %q, %v; want untouched", got, err)
 	}
 
@@ -1123,7 +1119,7 @@ func testSweepEmptyFileZeroSHA256Cleanup(t *testing.T, b Backend) {
 	if res.DeletedSHA256Entries != 1 {
 		t.Fatalf("DeletedSHA256Entries = %d, want 1 (the zero entry goes with its shard)", res.DeletedSHA256Entries)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != "" {
 		t.Fatalf("zero sha256 entry = %q, %v; want removed", got, err)
 	}
 }
@@ -1149,7 +1145,7 @@ func testSweepDeleteLoopAbortsOnRacingFileEntry(t *testing.T, b Backend) {
 			return
 		}
 		recommitted = true
-		b.SetIndexEntry(t, st, "index/files", f.FileHash.String(), f.ShardHash)
+		putFileIndexEntry(t, ctx, st, f.FileHash, f.ShardHash)
 	}
 	res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: time.Hour})
 	if err != nil {
@@ -1195,7 +1191,7 @@ func testSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 			return
 		}
 		recommitted = true
-		b.SetIndexEntry(t, st, "index/sha256", f.SHA256Hex, f.ShardHash)
+		putSHA256IndexEntry(t, ctx, st, SHA256Digest(f.SHA256Hex), f.ShardHash)
 	}
 	res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: NoGrace})
 	if err != nil {
@@ -1211,7 +1207,7 @@ func testSweepDeleteLoopAbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 	if res.DeletedSHA256Entries != 0 {
 		t.Fatalf("racing commit's sha256 entry touched: %+v", res)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 		t.Fatalf("sha256 entry = %q, %v; want %q", got, err, f.ShardHash)
 	}
 	if _, err := st.GetShardByHash(ctx, f.ShardHash); err != nil {
@@ -1237,7 +1233,7 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 	shardObj := shard.NewShard()
 	emptyHash, _, _ := AddFileBlock(t, ctx, st, shardObj, nil)
 	fullHash, fullXorbs, _ := AddFileBlock(t, ctx, st, shardObj, [][]byte{content})
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
 		t.Fatal(err)
 	}
 	var shardHash string
@@ -1250,7 +1246,6 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 		t.Fatalf("shard hash lookup: %q, %v", shardHash, err)
 	}
 	digest := sha256.Sum256(content)
-	nonZeroHex := hex.EncodeToString(digest[:])
 
 	g := storage.NewGC(st)
 	for _, fh := range []xet.FileHash{emptyHash, fullHash} {
@@ -1272,7 +1267,7 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 			return
 		}
 		recommitted = true
-		b.SetIndexEntry(t, st, "index/sha256", nonZeroHex, shardHash)
+		putSHA256IndexEntry(t, ctx, st, digest, shardHash)
 	}
 	res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Grace: NoGrace})
 	if err != nil {
@@ -1285,10 +1280,10 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 	if len(res.SweptShards) != 0 || res.DeletedSHA256Entries != 0 {
 		t.Fatalf("racing commit's shard or zero entry touched: %+v", res)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != shardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != shardHash {
 		t.Fatalf("zero sha256 entry = %q, %v; want untouched %q", got, err, shardHash)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, nonZeroHex); err != nil || got != shardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, digest); err != nil || got != shardHash {
 		t.Fatalf("racing sha256 entry = %q, %v; want %q", got, err, shardHash)
 	}
 	if _, err := st.GetShardByHash(ctx, shardHash); err != nil {
@@ -1345,11 +1340,11 @@ func testSweepAnchorSHA256LFSLifecycle(t *testing.T, b Backend) {
 	if got, err := st.GetFileIndexEntry(ctx, f2.FileHash); err != nil || got != f2.ShardHash {
 		t.Fatalf("f2 file entry = %q, %v; want %q", got, err, f2.ShardHash)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f2.SHA256Hex); err != nil || got != f2.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f2.SHA256Hex)); err != nil || got != f2.ShardHash {
 		t.Fatalf("f2 sha256 entry = %q, %v; want %q", got, err, f2.ShardHash)
 	}
 
-	// hasFile self-heal: the file entry is gone, so PutShard treats
+	// File-entry self-heal: the file entry is gone, so PutShard treats
 	// the content as absent and recommits it all.
 	if again := PutFile(t, ctx, st, parts1); again.ShardHash != f1.ShardHash {
 		t.Fatal("re-upload produced different hashes")
@@ -1390,7 +1385,7 @@ func testSweepAnchorSHA256KeepsUnanchorableFileShards(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 		t.Fatalf("GetShard after sweep: %v", err)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != f.ShardHash {
 		t.Fatalf("zero sha256 entry = %q, %v; want untouched", got, err)
 	}
 
@@ -1408,7 +1403,7 @@ func testSweepAnchorSHA256KeepsUnanchorableFileShards(t *testing.T, b Backend) {
 	if res.DeletedSHA256Entries != 1 {
 		t.Fatalf("DeletedSHA256Entries = %d, want 1 (the zero entry goes with its shard)", res.DeletedSHA256Entries)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, zeroSHA256); err != nil || got != "" {
 		t.Fatalf("zero sha256 entry = %q, %v; want removed", got, err)
 	}
 }
@@ -1424,7 +1419,7 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 	if _, err := storage.NewGC(st).Unlink(ctx, f.FileHash); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 		t.Fatalf("sha256 entry = %q, %v; want %q", got, err, f.ShardHash)
 	}
 
@@ -1444,7 +1439,7 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 	if len(res.DanglingSHA256Entries) != 0 {
 		t.Fatalf("DanglingSHA256Entries = %v, want empty (sha256 index not walked)", res.DanglingSHA256Entries)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != "" {
 		t.Fatalf("sha256 entry after sweep = %q, %v; want removed", got, err)
 	}
 	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
@@ -1453,12 +1448,11 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 }
 
 // testSweepAnchorFilesDeletesSharedSHA256Entry: identical content stored
-// under two chunkings shares one sha256 entry, owned by whichever PutShard
-// the backend keeps (FileStorage the first, S3 the last). An AnchorFiles
-// sweep of the owner deletes the entry outright: SHA-256 lookup misses, and
-// re-uploading the live chunking cannot heal it (PutShard's hasFile gate
-// skips every index write), while the live file stays whole by file hash;
-// re-uploading the dead chunking rewrites the entry.
+// under two chunkings shares one sha256 entry, owned by the first PutShard.
+// An AnchorFiles sweep of the owner deletes the entry outright: SHA-256
+// lookup misses, and re-uploading the live chunking cannot heal it
+// (PutShard's file-entry gate skips every index write), while the live file
+// stays whole by file hash; re-uploading the dead chunking rewrites the entry.
 func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 	content := []byte("same bytes, two chunkings, one sha256 entry")
 	wholeParts := [][]byte{content}
@@ -1471,16 +1465,10 @@ func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 	if whole.SHA256Hex != split.SHA256Hex || whole.FileHash == split.FileHash {
 		t.Fatal("test setup: chunkings must share the digest but not the file hash")
 	}
-	owner, err := st.GetSHA256IndexEntry(ctx, whole.SHA256Hex)
-	if err != nil {
-		t.Fatal(err)
+	if owner, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(whole.SHA256Hex)); err != nil || owner != whole.ShardHash {
+		t.Fatalf("sha256 entry owner = %q, %v; want the first PutShard's %q", owner, err, whole.ShardHash)
 	}
 	dead, live, deadParts, liveParts := whole, split, wholeParts, splitParts
-	if owner == split.ShardHash {
-		dead, live, deadParts, liveParts = split, whole, splitParts, wholeParts
-	} else if owner != whole.ShardHash {
-		t.Fatalf("sha256 entry owner = %q, want one of the two shards", owner)
-	}
 
 	if _, err := storage.NewGC(st).Unlink(ctx, dead.FileHash); err != nil {
 		t.Fatal(err)
@@ -1498,23 +1486,23 @@ func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, live.FileHash); err != nil {
 		t.Fatalf("GetShard(live): %v", err)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(live.SHA256Hex)); err != nil || got != "" {
 		t.Fatalf("shared sha256 entry = %q, %v; want removed", got, err)
 	}
 	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(live.SHA256Hex)); err == nil {
 		t.Fatal("SHA-256 lookup still resolves after the entry delete")
 	}
 
-	// The live chunking's re-upload is a no-op behind hasFile.
+	// The live chunking's re-upload is a no-op behind its file entry.
 	PutFile(t, ctx, st, liveParts)
-	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != "" {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(live.SHA256Hex)); err != nil || got != "" {
 		t.Fatalf("sha256 entry after live re-upload = %q, %v; want still removed", got, err)
 	}
 	// The dead chunking's re-upload rewrites it.
 	if again := PutFile(t, ctx, st, deadParts); again.ShardHash != dead.ShardHash {
 		t.Fatalf("re-upload shard = %s, want %s", again.ShardHash, dead.ShardHash)
 	}
-	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != dead.ShardHash {
+	if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(live.SHA256Hex)); err != nil || got != dead.ShardHash {
 		t.Fatalf("sha256 entry after dead re-upload = %q, %v; want %q", got, err, dead.ShardHash)
 	}
 	AssertFileIntact(t, ctx, st, live)
@@ -1528,7 +1516,7 @@ func testSweepAnchorFilesSkipsSHAWalk(t *testing.T, b Backend) {
 	st := b.New(t)
 
 	f := PutFile(t, ctx, st, [][]byte{[]byte("dangling sha, files anchor")})
-	if err := st.DeleteShard(ctx, f.ShardHash); err != nil {
+	if _, err := st.DeleteShard(ctx, f.ShardHash); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1576,7 +1564,7 @@ func testSweepAnchorSHA256AbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 				return
 			}
 			recommitted = true
-			b.SetIndexEntry(t, st, "index/sha256", f.SHA256Hex, f.ShardHash)
+			putSHA256IndexEntry(t, ctx, st, SHA256Digest(f.SHA256Hex), f.ShardHash)
 		}
 		res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Anchor: storage.AnchorSHA256, Grace: NoGrace})
 		if err != nil {
@@ -1612,7 +1600,7 @@ func testSweepAnchorSHA256AbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 				return
 			}
 			recommitted = true
-			b.SetIndexEntry(t, st, "index/sha256", f.SHA256Hex, f.ShardHash)
+			putSHA256IndexEntry(t, ctx, st, SHA256Digest(f.SHA256Hex), f.ShardHash)
 		}
 		res, err := storage.Sweep(ctx, hooked, storage.SweepOptions{Anchor: storage.AnchorSHA256, Grace: NoGrace})
 		if err != nil {
@@ -1629,7 +1617,7 @@ func testSweepAnchorSHA256AbortsOnRacingSHA256Entry(t *testing.T, b Backend) {
 		}
 		// The degraded-but-consistent outcome: the shard survives
 		// sha-resolvable, its file entry is gone.
-		if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != f.ShardHash {
+		if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != f.ShardHash {
 			t.Fatalf("sha256 entry = %q, %v; want %q", got, err, f.ShardHash)
 		}
 		if got, err := st.GetFileIndexEntry(ctx, f.FileHash); err != nil || got != "" {
@@ -1809,7 +1797,7 @@ func testSweepStepSparedUnanchorableShardCannotLivelock(t *testing.T, b Backend)
 		t.Fatal(err)
 	}
 	b.PutRawShardObject(t, ctx, st, spared, raw)
-	b.SetIndexEntry(t, st, "index/files", sparedFile.String(), spared)
+	putFileIndexEntry(t, ctx, st, sparedFile, spared)
 
 	g := storage.NewGC(st)
 	opts := storage.SweepOptions{Anchor: storage.AnchorSHA256, Grace: NoGrace, MaxDeletes: 1}

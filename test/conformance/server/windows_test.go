@@ -16,6 +16,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/test/conformance/rustref"
@@ -113,7 +114,7 @@ func TestServerWindowedDownloadConformance(t *testing.T) {
 			}
 			file.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 			sh.AddFile(file)
-			if _, err := stor.PutShard(t.Context(), sh); err != nil {
+			if _, err := storage.PutShard(t.Context(), stor, sh); err != nil {
 				t.Fatal(err)
 			}
 

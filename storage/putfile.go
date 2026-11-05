@@ -98,7 +98,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 			x.offsets = append(x.offsets, offsets[fresh[k]])
 		}
 		xorbHash := xet.ComputeXorbHash(hashes, x.sizes)
-		if _, err := stor.PutXorb(ctx, xorbHash, x); err != nil {
+		if _, err := PutXorb(ctx, stor, xorbHash, x); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store xorb %s: %w", xorbHash.String(), err)
 		}
 		for j, k := range group {
@@ -108,7 +108,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 	}
 
 	if len(chunks) > 0 {
-		if _, err := stor.PutShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
+		if _, err := PutShard(ctx, stor, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
 		}
 	}

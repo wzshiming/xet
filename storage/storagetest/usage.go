@@ -56,17 +56,15 @@ func testUsageCountsObjectsByKind(t *testing.T, b Backend) {
 	}
 
 	UnlinkFile(t, ctx, st, second)
-	res, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace})
-	if err != nil {
+	if _, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace}); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	// The dead shard owns chunk A's entry only where PutShard overwrites (S3).
-	chunks := 2 - int64(res.DeletedChunkEntries)
+	// The first file's shard owns chunk A's entry, so both chunk entries stay.
 	want = storage.Usage{
 		Xorbs:       storage.ObjectUsage{Count: 2, Bytes: xorbBytes(partA, partB)},
 		Shards:      storage.ObjectUsage{Count: 1, Bytes: shardBytes[first.ShardHash]},
 		FileIndex:   storage.ObjectUsage{Count: 1, Bytes: 64},
-		ChunkIndex:  storage.ObjectUsage{Count: chunks, Bytes: 64 * chunks},
+		ChunkIndex:  storage.ObjectUsage{Count: 2, Bytes: 128},
 		SHA256Index: storage.ObjectUsage{Count: 1, Bytes: 64},
 	}
 	if got, err = st.Usage(ctx); err != nil || got != want {

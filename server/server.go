@@ -434,8 +434,7 @@ func (s *Handler) handleUploadXorb(w http.ResponseWriter, r *http.Request) {
 
 	body = io.LimitReader(body, r.ContentLength)
 
-	// Store xorb directly. PutXorb will normalize to full format with footer.
-	wasInserted, err := s.storage.PutXorb(r.Context(), xorbHash, body)
+	wasInserted, err := storage.PutXorb(r.Context(), s.storage, xorbHash, body)
 	if err != nil {
 		http.Error(w, "Failed to store xorb", http.StatusInternalServerError)
 		return
@@ -544,7 +543,7 @@ func (s *Handler) storeUploadedShard(r *http.Request) (bool, int, error) {
 		}
 	}
 
-	wasInserted, err := s.storage.PutShard(r.Context(), shardObj)
+	wasInserted, err := storage.PutShard(r.Context(), s.storage, shardObj)
 	if err != nil {
 		if errors.Is(err, storage.ErrInvalidShard) {
 			return false, http.StatusBadRequest, err

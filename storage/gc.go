@@ -85,7 +85,7 @@ func (g *GC) UnlinkSHA256(ctx context.Context, digest [32]byte) (bool, error) {
 	if digest == [32]byte{} {
 		return false, errors.New("all-zero SHA-256 digest is the shared empty-file marker")
 	}
-	return g.st.DeleteSHA256IndexEntry(ctx, shard.NewSHA256Hash(digest).String())
+	return g.st.DeleteSHA256IndexEntry(ctx, digest)
 }
 
 // SweepStep runs one independent, stateless pass bounded by MaxDeletes and
@@ -142,9 +142,9 @@ type SweepOptions struct {
 // xorbs. An unreadable shard is treated as live, reported, and no xorb is deleted that pass.
 //
 // A dead shard's entries are deleted, never repointed, even when a live shard shares the chunk or
-// (under AnchorFiles) the SHA-256 of identical content — the local backend keeps an entry's first
-// writer, S3 its last — so that lookup misses until an upload of the content under a chunking with no
-// files entry rewrites it; the live file stays whole and file-hash resolvable.
+// (under AnchorFiles) the SHA-256 of identical content — an entry keeps its first writer — so that
+// lookup misses until an upload of the content under a chunking with no files entry rewrites it;
+// the live file stays whole and file-hash resolvable.
 //
 // PutShard writes chunk entries only for probe-able chunks (shard.GlobalDedupEligibleChunks), and
 // the sweep visits exactly those. Entries earlier versions wrote for other chunks are never
@@ -154,8 +154,8 @@ type SweepOptions struct {
 // last); negative Grace disables it — quiescent stores only. Guards are read-then-delete without
 // compare-and-delete: a commit landing between a final read and the delete can lose that shard or
 // its entries, and a shard object landing behind phase 2's walk cursor, or after the walk, can
-// lose a dedup-reused xorb. Run one sweeper per store: an object another actor removes between
-// its load and its delete is still reported and charged as swept.
+// lose a dedup-reused xorb. Run one sweeper per store: an object two sweepers delete at once may
+// be reported and charged as swept by both.
 func Sweep(ctx context.Context, st Storage, opts SweepOptions) (*SweepResult, error) {
 	return sweepPass(ctx, st, opts, 0, 0)
 }
@@ -359,8 +359,12 @@ func sweepPass(ctx context.Context, st Storage, opts SweepOptions, maxDeletes in
 			if err != nil {
 				return nil, fmt.Errorf("parse xorb hash %s: %w", obj.Hash, err)
 			}
-			if err := st.DeleteXorb(ctx, xorbHash); err != nil {
+			removed, err := st.DeleteXorb(ctx, xorbHash)
+			if err != nil {
 				return nil, err
+			}
+			if !removed {
+				continue
 			}
 			sweptCount++
 		}
@@ -428,7 +432,7 @@ func sweepShard(ctx context.Context, st Storage, res *SweepResult, anchor SweepA
 	} else {
 		for i := range sh.Files {
 			if ext := sh.Files[i].MetadataExt; ext != nil && ext.SHA256Hash != (shard.SHA256Hash{}) {
-				if err := deleteOwnedSHA256(ctx, st, res, ext.SHA256Hash.String(), shardHash); err != nil {
+				if err := deleteOwnedSHA256(ctx, st, res, ext.SHA256Hash, shardHash); err != nil {
 					return false, err
 				}
 			}
@@ -436,7 +440,7 @@ func sweepShard(ctx context.Context, st Storage, res *SweepResult, anchor SweepA
 	}
 	// Metadata-less files never own the zero entry, so this check is a no-op for them.
 	if hasUnanchorableFile(sh) {
-		if err := deleteOwnedSHA256(ctx, st, res, zeroSHA256Hex, shardHash); err != nil {
+		if err := deleteOwnedSHA256(ctx, st, res, [32]byte{}, shardHash); err != nil {
 			return false, err
 		}
 	}
@@ -448,12 +452,15 @@ func sweepShard(ctx context.Context, st Storage, res *SweepResult, anchor SweepA
 		if current != shardHash {
 			continue
 		}
-		if err := st.DeleteChunkIndexEntry(ctx, e.Hash); err != nil {
+		removed, err := st.DeleteChunkIndexEntry(ctx, e.Hash)
+		if err != nil {
 			return false, err
 		}
-		res.DeletedChunkEntries++
+		if removed {
+			res.DeletedChunkEntries++
+		}
 	}
-	return true, st.DeleteShard(ctx, shardHash)
+	return st.DeleteShard(ctx, shardHash)
 }
 
 // fileEntryPointsAt reports whether any files entry of the shard still points at shardHash.
@@ -477,7 +484,7 @@ func sha256EntryPointsAt(ctx context.Context, st Storage, sh *shard.Shard, shard
 		if ext == nil || ext.SHA256Hash == (shard.SHA256Hash{}) {
 			continue
 		}
-		current, err := st.GetSHA256IndexEntry(ctx, ext.SHA256Hash.String())
+		current, err := st.GetSHA256IndexEntry(ctx, ext.SHA256Hash)
 		if err != nil {
 			return false, err
 		}
@@ -488,16 +495,16 @@ func sha256EntryPointsAt(ctx context.Context, st Storage, sh *shard.Shard, shard
 	return false, nil
 }
 
-// deleteOwnedSHA256 deletes the sha256 entry hex if it still points at shardHash, counting real removals.
-func deleteOwnedSHA256(ctx context.Context, st Storage, res *SweepResult, hex, shardHash string) error {
-	current, err := st.GetSHA256IndexEntry(ctx, hex)
+// deleteOwnedSHA256 deletes the sha256 entry for digest if it still points at shardHash, counting real removals.
+func deleteOwnedSHA256(ctx context.Context, st Storage, res *SweepResult, digest [32]byte, shardHash string) error {
+	current, err := st.GetSHA256IndexEntry(ctx, digest)
 	if err != nil {
 		return err
 	}
 	if current != shardHash {
 		return nil
 	}
-	removed, err := st.DeleteSHA256IndexEntry(ctx, hex)
+	removed, err := st.DeleteSHA256IndexEntry(ctx, digest)
 	if err != nil {
 		return err
 	}
