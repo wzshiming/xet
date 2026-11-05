@@ -726,9 +726,9 @@ func TestBuildReconstructionFileAbsentFromShardIsAnError(t *testing.T) {
 	}
 }
 
-// TestBuildReconstructionRangeHeader pins which whole terms a Range header,
-// parsed against the file's size, selects; tails are never trimmed, so
-// ExpectedLength rounds up to a term end.
+// TestBuildReconstructionRangeHeader pins which terms a Range header, parsed
+// against the file's size, selects; each term is one chunk, so none is
+// trimmed and ExpectedLength rounds up to a term end.
 func TestBuildReconstructionRangeHeader(t *testing.T) {
 	var fileHash xet.FileHash
 	var entries []shard.FileDataSequenceEntry

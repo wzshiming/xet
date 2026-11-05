@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -19,6 +20,8 @@ import (
 // are served from the same stripped stream (see handleDownloadXorb).
 //
 // The terms are those holding bytes of rng; ParseByteRange("", size) selects the whole file.
+// The first and the last are trimmed to the chunks holding bytes of rng when the shard
+// has a CAS block of their xorb, so OffsetIntoFirstRange stays within the first chunk.
 func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rng ByteRange) (*ReconstructionResponseV1, error) {
 	fileBlock := sh.File(fileHash)
 	if fileBlock == nil {
@@ -35,9 +38,9 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 	var currentByteOffset int64
 
 	// Build terms from file data sequence entries
-	for _, entry := range fileBlock.Entries {
+	for _, seg := range fileBlock.Entries {
 		termStart := currentByteOffset
-		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
+		termEnd := currentByteOffset + int64(seg.UnpackedSegBytes)
 
 		// Skip terms that are completely outside the requested range
 		if termEnd <= rng.Start {
@@ -47,6 +50,9 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 		if termStart > rng.End {
 			break
 		}
+
+		entry, skipped := trimSegment(sh, seg, termStart, rng)
+		termStart += skipped
 
 		// Calculate offset into first term if this is the first included term
 		if len(response.Terms) == 0 && termStart < rng.Start {
@@ -94,8 +100,14 @@ func BuildReconstructionResponseV1(ctx context.Context, storage StorageAdapter, 
 			},
 		}
 
+		// hf_xet keys a xorb's blocks by start chunk: of the ranges sharing one, keep the longest.
 		xorbHashStr := entry.CASHash.String()
-		response.FetchInfo[xorbHashStr] = append(response.FetchInfo[xorbHashStr], fetchEntry)
+		entries := response.FetchInfo[xorbHashStr]
+		if k := slices.IndexFunc(entries, func(e FetchInfoEntry) bool { return e.Range.Start == fetchEntry.Range.Start }); k < 0 {
+			response.FetchInfo[xorbHashStr] = append(entries, fetchEntry)
+		} else if fetchEntry.Range.End > entries[k].Range.End {
+			entries[k] = fetchEntry
+		}
 
 		currentByteOffset = termEnd
 	}

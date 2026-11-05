@@ -31,7 +31,7 @@ import (
 // tsChunks is the chunk count of the 64 MiB fixture: one term, one LZ4 xorb of 64 KiB chunks.
 const tsChunks = 1024
 
-// tsRanged requests file bytes [1, 17) MiB: OffsetIntoFirstRange 1 MiB, then 16 MiB.
+// tsRanged requests file bytes [1, 17) MiB, chunks [16, 272) of the fixture.
 const tsRanged = "bytes=1048576-17825791"
 
 func tsStoreFile(t *testing.T) (storage.Storage, storagetest.File) {
@@ -301,20 +301,19 @@ func TestReconstructionV2TermSplit(t *testing.T) {
 	})
 
 	t.Run("ranged request has no term past its end", func(t *testing.T) {
-		// 16 pieces of 1 MiB requested: the first also holds the 1 MiB offset, the last runs from 16 MiB to the term's end.
-		bounds := slices.Concat([]uint32{0}, tsBounds(32, 16, 256), []uint32{tsChunks})
-		want := tsPieces(t, st, f, url, 1<<20, bounds)
+		// The term trimmed to the 16 MiB requested halves into 16 pieces of 1 MiB.
+		want := tsPieces(t, st, f, url, 0, tsBounds(16, 16, 272))
 		if got := tsDecode(t, tsGet(t, split, v2, tsRanged)); !reflect.DeepEqual(got, want) {
-			t.Errorf("V2 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(cuts only inside the requested bytes; the piece holding the last one runs to its term's end)", tsRanged, tsSummary(got), tsSummary(want))
+			t.Errorf("V2 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(the term is trimmed to the chunks holding the requested bytes, then cut into pieces)", tsRanged, tsSummary(got), tsSummary(want))
 		}
 	})
 
 	t.Run("pieceBytes keeps 1.5 MiB requested whole", func(t *testing.T) {
 		// Requested [1, 2.5) MiB: every cut leaves a piece under the 1 MiB floor.
 		const rangeHeader = "bytes=1048576-2621439"
-		want := tsPieces(t, st, f, url, 1<<20, []uint32{0, tsChunks})
+		want := tsPieces(t, st, f, url, 0, []uint32{16, 40})
 		if got := tsDecode(t, tsGet(t, split, v2, rangeHeader)); !reflect.DeepEqual(got, want) {
-			t.Errorf("V2 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(no cut leaves both pieces 1 MiB of requested bytes, so the term stays whole)", rangeHeader, tsSummary(got), tsSummary(want))
+			t.Errorf("V2 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(no cut leaves both pieces 1 MiB of requested bytes, so the trimmed term stays whole)", rangeHeader, tsSummary(got), tsSummary(want))
 		}
 	})
 
@@ -368,11 +367,10 @@ func TestReconstructionV1TermSplit(t *testing.T) {
 	})
 
 	t.Run("ranged request has no term past its end", func(t *testing.T) {
-		// 16 pieces of 1 MiB requested: the first also holds the 1 MiB offset, the last runs from 16 MiB to the term's end.
-		bounds := slices.Concat([]uint32{0}, tsBounds(32, 16, 256), []uint32{tsChunks})
-		want := tsPiecesV1(t, st, f, url, 1<<20, bounds)
+		// The term trimmed to the 16 MiB requested halves into 16 pieces of 1 MiB.
+		want := tsPiecesV1(t, st, f, url, 0, tsBounds(16, 16, 272))
 		if got := tsDecodeV1(t, tsGet(t, split, v1, tsRanged)); !reflect.DeepEqual(got, want) {
-			t.Errorf("V1 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(cuts only inside the requested bytes; the piece holding the last one runs to its term's end)", tsRanged, tsSummaryV1(got), tsSummaryV1(want))
+			t.Errorf("V1 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(the term is trimmed to the chunks holding the requested bytes, then cut into pieces)", tsRanged, tsSummaryV1(got), tsSummaryV1(want))
 		}
 	})
 
@@ -380,9 +378,9 @@ func TestReconstructionV1TermSplit(t *testing.T) {
 		wantSplit(t, "")
 		// Requested [1, 2.5) MiB: every cut leaves a piece under the 1 MiB floor.
 		const rangeHeader = "bytes=1048576-2621439"
-		want := tsPiecesV1(t, st, f, url, 1<<20, []uint32{0, tsChunks})
+		want := tsPiecesV1(t, st, f, url, 0, []uint32{16, 40})
 		if got := tsDecodeV1(t, tsGet(t, split, v1, rangeHeader)); !reflect.DeepEqual(got, want) {
-			t.Errorf("V1 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(no cut leaves both pieces 1 MiB of requested bytes, so the term stays whole)", rangeHeader, tsSummaryV1(got), tsSummaryV1(want))
+			t.Errorf("V1 with Range %s and WithTermSplit(16, 1 MiB) = %s\nwant %s\n(no cut leaves both pieces 1 MiB of requested bytes, so the trimmed term stays whole)", rangeHeader, tsSummaryV1(got), tsSummaryV1(want))
 		}
 	})
 
@@ -464,7 +462,7 @@ func TestReconstructionV1TermSplit(t *testing.T) {
 		}
 		defer r.Close()
 		got, err := io.ReadAll(r)
-		// The response runs from byte 1 MiB through its last term's end, past the 16 MiB requested.
+		// The response runs from byte 1 MiB through the end of the chunk holding the last byte requested.
 		want := f.Content[1<<20:][:download.ExpectedLengthV1(resp)]
 		if err != nil || !bytes.Equal(got, want) || len(got) < 16<<20 {
 			t.Errorf("NewReaderV1 over V1 with Range %s off a WithTermSplit(16, 1 MiB) server read %d bytes, %v; want the %d file bytes from 1 MiB on, the 16 MiB requested among them", tsRanged, len(got), err, len(want))

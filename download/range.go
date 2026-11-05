@@ -1,8 +1,11 @@
 package download
 
 import (
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/wzshiming/xet/shard"
 )
 
 // ParseByteRange returns the bytes [Start, End], End inclusive, that a Range header requests of a file of size bytes.
@@ -36,4 +39,36 @@ func ParseByteRange(header string, size int64) ByteRange {
 		rng.End = min(int64(lastPos), rng.End)
 	}
 	return rng
+}
+
+// trimSegment cuts seg, the segment start bytes into its file, to the chunks holding bytes of rng and returns it
+// with the number of bytes cut from its front. seg stays whole unless sh has a CAS block of its xorb agreeing with it.
+func trimSegment(sh *shard.Shard, seg shard.FileDataSequenceEntry, start int64, rng ByteRange) (shard.FileDataSequenceEntry, int64) {
+	end := start + int64(seg.UnpackedSegBytes)
+	if start >= rng.Start && end-1 <= rng.End {
+		return seg, 0
+	}
+	k := slices.IndexFunc(sh.CASInfos, func(b shard.CASBlock) bool { return b.CASHash == seg.CASHash })
+	if k < 0 || uint64(seg.ChunkIndexEnd) > uint64(len(sh.CASInfos[k].Chunks)) {
+		return seg, 0
+	}
+	chunks := sh.CASInfos[k].Chunks
+	// Chunks [first, last) hold bytes of rng; from and to are their bounds in the file.
+	first, last := seg.ChunkIndexStart, seg.ChunkIndexStart
+	from, to, at := start, start, start
+	for c := seg.ChunkIndexStart; c < seg.ChunkIndexEnd; c++ {
+		next := at + int64(chunks[c].UnpackedSegBytes)
+		if next <= rng.Start {
+			first, from = c+1, next
+		}
+		if at <= rng.End {
+			last, to = c+1, next
+		}
+		at = next
+	}
+	if at != end || first >= last {
+		return seg, 0
+	}
+	seg.ChunkIndexStart, seg.ChunkIndexEnd, seg.UnpackedSegBytes = first, last, uint32(to-from)
+	return seg, from - start
 }
