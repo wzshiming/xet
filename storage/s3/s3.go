@@ -36,8 +36,7 @@ import (
 // clients to work through a large reconstruction term by term.
 const defaultPresignExpiry = time.Hour
 
-// Cached copies stay mapped and keep what was read through them resident, up to 64 MiB per xorb, so 32 bound it at 2 GiB.
-const defaultXorbCacheSize = 32
+const defaultXorbCacheSize = 512
 
 // Storage implements storage.Storage backed by an S3-compatible object store.
 // It uses the same object layout as the local backend (xorbs/, shards/,
@@ -164,7 +163,7 @@ func WithCacheDir(dir string) Option {
 	}
 }
 
-// WithXorbCacheSize keeps at most n xorbs downloaded and mapped (default 32; unbounded when n < 1);
+// WithXorbCacheSize keeps at most n xorbs downloaded and mapped (default 512; unbounded when n < 1);
 // evicted copies stay on disk until their readers close.
 func WithXorbCacheSize(n int) Option {
 	return func(ss *Storage) {
