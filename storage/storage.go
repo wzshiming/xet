@@ -14,10 +14,13 @@ var ErrInvalidShard = errors.New("invalid shard")
 
 // Storage is the backend contract implemented by the local, s3 and memory
 // packages; the package overview describes the shared layout and semantics.
+// Its methods store, read and delete single objects and index entries; the
+// package's PutXorb, PutShard and PutFile functions validate and index uploads.
 type Storage interface {
 	// Xorb objects: content-addressed chunk data under xorbs/.
 
-	// PutXorb stores an xorb by its hash
+	// PutXorb stores r's bytes as the xorb unless it exists, reporting whether it inserted them;
+	// an error from r stores nothing. It does not validate them, unlike storage.PutXorb.
 	PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error)
 
 	// HasXorb checks whether an xorb exists.
@@ -42,15 +45,16 @@ type Storage interface {
 
 	// Shard objects: serialized shards under shards/, resolved through the indexes.
 
-	// PutShard stores a shard, named by the SHA-256 of its stored bytes
-	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
+	// PutShard stores the shard unless it exists, named by the SHA-256 of its stored bytes (EncodeShard),
+	// returning that name and whether it inserted it. storage.PutShard verifies and indexes a shard around this call.
+	PutShard(ctx context.Context, shard *shard.Shard) (string, bool, error)
 
 	// GetShard retrieves a shard by file hash
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)
 
 	// GetShardByChunkHash retrieves a shard by chunk hash (for deduplication).
-	// PutShard writes an entry only for a probe-able chunk of the shard
-	// (shard.GlobalDedupEligibleChunks); a hash PutShard did not index is not found.
+	// storage.PutShard writes an entry only for a probe-able chunk of the shard
+	// (shard.GlobalDedupEligibleChunks); a hash it did not index is not found.
 	GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkHash) (*shard.Shard, error)
 
 	// GetShardByHash loads by serialized shard hash, wrapping fs.ErrNotExist when absent.
@@ -74,10 +78,14 @@ type Storage interface {
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest, wrapping fs.ErrNotExist when the digest is unknown.
 	GetFileHashBySHA256(ctx context.Context, sha256 [32]byte) (xet.FileHash, error)
 
-	// GC index access: walks, cache-bypassing reads and deletes of index entries.
+	// Index entries: writes, walks, cache-bypassing reads and deletes. A write keeps
+	// an existing entry on the local and memory backends and replaces it on s3.
 
 	// WalkFileIndex calls fn with each file hash and its owning shard hash from index/files.
 	WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error
+
+	// PutFileIndexEntry records shardHash as the shard holding fileHash in index/files.
+	PutFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error
 
 	// GetFileIndexEntry returns the shard hash recorded for fileHash, "" when absent, bypassing caches.
 	GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error)
@@ -85,9 +93,12 @@ type Storage interface {
 	// DeleteFileIndexEntry removes the index/files entry for fileHash, reporting whether it existed.
 	DeleteFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (bool, error)
 
+	// PutChunkIndexEntry records shardHash as the shard holding chunkHash in index/chunks.
+	PutChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error
+
 	// GetChunkIndexEntry returns the shard hash recorded for chunkHash, "" when absent,
-	// bypassing caches. PutShard writes an entry only for a probe-able chunk of the shard
-	// (shard.GlobalDedupEligibleChunks); a hash PutShard did not index is not found.
+	// bypassing caches. storage.PutShard writes an entry only for a probe-able chunk of the shard
+	// (shard.GlobalDedupEligibleChunks); a hash it did not index is not found.
 	GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (string, error)
 
 	// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
@@ -96,6 +107,9 @@ type Storage interface {
 
 	// WalkSHA256Index calls fn for every index/sha256 entry.
 	WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error
+
+	// PutSHA256IndexEntry records shardHash as the shard holding the file with sha256Hex in index/sha256.
+	PutSHA256IndexEntry(ctx context.Context, sha256Hex, shardHash string) error
 
 	// GetSHA256IndexEntry returns the shard hash recorded for sha256Hex, "" when absent, bypassing caches.
 	GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error)

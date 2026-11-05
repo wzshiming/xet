@@ -20,7 +20,6 @@ import (
 	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // Storage implements storage.Storage on the local filesystem.
@@ -95,21 +94,6 @@ func NewStorage(opts ...Option) (*Storage, error) {
 // objectPath returns the on-disk location of a hash-named object under basePath.
 func (fs *Storage) objectPath(kind, name string) string {
 	return filepath.Join(fs.basePath, filepath.FromSlash(storage.ObjectKey(kind, name)))
-}
-
-// hasFile checks whether a file hash already has a shard mapping.
-func (fs *Storage) hasFile(fileHash xet.FileHash) (bool, error) {
-	if _, exists := fs.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	filePath := fs.objectPath("index/files", fileHash.String())
-	if _, err := os.Stat(filePath); err == nil {
-		return true, nil
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return false, nil
 }
 
 // getShard resolves a file hash through index/files/<file-hash>, whose contents
@@ -229,11 +213,10 @@ func (fs *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Read
 	}
 	tmpPath := f.Name()
 
-	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
-	if err != nil {
+	if _, err := io.Copy(f, r); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return false, fmt.Errorf("validate xorb: %w", err)
+		return false, fmt.Errorf("write xorb file: %w", err)
 	}
 	if err := f.Chmod(0644); err != nil {
 		f.Close()
@@ -282,51 +265,38 @@ func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 	return false, fmt.Errorf("check xorb file: %w", err)
 }
 
-// PutShard stores a shard
-func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := fs.hasFile(fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, fs); err != nil {
-		return false, err
-	}
-
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-
 	shardPath := fs.objectPath("shards", shardHash)
-	wasInserted := true
 	if _, err := os.Stat(shardPath); err == nil {
-		wasInserted = false
+		return shardHash, false, nil
 	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check shard file: %w", err)
-	} else if err := overwriteIndexFile(shardPath, encoded); err != nil {
-		return false, fmt.Errorf("write shard file: %w", err)
+		return "", false, fmt.Errorf("check shard file: %w", err)
 	}
+	if err := overwriteIndexFile(shardPath, encoded); err != nil {
+		return "", false, fmt.Errorf("write shard file: %w", err)
+	}
+	return shardHash, true, nil
+}
 
-	// Nothing is cached here; the read path populates the caches from the
-	// stored objects, so a warm process serves exactly what a restarted one
-	// would.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		return writeIndexFile(fs.objectPath(kind, name), value)
-	})
-	return wasInserted, err
+// PutFileIndexEntry writes the index/files entry for fileHash unless one exists.
+// Nothing is cached on writes; reads fill the caches from the stored entries.
+func (fs *Storage) PutFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	return writeIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(shardHash))
+}
+
+// PutChunkIndexEntry writes the index/chunks entry for chunkHash unless one exists.
+func (fs *Storage) PutChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
+	return writeIndexFile(fs.objectPath("index/chunks", chunkHash.String()), []byte(shardHash))
+}
+
+// PutSHA256IndexEntry writes the index/sha256 entry for sha256Hex unless one exists.
+func (fs *Storage) PutSHA256IndexEntry(ctx context.Context, sha256Hex, shardHash string) error {
+	return writeIndexFile(fs.objectPath("index/sha256", sha256Hex), []byte(shardHash))
 }
 
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in

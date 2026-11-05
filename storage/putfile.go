@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -98,7 +99,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 			x.offsets = append(x.offsets, offsets[fresh[k]])
 		}
 		xorbHash := xet.ComputeXorbHash(hashes, x.sizes)
-		if _, err := stor.PutXorb(ctx, xorbHash, x); err != nil {
+		if _, err := PutXorb(ctx, stor, xorbHash, x); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store xorb %s: %w", xorbHash.String(), err)
 		}
 		for j, k := range group {
@@ -108,7 +109,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 	}
 
 	if len(chunks) > 0 {
-		if _, err := stor.PutShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
+		if _, err := PutShard(ctx, stor, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
 		}
 	}
@@ -138,4 +139,53 @@ func (x *xorbReader) Read(p []byte) (int, error) {
 		}
 	}
 	return x.buf.Read(p)
+}
+
+// PutXorb stores the xorb read from r through st while xorb.Validate checks it
+// against xorbHash: st reads the bytes Validate consumes, then io.EOF or the
+// validation error, so a rejected xorb is not stored.
+func PutXorb(ctx context.Context, st Storage, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+	v := &validatingReader{r: r, xorbHash: xorbHash}
+	inserted, err := st.PutXorb(ctx, xorbHash, v)
+	if verr := v.stop(); verr != nil {
+		return false, fmt.Errorf("validate xorb: %w", verr)
+	}
+	return inserted, err
+}
+
+// validatingReader yields the bytes xorb.Validate consumes from r, starting
+// Validate on the first Read.
+type validatingReader struct {
+	r        io.Reader
+	xorbHash xet.XorbHash
+	pr       *io.PipeReader
+	done     chan struct{}
+	err      error
+}
+
+func (v *validatingReader) Read(p []byte) (int, error) {
+	if v.pr == nil {
+		pr, pw := io.Pipe()
+		v.pr, v.done = pr, make(chan struct{})
+		go func() {
+			defer close(v.done)
+			v.err = xorb.Validate(io.TeeReader(v.r, pw), v.xorbHash)
+			pw.CloseWithError(v.err)
+		}()
+	}
+	return v.pr.Read(p)
+}
+
+// stop ends a validation the store stopped reading and returns its error,
+// ignoring the one the stop itself causes.
+func (v *validatingReader) stop() error {
+	if v.pr == nil {
+		return nil
+	}
+	v.pr.Close()
+	<-v.done
+	if errors.Is(v.err, io.ErrClosedPipe) {
+		return nil
+	}
+	return v.err
 }
