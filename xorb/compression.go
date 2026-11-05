@@ -2,7 +2,6 @@ package xorb
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
@@ -113,18 +112,15 @@ func applyByteGrouping4(dst, data []byte) ([]byte, error) {
 	dst = dst[:off+len(data)]
 	result := dst[off:]
 
-	writePos := 0
-
-	// Process each byte position within groups (0-3)
-	for bytePos := range 4 {
-		// Collect bytes at this position from all groups
-		for groupStart := 0; groupStart < len(data); groupStart += 4 {
-			idx := groupStart + bytePos
-			if idx < len(data) {
-				result[writePos] = data[idx]
-				writePos++
-			}
-		}
+	// Plane k holds byte k of every group and, below tail, one byte of the partial group, so it starts at k*groups+min(k, tail).
+	groups, tail := len(data)/4, len(data)%4
+	p0 := result[:groups]
+	p1 := result[groups+min(1, tail):][:groups]
+	p2 := result[2*groups+min(2, tail):][:groups]
+	p3 := result[3*groups+min(3, tail):][:groups]
+	deinterleave4(p0, p1, p2, p3, data)
+	for k := range tail {
+		result[(k+1)*groups+k] = data[4*groups+k]
 	}
 
 	return dst, nil
@@ -144,24 +140,15 @@ func reverseByteGrouping4(dst, data []byte) ([]byte, error) {
 	dst = dst[:off+len(data)]
 	result := dst[off:]
 
-	// Plane k holds byte k of every group; planes below len%4 also hold one byte of the partial group.
+	// Plane k holds byte k of every group and, below tail, one byte of the partial group, so it starts at k*groups+min(k, tail).
 	groups, tail := len(data)/4, len(data)%4
-	var start [4]int
-	for k := 1; k < 4; k++ {
-		start[k] = start[k-1] + groups
-		if k <= tail {
-			start[k]++
-		}
-	}
-	p0 := data[start[0]:][:groups]
-	p1 := data[start[1]:][:groups]
-	p2 := data[start[2]:][:groups]
-	p3 := data[start[3]:][:groups]
-	for i := range p0 {
-		binary.LittleEndian.PutUint32(result[4*i:], uint32(p0[i])|uint32(p1[i])<<8|uint32(p2[i])<<16|uint32(p3[i])<<24)
-	}
+	p0 := data[:groups]
+	p1 := data[groups+min(1, tail):][:groups]
+	p2 := data[2*groups+min(2, tail):][:groups]
+	p3 := data[3*groups+min(3, tail):][:groups]
+	interleave4(result, p0, p1, p2, p3)
 	for k := range tail {
-		result[4*groups+k] = data[start[k]+groups]
+		result[4*groups+k] = data[(k+1)*groups+k]
 	}
 
 	return dst, nil

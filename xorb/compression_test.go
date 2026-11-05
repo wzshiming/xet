@@ -2,7 +2,10 @@ package xorb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math/rand/v2"
+	"strings"
 	"testing"
 
 	"github.com/wzshiming/xet"
@@ -414,19 +417,64 @@ func BenchmarkDecompressLZ4(b *testing.B) {
 	}
 }
 
-func BenchmarkSelectBestCompression(b *testing.B) {
-	data := make([]byte, 65536)
-	for i := range data {
-		data[i] = byte(i % 256)
-	}
-	b.ResetTimer()
-	b.ReportAllocs()
-	var buf []byte
-	for b.Loop() {
-		var err error
-		buf, _, err = selectBestCompression(buf[:0], data)
-		if err != nil {
-			b.Fatal(err)
+// selectionClassesForTest are BenchmarkSelectBestCompression's chunks and the type each must get; bg4 and text are
+// genBG4 and genLZ4 of decode_bench_test.go.
+var selectionClassesForTest = []struct {
+	name string
+	ct   CompressionType
+	fill func(src *rand.ChaCha8, p []byte)
+}{
+	{"random", CompressionNone, func(src *rand.ChaCha8, p []byte) {
+		_, _ = src.Read(p)
+	}},
+	{"bg4", CompressionByteGrouping4, func(src *rand.ChaCha8, p []byte) {
+		r := rand.New(src)
+		hi := r.Uint32()
+		for i := range len(p) / 4 {
+			if r.IntN(64) == 0 {
+				hi++
+			}
+			binary.LittleEndian.PutUint32(p[4*i:], hi<<16|r.Uint32N(1<<16))
 		}
+	}},
+	// A rough stand-in for bf16 weights: a random low byte and a high byte in 0x3c-0x3e.
+	{"bf16-like", CompressionByteGrouping4, func(src *rand.ChaCha8, p []byte) {
+		r := rand.New(src)
+		for i := range len(p) / 2 {
+			binary.LittleEndian.PutUint16(p[2*i:], uint16(0x3c+r.IntN(3))<<8|uint16(r.IntN(256)))
+		}
+	}},
+	{"text", CompressionLZ4, func(src *rand.ChaCha8, p []byte) {
+		r := rand.New(src)
+		words := strings.Fields("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
+		for i := 0; i < len(p); {
+			i += copy(p[i:], words[r.IntN(len(words))])
+			if i < len(p) {
+				p[i] = ' '
+				i++
+			}
+		}
+	}},
+}
+
+func BenchmarkSelectBestCompression(b *testing.B) {
+	for _, class := range selectionClassesForTest {
+		b.Run("class="+class.name, func(b *testing.B) {
+			var seed [32]byte
+			copy(seed[:], class.name)
+			data := make([]byte, xet.TargetChunkSize)
+			class.fill(rand.NewChaCha8(seed), data)
+			buf, ct, err := selectBestCompression(nil, data)
+			if err != nil || ct != class.ct {
+				b.Fatalf("selectBestCompression(class %s) = type %d, %v; want type %d", class.name, ct, err, class.ct)
+			}
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if buf, _, err = selectBestCompression(buf[:0], data); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
