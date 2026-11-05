@@ -193,6 +193,7 @@ func WithCacheDir(dir string) Option {
 }
 
 // WithSpool shares a Spool built elsewhere; by default the mirror builds its own under cacheDir/spool.
+// A spool the mirror builds itself pins nothing; pass one built with spool.WithPins and hand the same table to the sweeper.
 func WithSpool(s *spool.Spool) Option {
 	return func(m *Mirror) { m.spool = s }
 }

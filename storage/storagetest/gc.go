@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 )
@@ -1892,5 +1893,108 @@ func testSweepCanceledContextFailsBeforeWork(t *testing.T, b Backend) {
 	}
 	if _, err := storage.NewGC(st).SweepStep(ctx, storage.SweepOptions{Grace: NoGrace}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("SweepStep = %v, want context.Canceled", err)
+	}
+}
+
+// testSweepKeepsPinnedXorb: GC.SweepStep spares an unreferenced xorb pinned in SweepOptions.Pins, dry run or real, and sweeps it once unpinned.
+func testSweepKeepsPinnedXorb(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	encoded, xorbHash := EncodeXorb(t, true, []byte("pinned unreferenced xorb"))
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	g := storage.NewGC(st)
+	table := pins.New[xet.XorbHash]()
+	unpin := table.Pin(xorbHash)
+	for _, dryRun := range []bool{true, false} {
+		res, err := g.SweepStep(ctx, storage.SweepOptions{Grace: NoGrace, DryRun: dryRun, Pins: table})
+		if err != nil {
+			t.Fatalf("SweepStep(dryRun=%v): %v", dryRun, err)
+		}
+		if len(res.SweptXorbs) != 0 {
+			t.Fatalf("SweptXorbs(dryRun=%v) = %v, want none: the xorb is pinned in SweepOptions.Pins", dryRun, SweptHashes(res.SweptXorbs))
+		}
+		if res.SkippedPinned != 1 {
+			t.Fatalf("SkippedPinned(dryRun=%v) = %d, want 1", dryRun, res.SkippedPinned)
+		}
+		if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
+			t.Fatalf("HasXorb after SweepStep(dryRun=%v) = %v, %v; want present", dryRun, ok, err)
+		}
+	}
+
+	unpin()
+	res, err := g.SweepStep(ctx, storage.SweepOptions{Grace: NoGrace, Pins: table})
+	if err != nil {
+		t.Fatalf("SweepStep after unpin: %v", err)
+	}
+	if got, want := SweptHashes(res.SweptXorbs), []string{xorbHash.String()}; !slices.Equal(got, want) {
+		t.Fatalf("SweptXorbs after unpin = %v, want %v", got, want)
+	}
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || ok {
+		t.Fatalf("HasXorb after the unpinned sweep = %v, %v; want absent", ok, err)
+	}
+}
+
+// Without Pins a pass spares no pinned xorb, whichever table pinned it.
+func testSweepWithoutPinsSweepsPinnedXorb(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	encoded, xorbHash := EncodeXorb(t, true, []byte("xorb pinned in a table the pass is not given"))
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	g := storage.NewGC(st)
+	table := pins.New[xet.XorbHash]()
+	table.Pin(xorbHash)
+	res, err := g.SweepStep(ctx, storage.SweepOptions{Grace: NoGrace, Pins: table})
+	if err != nil {
+		t.Fatalf("SweepStep with Pins: %v", err)
+	}
+	if len(res.SweptXorbs) != 0 || res.SkippedPinned != 1 {
+		t.Fatalf("SweepStep with Pins swept xorbs %v with SkippedPinned %d; want none and 1: the xorb is pinned in SweepOptions.Pins", SweptHashes(res.SweptXorbs), res.SkippedPinned)
+	}
+
+	res, err = g.SweepStep(ctx, storage.SweepOptions{Grace: NoGrace})
+	if err != nil {
+		t.Fatalf("SweepStep without Pins: %v", err)
+	}
+	if got, want := SweptHashes(res.SweptXorbs), []string{xorbHash.String()}; !slices.Equal(got, want) || res.SkippedPinned != 0 {
+		t.Fatalf("SweepStep without Pins swept xorbs %v with SkippedPinned %d; want %v and 0: pins protect only the passes given them", got, res.SkippedPinned, want)
+	}
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || ok {
+		t.Fatalf("HasXorb after the step without Pins = %v, %v; want absent", ok, err)
+	}
+}
+
+func testSweepFuncHonoursPins(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	encoded, xorbHash := EncodeXorb(t, true, []byte("xorb pinned for the package sweep"))
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	table := pins.New[xet.XorbHash]()
+	table.Pin(xorbHash)
+	res, err := storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace, Pins: table})
+	if err != nil {
+		t.Fatalf("Sweep with Pins: %v", err)
+	}
+	if len(res.SweptXorbs) != 0 || res.SkippedPinned != 1 {
+		t.Fatalf("Sweep with Pins swept xorbs %v with SkippedPinned %d; want none and 1: the xorb is pinned in SweepOptions.Pins", SweptHashes(res.SweptXorbs), res.SkippedPinned)
+	}
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
+		t.Fatalf("HasXorb after Sweep with Pins = %v, %v; want present", ok, err)
+	}
+
+	res, err = storage.Sweep(ctx, st, storage.SweepOptions{Grace: NoGrace})
+	if err != nil {
+		t.Fatalf("Sweep without Pins: %v", err)
+	}
+	if got, want := SweptHashes(res.SweptXorbs), []string{xorbHash.String()}; !slices.Equal(got, want) || res.SkippedPinned != 0 {
+		t.Fatalf("Sweep without Pins swept xorbs %v with SkippedPinned %d; want %v and 0", got, res.SkippedPinned, want)
 	}
 }

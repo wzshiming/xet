@@ -28,6 +28,8 @@ import (
 	"sync/atomic"
 
 	"github.com/wzshiming/ioswmr"
+	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/storage"
 )
 
@@ -35,17 +37,30 @@ import (
 type Spool struct {
 	dir     string
 	st      storage.Storage
+	pins    *pins.Table[xet.XorbHash]
 	mu      sync.Mutex // flights
 	openMu  sync.Mutex // serializes spool open+register against Sweep
 	flights map[string]*flight
 }
 
+// Option configures a Spool.
+type Option func(*Spool)
+
+// WithPins makes every ingest pin the xorbs it stores or reuses in p until its PutFile returns; give the same table to the sweeper (SweepOptions.Pins).
+func WithPins(p *pins.Table[xet.XorbHash]) Option {
+	return func(s *Spool) { s.pins = p }
+}
+
 // NewSpool returns the spool ledger over dir, ingesting into st.
-func NewSpool(dir string, st storage.Storage) (*Spool, error) {
+func NewSpool(dir string, st storage.Storage, opts ...Option) (*Spool, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("spool: create %s: %w", dir, err)
 	}
-	return &Spool{dir: dir, st: st, flights: map[string]*flight{}}, nil
+	s := &Spool{dir: dir, st: st, flights: map[string]*flight{}}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // Source is what a caller knows about the content it wants spooled.
@@ -230,7 +245,7 @@ func (it *Item) Finish(ctx context.Context, err error) {
 			if rs, e := it.NewSeekReader(0, int(size)); e != nil {
 				err = e
 			} else {
-				res, err = ingest(ctx, s.st, rs, it.src.SHA256)
+				res, err = ingest(ctx, s.st, rs, it.src.SHA256, storage.WithPins(s.pins))
 				_ = rs.Close()
 			}
 		}
@@ -259,7 +274,7 @@ type Result struct {
 
 // ingest verifies the spooled bytes against wantSHA256 (when given) and
 // stores them in st.
-func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256 string) (Result, error) {
+func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256 string, opts ...storage.PutFileOption) (Result, error) {
 	hasher := sha256.New()
 	size, err := io.Copy(hasher, r)
 	if err != nil {
@@ -275,7 +290,7 @@ func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return Result{}, fmt.Errorf("rewind spool: %w", err)
 		}
-		fileHash, err := storage.PutFile(ctx, st, r)
+		fileHash, err := storage.PutFile(ctx, st, r, opts...)
 		if err != nil {
 			return Result{}, fmt.Errorf("ingest into storage: %w", err)
 		}

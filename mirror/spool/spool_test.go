@@ -13,11 +13,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/ioswmr"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/memory"
 )
@@ -29,6 +32,37 @@ type xorbRejectingStorage struct {
 
 func (xorbRejectingStorage) PutXorb(context.Context, xet.XorbHash, io.Reader) (bool, error) {
 	return false, errors.New("xorb write refused")
+}
+
+// gateStorage records each PutXorb's xorb, noting those pins did not hold as the call started, and holds every PutShard, ignoring ctx, until release closes.
+type gateStorage struct {
+	storage.Storage
+	pins    *pins.Table[xet.XorbHash]
+	entered chan struct{} // signalled as a PutShard reaches the gate
+	release chan struct{}
+
+	mu       sync.Mutex
+	xorbs    []xet.XorbHash
+	unpinned []xet.XorbHash
+}
+
+func (g *gateStorage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+	g.mu.Lock()
+	g.xorbs = append(g.xorbs, xorbHash)
+	if !g.pins.Pinned(xorbHash) {
+		g.unpinned = append(g.unpinned, xorbHash)
+	}
+	g.mu.Unlock()
+	return g.Storage.PutXorb(ctx, xorbHash, r)
+}
+
+func (g *gateStorage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return g.Storage.PutShard(ctx, sh)
 }
 
 // spoolFiles lists the .spool names under dir in directory order.
@@ -965,5 +999,81 @@ func TestSpoolReleaseBeforeFinish(t *testing.T) {
 	f.Release()
 	if _, err := q.Wait(ctx, w); err == nil {
 		t.Fatal("a late Finish overturned the release failure")
+	}
+}
+
+// testWait bounds a wait on the ingest so a hang fails the test before the binary's deadline.
+func testWait(t *testing.T) time.Duration {
+	if deadline, ok := t.Deadline(); ok {
+		return min(10*time.Minute, time.Until(deadline)*9/10)
+	}
+	return 10 * time.Minute
+}
+
+// The ingest pins each xorb in the spool's table before storing it and keeps it pinned while the file's shard is pending; Wait returns with every pin released.
+func TestSpoolIngestPinsXorbs(t *testing.T) {
+	ctx := context.Background()
+	table := pins.New[xet.XorbHash]()
+	st := &gateStorage{Storage: memory.NewStorage(), pins: table, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	q, err := NewSpool(filepath.Join(t.TempDir(), "spool"), st, WithPins(table))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 1<<20)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	it, err := q.Accept(ctx, Source{Origin: "https://hub.example", Key: "/org/repo/resolve/main/model.bin", ETag: "etag", Size: int64(len(data))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Release()
+	release := sync.OnceFunc(func() { close(st.release) })
+	defer release() // before the Release, which awaits the held ingest
+	if _, err := it.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		it.Finish(ctx, nil)
+	}()
+	wait := testWait(t)
+	select {
+	case <-st.entered:
+	case <-finished:
+		_, err := q.Wait(ctx, it)
+		t.Fatalf("the ingest ended before its PutShard: %v", err)
+	case <-time.After(wait):
+		t.Fatalf("the ingest reached no PutShard within %v", wait)
+	}
+
+	st.mu.Lock()
+	xorbs, unpinned := slices.Clone(st.xorbs), slices.Clone(st.unpinned)
+	st.mu.Unlock()
+	if len(xorbs) == 0 {
+		t.Fatal("the ingest made no PutXorb before its PutShard")
+	}
+	if len(unpinned) > 0 {
+		t.Fatalf("PutXorb started with xorbs %v unpinned, want each pinned in the spool's table before it is stored", unpinned)
+	}
+	for _, h := range xorbs {
+		if !table.Pinned(h) {
+			t.Fatalf("xorb %s unpinned while the ingest's shard is pending, want every xorb of the in-flight ingest pinned", h)
+		}
+	}
+	release()
+	select {
+	case <-finished:
+	case <-time.After(wait):
+		t.Fatalf("Finish did not return within %v after the PutShard was released", wait)
+	}
+	if res, err := q.Wait(ctx, it); err != nil || res.Size != int64(len(data)) || res.FileHash == "" {
+		t.Fatalf("Wait = %+v, %v; want the %d bytes stored", res, err, len(data))
+	}
+	for _, h := range xorbs {
+		if table.Pinned(h) {
+			t.Fatalf("xorb %s still pinned once Wait returned, want every pin released with the ingest", h)
+		}
 	}
 }
