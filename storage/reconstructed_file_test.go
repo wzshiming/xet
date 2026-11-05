@@ -1018,7 +1018,7 @@ func TestReconstructedFileTermSizeMismatchFails(t *testing.T) {
 func TestReconstructedFileTermShortByWholeChunksFails(t *testing.T) {
 	st := newLocal(t)
 	// Terms long enough to leave out more chunks than the window holds.
-	xorbs := xorbsOf(lz4Class, 3, slices.Repeat([]int{4 << 10}, 8+2))
+	xorbs := xorbsOf(lz4Class, 3, slices.Repeat([]int{4 << 10}, 32+2))
 	f := putXorbs(t, st, xorbs)
 	last := len(xorbs) - 1
 	for _, c := range []struct {
@@ -1026,7 +1026,7 @@ func TestReconstructedFileTermShortByWholeChunksFails(t *testing.T) {
 		term, short int
 	}{
 		{"last term declared one chunk short", last, 1},
-		{"last term declared more chunks short than the window", last, 8 + 1},
+		{"last term declared more chunks short than the window", last, 32 + 1},
 		{"middle term declared one chunk short", 1, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1138,7 +1138,7 @@ func TestReconstructedFileServeContentOfShortLastTermFallsShort(t *testing.T) {
 func TestReconstructedFileDrainsEmptyChunksPastWindow(t *testing.T) {
 	const size = 4 << 10
 	chunks := xorbsOf(lz4Class, 1, []int{size, size, size})[0]
-	empty := make([][]byte, 3*8)
+	empty := make([][]byte, 3*32)
 	for _, c := range []struct {
 		name    string
 		chunks  [][]byte
@@ -1498,23 +1498,23 @@ func TestReconstructedFileSeekAwayReleasesPipeline(t *testing.T) {
 // A reader stalled after its first byte reads ahead until its window is full.
 func TestReconstructedFileReadAheadFillsWindow(t *testing.T) {
 	dec, rc, frames := stalledReader(t)
-	want := frames[8-1].end
+	want := frames[32-1].end
 	if !eventually(func() bool { return dec.seekBytes() >= want }) {
-		t.Fatalf("stalled reader fetched %d bytes, want read-ahead through the window's %d frames, %d bytes", dec.seekBytes(), 8, want)
+		t.Fatalf("stalled reader fetched %d bytes, want read-ahead through the window's %d frames, %d bytes", dec.seekBytes(), 32, want)
 	}
 	closeWithin(t, rc, time.Second)
 }
 
 // However long it stalls, a reader holds a window of frames, not the file:
-// at most 8+2 frames fetched and a fetcher beside min(GOMAXPROCS, 4) workers.
+// at most 32+2 frames fetched and a fetcher beside min(GOMAXPROCS, 4) workers.
 func TestReconstructedFileStalledReaderStaysBounded(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	dec, rc, frames := stalledReader(t)
-	if full := frames[8-1].end; !eventually(func() bool { return dec.seekBytes() >= full }) {
-		t.Fatalf("stalled reader fetched %d bytes, never filling its window of %d frames, %d bytes", dec.seekBytes(), 8, full)
+	if full := frames[32-1].end; !eventually(func() bool { return dec.seekBytes() >= full }) {
+		t.Fatalf("stalled reader fetched %d bytes, never filling its window of %d frames, %d bytes", dec.seekBytes(), 32, full)
 	}
-	if got, limit := dec.seekBytes(), frames[8+1].end; got > limit {
-		t.Errorf("stalled reader fetched %d of %d bytes, want at most 8+2 frames, %d bytes", got, frames[len(frames)-1].end, limit)
+	if got, limit := dec.seekBytes(), frames[32+1].end; got > limit {
+		t.Errorf("stalled reader fetched %d of %d bytes, want at most 32+2 frames, %d bytes", got, frames[len(frames)-1].end, limit)
 	}
 	workers := min(runtime.GOMAXPROCS(0), 4)
 	if got, limit := runtime.NumGoroutine()-baseline, 1+workers; got > limit {
