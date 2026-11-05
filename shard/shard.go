@@ -185,6 +185,18 @@ func (s *Shard) File(hash xet.FileHash) *FileBlock {
 	return nil
 }
 
+// FindFileBySHA256 returns the file whose recorded SHA-256 matches digest,
+// or nil when the shard does not carry it.
+func (s *Shard) FindFileBySHA256(digest [32]byte) *FileBlock {
+	want := NewSHA256Hash(digest)
+	for i := range s.Files {
+		if s.Files[i].MetadataExt != nil && s.Files[i].MetadataExt.SHA256Hash == want {
+			return &s.Files[i]
+		}
+	}
+	return nil
+}
+
 // UnpackedSize returns the file's size, the sum of its entries' unpacked bytes; 0 for a nil block.
 func (f *FileBlock) UnpackedSize() int64 {
 	if f == nil {

@@ -144,12 +144,12 @@ func (s *Handler) handleXetBridge(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-	content, err := storage.NewReconstructedFile(r.Context(), s.storage, sh, digest)
-	if err != nil {
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-
+	content := storage.NewReconstructedFile(r.Context(), s.storage, file.Entries)
 	defer content.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")

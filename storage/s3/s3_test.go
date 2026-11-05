@@ -350,10 +350,11 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetShardBySHA256: %v", err)
 	}
-	f, err := storage.NewReconstructedFile(ctx, fresh, sh, digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile: %v", err)
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		t.Fatal("FindFileBySHA256: not found")
 	}
+	f := storage.NewReconstructedFile(ctx, fresh, file.Entries)
 	defer f.Close()
 	got, err := io.ReadAll(f)
 	if err != nil {

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet/mirror/spool"
-	"github.com/wzshiming/xet/storage"
 )
 
 // task tracks one in-flight ingestion. All concurrent requests for the same
@@ -225,7 +224,7 @@ func (m *Mirror) heldEntry(ctx context.Context, pr *probeResult) *fileEntry {
 	if err != nil {
 		return nil
 	}
-	file := storage.FindFileBySHA256(sh, digest)
+	file := sh.FindFileBySHA256(digest)
 	if file == nil {
 		return nil
 	}

@@ -359,7 +359,7 @@ func (fs *Storage) GetFileHashBySHA256(ctx context.Context, digest [32]byte) (xe
 	if err != nil {
 		return xet.FileHash{}, err
 	}
-	file := storage.FindFileBySHA256(sh, digest)
+	file := sh.FindFileBySHA256(digest)
 	if file == nil {
 		return xet.FileHash{}, fmt.Errorf("SHA-256 is not present in shard")
 	}

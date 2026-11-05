@@ -3,7 +3,6 @@ package download
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -123,10 +122,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				rc, err := storage.NewReconstructedFile(ctx, st, sh, sha256.Sum256(second))
-				if err != nil {
-					t.Fatal(err)
-				}
+				rc := storage.NewReconstructedFile(ctx, st, entries)
 				defer rc.Close()
 				if _, err := rc.Seek(offset, io.SeekStart); err != nil {
 					t.Fatal(err)

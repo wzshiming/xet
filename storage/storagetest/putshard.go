@@ -337,10 +337,11 @@ func testPutShardCommitsMultiTermFile(t *testing.T, b Backend) {
 	if err != nil {
 		t.Fatalf("GetShardBySHA256(): %v", err)
 	}
-	rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
-	if err != nil {
-		t.Fatalf("NewReconstructedFile(): %v", err)
+	file := sh.FindFileBySHA256(digest)
+	if file == nil {
+		t.Fatal("FindFileBySHA256(): not found")
 	}
+	rc := storage.NewReconstructedFile(ctx, st, file.Entries)
 	defer rc.Close()
 	if _, err := io.ReadFull(rc, make([]byte, 1)); err != nil {
 		t.Fatalf("Read(): %v", err)

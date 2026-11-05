@@ -31,35 +31,18 @@ type reconstructedFile struct {
 	chunkOff int64  // file offset of cur.data[0]
 }
 
-// FindFileBySHA256 returns the shard file whose recorded SHA-256 matches
-// digest, or nil when the shard does not carry it.
-func FindFileBySHA256(sh *shard.Shard, digest [32]byte) *shard.FileBlock {
-	want := shard.NewSHA256Hash(digest)
-	for i := range sh.Files {
-		if sh.Files[i].MetadataExt != nil && sh.Files[i].MetadataExt.SHA256Hash == want {
-			return &sh.Files[i]
-		}
-	}
-	return nil
-}
-
-// NewReconstructedFile exposes the file in sh whose recorded SHA-256 is digest.
-func NewReconstructedFile(ctx context.Context, stor Storage, sh *shard.Shard, digest [32]byte) (io.ReadSeekCloser, error) {
-	file := FindFileBySHA256(sh, digest)
-	if file == nil {
-		return nil, fmt.Errorf("SHA-256 is not present in shard")
-	}
-
+// NewReconstructedFile exposes the file whose terms are entries.
+func NewReconstructedFile(ctx context.Context, storage Storage, entries []shard.FileDataSequenceEntry) io.ReadSeekCloser {
 	f := &reconstructedFile{
 		ctx:     ctx,
-		storage: stor,
-		entries: file.Entries,
+		storage: storage,
+		entries: entries,
 	}
 	f.life, f.cancel = context.WithCancel(ctx)
 	for i := range f.entries {
 		f.size += int64(f.entries[i].UnpackedSegBytes)
 	}
-	return f, nil
+	return f
 }
 
 func (f *reconstructedFile) Read(p []byte) (int, error) {

@@ -409,11 +409,12 @@ func (h *Hub) cdn(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	content, err := storage.NewReconstructedFile(r.Context(), h.opts.Storage, sh, sum)
-	if err != nil {
+	file := sh.FindFileBySHA256(sum)
+	if file == nil {
 		http.NotFound(w, r)
 		return
 	}
+	content := storage.NewReconstructedFile(r.Context(), h.opts.Storage, file.Entries)
 	defer content.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", `"`+r.PathValue("sha256")+`"`)

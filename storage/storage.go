@@ -68,7 +68,7 @@ type Storage interface {
 	// File lookups by content SHA-256 through index/sha256.
 
 	// GetShardBySHA256 retrieves the shard holding the file with a SHA-256 digest, wrapping fs.ErrNotExist when the digest is unknown.
-	// NewReconstructedFile reads the file from it.
+	// NewReconstructedFile reads the file from its FindFileBySHA256 entries.
 	GetShardBySHA256(ctx context.Context, sha256 [32]byte) (*shard.Shard, error)
 
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest, wrapping fs.ErrNotExist when the digest is unknown.
