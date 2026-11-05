@@ -15,7 +15,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/wzshiming/httpseek v0.7.0
 	github.com/wzshiming/ioswmr v0.3.1
-	github.com/zeebo/blake3 v0.2.4
+	github.com/zeebo/blake3 v0.2.5-0.20261020032212-28a397d2ee4c
 	golang.org/x/sync v0.24.0
 	golang.org/x/sys v0.49.0
 )
@@ -37,7 +37,6 @@ require (
 	github.com/aws/smithy-go v1.28.8 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/cpuid/v2 v2.4.2 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d // indirect

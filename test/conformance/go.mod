@@ -30,12 +30,11 @@ require (
 	github.com/aws/smithy-go v1.28.8 // indirect
 	github.com/edsrzf/mmap-go v1.2.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
-	github.com/klauspost/cpuid/v2 v2.4.2 // indirect
 	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/wzshiming/httpseek v0.7.0 // indirect
 	github.com/wzshiming/ioswmr v0.3.1 // indirect
-	github.com/zeebo/blake3 v0.2.4 // indirect
+	github.com/zeebo/blake3 v0.2.5-0.20261020032212-28a397d2ee4c // indirect
 	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
