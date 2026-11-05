@@ -1,6 +1,7 @@
 package xet
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -43,6 +44,19 @@ func TestChunkHashHMAC(t *testing.T) {
 	}
 	if keyed == ComputeChunkHash([]byte("other")).HMAC(key1) {
 		t.Error("different hashes must produce different keyed hashes")
+	}
+}
+
+func BenchmarkComputeChunkHash(b *testing.B) {
+	for _, n := range []int{MinChunkSize, TargetChunkSize, MaxChunkSize} {
+		b.Run(fmt.Sprintf("size=%dKiB", n>>10), func(b *testing.B) {
+			data := make([]byte, n)
+			b.SetBytes(int64(n))
+			b.ReportAllocs()
+			for b.Loop() {
+				ComputeChunkHash(data)
+			}
+		})
 	}
 }
 
