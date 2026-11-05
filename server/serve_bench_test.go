@@ -3,16 +3,36 @@
 // storage.NewReconstructedFile through http.ServeContent) and by path=plain
 // (http.ServeContent of the same bytes from an *os.File, which net sends with
 // sendfile). Files are 64 KiB chunks in xorbs of at most xet.MaxXorbSize:
-// 1 MiB = 1 xorb × 16 chunks, 64 MiB = 1 × 1024, 256 MiB = 4 × 1024; the
-// 64 MiB row differs from the storage bench's 4 × 256 shape. Each (size, class)
-// fixture is built once per process, so -count repeats rows only; the full
-// matrix takes about 1.6 GiB of temp disk, which TestMain removes. One client
+// 1 MiB = 1 xorb × 16 chunks, 64 MiB = 1 × 1024, 256 MiB = 4 × 1024,
+// 1 GiB = 16 × 1024; the 64 MiB row differs from the storage bench's 4 × 256
+// shape. Each (size, class) fixture is built once per process, when a row
+// first selects it, so -count repeats rows only; the full matrix takes about
+// 8.8 GiB of temp disk (2.1 GiB without the 1 GiB rows, whose fixtures also
+// hold 2 GiB of memory while they are built), which TestMain removes. One client
 // keeps its connections warm and drains bodies through a 1 MiB buffer into a
-// writer without ReadFrom; allocs include the in-process server. Numbers are
-// indicative; compare the paths with
+// writer without ReadFrom; allocs include the in-process server.
+//
+// Each row also reports, per GiB (2^30 bytes) of file requested in its timed
+// loop: cpu-s/GiB, usr-s/GiB and sys-s/GiB, this process's CPU seconds
+// (getrusage RUSAGE_SELF), which include the client's drain, the same on both
+// paths, so compare differences between paths; minflt/GiB and majflt/GiB, its
+// page faults; writes/GiB, the socket writes of the server's connections, a
+// sendfile counting as one. served/file is the bytes those connections wrote
+// per file byte requested. Numbers are indicative; compare the paths with
 //
 //	go test ./server -run '^$' -bench Serve -benchtime 3x -count 3 >serve.txt
 //	benchstat -row .name -col /path serve.txt
+//
+// XET_BENCH_PROFILE_DIR=<absolute dir> writes each row's CPU profile, over its
+// timed loop only, to <dir>/<b.Name() with "/" as "_">-<n>.pprof, n numbering
+// this process's profiles so -count keeps every run's. A bridge reader decodes
+// with min(GOMAXPROCS, 4) workers; vary them with GOMAXPROCS=n go test ....
+//
+// XET_SERVE_BENCH_STORE=<dir> with XET_SERVE_BENCH_SHA256=<64 hex> adds the
+// rows size=real/class=real: path=bridge serves that file from dir, the
+// -storage directory of an xetd, and path=plain a copy reconstructed once
+// from it and checked against the digest. Pass a copy of the directory:
+// opening it creates any storage subdirectory it lacks.
 package server_test
 
 import (
@@ -23,11 +43,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/server"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/local"
 	"github.com/wzshiming/xet/storage/storagetest"
 )
@@ -47,7 +70,11 @@ var shapes = []shape{
 	{"1MiB", 1, 16},
 	{"64MiB", 1, xet.MaxXorbSize / chunkSize},
 	{"256MiB", 4, xet.MaxXorbSize / chunkSize},
+	{"1GiB", 16, xet.MaxXorbSize / chunkSize},
 }
+
+// classes are the storage classes plus bf16 model weights.
+var classes = append(slices.Clone(storagetest.ChunkClasses), storagetest.ChunkClassBF16)
 
 // paths are the routes a fixture serves its file on, by its SHA-256 hex.
 var paths = []struct{ name, route string }{
@@ -64,6 +91,7 @@ var client = func() *http.Client {
 // fixture is what a (size, class) cell keeps once its payloads are dropped.
 type fixture struct {
 	srv    *httptest.Server
+	conns  *connStats
 	size   int64
 	sha256 string
 }
@@ -73,7 +101,7 @@ func (fx *fixture) url(route string) string {
 }
 
 var (
-	fixtureRoot string                  // made by the first fixture
+	fixtureRoot string                  // made by benchRoot
 	fixtures    = map[string]*fixture{} // by "<size>/<class>"
 )
 
@@ -82,8 +110,25 @@ func TestMain(m *testing.M) {
 	for _, fx := range fixtures {
 		fx.srv.Close()
 	}
+	for _, st := range routeStacks {
+		st.srv.Close()
+		st.hubSrv.Close()
+	}
 	os.RemoveAll(fixtureRoot)
 	os.Exit(code)
+}
+
+// benchRoot returns the temp dir all fixtures live under, making it on first use.
+func benchRoot(tb testing.TB) string {
+	tb.Helper()
+	if fixtureRoot == "" {
+		root, err := os.MkdirTemp("", "xet-serve-bench-*")
+		if err != nil {
+			tb.Fatal(err)
+		}
+		fixtureRoot = root
+	}
+	return fixtureRoot
 }
 
 // fixtureFor returns the fixture of s and c, building it on first use.
@@ -98,27 +143,28 @@ func fixtureFor(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 
 func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 	tb.Helper()
-	if fixtureRoot == "" {
-		root, err := os.MkdirTemp("", "xet-serve-bench-*")
-		if err != nil {
-			tb.Fatal(err)
-		}
-		fixtureRoot = root
-	}
-	dir := filepath.Join(fixtureRoot, s.name, c.Name)
+	dir := filepath.Join(benchRoot(tb), s.name, c.Name)
 	st, err := local.NewStorage(local.WithBasePath(filepath.Join(dir, "store")))
 	if err != nil {
 		tb.Fatal(err)
 	}
 	f := storagetest.PutXorbFile(tb, tb.Context(), st, c.Xorbs(s.xorbs, s.chunksPerXorb, chunkSize))
 	storagetest.AssertFileCompression(tb, tb.Context(), st, f, c.Compression)
+	if c.Name == storagetest.ChunkClassBF16.Name {
+		storagetest.AssertFileStoredRatio(tb, tb.Context(), st, f, 0.85, 0.92)
+	}
 	plain := filepath.Join(dir, "plain")
 	if err := os.WriteFile(plain, f.Content, 0o644); err != nil {
 		tb.Fatal(err)
 	}
+	return serveFixture(st, plain, int64(len(f.Content)), f.SHA256Hex)
+}
 
+// serveFixture serves the file of SHA-256 hex sum on /plain/ from the file
+// plain and on /xet-bridge/ from st.
+func serveFixture(st storage.Storage, plain string, size int64, sum string) *fixture {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/plain/"+f.SHA256Hex, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/plain/"+sum, func(w http.ResponseWriter, r *http.Request) {
 		file, err := os.Open(plain)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -130,7 +176,8 @@ func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 		http.ServeContent(w, r, plain, time.Time{}, file)
 	})
 	mux.Handle("/", server.NewHandler(server.WithStorage(st)))
-	return &fixture{srv: httptest.NewServer(mux), size: int64(len(f.Content)), sha256: f.SHA256Hex}
+	srv, conns := newCountingServer(mux)
+	return &fixture{srv: srv, conns: conns, size: size, sha256: sum}
 }
 
 // checkGet fails tb unless url answers 200 with fx's length and SHA-256.
@@ -163,7 +210,7 @@ func (w *countWriter) Write(p []byte) (int, error) {
 // TestServe checks that both paths serve every class's 1 MiB file whole.
 func TestServe(t *testing.T) {
 	buf := make([]byte, drainBufSize)
-	for _, c := range storagetest.ChunkClasses {
+	for _, c := range classes {
 		t.Run("class="+c.Name, func(t *testing.T) {
 			fx := fixtureFor(t, shapes[0], c)
 			for _, p := range paths {
@@ -177,15 +224,65 @@ func TestServe(t *testing.T) {
 func BenchmarkServe(b *testing.B) {
 	for _, s := range shapes {
 		b.Run("size="+s.name, func(b *testing.B) {
-			for _, c := range storagetest.ChunkClasses {
-				b.Run("class="+c.Name, func(b *testing.B) {
-					fx := fixtureFor(b, s, c)
-					for _, p := range paths {
-						b.Run("path="+p.name, func(b *testing.B) { benchmarkGet(b, fx, fx.url(p.route)) })
-					}
-				})
+			for _, c := range classes {
+				b.Run("class="+c.Name, func(b *testing.B) { benchmarkPaths(b, fixtureFor(b, s, c)) })
 			}
 		})
+	}
+	if dir, sum := os.Getenv("XET_SERVE_BENCH_STORE"), os.Getenv("XET_SERVE_BENCH_SHA256"); dir != "" && sum != "" {
+		b.Run("size=real", func(b *testing.B) {
+			b.Run("class=real", func(b *testing.B) { benchmarkPaths(b, realFixture(b, dir, sum)) })
+		})
+	}
+}
+
+// realFixture serves the file of SHA-256 hex sum stored in the storage dir
+// of an xetd: on /xet-bridge/ from dir, on /plain/ from a copy reconstructed
+// once and checked against sum.
+func realFixture(tb testing.TB, dir, sum string) *fixture {
+	tb.Helper()
+	const key = "real/real"
+	if fixtures[key] != nil {
+		return fixtures[key]
+	}
+	sum = strings.ToLower(sum)
+	digest, err := hex.DecodeString(sum)
+	if err != nil || len(digest) != sha256.Size {
+		tb.Fatalf("XET_SERVE_BENCH_SHA256=%q is not 64 hex digits", sum)
+	}
+	st, err := local.NewStorage(local.WithBasePath(dir))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	rc, err := st.GetReconstructedFile(tb.Context(), [sha256.Size]byte(digest))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer rc.Close()
+	plain := filepath.Join(benchRoot(tb), "real")
+	out, err := os.Create(plain)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(out, h), rc)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		tb.Fatal(err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != sum {
+		tb.Fatalf("%s reconstructs %d bytes with SHA-256 %s, want %s", dir, size, got, sum)
+	}
+	fixtures[key] = serveFixture(st, plain, size, sum)
+	return fixtures[key]
+}
+
+// benchmarkPaths runs one row per path of fx.
+func benchmarkPaths(b *testing.B, fx *fixture) {
+	for _, p := range paths {
+		b.Run("path="+p.name, func(b *testing.B) { benchmarkGet(b, fx, fx.url(p.route)) })
 	}
 }
 
@@ -196,6 +293,8 @@ func benchmarkGet(b *testing.B, fx *fixture, url string) {
 	var body countWriter
 	b.SetBytes(fx.size)
 	b.ReportAllocs()
+	n := 0
+	w := startWindow(b, fx.conns)
 	for b.Loop() {
 		resp, err := client.Get(url)
 		if err != nil {
@@ -210,5 +309,7 @@ func benchmarkGet(b *testing.B, fx *fixture, url string) {
 		if err != nil || body.n != fx.size {
 			b.Fatalf("GET %s: drained %d bytes, %v; want %d", url, body.n, err, fx.size)
 		}
+		n++
 	}
+	w.stop(b, fx.size, n)
 }
