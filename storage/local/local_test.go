@@ -20,6 +20,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
+	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -42,7 +43,7 @@ func TestShardNameIsDeterministicContentHash(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inserted, err := st.PutShard(context.Background(), newIdenticalShard(st, creationTime)); err != nil || !inserted {
+		if inserted, err := storage.PutShard(context.Background(), st, newIdenticalShard(st, creationTime)); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 		entries, err := fanoutEntries(filepath.Join(basePath, "shards"))
@@ -137,19 +138,19 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.PutShard(ctx, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj); err == nil {
 		t.Fatal("PutShard() succeeded despite blocked sha256 index")
 	}
 
 	// The partial shard must not count as existing.
-	if exists, err := fs.hasFile(fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	if got, err := fs.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+		t.Fatalf("GetFileIndexEntry() after partial failure = %q, %v", got, err)
 	}
 
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fs.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 
@@ -209,7 +210,7 @@ func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
 	content := []byte("fan me out")
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, fs, shardObj, [][]byte{content})
-	if inserted, err := fs.PutShard(ctx, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, fs, shardObj); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
 
@@ -384,7 +385,7 @@ func TestOverwriteIndexFileConcurrentSameKey(t *testing.T) {
 
 // stepReader feeds PutXorb its input one step at a time. A Read that finds
 // nothing buffered first signals entered, proving the previous step was
-// fully consumed and teed to disk, then blocks until the test sends the next
+// fully consumed and teed to the store, then blocks until the test sends the next
 // step; a closed steps channel reads as EOF.
 type stepReader struct {
 	steps   chan readStep
@@ -423,7 +424,7 @@ func (r *stepReader) Read(p []byte) (int, error) {
 func putXorbAsync(fs *Storage, xorbHash xet.XorbHash, r io.Reader) <-chan error {
 	done := make(chan error, 1)
 	go func() {
-		_, err := fs.PutXorb(context.Background(), xorbHash, r)
+		_, err := storage.PutXorb(context.Background(), fs, xorbHash, r)
 		done <- err
 	}()
 	return done
@@ -494,7 +495,7 @@ func TestPutXorbInterruptedConcurrentWriterKeepsCommittedBytes(t *testing.T) {
 	firstDone := putXorbAsync(fs, xorbHash, first)
 	await(t, first.entered)
 	first.steps <- readStep{data: encoded[:split]}
-	await(t, first.entered) // prefix consumed and teed to disk
+	await(t, first.entered) // prefix consumed and teed to the store
 
 	second := newStepReader()
 	secondDone := putXorbAsync(fs, xorbHash, second)

@@ -18,6 +18,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
+	"github.com/wzshiming/xet/storage/local"
 )
 
 type shardV2TestStorage struct {
@@ -31,10 +32,28 @@ func (s *shardV2TestStorage) HasXorb(context.Context, xet.XorbHash) (bool, error
 	return true, nil
 }
 
-func (s *shardV2TestStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
+func (s *shardV2TestStorage) PutShard(ctx context.Context, sh *shard.Shard) (string, bool, error) {
 	close(s.putStarted)
 	<-s.putContinue
-	return s.putErr == nil, s.putErr
+	if s.putErr != nil {
+		return "", false, s.putErr
+	}
+	return s.Storage.PutShard(ctx, sh)
+}
+
+// uncommittedFixture returns a store holding only authorizerFixture's xorb,
+// and the encoded shard that commits the fixture's file over it.
+func uncommittedFixture(t *testing.T) (storage.Storage, []byte) {
+	t.Helper()
+	_, _, xorbHash, _, _, xorbBytes, shardBytes := authorizerFixture(t)
+	stor, err := local.NewStorage(local.WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stor.PutXorb(t.Context(), xorbHash, bytes.NewReader(xorbBytes)); err != nil {
+		t.Fatal(err)
+	}
+	return stor, shardBytes
 }
 
 type shardUploadWireEvent struct {
@@ -60,21 +79,13 @@ func readShardUploadWireEvent(t *testing.T, r *bufio.Reader) shardUploadWireEven
 }
 
 func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
-	shardObj := shard.NewShard()
-	shardObj.AddCASBlock(shard.CASBlock{})
-	encoded, err := shardObj.Encode(false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
+	target, body := uncommittedFixture(t)
 	// Leave the final CAS-section bookend unsent. The first CAS block is
 	// complete, but Decode cannot finish until these last 48 bytes arrive.
 	partialSize := len(body) - 48
 
 	stor := &shardV2TestStorage{
+		Storage:     target,
 		putStarted:  make(chan struct{}),
 		putContinue: make(chan struct{}),
 	}
@@ -161,10 +172,11 @@ func TestUploadShardV2StreamsWhileRequestBodyIsArriving(t *testing.T) {
 }
 
 func TestUploadShardStorageFailureRemainsRetryable(t *testing.T) {
-	_, _, _, _, _, _, body := authorizerFixture(t)
 	for _, endpoint := range []string{"/shards", "/v1/shards", "/v2/shards"} {
 		t.Run(endpoint, func(t *testing.T) {
+			target, body := uncommittedFixture(t)
 			stor := &shardV2TestStorage{
+				Storage:     target,
 				putStarted:  make(chan struct{}),
 				putContinue: make(chan struct{}),
 				putErr:      fmt.Errorf("backend unavailable"),

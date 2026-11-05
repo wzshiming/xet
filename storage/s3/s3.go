@@ -28,7 +28,6 @@ import (
 	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -312,9 +311,8 @@ func (ss *Storage) putIndexObject(ctx context.Context, key string, value []byte)
 	return ss.putObject(ctx, key, bytes.NewReader(value))
 }
 
-// PutXorb stores an xorb. The stream is validated while being spooled to a
-// temporary file, then uploaded with a known length so the SDK can sign and
-// retry the request.
+// PutXorb stores an xorb. The stream is spooled to a temporary file, then
+// uploaded with a known length so the SDK can sign and retry the request.
 func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	key := ss.objectKey("xorbs", xorbHash.String())
 
@@ -334,8 +332,8 @@ func (ss *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Read
 		os.Remove(f.Name())
 	}()
 
-	if err := xorb.Validate(io.TeeReader(r, f), xorbHash); err != nil {
-		return false, fmt.Errorf("validate xorb: %w", err)
+	if _, err := io.Copy(f, r); err != nil {
+		return false, fmt.Errorf("spool xorb: %w", err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return false, fmt.Errorf("rewind xorb spool file: %w", err)
@@ -393,83 +391,51 @@ func (ss *Storage) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHas
 	return ss.xorbChunkOffsets(xorbHash)
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, error) {
-	if _, exists := ss.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	_, exists, err := ss.headObject(ctx, ss.objectKey("index/files", fileHash.String()))
-	if err != nil {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return exists, nil
-}
-
-// PutShard stores a shard and its file/chunk/sha256 index objects.
-func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := ss.hasFile(ctx, fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, ss); err != nil {
-		return false, err
-	}
-
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-
-	shardKey := ss.objectKey("shards", shardHash)
-	wasInserted := true
-	if _, exists, err := ss.headObject(ctx, shardKey); err != nil {
-		return false, fmt.Errorf("check shard object: %w", err)
+	key := ss.objectKey("shards", shardHash)
+	if _, exists, err := ss.headObject(ctx, key); err != nil {
+		return "", false, fmt.Errorf("check shard object: %w", err)
 	} else if exists {
-		wasInserted = false
-	} else if err := ss.putObject(ctx, shardKey, bytes.NewReader(encoded)); err != nil {
-		return false, fmt.Errorf("upload shard: %w", err)
+		return shardHash, false, nil
 	}
-
-	// Nothing is cached here, but putIndexObject overwrites entries the caches
-	// may still hold, so each written key is evicted to keep warm reads from
-	// resolving a mapping the store no longer has.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(ctx context.Context, kind, name string, value []byte) error {
-		if err := ss.putIndexObject(ctx, ss.objectKey(kind, name), value); err != nil {
-			return err
-		}
-		ss.evictIndexEntry(kind, name)
-		return nil
-	})
-	return wasInserted, err
+	if err := ss.putObject(ctx, key, bytes.NewReader(encoded)); err != nil {
+		return "", false, fmt.Errorf("upload shard: %w", err)
+	}
+	return shardHash, true, nil
 }
 
-// evictIndexEntry drops the cached mapping for an overwritten index object.
-func (ss *Storage) evictIndexEntry(kind, name string) {
-	switch kind {
-	case "index/chunks":
-		if h, err := xet.ParseChunkHash(name); err == nil {
-			ss.caches.Chunks.Remove(h)
-		}
-	case "index/sha256":
-		ss.evictSHA256(name)
-	case "index/files":
-		if h, err := xet.ParseFileHash(name); err == nil {
-			ss.caches.Files.Remove(h)
-		}
+// PutFileIndexEntry overwrites the index/files entry for fileHash. Nothing is
+// cached on writes, but each one evicts the mapping it may have replaced, so
+// warm reads do not resolve a mapping the store no longer has.
+func (ss *Storage) PutFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(shardHash)); err != nil {
+		return err
 	}
+	ss.caches.Files.Remove(fileHash)
+	return nil
+}
+
+// PutChunkIndexEntry overwrites the index/chunks entry for chunkHash, evicting its cached mapping.
+func (ss *Storage) PutChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/chunks", chunkHash.String()), []byte(shardHash)); err != nil {
+		return err
+	}
+	ss.caches.Chunks.Remove(chunkHash)
+	return nil
+}
+
+// PutSHA256IndexEntry overwrites the index/sha256 entry for sha256Hex, evicting its cached mapping.
+func (ss *Storage) PutSHA256IndexEntry(ctx context.Context, sha256Hex, shardHash string) error {
+	if err := ss.putIndexObject(ctx, ss.objectKey("index/sha256", sha256Hex), []byte(shardHash)); err != nil {
+		return err
+	}
+	ss.evictSHA256(sha256Hex)
+	return nil
 }
 
 func (ss *Storage) getShardByHash(ctx context.Context, shardHash string) (*shard.Shard, error) {
