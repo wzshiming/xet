@@ -253,3 +253,16 @@ func TestXorbChunkOffsetsShareOpenReaderMap(t *testing.T) {
 	}
 	assertRest(t, a, encoded[7:])
 }
+
+// PutFile commits its shard without mapping the xorb it wrote.
+func TestPutFileMapsNoXorb(t *testing.T) {
+	fs := newRangeStore(t)
+	data := make([]byte, 1<<20)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+	if _, err := storage.PutFile(context.Background(), fs, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if cached, mapped := fs.xorbCache.Len(), fs.xorbCache.Mapped(); cached != 0 || mapped != 0 {
+		t.Fatalf("after PutFile: xorbCache.Len() = %d, Mapped() = %d; want 0, 0", cached, mapped)
+	}
+}

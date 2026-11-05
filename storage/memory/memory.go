@@ -211,6 +211,15 @@ func (s *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) 
 
 // PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
 func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	return s.putShard(ctx, sh, func() error { return storage.PrepareShard(ctx, sh, s) })
+}
+
+// PutVerifiedShard stores a shard as PutShard does, trusting the caller's verification.
+func (s *Storage) PutVerifiedShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	return s.putShard(ctx, sh, func() error { return storage.CheckVerifiedShard(sh) })
+}
+
+func (s *Storage) putShard(ctx context.Context, sh *shard.Shard, prepare func() error) (bool, error) {
 	// Only a shard whose every file is already indexed is a no-op
 	alreadyExists := len(sh.Files) > 0
 	for _, file := range sh.Files {
@@ -222,7 +231,7 @@ func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
 	if alreadyExists {
 		return false, nil
 	}
-	if err := storage.PrepareShard(ctx, sh, s); err != nil {
+	if err := prepare(); err != nil {
 		return false, err
 	}
 	encoded, shardHash, err := storage.EncodeShard(sh)

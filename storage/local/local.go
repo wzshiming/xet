@@ -283,6 +283,15 @@ func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 
 // PutShard stores a shard
 func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	return fs.putShard(ctx, s, func() error { return storage.PrepareShard(ctx, s, fs) })
+}
+
+// PutVerifiedShard stores a shard as PutShard does, trusting the caller's verification.
+func (fs *Storage) PutVerifiedShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	return fs.putShard(ctx, s, func() error { return storage.CheckVerifiedShard(s) })
+}
+
+func (fs *Storage) putShard(ctx context.Context, s *shard.Shard, prepare func() error) (bool, error) {
 	// Only a shard whose every file is already indexed is a no-op
 	alreadyExists := len(s.Files) > 0
 	for _, fileBlock := range s.Files {
@@ -300,7 +309,7 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 		return false, nil // Already exists
 	}
 
-	if err := storage.PrepareShard(ctx, s, fs); err != nil {
+	if err := prepare(); err != nil {
 		return false, err
 	}
 
