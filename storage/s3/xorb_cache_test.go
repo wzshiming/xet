@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -273,6 +274,27 @@ func TestS3XorbRangesAndOffsetsOneGet(t *testing.T) {
 	key := ss.objectKey("xorbs", x.String())
 	if gets, ranged := ct.count(http.MethodGet, key), ct.ranged(http.MethodGet, key); gets != 1 || ranged != 0 {
 		t.Fatalf("chunk offsets and %d ranged reads sent %d GET requests for %s, %d with a Range header; want 1, 0", reads, gets, key, ranged)
+	}
+}
+
+// PutFile commits its shard without downloading back, or keeping a copy of, the xorb it uploaded.
+func TestS3PutFileGetsNoXorb(t *testing.T) {
+	ctx := context.Background()
+	ss, ct := newCountingS3Storage(t)
+	data := make([]byte, 1<<20)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+	fileHash, err := storage.PutFile(ctx, ss, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if puts, gets := ct.count(http.MethodPut, "/xorbs/"), ct.count(http.MethodGet, "/xorbs/"); puts != 1 || gets != 0 {
+		t.Fatalf("PutFile sent %d xorb PUT and %d xorb GET requests; want 1 and 0", puts, gets)
+	}
+	if n := cachedXorbFiles(t, ss); n != 0 {
+		t.Fatalf("PutFile left %d files in the local xorb cache, want none", n)
+	}
+	if got, err := ss.GetFileHashBySHA256(ctx, sha256.Sum256(data)); err != nil || got != fileHash {
+		t.Fatalf("GetFileHashBySHA256() = %s, %v; want %s", got.String(), err, fileHash.String())
 	}
 }
 

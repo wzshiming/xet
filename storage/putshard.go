@@ -119,6 +119,19 @@ func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	return nil
 }
 
+// CheckVerifiedShard checks what PutVerifiedShard needs of s instead of PrepareShard: a file block, and each file's SHA-256.
+func CheckVerifiedShard(s *shard.Shard) error {
+	if len(s.Files) == 0 {
+		return fmt.Errorf("shard has no file blocks")
+	}
+	for _, file := range s.Files {
+		if file.MetadataExt == nil || file.Flags&shard.FileWithMetadataExt == 0 {
+			return fmt.Errorf("file %s has no SHA-256", file.FileHash.String())
+		}
+	}
+	return nil
+}
+
 // PutShardIndexes indexes only the shard's probe-able chunks (shard.GlobalDedupEligibleChunks)
 // and writes the files entries last, so a partial write remains retryable.
 func PutShardIndexes(ctx context.Context, s *shard.Shard, shardHash string, put func(ctx context.Context, kind, name string, value []byte) error) error {

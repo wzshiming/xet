@@ -408,6 +408,15 @@ func (ss *Storage) hasFile(ctx context.Context, fileHash xet.FileHash) (bool, er
 
 // PutShard stores a shard and its file/chunk/sha256 index objects.
 func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	return ss.putShard(ctx, s, func() error { return storage.PrepareShard(ctx, s, ss) })
+}
+
+// PutVerifiedShard stores a shard as PutShard does, trusting the caller's verification.
+func (ss *Storage) PutVerifiedShard(ctx context.Context, s *shard.Shard) (bool, error) {
+	return ss.putShard(ctx, s, func() error { return storage.CheckVerifiedShard(s) })
+}
+
+func (ss *Storage) putShard(ctx context.Context, s *shard.Shard, prepare func() error) (bool, error) {
 	// Only a shard whose every file is already indexed is a no-op
 	alreadyExists := len(s.Files) > 0
 	for _, fileBlock := range s.Files {
@@ -424,7 +433,7 @@ func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 		return false, nil // Already exists
 	}
 
-	if err := storage.PrepareShard(ctx, s, ss); err != nil {
+	if err := prepare(); err != nil {
 		return false, err
 	}
 
