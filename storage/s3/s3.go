@@ -424,7 +424,7 @@ func (ss *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 		return false, nil // Already exists
 	}
 
-	if err := storage.PrepareShard(ctx, s, ss); err != nil {
+	if err := storage.PrepareShard(ctx, s, copyXorbs{ss}); err != nil {
 		return false, err
 	}
 

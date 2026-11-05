@@ -12,7 +12,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -484,6 +486,76 @@ func TestS3XorbConcurrentFirstReadersShareOneGet(t *testing.T) {
 	key := ss.objectKey("xorbs", x.String())
 	if gets := ct.count(http.MethodGet, key); gets != 1 {
 		t.Fatalf("%d concurrent first readers sent %d GET requests for %s, want 1", len(results), gets, key)
+	}
+}
+
+// residentBytes sums the Rss that /proc/self/smaps reports for this process's mappings of path.
+func residentBytes(t *testing.T, path string) int64 {
+	t.Helper()
+	path, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smaps, err := os.ReadFile("/proc/self/smaps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	inPath := false
+	for line := range strings.Lines(string(smaps)) {
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) >= 5 && strings.Contains(fields[0], "-"):
+			// A mapping's header: addresses, perms, offset, device, inode, then the path of a file mapping.
+			inPath = len(fields) == 6 && fields[5] == path
+		case inPath && len(fields) == 3 && fields[0] == "Rss:":
+			kb, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			total += kb << 10
+		}
+	}
+	return total
+}
+
+// PutFile's shard is verified through the cached copy's file: the xorb downloads
+// once for its CAS block, its term and its chunk offsets alike and stays cached,
+// but no page of it is resident in the process until a read through the mapping.
+func TestS3PutFileLeavesCopyCachedNotResident(t *testing.T) {
+	ctx := context.Background()
+	ss, ct := newCountingS3Storage(t)
+	data := make([]byte, 1<<20)
+	rand.NewChaCha8([32]byte{1}).Read(data)
+	fileHash, err := storage.PutFile(ctx, ss, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := ss.GetShard(ctx, fileHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := sh.CASInfos[0].CASHash
+	key := ss.objectKey("xorbs", x.String())
+	if gets, cached := ct.count(http.MethodGet, key), ss.xorbCache.Has(x); gets != 1 || !cached {
+		t.Fatalf("after PutFile: %d GET requests for its xorb, cached %v; want 1, true", gets, cached)
+	}
+	onLinux := runtime.GOOS == "linux"
+	if onLinux {
+		if rss := residentBytes(t, ss.xorbCachePath(x)); rss != 0 {
+			t.Fatalf("after PutFile: %d bytes of its xorb's copy resident, want 0", rss)
+		}
+	}
+
+	if got := drainXorb(ss, x); got.err != nil {
+		t.Fatal(got.err)
+	}
+	if gets := ct.count(http.MethodGet, key); gets != 1 {
+		t.Fatalf("GET requests for the xorb after PutFile and a read = %d, want still 1", gets)
+	}
+	// The 0 above means something only if a read through the mapping shows up here.
+	if onLinux && residentBytes(t, ss.xorbCachePath(x)) == 0 {
+		t.Fatal("after a read through the mapping: no byte of the copy resident, want some")
 	}
 }
 
