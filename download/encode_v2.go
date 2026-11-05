@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
@@ -13,6 +14,8 @@ import (
 // The V2 format groups fetch ranges by xorb and combines consecutive chunk ranges
 // into multi-range fetch entries for more efficient downloading.
 // The terms are those holding bytes of rng; ParseByteRange("", size) selects the whole file.
+// The first and the last are trimmed to the chunks holding bytes of rng when the shard
+// has a CAS block of their xorb, so OffsetIntoFirstRange stays within the first chunk.
 func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, sh *shard.Shard, fileHash xet.FileHash, rng ByteRange) (*ReconstructionResponseV2, error) {
 	fileBlock := sh.File(fileHash)
 	if fileBlock == nil {
@@ -37,9 +40,9 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 	}
 	xorbFetchRanges := make(map[string][]fetchInfo)
 
-	for _, entry := range fileBlock.Entries {
+	for _, seg := range fileBlock.Entries {
 		termStart := currentByteOffset
-		termEnd := currentByteOffset + int64(entry.UnpackedSegBytes)
+		termEnd := currentByteOffset + int64(seg.UnpackedSegBytes)
 
 		// Skip terms that are completely outside the requested range
 		if termEnd <= rng.Start {
@@ -49,6 +52,9 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		if termStart > rng.End {
 			break
 		}
+
+		entry, skipped := trimSegment(sh, seg, termStart, rng)
+		termStart += skipped
 
 		// Calculate offset into first term if this is the first included term
 		if len(response.Terms) == 0 && termStart < rng.Start {
@@ -74,14 +80,21 @@ func BuildReconstructionResponseV2(ctx context.Context, storage StorageAdapter, 
 		if err != nil {
 			return nil, fmt.Errorf("failed to get xorb data range: %w", err)
 		}
-		// Collect fetch info grouped by xorb
+		// Collect fetch info grouped by xorb; hf_xet keys a xorb's blocks by start chunk,
+		// so of the ranges sharing one keep the longest.
 		xorbHashStr := entry.CASHash.String()
-		xorbFetchRanges[xorbHashStr] = append(xorbFetchRanges[xorbHashStr], fetchInfo{
+		info := fetchInfo{
 			chunkStart: entry.ChunkIndexStart,
 			chunkEnd:   entry.ChunkIndexEnd,
 			startByte:  startByte,
 			endByte:    endByte,
-		})
+		}
+		ranges := xorbFetchRanges[xorbHashStr]
+		if k := slices.IndexFunc(ranges, func(r fetchInfo) bool { return r.chunkStart == info.chunkStart }); k < 0 {
+			xorbFetchRanges[xorbHashStr] = append(ranges, info)
+		} else if info.chunkEnd > ranges[k].chunkEnd {
+			ranges[k] = info
+		}
 
 		currentByteOffset = termEnd
 	}

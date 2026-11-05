@@ -120,9 +120,17 @@ func (f *tsFixture) parse(rangeHeader string) ByteRange {
 	return ParseByteRange(rangeHeader, f.fileSize)
 }
 
+// whole is the shard without its CAS blocks, so the builders leave the terms a range starts in or runs past whole:
+// the split tests pin how SplitTerms cuts such terms.
+func (f *tsFixture) whole() *shard.Shard {
+	sh := *f.sh
+	sh.CASInfos = nil
+	return &sh
+}
+
 func (f *tsFixture) build(t *testing.T, rng ByteRange) *ReconstructionResponseV2 {
 	t.Helper()
-	in, err := BuildReconstructionResponseV2(t.Context(), f.st, f.sh, f.file, rng)
+	in, err := BuildReconstructionResponseV2(t.Context(), f.st, f.whole(), f.file, rng)
 	if err != nil {
 		t.Fatalf("BuildReconstructionResponseV2 with range %+v: %v", rng, err)
 	}

@@ -20,7 +20,7 @@ import (
 
 func (f *tsFixture) buildV1(t *testing.T, rng ByteRange) *ReconstructionResponseV1 {
 	t.Helper()
-	in, err := BuildReconstructionResponseV1(t.Context(), f.st, f.sh, f.file, rng)
+	in, err := BuildReconstructionResponseV1(t.Context(), f.st, f.whole(), f.file, rng)
 	if err != nil {
 		t.Fatalf("BuildReconstructionResponseV1 with range %+v: %v", rng, err)
 	}
