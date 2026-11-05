@@ -33,10 +33,10 @@ func baseName(p string) string {
 	return p
 }
 
-// Options returns the client options every xetc transfer uses: concurrency, chunk cache and progress reporting to out.
-func Options(concurrency int, cacheDir string, out io.Writer) []client.Options {
+// Options returns the client options every xetc transfer uses: concurrency, chunk cache, progress reporting to out and, with verify, download verification.
+func Options(concurrency int, cacheDir string, verify bool, out io.Writer) []client.Options {
 	progressSummary := newProgressSummary()
-	return []client.Options{
+	opts := []client.Options{
 		client.WithProgressFunc(func(name string, current, total int64) {
 			progressSummary.Update(baseName(name), current, total)
 			progressSummary.Output(out)
@@ -44,6 +44,10 @@ func Options(concurrency int, cacheDir string, out io.Writer) []client.Options {
 		client.WithConcurrency(concurrency),
 		client.WithCache(client.NewCache(cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)),
 	}
+	if verify {
+		opts = append(opts, client.WithVerifyDownloads())
+	}
+	return opts
 }
 
 func ExecuteUpload(ctx context.Context, filename string, cli *client.Client, out io.Writer) (err error) {
@@ -73,12 +77,12 @@ func ExecuteUpload(ctx context.Context, filename string, cli *client.Client, out
 }
 
 // ExecuteResolveDownload downloads the Hugging Face file behind resolveURL through a client bound to its repository, authenticating with token; the destination is opened only once the resolution succeeded.
-func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile string, concurrency int, cacheDir string, resume bool, out io.Writer) error {
+func ExecuteResolveDownload(ctx context.Context, resolveURL, token, outputFile string, concurrency int, cacheDir string, verify, resume bool, out io.Writer) error {
 	repo, path, err := hf.ParseResolveURL(resolveURL)
 	if err != nil {
 		return fmt.Errorf("resolve download target: %w", err)
 	}
-	cli, err := hf.NewClient(repo, hf.WithToken(token), hf.WithClientOptions(Options(concurrency, cacheDir, out)...))
+	cli, err := hf.NewClient(repo, hf.WithToken(token), hf.WithClientOptions(Options(concurrency, cacheDir, verify, out)...))
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}

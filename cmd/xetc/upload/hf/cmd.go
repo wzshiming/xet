@@ -39,7 +39,7 @@ func NewCommand() *cobra.Command {
 				Revision: hfRevision,
 			}
 
-			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(concurrency, cacheDir, os.Stderr)...))
+			cli, err := hfclient.NewClient(repo, hfclient.WithToken(hfToken), hfclient.WithClientOptions(common.Options(concurrency, cacheDir, false, os.Stderr)...))
 			if err != nil {
 				return fmt.Errorf("upload failed: create client: %w", err)
 			}

@@ -12,6 +12,7 @@ func NewCommand() *cobra.Command {
 		token       string
 		concurrency int
 		cacheDir    string
+		verify      bool
 		resume      bool
 	)
 
@@ -20,13 +21,14 @@ func NewCommand() *cobra.Command {
 		Short: "Resolve a Hugging Face URL and download through CAS",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return common.ExecuteResolveDownload(cmd.Context(), args[0], token, args[1], concurrency, cacheDir, resume, os.Stderr)
+			return common.ExecuteResolveDownload(cmd.Context(), args[0], token, args[1], concurrency, cacheDir, verify, resume, os.Stderr)
 		},
 	}
 
 	cmd.Flags().StringVar(&token, "token", "", "Hugging Face access token")
 	cmd.Flags().IntVar(&concurrency, "concurrency", 4, "Number of xorb ranges to prefetch concurrently")
 	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "Cache root: <dir>/download holds the chunk cache, <dir>/upload holds upload staging and cached chunk locations (default: <os temp dir>/xet-cache)")
+	cmd.Flags().BoolVar(&verify, "verify", false, "Verify the downloaded file against its xet hash by hashing every chunk (slower)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "Resume a partially downloaded file")
 	return cmd
 }

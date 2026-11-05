@@ -23,7 +23,7 @@ const (
 // DownloadFile downloads and reconstructs a file from its hash into w,
 // automatically falling back to V1 if V2 is not supported. It seeks w to
 // determine the current size for resume support.
-// Full downloads are hash-verified; resumed suffixes are not.
+// With WithVerifyDownloads, full downloads are hash-verified; resumed suffixes never are.
 func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
 	err := c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV2)
 	if err != nil {
@@ -138,13 +138,13 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, fileHash xet.FileHash,
 	return reader, download.ExpectedLengthV2(reconstructionResp), nil
 }
 
-// Only full downloads have all chunks needed to verify fileHash.
+// Verification is opt-in, and only full downloads have all chunks needed to verify fileHash.
 func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []download.Option {
 	opts := []download.Option{
 		download.WithConcurrency(c.concurrency),
 		download.WithCacheManager(c.cache.Download),
 	}
-	if resumeOffset == 0 {
+	if c.verifyDownloads && resumeOffset == 0 {
 		opts = append(opts, download.WithExpectedFileHash(fileHash))
 	}
 	if c.progressFunc != nil {
@@ -158,7 +158,7 @@ func (c *Client) downloadOptions(fileHash xet.FileHash, resumeOffset int64) []do
 // All files share one fetch_info map, so each xorb is fetched only once across the batch.
 // It returns a reader and size per file in the same order as fileHashes.
 // Individual errors are embedded per-entry; a nil reader means that file was not found.
-// Each reader verifies its content against the requested hash before EOF.
+// With WithVerifyDownloads, each reader verifies its content against the requested hash before EOF.
 // Readers release their cache references when read to EOF; close any reader
 // that is not fully consumed.
 func (c *Client) DownloadFiles(ctx context.Context, fileHashes []xet.FileHash) ([]io.ReadCloser, []int64, error) {
