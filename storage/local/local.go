@@ -32,7 +32,8 @@ type Storage struct {
 	xorbCache     *xorbmap.Cache // bounded xorb mapping cache
 }
 
-const defaultXorbCacheSize = 512
+// Cached mappings keep what was read through them resident, up to 64 MiB per xorb, so 32 bound it at 2 GiB.
+const defaultXorbCacheSize = 32
 
 type Option func(*Storage)
 
