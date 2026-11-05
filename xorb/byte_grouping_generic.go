@@ -1,7 +1,7 @@
 package xorb
 
-// interleave4 sets dst[4*i+k] = pk[i] for every i below len(p0).
-func interleave4(dst, p0, p1, p2, p3 []byte) {
+// interleave4Generic sets dst[4*i+k] = pk[i] for every i below len(p0).
+func interleave4Generic(dst, p0, p1, p2, p3 []byte) {
 	n := len(p0)
 	if n == 0 {
 		return
@@ -21,8 +21,8 @@ func interleave4(dst, p0, p1, p2, p3 []byte) {
 	}
 }
 
-// deinterleave4 sets pk[i] = src[4*i+k] for every i below len(p0).
-func deinterleave4(p0, p1, p2, p3, src []byte) {
+// deinterleave4Generic sets pk[i] = src[4*i+k] for every i below len(p0).
+func deinterleave4Generic(p0, p1, p2, p3, src []byte) {
 	n := len(p0)
 	if n == 0 {
 		return
