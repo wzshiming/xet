@@ -67,8 +67,9 @@ type Storage interface {
 
 	// File lookups by content SHA-256 through index/sha256.
 
-	// GetReconstructedFile returns a ReadSeekCloser for a file reconstructed from a shard by its SHA-256 digest.
-	GetReconstructedFile(ctx context.Context, sha256 [32]byte) (io.ReadSeekCloser, error)
+	// GetShardBySHA256 retrieves the shard holding the file with a SHA-256 digest, wrapping fs.ErrNotExist when the digest is unknown.
+	// NewReconstructedFile reads the file from it.
+	GetShardBySHA256(ctx context.Context, sha256 [32]byte) (*shard.Shard, error)
 
 	// GetFileHashBySHA256 resolves a file's SHA-256 digest to the xet file hash recorded at ingest, wrapping fs.ErrNotExist when the digest is unknown.
 	GetFileHashBySHA256(ctx context.Context, sha256 [32]byte) (xet.FileHash, error)

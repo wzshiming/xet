@@ -123,7 +123,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				rc, err := st.GetReconstructedFile(ctx, sha256.Sum256(second))
+				rc, err := storage.NewReconstructedFile(ctx, st, sh, sha256.Sum256(second))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -136,7 +136,7 @@ func TestReadersMatchStorageReconstructedFile(t *testing.T) {
 					t.Fatal(err)
 				}
 				if !bytes.Equal(got, want) {
-					t.Fatalf("reader returned %d bytes, differing from GetReconstructedFile's %d", len(got), len(want))
+					t.Fatalf("reader returned %d bytes, differing from NewReconstructedFile's %d", len(got), len(want))
 				}
 				if int64(len(got)) != length {
 					t.Fatalf("reader returned %d bytes, expected length %d", len(got), length)

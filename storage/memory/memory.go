@@ -260,13 +260,9 @@ func (s *Storage) GetFileHashBySHA256(_ context.Context, digest [32]byte) (xet.F
 	return file.FileHash, nil
 }
 
-// GetReconstructedFile returns a ReadSeekCloser for the file recorded under the SHA-256 digest.
-func (s *Storage) GetReconstructedFile(ctx context.Context, digest [32]byte) (io.ReadSeekCloser, error) {
-	sh, err := s.shardByIndex("index/sha256", shard.NewSHA256Hash(digest).String())
-	if err != nil {
-		return nil, fmt.Errorf("get shard by sha256: %w", err)
-	}
-	return storage.NewReconstructedFile(ctx, s, sh, digest)
+// GetShardBySHA256 retrieves the shard holding the file with the SHA-256 digest.
+func (s *Storage) GetShardBySHA256(_ context.Context, digest [32]byte) (*shard.Shard, error) {
+	return s.shardByIndex("index/sha256", shard.NewSHA256Hash(digest).String())
 }
 
 // GetShardByHash loads a stored shard by the hash of its serialized bytes; the error wraps fs.ErrNotExist when absent.

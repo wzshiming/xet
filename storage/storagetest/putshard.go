@@ -332,9 +332,14 @@ func testPutShardCommitsMultiTermFile(t *testing.T, b Backend) {
 	}
 	assertFilesCommitted(t, ctx, st, f)
 
-	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
+	digest := SHA256Digest(f.SHA256Hex)
+	sh, err = st.GetShardBySHA256(ctx, digest)
 	if err != nil {
-		t.Fatalf("GetReconstructedFile(): %v", err)
+		t.Fatalf("GetShardBySHA256(): %v", err)
+	}
+	rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
+	if err != nil {
+		t.Fatalf("NewReconstructedFile(): %v", err)
 	}
 	defer rc.Close()
 	if _, err := io.ReadFull(rc, make([]byte, 1)); err != nil {

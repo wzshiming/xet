@@ -155,7 +155,13 @@ func TestConcurrentAccess(t *testing.T) {
 			if ok, err := st.PutShard(ctx, own[i]); err != nil || !ok {
 				t.Errorf("PutShard(own %d) = %v, %v", i, ok, err)
 			}
-			rc, err := st.GetReconstructedFile(ctx, sha256.Sum256(contents[i]))
+			digest := sha256.Sum256(contents[i])
+			sh, err := st.GetShardBySHA256(ctx, digest)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
 			if err != nil {
 				t.Error(err)
 				return

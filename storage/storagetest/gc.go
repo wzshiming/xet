@@ -70,14 +70,9 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	f := PutFile(t, ctx, st, [][]byte{[]byte("unlink my sha256")})
 
 	// Warm the sha256 cache so the unlink must evict it.
-	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
-	if err != nil {
+	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(f.SHA256Hex)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.ReadAll(rc); err != nil {
-		t.Fatal(err)
-	}
-	_ = rc.Close()
 
 	removed, err := storage.NewGC(st).UnlinkSHA256(ctx, SHA256Digest(f.SHA256Hex))
 	if err != nil {
@@ -90,8 +85,8 @@ func testUnlinkSHA256RemovesEntry(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("sha256 entry after unlink = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
-		t.Fatal("sha256 reconstruction still resolves")
+	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
+		t.Fatalf("GetShardBySHA256 after unlink = %v, want ErrNotExist", err)
 	}
 	if _, err := st.GetFileHashBySHA256(ctx, SHA256Digest(f.SHA256Hex)); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("GetFileHashBySHA256 after unlink = %v, want ErrNotExist", err)
@@ -148,9 +143,14 @@ func testSweepNeedsBothUnlinks(t *testing.T, b Backend) {
 		if ok, _ := st.HasXorb(ctx, f.XorbHashes[0]); !ok {
 			t.Fatal("xorb swept")
 		}
-		rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
+		digest := SHA256Digest(f.SHA256Hex)
+		sh, err := st.GetShardBySHA256(ctx, digest)
 		if err != nil {
-			t.Fatalf("GetReconstructedFile: %v", err)
+			t.Fatalf("GetShardBySHA256: %v", err)
+		}
+		rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
+		if err != nil {
+			t.Fatalf("NewReconstructedFile: %v", err)
 		}
 		data, err := io.ReadAll(rc)
 		_ = rc.Close()
@@ -237,7 +237,12 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShardByChunkHash(ctx, fileA.ChunkHashes[1]); err != nil {
 		t.Fatal(err)
 	}
-	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(fileA.SHA256Hex))
+	digestA := SHA256Digest(fileA.SHA256Hex)
+	sh, err := st.GetShardBySHA256(ctx, digestA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := storage.NewReconstructedFile(ctx, st, sh, digestA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +290,7 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShardByChunkHash(ctx, fileA.ChunkHashes[1]); err == nil {
 		t.Fatal("chunk lookup for the dead shard's exclusive chunk still resolves")
 	}
-	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(fileA.SHA256Hex)); err == nil {
+	if _, err := st.GetShardBySHA256(ctx, digestA); err == nil {
 		t.Fatal("sha256 lookup for the swept file still resolves")
 	}
 
@@ -304,9 +309,14 @@ func testSweepRemovesOrphanedObjects(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, fileB.FileHash); err != nil {
 		t.Fatalf("GetShard(fileB): %v", err)
 	}
-	rc, err = st.GetReconstructedFile(ctx, SHA256Digest(fileB.SHA256Hex))
+	digestB := SHA256Digest(fileB.SHA256Hex)
+	sh, err = st.GetShardBySHA256(ctx, digestB)
 	if err != nil {
-		t.Fatalf("GetReconstructedFile(fileB): %v", err)
+		t.Fatalf("GetShardBySHA256(fileB): %v", err)
+	}
+	rc, err = storage.NewReconstructedFile(ctx, st, sh, digestB)
+	if err != nil {
+		t.Fatalf("NewReconstructedFile(fileB): %v", err)
 	}
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
@@ -690,9 +700,14 @@ func testSweepThenReuploadResurrects(t *testing.T, b Backend) {
 	if _, err := st.GetShard(ctx, f.FileHash); err != nil {
 		t.Fatalf("GetShard after re-upload: %v", err)
 	}
-	rc, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex))
+	digest := SHA256Digest(f.SHA256Hex)
+	sh, err := st.GetShardBySHA256(ctx, digest)
 	if err != nil {
-		t.Fatalf("GetReconstructedFile after re-upload: %v", err)
+		t.Fatalf("GetShardBySHA256 after re-upload: %v", err)
+	}
+	rc, err := storage.NewReconstructedFile(ctx, st, sh, digest)
+	if err != nil {
+		t.Fatalf("NewReconstructedFile after re-upload: %v", err)
 	}
 	data, err := io.ReadAll(rc)
 	_ = rc.Close()
@@ -1428,7 +1443,7 @@ func testSweepAnchorFilesUnlinkAloneReclaims(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("sha256 entry after sweep = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
+	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(f.SHA256Hex)); err == nil {
 		t.Fatal("sha256 lookup still resolves")
 	}
 }
@@ -1482,7 +1497,7 @@ func testSweepAnchorFilesDeletesSharedSHA256Entry(t *testing.T, b Backend) {
 	if got, err := st.GetSHA256IndexEntry(ctx, live.SHA256Hex); err != nil || got != "" {
 		t.Fatalf("shared sha256 entry = %q, %v; want removed", got, err)
 	}
-	if _, err := st.GetReconstructedFile(ctx, SHA256Digest(live.SHA256Hex)); err == nil {
+	if _, err := st.GetShardBySHA256(ctx, SHA256Digest(live.SHA256Hex)); err == nil {
 		t.Fatal("SHA-256 lookup still resolves after the entry delete")
 	}
 
