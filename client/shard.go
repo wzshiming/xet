@@ -81,8 +81,7 @@ func (c *Client) UploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upl
 		if err == nil {
 			return uploadResp, nil
 		}
-		var retryable *retryableShardUploadError
-		if !errors.As(err, &retryable) {
+		if _, ok := errors.AsType[*retryableShardUploadError](err); !ok {
 			return nil, err
 		}
 		lastErr = err

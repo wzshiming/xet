@@ -195,8 +195,7 @@ func isNetworkError(err error) bool {
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if _, ok := errors.AsType[*url.Error](err); ok {
 		return true
 	}
 	return false

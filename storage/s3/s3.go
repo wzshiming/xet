@@ -246,12 +246,10 @@ func (ss *Storage) objectKey(kind, name string) string {
 // isS3NotFound reports whether err indicates a missing object, covering
 // GetObject (NoSuchKey), HeadObject (NotFound) and plain 404 responses.
 func isS3NotFound(err error) bool {
-	var noSuchKey *types.NoSuchKey
-	if errors.As(err, &noSuchKey) {
+	if _, ok := errors.AsType[*types.NoSuchKey](err); ok {
 		return true
 	}
-	var notFound *types.NotFound
-	if errors.As(err, &notFound) {
+	if _, ok := errors.AsType[*types.NotFound](err); ok {
 		return true
 	}
 	var respErr *awshttp.ResponseError

@@ -161,7 +161,6 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Run("upload_conformance", func(t *testing.T) {
 				for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
-					protocol := protocol
 					t.Run(protocol.String(), func(t *testing.T) {
 						// Create separate temp directories for each client's storage
 						rustrefStorageDir := t.TempDir()
@@ -284,7 +283,6 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 			t.Run("download_conformance", func(t *testing.T) {
 				for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
-					protocol := protocol
 					t.Run(protocol.String(), func(t *testing.T) {
 						// Setup shared server
 						storageDir := t.TempDir()
@@ -403,7 +401,6 @@ func TestClientUploadDownloadRequestConformance(t *testing.T) {
 
 func TestClientUploadConformanceWithExistingData(t *testing.T) {
 	for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
-		protocol := protocol
 		t.Run(protocol.String(), func(t *testing.T) {
 			testClientUploadConformanceWithExistingData(t, protocol)
 		})

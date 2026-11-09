@@ -620,8 +620,7 @@ func (s *Handler) handleQueryChunksBatch(w http.ResponseWriter, r *http.Request)
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChunkQueryBodyBytes))
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -673,8 +672,7 @@ func (s *Handler) handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxTelemetryBodyBytes))
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}

@@ -379,7 +379,7 @@ func hasHFXet(hfBin string) bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if k, v, ok := strings.Cut(line, ":"); ok &&
 			strings.Contains(k, "hf_xet") && !strings.Contains(v, "not installed") {
 			return true

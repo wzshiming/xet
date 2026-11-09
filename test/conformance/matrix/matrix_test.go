@@ -1074,7 +1074,7 @@ func queriedChunkHashes(reqs []RequestRecord) map[string]bool {
 		if req.Method != http.MethodGet || !strings.HasPrefix(req.Path, "/v1/chunks/") {
 			continue
 		}
-		hash := strings.SplitN(strings.TrimPrefix(req.Path, "/v1/chunks/"), "/", 2)[0]
+		hash, _, _ := strings.Cut(strings.TrimPrefix(req.Path, "/v1/chunks/"), "/")
 		if len(hash) == 64 && isHexString(hash) {
 			hashes[hash] = true
 		}
