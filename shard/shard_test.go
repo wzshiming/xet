@@ -189,7 +189,7 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 			shard: &Shard{CASInfos: []CASBlock{
 				{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1, Flags: ChunkGlobalDedupEligible}}},
 			}},
-			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+			want: []LocatedChunk{{Hash: c1, XorbHash: xorbA, ChunkIndex: 0}},
 		},
 		{
 			name: "first chunk of a file",
@@ -199,14 +199,14 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}}},
 				},
 			},
-			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+			want: []LocatedChunk{{Hash: c1, XorbHash: xorbA, ChunkIndex: 0}},
 		},
 		{
 			name: "hash-sampled entry",
 			shard: &Shard{CASInfos: []CASBlock{
 				{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: sampled2}}},
 			}},
-			want: []LocatedChunk{{Hash: sampled2, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 1}}},
+			want: []LocatedChunk{{Hash: sampled2, XorbHash: xorbA, ChunkIndex: 1}},
 		},
 		{
 			name: "file whose first term is in a foreign xorb",
@@ -225,7 +225,7 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}, {ChunkHash: c3}}},
 				},
 			},
-			want: []LocatedChunk{{Hash: c3, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 2}}},
+			want: []LocatedChunk{{Hash: c3, XorbHash: xorbA, ChunkIndex: 2}},
 		},
 		{
 			name: "first chunk shared by two files",
@@ -238,7 +238,7 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: c1}, {ChunkHash: c2}}},
 				},
 			},
-			want: []LocatedChunk{{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+			want: []LocatedChunk{{Hash: c1, XorbHash: xorbA, ChunkIndex: 0}},
 		},
 		{
 			name: "flagged hash-sampled first chunk",
@@ -248,7 +248,7 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 					{CASHash: xorbA, Chunks: []CASChunkSequenceEntry{{ChunkHash: sampled1, Flags: ChunkGlobalDedupEligible}}},
 				},
 			},
-			want: []LocatedChunk{{Hash: sampled1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+			want: []LocatedChunk{{Hash: sampled1, XorbHash: xorbA, ChunkIndex: 0}},
 		},
 		{
 			name: "flagged entry inside a file",
@@ -259,8 +259,8 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 				},
 			},
 			want: []LocatedChunk{
-				{Hash: c1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}},
-				{Hash: c2, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 1}},
+				{Hash: c1, XorbHash: xorbA, ChunkIndex: 0},
+				{Hash: c2, XorbHash: xorbA, ChunkIndex: 1},
 			},
 		},
 		{
@@ -288,8 +288,8 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 				{CASHash: xorbB, Chunks: []CASChunkSequenceEntry{{ChunkHash: b1, Flags: ChunkGlobalDedupEligible}, {ChunkHash: a1}}},
 			}},
 			want: []LocatedChunk{
-				{Hash: a1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}},
-				{Hash: b1, ChunkLocation: ChunkLocation{XorbHash: xorbB, ChunkIndex: 0}},
+				{Hash: a1, XorbHash: xorbA, ChunkIndex: 0},
+				{Hash: b1, XorbHash: xorbB, ChunkIndex: 0},
 			},
 		},
 		{
@@ -301,7 +301,7 @@ func TestGlobalDedupEligibleChunks(t *testing.T) {
 					{CASHash: xorbB, Chunks: []CASChunkSequenceEntry{{ChunkHash: a1}}},
 				},
 			},
-			want: []LocatedChunk{{Hash: a1, ChunkLocation: ChunkLocation{XorbHash: xorbA, ChunkIndex: 0}}},
+			want: []LocatedChunk{{Hash: a1, XorbHash: xorbA, ChunkIndex: 0}},
 		},
 		{
 			name:  "empty shard",

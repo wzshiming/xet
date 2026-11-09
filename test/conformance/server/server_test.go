@@ -61,7 +61,6 @@ func TestServerUploadDownloadConformance(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, protocol := range []rustref.ProtocolVersion{rustref.ProtocolV1, rustref.ProtocolV2} {
-				protocol := protocol
 				t.Run(protocol.String(), func(t *testing.T) {
 					// Create temporary directory for storage
 					storageDir := t.TempDir()
@@ -603,8 +602,8 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		var batchResp struct {
-			Files     map[string]interface{} `json:"files"`
-			FetchInfo map[string]interface{} `json:"fetch_info"`
+			Files     map[string]any `json:"files"`
+			FetchInfo map[string]any `json:"fetch_info"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 			t.Fatalf("decode batch response: %v", err)
@@ -635,8 +634,8 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		var batchResp struct {
-			Files     map[string]interface{} `json:"files"`
-			FetchInfo map[string]interface{} `json:"fetch_info"`
+			Files     map[string]any `json:"files"`
+			FetchInfo map[string]any `json:"fetch_info"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 			t.Fatalf("decode empty batch response: %v", err)
@@ -664,8 +663,8 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		var batchResp struct {
-			Files     map[string]interface{} `json:"files"`
-			FetchInfo map[string]interface{} `json:"fetch_info"`
+			Files     map[string]any `json:"files"`
+			FetchInfo map[string]any `json:"fetch_info"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 			t.Fatalf("decode single-file batch response: %v", err)
@@ -699,8 +698,8 @@ func TestServerBatchGetReconstructionConformance(t *testing.T) {
 		}
 
 		var batchResp struct {
-			Files     map[string]interface{} `json:"files"`
-			FetchInfo map[string]interface{} `json:"fetch_info"`
+			Files     map[string]any `json:"files"`
+			FetchInfo map[string]any `json:"fetch_info"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
 			t.Fatalf("decode partial batch response: %v", err)

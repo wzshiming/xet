@@ -345,8 +345,7 @@ func TestRawGETIdleTimeout(t *testing.T) {
 	for name, call := range calls {
 		before := requests.Load()
 		err := call()
-		var idle *idleTimeoutError
-		if !errors.As(err, &idle) {
+		if _, ok := errors.AsType[*idleTimeoutError](err); !ok {
 			t.Fatalf("%s: err = %v, want idle timeout", name, err)
 		}
 		if ctx.Err() != nil {
