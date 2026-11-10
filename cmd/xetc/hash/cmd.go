@@ -36,6 +36,9 @@ func NewCommand() *cobra.Command {
 				unique = map[xet.ChunkHash]int{}
 			}
 			var buf bytes.Buffer
+			var enc *xorb.Encoder
+			var xorbChunks int
+			var xorbBytes uint64
 			if err := xet.ChunkData(reader, func(_ int64, chunk []byte) error {
 				h := xet.ComputeChunkHash(chunk)
 				hashes = append(hashes, h)
@@ -44,10 +47,16 @@ func NewCommand() *cobra.Command {
 					size += uint64(len(chunk))
 					if _, ok := unique[h]; !ok {
 						unique[h] = len(uniqueHashes)
+						// One encoder per xorb, as storage.PutFile packs it; xorbs split where xorb.GroupChunkIndicesBySize splits them.
+						if enc == nil || xorbBytes+uint64(len(chunk)) > xet.MaxXorbSize || xorbChunks >= xet.MaxChunksPerXorb {
+							enc, xorbChunks, xorbBytes = xorb.NewEncoder(&buf, false), 0, 0
+						}
 						buf.Reset()
-						if _, err := xorb.NewEncoder(&buf, false).Write(chunk); err != nil {
+						if _, err := enc.Write(chunk); err != nil {
 							return err
 						}
+						xorbChunks++
+						xorbBytes += uint64(len(chunk))
 						uniqueHashes = append(uniqueHashes, h)
 						uniqueSizes = append(uniqueSizes, uint32(len(chunk)))
 						uniqueBytes += uint64(len(chunk))

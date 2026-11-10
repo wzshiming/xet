@@ -61,6 +61,8 @@ func pipelineFixtureForTest(t *testing.T) (*fakeStore, [][]byte, shard.FileDataS
 	enc := xorb.NewEncoder(&buf, false)
 	term := shard.FileDataSequenceEntry{ChunkIndexEnd: uint32(len(chunks))}
 	for _, c := range chunks {
+		// Each chunk starts a file, so it gets a compression scheme of its own.
+		enc.StartFile()
 		if _, err := enc.Write(c); err != nil {
 			t.Fatalf("encode %d-byte chunk: %v", len(c), err)
 		}

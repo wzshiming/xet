@@ -13,7 +13,10 @@ import (
 )
 
 // ChunkClass pairs a chunk generator with the compression type the xorb
-// encoder must pick for every chunk it yields, written one chunk per Write.
+// encoder must pick for every chunk it yields, written one chunk per Write
+// into xorbs that hold the class alone, when the chunk starting each of the
+// encoder's blocks predicts the class's scheme, any for none; some small
+// and full-size bg4 chunks predict LZ4.
 type ChunkClass struct {
 	Name        string
 	Compression xorb.CompressionType

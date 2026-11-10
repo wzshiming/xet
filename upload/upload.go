@@ -422,7 +422,11 @@ func uploadXorbs(ctx context.Context, client ClientAdapter, uploaded map[xet.Chu
 				stagedMu.Unlock()
 
 				encoder := xorb.NewEncoder(tmpFile, true)
-				for _, chunk := range group.Chunks {
+				for i, chunk := range group.Chunks {
+					// Readers identify files; a chunk shared by several files belongs to the first.
+					if i > 0 && chunk.Reader != group.Chunks[i-1].Reader {
+						encoder.StartFile()
+					}
 					if err := chunk.Reader.readAt(buf[:chunk.Size], chunk.Offset); err != nil {
 						_ = tmpFile.Close()
 						errOnce.Do(func() {

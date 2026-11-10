@@ -579,12 +579,14 @@ func TestReconstructedFileMatchesContent(t *testing.T) {
 		{"32 KiB", func(r io.Reader) ([]byte, error) { return readAllBy(r, 32<<10) }},
 		{"io.ReadAll", io.ReadAll},
 	}
+	// Xorb 0 starts at the full chunk: a 1-byte first chunk would pick LZ4 for its whole block.
+	sizes := slices.Concat(mixedChunkSizes[1:], mixedChunkSizes[:1])
 	for _, b := range backends {
 		for _, c := range storagetest.ChunkClasses {
 			for _, n := range []int{1, 3} {
 				t.Run(fmt.Sprintf("%s/%s/xorbs=%d", b.name, c.Name, n), func(t *testing.T) {
 					st := b.open(t)
-					f := putXorbs(t, st, xorbsOf(c, n, mixedChunkSizes))
+					f := putXorbs(t, st, xorbsOf(c, n, sizes))
 					seen := map[xorb.CompressionType]bool{}
 					for _, h := range f.XorbHashes {
 						for _, fr := range framesOf(t, st, h) {
