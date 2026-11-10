@@ -418,7 +418,7 @@ func BenchmarkDecompressLZ4(b *testing.B) {
 }
 
 // selectionClassesForTest are BenchmarkSelectBestCompression's chunks and the type each must get; bg4 and text are
-// genBG4 and genLZ4 of decode_bench_test.go.
+// genBG4 and genLZ4 of storage/storagetest/chunkclass.go.
 var selectionClassesForTest = []struct {
 	name string
 	ct   CompressionType

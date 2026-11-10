@@ -1,0 +1,193 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      bench:
+        description: go test -bench regexp over ./server ./xorb ./shard ./storage; empty runs the default groups
+        default: ''
+      benchtime:
+        description: go test -benchtime, used only with a non-empty bench
+        default: 5x
+      count:
+        description: go test -count
+        default: '6'
+  pull_request:
+    branches: [ master ]
+    paths:
+    - server/serve_bench_test.go
+    - server/transfer_bench_test.go
+    - xorb/decode_bench_test.go
+    - shard/codec_bench_test.go
+    - storage/ingest_bench_test.go
+    - internal/benchprof/**
+    - storage/storagetest/**
+    - .github/workflows/bench.yml
+
+jobs:
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      OUT: ${{ github.workspace }}/bench-out
+      COUNT: ${{ inputs.count || '6' }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Log environment
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT"
+        {
+          echo "nproc: $(nproc)"
+          lscpu | grep -E '^(CPU\(s\)|Model name|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)):' || true
+          echo "kernel: $(uname -r)"
+          go version
+          head -3 /proc/meminfo
+          uptime
+          echo "commit: $(git rev-parse HEAD)"
+        } > "$OUT/env.txt"
+        cat "$OUT/env.txt"
+        {
+          echo '### Environment'
+          echo '```'
+          cat "$OUT/env.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run benchmark groups
+      if: inputs.bench == ''
+      run: |
+        set -euo pipefail
+        run() { # <group> <go test arguments...>
+          out=$OUT/$1.txt
+          shift
+          go test "$@" -run '^$' 2>&1 | tee "$out"
+        }
+        ingest_count=$COUNT
+        if [ "$COUNT" -gt 5 ]; then ingest_count=5; fi
+        run serve-1mib ./server -bench 'Serve/size=1MiB' -benchtime 200x -count "$COUNT"
+        run serve-big ./server -bench 'Serve/size=(64MiB|256MiB)' -benchtime 10x -count "$COUNT"
+        run serve-cpu ./server -bench 'Serve/size=64MiB' -benchtime 10x -count "$COUNT" -cpu 1,2,4
+        run transfer-1mib ./server -bench 'Transfer/size=1MiB' -benchtime 50x -count "$COUNT"
+        run transfer-big ./server -bench 'Transfer/size=(64MiB|256MiB)' -benchtime 3x -count "$COUNT"
+        run xorb ./xorb -bench 'Encoder|Decoder' -benchtime 20x -count "$COUNT"
+        run shard ./shard -bench 'BuildShard|ShardEncode|ShardDecode' -benchtime 20x -count "$COUNT"
+        run ingest ./storage -bench Ingest -benchtime 3x -count "$ingest_count"
+
+    - name: Profile benchmark groups
+      if: inputs.bench == ''
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT/prof"
+        prof() { # <group> <go test arguments...>
+          group=$1
+          shift
+          XET_BENCH_PROFILE_DIR="$OUT/prof/$group" go test "$@" -run '^$' -count 1 2>&1 | tee "$OUT/prof/$group.txt"
+        }
+        prof serve ./server -bench 'Serve/size=256MiB' -benchtime 20x
+        prof transfer ./server -bench 'Transfer/size=64MiB' -benchtime 5x
+        prof xorb ./xorb -bench 'Encoder|Decoder' -benchtime 30x
+        prof shard ./shard -bench 'BuildShard|ShardEncode|ShardDecode' -benchtime 100x
+        prof ingest ./storage -bench Ingest -benchtime 5x
+
+    - name: Run custom benchmarks
+      if: inputs.bench != ''
+      env:
+        BENCH: ${{ inputs.bench }}
+        BENCHTIME: ${{ inputs.benchtime || '5x' }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT/prof"
+        go test ./server ./xorb ./shard ./storage -run '^$' -bench "$BENCH" -benchtime "$BENCHTIME" -count "$COUNT" 2>&1 | tee "$OUT/custom.txt"
+        XET_BENCH_PROFILE_DIR="$OUT/prof/custom" go test ./server ./xorb ./shard ./storage -run '^$' -bench "$BENCH" -benchtime "$BENCHTIME" -count 1 2>&1 | tee "$OUT/prof/custom.txt"
+
+    - name: Summarize benchmark groups
+      if: inputs.bench == ''
+      run: |
+        set -euo pipefail
+        cd "$OUT"
+        table() { # <name> <benchstat arguments...>
+          name=$1
+          shift
+          go run golang.org/x/perf/cmd/benchstat@latest "$@" > "benchstat-$name.txt"
+          {
+            echo "### $name"
+            echo '```'
+            cat "benchstat-$name.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        }
+        cat serve-1mib.txt serve-big.txt > serve.txt
+        # go test ends a name in -N for GOMAXPROCS N > 1 only; benchstat columns need /procs=N.
+        sed -E -e '/^Benchmark/!b' -e 's/^([^[:space:]]+)-([0-9]+)([[:space:]])/\1\/procs=\2\3/' -e t -e 's/^([^[:space:]]+)([[:space:]])/\1\/procs=1\2/' serve-cpu.txt > serve-cpu-procs.txt
+        table serve -row /size,/class -col /path serve.txt
+        table serve-cpu -row /class,/path -col /procs serve-cpu-procs.txt
+        cat transfer-1mib.txt transfer-big.txt > transfer.txt
+        table transfer -row /op,/size,/class -col /path transfer.txt
+        table xorb -row .name,/class -col /footer xorb.txt
+        # BuildShard rows have no /footer, so they get a table of their own.
+        table shard-build -filter .name:BuildShard -row /shape -col .name shard.txt
+        table shard -filter -.name:BuildShard -row .name,/shape -col /footer shard.txt
+        table ingest -row /class -col /stage ingest.txt
+
+    - name: Summarize custom benchmarks
+      if: inputs.bench != ''
+      run: |
+        set -euo pipefail
+        cd "$OUT"
+        go run golang.org/x/perf/cmd/benchstat@latest custom.txt > benchstat-custom.txt
+        {
+          echo '### custom'
+          echo '```'
+          cat benchstat-custom.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Summarize CPU profiles
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        mkdir -p "$OUT/top"
+        omitted=0
+        for f in "$OUT"/prof/*/*.pprof; do
+          name=$(basename "$f" .pprof)
+          go tool pprof -top -nodecount=25 "$f" > "$OUT/top/$name.txt"
+          # GitHub drops a step summary over 1 MiB.
+          if [ "$(wc -c < "$GITHUB_STEP_SUMMARY")" -gt 900000 ]; then
+            omitted=$((omitted + 1))
+            continue
+          fi
+          {
+            echo "<details><summary>$name</summary>"
+            echo
+            echo '```'
+            cat "$OUT/top/$name.txt"
+            echo '```'
+            echo
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+        done
+        if [ "$omitted" -gt 0 ]; then
+          echo "$omitted more pprof tops are left out of this summary; every top is under top/ in the benchmarks artifact." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmarks
+        path: ${{ env.OUT }}/**

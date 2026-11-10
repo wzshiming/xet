@@ -2,13 +2,12 @@ package xorb_test
 
 import (
 	"bytes"
-	"encoding/binary"
 	"io"
-	"math/rand/v2"
-	"strings"
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/benchprof"
+	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
 )
 
@@ -18,62 +17,95 @@ const (
 	xorbSize      = chunksPerXorb * chunkSize
 )
 
-// benchClass pairs a chunk generator with the compression type (chunk header
-// byte 4) the encoder must pick for every chunk it yields.
-type benchClass struct {
-	name string
-	ct   byte
-	gen  func(src *rand.ChaCha8, p []byte)
+// BenchmarkEncoder encodes an xorb of 256 x 64 KiB chunks into io.Discard,
+// per chunk class and footer mode.
+func BenchmarkEncoder(b *testing.B) {
+	codecRows(b, func(b *testing.B, c storagetest.ChunkClass, withFooter bool) {
+		chunks, _ := codecFixture(b, c, withFooter)
+		b.SetBytes(xorbSize)
+		b.ReportAllocs()
+		stop := benchprof.Start(b)
+		for b.Loop() {
+			if err := encodeXorb(io.Discard, chunks, withFooter); err != nil {
+				b.Fatal(err)
+			}
+		}
+		stop()
+	})
 }
 
-var benchClasses = []benchClass{
-	{name: "none", ct: 0, gen: genNone},
-	{name: "lz4", ct: 1, gen: genLZ4},
-	{name: "bg4", ct: 2, gen: genBG4},
+// BenchmarkDecoder reads back the in-memory xorb BenchmarkEncoder writes, per
+// chunk class and footer mode.
+func BenchmarkDecoder(b *testing.B) {
+	codecRows(b, func(b *testing.B, c storagetest.ChunkClass, withFooter bool) {
+		_, encoded := codecFixture(b, c, withFooter)
+		buf := make([]byte, xet.MaxChunkSize)
+		b.SetBytes(xorbSize)
+		b.ReportAllocs()
+		stop := benchprof.Start(b)
+		for b.Loop() {
+			dec := xorb.NewDecoder(bytes.NewReader(encoded), withFooter)
+			var n int64
+			for {
+				m, err := dec.Read(buf)
+				n += int64(m)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			if n != xorbSize {
+				b.Fatalf("decoded %d bytes, want %d", n, xorbSize)
+			}
+		}
+		stop()
+	})
 }
 
-// chunkSource seeds a stream unique to one chunk of one class.
-func chunkSource(class string, xorbIndex, chunkIndex int) *rand.ChaCha8 {
-	var seed [32]byte
-	copy(seed[:], class)
-	binary.LittleEndian.PutUint32(seed[24:], uint32(xorbIndex))
-	binary.LittleEndian.PutUint32(seed[28:], uint32(chunkIndex))
-	return rand.NewChaCha8(seed)
-}
-
-func genNone(src *rand.ChaCha8, p []byte) {
-	_, _ = src.Read(p)
-}
-
-var loremWords = strings.Fields("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua")
-
-// genLZ4 writes random words, whose repeats byte grouping would split.
-func genLZ4(src *rand.ChaCha8, p []byte) {
-	r := rand.New(src)
-	for i := 0; i < len(p); {
-		i += copy(p[i:], loremWords[r.IntN(len(loremWords))])
-		if i < len(p) {
-			p[i] = ' '
-			i++
+// codecRows runs bench as row class=<name>/footer=<with|without> for each
+// chunk class and footer mode.
+func codecRows(b *testing.B, bench func(b *testing.B, c storagetest.ChunkClass, withFooter bool)) {
+	for _, c := range storagetest.ChunkClasses {
+		for _, footer := range []string{"with", "without"} {
+			b.Run("class="+c.Name+"/footer="+footer, func(b *testing.B) {
+				bench(b, c, footer == "with")
+			})
 		}
 	}
 }
 
-// genBG4 writes LE uint32s with a random low half and a slowly drifting high half.
-func genBG4(src *rand.ChaCha8, p []byte) {
-	r := rand.New(src)
-	hi := r.Uint32()
-	for i := range len(p) / 4 {
-		if r.IntN(64) == 0 {
-			hi++
-		}
-		binary.LittleEndian.PutUint32(p[4*i:], hi<<16|r.Uint32N(1<<16))
+// codecFixture returns xorb 0 of class c and its encoding with or without a
+// footer, failing b unless every chunk is stored with the class's compression
+// type and the encoding decodes back to the chunks.
+func codecFixture(b *testing.B, c storagetest.ChunkClass, withFooter bool) (chunks [][]byte, encoded []byte) {
+	b.Helper()
+	chunks = c.Xorbs(1, chunksPerXorb, chunkSize)[0]
+	var buf bytes.Buffer
+	if err := encodeXorb(&buf, chunks, withFooter); err != nil {
+		b.Fatal(err)
 	}
+	encoded = buf.Bytes()
+	assertChunkTypes(b, encoded, c)
+	assertDecodesTo(b, encoded, withFooter, chunks)
+	return chunks, encoded
+}
+
+// encodeXorb is the encoding BenchmarkEncoder times and codecFixture checks.
+func encodeXorb(w io.Writer, chunks [][]byte, withFooter bool) error {
+	enc := xorb.NewEncoder(w, withFooter)
+	for _, chunk := range chunks {
+		if _, err := enc.Write(chunk); err != nil {
+			return err
+		}
+	}
+	return enc.Close()
 }
 
 // assertChunkTypes walks the encoded chunk headers (layout in decoder.go) and
 // fails unless each carries the class's compression type.
-func assertChunkTypes(b *testing.B, encoded []byte, c benchClass) {
+func assertChunkTypes(b *testing.B, encoded []byte, c storagetest.ChunkClass) {
 	b.Helper()
 	r := bytes.NewReader(encoded)
 	var hdr [8]byte
@@ -81,8 +113,8 @@ func assertChunkTypes(b *testing.B, encoded []byte, c benchClass) {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
 			b.Fatalf("chunk %d header: %v", i, err)
 		}
-		if hdr[4] != c.ct {
-			b.Fatalf("chunk %d: compression type %d, want %d for class %s", i, hdr[4], c.ct, c.name)
+		if xorb.CompressionType(hdr[4]) != c.Compression {
+			b.Fatalf("chunk %d: compression type %d, want %d for class %s", i, hdr[4], c.Compression, c.Name)
 		}
 		if _, err := r.Seek(int64(hdr[1])|int64(hdr[2])<<8|int64(hdr[3])<<16, io.SeekCurrent); err != nil {
 			b.Fatal(err)
@@ -90,45 +122,30 @@ func assertChunkTypes(b *testing.B, encoded []byte, c benchClass) {
 	}
 }
 
-// BenchmarkDecoderRead decodes an in-memory footerless xorb of 256 x 64 KiB
-// chunks, per compression class.
-func BenchmarkDecoderRead(b *testing.B) {
-	for _, c := range benchClasses {
-		b.Run("class="+c.name, func(b *testing.B) {
-			var encoded bytes.Buffer
-			enc := xorb.NewEncoder(&encoded, false)
-			chunk := make([]byte, chunkSize)
-			for i := range chunksPerXorb {
-				c.gen(chunkSource(c.name, 0, i), chunk)
-				if _, err := enc.Write(chunk); err != nil {
-					b.Fatal(err)
-				}
-			}
-			if err := enc.Close(); err != nil {
-				b.Fatal(err)
-			}
-			assertChunkTypes(b, encoded.Bytes(), c)
-
-			buf := make([]byte, xet.MaxChunkSize)
-			b.SetBytes(xorbSize)
-			b.ReportAllocs()
-			for b.Loop() {
-				dec := xorb.NewDecoder(bytes.NewReader(encoded.Bytes()), false)
-				var n int64
-				for {
-					m, err := dec.Read(buf)
-					n += int64(m)
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						b.Fatal(err)
-					}
-				}
-				if n != xorbSize {
-					b.Fatalf("decoded %d bytes, want %d", n, xorbSize)
-				}
-			}
-		})
+// assertDecodesTo fails b unless encoded decodes, one Read per chunk, to
+// chunks and the decoder's Chunks lists a hash and a size for each.
+func assertDecodesTo(b *testing.B, encoded []byte, withFooter bool, chunks [][]byte) {
+	b.Helper()
+	dec := xorb.NewDecoder(bytes.NewReader(encoded), withFooter)
+	buf := make([]byte, xet.MaxChunkSize)
+	n := 0
+	for {
+		m, err := dec.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			b.Fatalf("chunk %d: %v", n, err)
+		}
+		if n >= len(chunks) || !bytes.Equal(buf[:m], chunks[n]) {
+			b.Fatalf("chunk %d decodes to %d bytes that are not the chunk encoded", n, m)
+		}
+		n++
+	}
+	if n != len(chunks) {
+		b.Fatalf("decoded %d chunks, want %d", n, len(chunks))
+	}
+	if hashes, sizes := dec.Chunks(); len(hashes) != len(chunks) || len(sizes) != len(chunks) {
+		b.Fatalf("Chunks() lists %d hashes and %d sizes, want %d", len(hashes), len(sizes), len(chunks))
 	}
 }
