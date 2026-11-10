@@ -273,7 +273,9 @@ func TestCommitRoundTrip(t *testing.T) {
 			t.Fatalf("CAS request %s %s carried the hub token", req.Method, req.Path)
 		}
 		dataFetch := req.Method == http.MethodGet && req.Route() == "GET xorbs"
-		if req.Authorization == "" && !dataFetch {
+		// The granted PUT is credential-free by protocol.
+		grantedPut := req.Method == http.MethodPut && req.Route() == "PUT xorb-uploads"
+		if req.Authorization == "" && !dataFetch && !grantedPut {
 			t.Fatalf("CAS request %s %s carried no token", req.Method, req.Path)
 		}
 		if token, ok := strings.CutPrefix(req.Authorization, "Bearer "); ok {
@@ -472,11 +474,18 @@ func TestCommitWireShape(t *testing.T) {
 		t.Fatalf("file = %+v (%v)", regular, err)
 	}
 
-	// The reference's shard upload went to /v2/shards; so does the client's, after the xorb.
+	// The reference's shard upload went to /v2/shards; so does the client's, after the xorb went up through a grant or, where the CAS grants none, the legacy POST.
 	cas := routes(repo.cas.requests())
-	shards, xorbs := slices.Index(cas, "POST shards"), slices.Index(cas, "POST xorbs")
-	if shards < 0 || xorbs < 0 || xorbs > shards || requestOf(t, repo.cas.requests(), "POST shards").Path != "/v2/shards" {
-		t.Fatalf("CAS routes = %q, want a xorb POST followed by POST /v2/shards", cas)
+	steps := []string{"POST xorbs", "POST shards"}
+	if slices.Contains(cas, "PUT xorb-uploads") || slices.Contains(cas, "POST xorb-commits") {
+		steps = []string{"POST xorb-grants", "PUT xorb-uploads", "POST xorb-commits", "POST shards"}
+	}
+	at := make([]int, 0, len(steps))
+	for _, step := range steps {
+		at = append(at, slices.Index(cas, step))
+	}
+	if at[0] < 0 || !slices.IsSorted(at) || requestOf(t, repo.cas.requests(), "POST shards").Path != "/v2/shards" {
+		t.Fatalf("CAS routes = %q, want %q in turn, the shards at /v2/shards", cas, steps)
 	}
 	if refCAS := routes(exchangesToRequests(ref.CAS())); !slices.Contains(refCAS, "POST shards") || !slices.Contains(refCAS, "POST xorbs") {
 		t.Fatalf("reference CAS routes = %q", refCAS)

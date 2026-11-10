@@ -1,6 +1,7 @@
 // Package s3 implements storage.Storage over an S3-compatible object store
 // with the local backend's layout under an optional key prefix. Index entries
-// are overwritten on every write and xorb download URLs are presigned by default.
+// are overwritten on every write, and xorb download URLs and upload grants are
+// presigned by default.
 // Xorbs are read from mapped whole-object local copies in a bounded cache.
 package s3
 
@@ -13,6 +14,7 @@ import (
 	"io"
 	iofs "io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -44,16 +47,18 @@ const defaultXorbCacheSize = 512
 // fanout), so a bucket populated by syncing a local storage directory is
 // directly usable.
 type Storage struct {
-	client          *awss3.Client
-	presignClient   *awss3.PresignClient
-	bucket          string
-	prefix          string
-	baseURL         string
-	presign         bool
-	presignExpiry   time.Duration
-	presignEndpoint string
+	client              *awss3.Client
+	presignClient       *awss3.PresignClient
+	uploadPresignClient *awss3.PresignClient
+	bucket              string
+	prefix              string
+	baseURL             string
+	presign             bool
+	presignExpiry       time.Duration
+	presignEndpoint     string
 
 	caches *storage.IndexCaches
+	grants *storage.GrantRegistry // grants live as long as presigned URLs
 
 	cacheDir      string
 	xorbCacheSize int
@@ -125,17 +130,19 @@ func WithPathStyle(pathStyle bool) Option {
 	}
 }
 
-// WithPresign controls whether xorb download URLs are presigned S3 GET
-// URLs (default) or relative paths served through the CAS server. Disable
-// it when clients cannot reach the S3 endpoint directly.
+// WithPresign controls whether xorb download URLs are presigned S3 GET URLs
+// and upload grants presigned PutObject requests to the staging key (default),
+// or both go through the CAS server. Disable it when clients cannot reach the
+// S3 endpoint directly.
 func WithPresign(presign bool) Option {
 	return func(ss *Storage) {
 		ss.presign = presign
 	}
 }
 
-// WithPresignExpiry sets how long presigned xorb URLs stay valid.
-// Non-positive values are ignored.
+// WithPresignExpiry sets how long presigned xorb URLs and upload grants stay
+// valid; S3 accepts whole seconds from 1 s to 7 days. Non-positive values are
+// ignored.
 func WithPresignExpiry(expiry time.Duration) Option {
 	return func(ss *Storage) {
 		if expiry > 0 {
@@ -144,11 +151,11 @@ func WithPresignExpiry(expiry time.Duration) Option {
 	}
 }
 
-// WithPresignEndpoint presigns xorb URLs against a different endpoint than
-// the one the server itself uses, for deployments where clients reach the
-// object store through a public address while the server uses an internal
-// one. Signatures cover the host, so the two endpoints must be the same
-// store; defaults to the server's endpoint.
+// WithPresignEndpoint presigns xorb URLs and upload grants against a
+// different endpoint than the one the server itself uses, for deployments
+// where clients reach the object store through a public address while the
+// server uses an internal one. Signatures cover the host, so the two
+// endpoints must be the same store; defaults to the server's endpoint.
 func WithPresignEndpoint(endpoint string) Option {
 	return func(ss *Storage) {
 		ss.presignEndpoint = endpoint
@@ -186,6 +193,7 @@ func NewStorage(ctx context.Context, opts ...Option) (*Storage, error) {
 	for _, opt := range opts {
 		opt(ss)
 	}
+	ss.grants = storage.NewGrantRegistry(ss.presignExpiry)
 
 	if ss.bucket == "" {
 		return nil, fmt.Errorf("s3 storage requires a bucket")
@@ -220,15 +228,25 @@ func NewStorage(ctx context.Context, opts ...Option) (*Storage, error) {
 			o.UsePathStyle = ss.pathStyle
 		})
 	}
+	presignAPI := ss.client
 	if ss.presignEndpoint != "" {
 		// The presign client never sends requests; it only shapes and signs
 		// the URL, so a client copy with the public endpoint is enough.
 		presignOpts := ss.client.Options()
 		presignOpts.BaseEndpoint = aws.String(ss.presignEndpoint)
-		ss.presignClient = awss3.NewPresignClient(awss3.New(presignOpts))
-	} else {
-		ss.presignClient = awss3.NewPresignClient(ss.client)
+		presignAPI = awss3.New(presignOpts)
 	}
+	// X-Amz-Expires counts whole seconds and must be at least one.
+	expires := awss3.WithPresignExpires(max(ss.presignExpiry, time.Second))
+	ss.presignClient = awss3.NewPresignClient(presignAPI, expires)
+	// Only uploads keep X-Amz-* headers out of the query: the checksum must be
+	// a header, while a GET's x-amz-checksum-mode must stay a query parameter.
+	ss.uploadPresignClient = awss3.NewPresignClient(presignAPI, expires, func(o *awss3.PresignOptions) {
+		o.Presigner = v4.NewSigner(func(so *v4.SignerOptions) {
+			so.DisableURIPathEscaping = true
+			so.DisableHeaderHoisting = true
+		})
+	})
 
 	return ss, nil
 }
@@ -299,6 +317,15 @@ func (ss *Storage) putObject(ctx context.Context, key string, body io.ReadSeeker
 		Bucket: aws.String(ss.bucket),
 		Key:    aws.String(key),
 		Body:   body,
+	})
+	return err
+}
+
+func (ss *Storage) copyObject(ctx context.Context, srcKey, dstKey string) error {
+	_, err := ss.client.CopyObject(ctx, &awss3.CopyObjectInput{
+		Bucket:     aws.String(ss.bucket),
+		Key:        aws.String(dstKey),
+		CopySource: aws.String((&url.URL{Path: ss.bucket + "/" + srcKey}).EscapedPath()),
 	})
 	return err
 }
@@ -918,7 +945,7 @@ func (ss *Storage) GetXorbURL(ctx context.Context, xorbHash xet.XorbHash) (strin
 		req, err := ss.presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
 			Bucket: aws.String(ss.bucket),
 			Key:    aws.String(ss.objectKey("xorbs", xorbHash.String())),
-		}, awss3.WithPresignExpires(ss.presignExpiry))
+		})
 		if err != nil {
 			return "", fmt.Errorf("presign xorb URL: %w", err)
 		}

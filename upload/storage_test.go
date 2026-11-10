@@ -129,6 +129,18 @@ func TestUploadFileMatchesStoragePutFile(t *testing.T) {
 			t.Fatalf("%s: UploadFile() = %s, %v; PutFile() = %s", file.name, got.String(), err, want.String())
 		}
 		nativeState, uploadedState := snapshot(t, ctx, native), snapshot(t, ctx, uploaded)
+		// UploadFile sends, so the store keeps, PutFile's xorbs without their footers.
+		for hash, stored := range nativeState.xorbs {
+			offsets, err := storage.ReadXorbChunkOffsets(bytes.NewReader(stored))
+			if err != nil || len(offsets) == 0 {
+				t.Fatalf("%s: PutFile's xorb %s chunk offsets = %v, %v", file.name, hash, offsets, err)
+			}
+			chunks := stored[:offsets[len(offsets)-1]]
+			if got := uploadedState.xorbs[hash]; !bytes.Equal(got, chunks) {
+				t.Fatalf("%s: UploadFile stored xorb %s as %d bytes, want the %d of PutFile's before its footer", file.name, hash, len(got), len(chunks))
+			}
+			nativeState.xorbs[hash] = chunks
+		}
 		if !reflect.DeepEqual(uploadedState, nativeState) {
 			t.Fatalf("%s: stores differ in xorb bytes or in UploadFile's xorbs %v, shards %v, file index %v vs PutFile's %v, %v, %v", file.name,
 				slices.Sorted(maps.Keys(uploadedState.xorbs)), uploadedState.shards, uploadedState.fileIndex,

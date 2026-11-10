@@ -3,7 +3,11 @@ package storagetest
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/wzshiming/xet/storage"
 )
@@ -13,10 +17,58 @@ type Backend struct {
 	Name string
 	// New returns a fresh store.
 	New func(t *testing.T) storage.Storage
+	// NewWithUploadGrantTTL returns a fresh store whose upload grants expire after ttl.
+	NewWithUploadGrantTTL func(t *testing.T, ttl time.Duration) storage.Storage
 	// SetIndexEntry writes, overwriting any existing value, the index entry kind/name directly on the backend.
 	SetIndexEntry func(t *testing.T, st storage.Storage, kind, name, shardHash string)
 	// PutRawShardObject stores raw bytes as the shard object named hash, bypassing PutShard and its index writes.
 	PutRawShardObject func(t *testing.T, ctx context.Context, st storage.Storage, hash string, raw []byte)
+	// UploadGranted sends the length bytes of body where grant directs; nil means st.PutStagedXorb(ctx, grant.ID, body).
+	UploadGranted func(t *testing.T, ctx context.Context, st storage.Storage, grant *storage.XorbUploadGrant, length int64, body io.Reader) error
+}
+
+// upload sends body under grant the way the backend's clients do.
+func (b Backend) upload(t *testing.T, ctx context.Context, st storage.Storage, grant *storage.XorbUploadGrant, length int64, body io.Reader) error {
+	if b.UploadGranted == nil {
+		return st.PutStagedXorb(ctx, grant.ID, body)
+	}
+	return b.UploadGranted(t, ctx, st, grant, length, body)
+}
+
+// DirectUpload is an UploadGranted sending body as the xet client does, with exactly
+// the grant's headers plus Content-Length, and mapping the status back to the
+// sentinel the server's upload route answers with it.
+func DirectUpload(_ *testing.T, ctx context.Context, _ storage.Storage, grant *storage.XorbUploadGrant, length int64, body io.Reader) error {
+	req, err := http.NewRequestWithContext(ctx, grant.Method, grant.URL, body)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = length
+	for name, value := range grant.Headers {
+		req.Header.Set(name, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	var sentinel error
+	switch code := resp.StatusCode; {
+	case code/100 == 2:
+		return nil
+	case code == http.StatusPreconditionFailed:
+		sentinel = storage.ErrStagedXorbExists
+	case code == http.StatusNotFound:
+		sentinel = storage.ErrUploadGrantNotFound
+	case code == http.StatusForbidden:
+		sentinel = storage.ErrUploadGrantExpired
+	case code == http.StatusBadRequest:
+		sentinel = storage.ErrStagedXorbMismatch
+	default:
+		return fmt.Errorf("direct upload answered %s", resp.Status)
+	}
+	return fmt.Errorf("direct upload answered %s: %w", resp.Status, sentinel)
 }
 
 // Run runs every case as a subtest under b.Name.
@@ -87,4 +139,21 @@ var cases = []struct {
 	{"TestPutFileEmpty", testPutFileEmpty},
 	{"TestUsageCountsObjectsByKind", testUsageCountsObjectsByKind},
 	{"TestXorbChunkRangesReadBack", testXorbChunkRangesReadBack},
+	{"TestGrantRoundTrip", testGrantRoundTrip},
+	{"TestGrantCommitExistingXorb", testGrantCommitExistingXorb},
+	{"TestGrantPutLengthMismatch", testGrantPutLengthMismatch},
+	{"TestGrantPutChecksumMismatch", testGrantPutChecksumMismatch},
+	{"TestGrantPutRepeat", testGrantPutRepeat},
+	{"TestGrantPutUnknownID", testGrantPutUnknownID},
+	{"TestGrantExpired", testGrantExpired},
+	{"TestGrantCommitInvalidXorb", testGrantCommitInvalidXorb},
+	{"TestGrantCommitTrailingBytes", testGrantCommitTrailingBytes},
+	{"TestGrantCommitRefreshesModTime", testGrantCommitRefreshesModTime},
+	{"TestGrantCommitAfterExpiry", testGrantCommitAfterExpiry},
+	{"TestGrantCommitUnknownID", testGrantCommitUnknownID},
+	{"TestSweepReclaimsStaleStagedXorb", testSweepReclaimsStaleStagedXorb},
+	{"TestSweepStepCountsStagedDeletes", testSweepStepCountsStagedDeletes},
+	{"TestGrantUsageUnaffected", testGrantUsageUnaffected},
+	{"TestGrantInvisibleToWalkXorbs", testGrantInvisibleToWalkXorbs},
+	{"TestGrantPutInFlightHidden", testGrantPutInFlightHidden},
 }

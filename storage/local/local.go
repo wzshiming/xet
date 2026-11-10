@@ -30,6 +30,7 @@ type Storage struct {
 	caches        *storage.IndexCaches
 	xorbCacheSize int
 	xorbCache     *xorbmap.Cache // bounded xorb mapping cache
+	grants        *storage.GrantRegistry
 }
 
 const defaultXorbCacheSize = 512
@@ -55,6 +56,14 @@ func WithXorbCacheSize(size int) Option {
 	}
 }
 
+// WithUploadGrantTTL sets how long upload grants accept their upload;
+// non-positive values keep storage.DefaultUploadGrantTTL.
+func WithUploadGrantTTL(ttl time.Duration) Option {
+	return func(fs *Storage) {
+		fs.grants = storage.NewGrantRegistry(ttl)
+	}
+}
+
 // NewStorage creates a new filesystem-based storage
 func NewStorage(opts ...Option) (*Storage, error) {
 	fs := &Storage{
@@ -62,6 +71,7 @@ func NewStorage(opts ...Option) (*Storage, error) {
 		baseURL:       "",
 		caches:        storage.NewIndexCaches(),
 		xorbCacheSize: defaultXorbCacheSize,
+		grants:        storage.NewGrantRegistry(storage.DefaultUploadGrantTTL),
 	}
 
 	for _, opt := range opts {
@@ -77,6 +87,7 @@ func NewStorage(opts ...Option) (*Storage, error) {
 	dirs := []string{
 		filepath.Join(fs.basePath, "xorbs"),
 		filepath.Join(fs.basePath, "shards"),
+		filepath.Join(fs.basePath, "staging"),
 		filepath.Join(fs.basePath, "index", "files"),
 		filepath.Join(fs.basePath, "index", "chunks"),
 		filepath.Join(fs.basePath, "index", "sha256"),

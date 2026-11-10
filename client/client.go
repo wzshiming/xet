@@ -24,14 +24,15 @@ type UpstreamProvider interface {
 
 // Client represents an HTTP client for the XET protocol
 type Client struct {
-	provider      UpstreamProvider
-	httpClient    *http.Client
-	getHttpClient *http.Client
-	concurrency   int
-	retries       int
-	idleTimeout   time.Duration
-	progressFunc  progress.ProgressFunc
-	cache         *Cache
+	provider         UpstreamProvider
+	httpClient       *http.Client
+	getHttpClient    *http.Client
+	concurrency      int
+	retries          int
+	idleTimeout      time.Duration
+	progressFunc     progress.ProgressFunc
+	cache            *Cache
+	xorbUploadGrants bool
 }
 
 type Options func(*Client)
@@ -92,13 +93,21 @@ func WithUpstreamProvider(provider UpstreamProvider) Options {
 	}
 }
 
+// WithXorbUploadGrants toggles uploading xorbs through xet-core 1.8.0's upload grants (default on); off sends only the legacy POST /v1/xorbs.
+func WithXorbUploadGrants(enabled bool) Options {
+	return func(c *Client) {
+		c.xorbUploadGrants = enabled
+	}
+}
+
 // NewClient creates a new API client
 func NewClient(opts ...Options) (*Client, error) {
 	c := &Client{
-		httpClient:  &http.Client{},
-		concurrency: 4,
-		retries:     5,
-		idleTimeout: DefaultIdleTimeout,
+		httpClient:       &http.Client{},
+		concurrency:      4,
+		retries:          5,
+		idleTimeout:      DefaultIdleTimeout,
+		xorbUploadGrants: true,
 	}
 	for _, opt := range opts {
 		opt(c)
