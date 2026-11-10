@@ -66,6 +66,8 @@ type fixture struct {
 	srv    *httptest.Server
 	size   int64
 	sha256 string
+	hash   xet.FileHash
+	plain  string // the file's bytes
 }
 
 func (fx *fixture) url(route string) string {
@@ -130,7 +132,7 @@ func buildFixture(tb testing.TB, s shape, c storagetest.ChunkClass) *fixture {
 		http.ServeContent(w, r, plain, time.Time{}, file)
 	})
 	mux.Handle("/", server.NewHandler(server.WithStorage(st)))
-	return &fixture{srv: httptest.NewServer(mux), size: int64(len(f.Content)), sha256: f.SHA256Hex}
+	return &fixture{srv: httptest.NewServer(mux), size: int64(len(f.Content)), sha256: f.SHA256Hex, hash: f.FileHash, plain: plain}
 }
 
 // checkGet fails tb unless url answers 200 with fx's length and SHA-256.
