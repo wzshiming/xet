@@ -1,0 +1,114 @@
+name: Bench A/B
+
+on:
+  pull_request:
+    branches: [ master ]
+    paths:
+      - .github/workflows/bench-ab.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-ab:
+    name: Same-runner A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # A: master + benchmarks; B: #293 + the same benchmarks.
+      A_BRANCH: tmp/bench-ab-a
+      A_REF: bd8cff0fe3f5b75725562c1638fe46206e25d1d9
+      B_BRANCH: test/memnet-codec-benches
+      B_REF: 99d6529f528ddd3e47a308b1b2f3e1063c0c1b07
+      OUT: ${{ github.workspace }}/ab-out
+      ROUNDS: 6
+      XORB_BENCHTIME: 20x
+      SERVE_BENCHTIME: 10x
+      TRANSFER_BENCHTIME: 3x
+      INGEST_BENCHTIME: 3x
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Check out trees A and B
+      run: |
+        set -euo pipefail
+        add_tree() { # tree branch want
+          git fetch --depth=1 origin "$2"
+          git worktree add --detach "$RUNNER_TEMP/$1" FETCH_HEAD
+          got=$(git -C "$RUNNER_TEMP/$1" rev-parse HEAD)
+          if [[ $got != "$3" ]]; then
+            echo "::error::tree $1 ($2) is at $got, want $3"
+            exit 1
+          fi
+        }
+        add_tree A "$A_BRANCH" "$A_REF"
+        add_tree B "$B_BRANCH" "$B_REF"
+
+    - name: Record the runner
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT"
+        {
+          printf 'nproc: '
+          nproc
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core'
+          go version
+        } | tee "$OUT/env.txt"
+        {
+          echo '## Runner'
+          echo '```'
+          cat "$OUT/env.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Measure
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT"
+        bench() { # group package filter benchtime, for the loops' round and tree
+          echo "$(date -u +%FT%TZ) round=$round tree=$tree group=$1 $(uptime)" | tee -a "$OUT/runs.log"
+          go -C "$RUNNER_TEMP/$tree" test "$2" -run '^$' -bench "$3" -benchtime "$4" -count 1 >> "$OUT/$tree-$1.txt"
+        }
+        for tree in A B; do
+          go -C "$RUNNER_TEMP/$tree" test ./xorb ./server ./storage -run '^$' -bench NONE -benchtime 1x
+        done
+        for round in $(seq "$ROUNDS"); do
+          order=(A B)
+          if (( round % 2 == 0 )); then order=(B A); fi
+          for tree in "${order[@]}"; do
+            bench xorb ./xorb 'ApplyByteGrouping4|ReverseByteGrouping4|DecodeChunk/class=bg4|Encoder/class=bg4|Decoder/class=bg4' "$XORB_BENCHTIME"
+            bench serve ./server 'Serve/size=(64MiB|256MiB)/class=(bg4|none)' "$SERVE_BENCHTIME"
+            bench transfer ./server 'Transfer/size=64MiB/class=(bg4|none)' "$TRANSFER_BENCHTIME"
+            bench ingest ./storage 'Ingest/stage=(encode|putfile)/class=(bg4|none)' "$INGEST_BENCHTIME"
+          done
+        done
+        echo "$(date -u +%FT%TZ) done $(uptime)" | tee -a "$OUT/runs.log"
+
+    - name: Summarize
+      run: |
+        set -euo pipefail
+        cd "$OUT"
+        for g in xorb serve transfer ingest; do
+          go run golang.org/x/perf/cmd/benchstat@latest -row .name,/class,/footer,/size,/op,/path,/stage -col .file "A-$g.txt" "B-$g.txt" > "benchstat-$g.txt"
+          {
+            echo "## $g"
+            echo '```'
+            cat "benchstat-$g.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        done
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-ab
+        path: ${{ env.OUT }}/**
