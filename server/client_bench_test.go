@@ -3,8 +3,6 @@
 package server_test
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +85,8 @@ func benchmarkUpload(b *testing.B, fx *fixture) {
 }
 
 func benchmarkDownload(b *testing.B, fx *fixture) {
+	srv := httptest.NewServer(fx.handler)
+	defer srv.Close()
 	var cpu time.Duration
 	n := 0
 	b.SetBytes(fx.size)
@@ -96,7 +96,7 @@ func benchmarkDownload(b *testing.B, fx *fixture) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		cli, transport := newTransferClient(b, fx.srv.URL, filepath.Join(dir, "cache"))
+		cli, transport := newTransferClient(b, srv.URL, filepath.Join(dir, "cache"))
 		name := filepath.Join(dir, "file")
 		out, err := os.Create(name)
 		if err != nil {
@@ -104,7 +104,7 @@ func benchmarkDownload(b *testing.B, fx *fixture) {
 		}
 		from := cpuTime(b)
 		b.StartTimer()
-		err = cli.DownloadFile(b.Context(), fx.hash, out)
+		err = cli.DownloadFile(b.Context(), fx.fileHash, out)
 		b.StopTimer()
 		cpu += cpuTime(b) - from
 		n++
@@ -153,24 +153,6 @@ func chunkedFileHash(tb testing.TB, r io.Reader) xet.FileHash {
 		tb.Fatal(err)
 	}
 	return xet.ComputeFileHash(hashes, sizes)
-}
-
-// checkFile fails tb unless the file at name holds fx's bytes.
-func checkFile(tb testing.TB, name string, fx *fixture) {
-	tb.Helper()
-	f, err := os.Open(name)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	defer f.Close()
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	if sum := hex.EncodeToString(h.Sum(nil)); n != fx.size || sum != fx.sha256 {
-		tb.Fatalf("downloaded %d bytes with SHA-256 %s, want %d bytes with %s", n, sum, fx.size, fx.sha256)
-	}
 }
 
 // cpuTime is the user and system CPU time this process has used so far.
