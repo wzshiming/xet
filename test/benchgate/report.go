@@ -36,7 +36,7 @@ func render(o options, cfg config, res result) []byte {
 	comparison(&b, o, cfg, res)
 	notMeasured(&b, res)
 	loadPerRound(&b, res)
-	fmt.Fprintf(&b, "## Reproduce\n\nWith worktrees `<base>` at %s and `<head>` at %s, run `%s` with absolute paths and a new directory `<out>`.\n",
+	fmt.Fprintf(&b, "## Reproduce\n\nWith worktrees `<base>` at %s and `<head>` at %s, build the gate with `go -C <head>/test/benchgate build -o <benchgate> .` and run `%s` with absolute paths and a new directory `<out>`.\n",
 		o.baseLabel, o.headLabel, o.command())
 	return []byte(b.String())
 }
@@ -246,9 +246,9 @@ func (o options) inOut(path string) string {
 	return filepath.ToSlash(rel)
 }
 
-// command is a command line repeating this run, with placeholders for local paths.
+// command is a command line of the built gate repeating this run, with placeholders for local paths.
 func (o options) command() string {
-	args := []string{"go -C <head>/test/benchgate run . -base <base> -head <head>",
+	args := []string{"<benchgate> -base <base> -head <head>",
 		"-base-label " + quote(o.baseLabel), "-head-label " + quote(o.headLabel), "-config " + o.configArg()}
 	if o.groups != "" {
 		args = append(args, "-groups "+quote(o.groups))

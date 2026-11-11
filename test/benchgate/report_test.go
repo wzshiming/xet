@@ -196,9 +196,14 @@ func TestReportHasEverySection(t *testing.T) {
 		}
 	})
 	t.Run("reproduce", func(t *testing.T) {
-		want := "`go -C <head>/test/benchgate run . -base <base> -head <head> -base-label abc1234 -head-label 'def5678 (merge)' -config <head>/.github/bench-gate.json -out <out>`"
-		if got := section(t, report, "## Reproduce"); !strings.Contains(got, want) {
-			t.Errorf("reproduce %q does not hold %s", got, want)
+		got := section(t, report, "## Reproduce")
+		for _, want := range []string{
+			"`go -C <head>/test/benchgate build -o <benchgate> .`",
+			"`<benchgate> -base <base> -head <head> -base-label abc1234 -head-label 'def5678 (merge)' -config <head>/.github/bench-gate.json -out <out>`",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("reproduce %q does not hold %s", got, want)
+			}
 		}
 	})
 }
@@ -289,7 +294,7 @@ func TestConclusionLine(t *testing.T) {
 func TestReproduceRepeatsTheOverridesAndHidesPaths(t *testing.T) {
 	t.Parallel()
 	r := runFull(t, "-groups", "cpu,mem", "-measure-identical=false")
-	want := "`go -C <head>/test/benchgate run . -base <base> -head <head> -base-label abc1234 -head-label 'def5678 (merge)' -config <head>/.github/bench-gate.json -groups cpu,mem -measure-identical=false -out <out>`"
+	want := "`<benchgate> -base <base> -head <head> -base-label abc1234 -head-label 'def5678 (merge)' -config <head>/.github/bench-gate.json -groups cpu,mem -measure-identical=false -out <out>`"
 	if got := section(t, r.report, "## Reproduce"); !strings.Contains(got, want) {
 		t.Errorf("reproduce %q does not hold %s", got, want)
 	}

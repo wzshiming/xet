@@ -23,29 +23,31 @@ same metric.
 
 A base tree that lacks a package, or whose package fails to build or run, is
 not a failure: the report lists the package as not measured, and the command
-prints why the base failed on standard error. A failure on both
-sides is the head's and exits 2, whichever side ran first; so does a package
-without test files, of which `go test` builds no test binary.
+prints why the base failed on standard error. A failure on both sides is the
+head's and exits 2, whichever side ran first; so does a package without test
+files, of which `go test` builds no test binary.
 
 ## Running it locally
 
-Check out the two commits as worktrees and run the gate from the head tree's
-copy of this module, here with the configuration below saved as
-`/tmp/gate.json`. Paths must be absolute, as `go -C` changes directory, and
-the output directory must be new or empty:
+Check out the two commits as worktrees, build the gate from the head tree's
+copy of this module and run the binary, here with the configuration below
+saved as `/tmp/gate.json`. Paths must be absolute, as `go -C` changes
+directory, and the output directory must be new or empty:
 
 ```sh
 git worktree add /tmp/xet-base origin/master
 git worktree add /tmp/xet-head HEAD
-go -C /tmp/xet-head/test/benchgate run . \
+go -C /tmp/xet-head/test/benchgate build -o /tmp/benchgate .
+/tmp/benchgate \
   -base /tmp/xet-base -head /tmp/xet-head \
   -base-label "$(git -C /tmp/xet-base rev-parse --short HEAD)" \
   -head-label "$(git -C /tmp/xet-head rev-parse --short HEAD)" \
   -config /tmp/gate.json -out /tmp/xet-gate
 ```
 
-Both sides build with the `go` command on `PATH`, whatever toolchain their
-`go.mod` names. The flags:
+Run the built binary rather than `go run`: `go run` exits 1 whenever the
+program exits non-zero, so exit code 2 would read as 1. Both sides build with
+the `go` command on `PATH`, whatever toolchain their `go.mod` names. The flags:
 
 | Flag | Meaning |
 | --- | --- |
@@ -61,7 +63,8 @@ prints, and the raw samples: `first/<group>.base.txt` and
 `first/<group>.head.txt` for the first pass, `recheck/` likewise for the
 re-check. benchstat recomputes any table from them, for example
 `go -C test/benchgate run golang.org/x/perf/cmd/benchstat /tmp/xet-gate/first/cpu.base.txt /tmp/xet-gate/first/cpu.head.txt`.
-Every report ends with a command line that repeats its run.
+Every report ends with the command lines that build the gate and repeat its
+run.
 
 ## Configuration
 
