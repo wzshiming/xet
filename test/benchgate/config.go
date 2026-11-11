@@ -2,11 +2,22 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/wzshiming/xet/test/benchgate/verdict"
 )
+
+// judgedMetrics are the metrics a threshold may be set for.
+var judgedMetrics = []string{"sec/op", "B/op", "allocs/op"}
+
+// minJudgedRounds is the fewest rounds of a judged group.
+const minJudgedRounds = 10
 
 // config is the gate's configuration file.
 type config struct {
@@ -28,15 +39,82 @@ type group struct {
 }
 
 func loadConfig(path string) (config, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return config{}, err
 	}
+	defer f.Close()
 	var c config
-	if err := json.Unmarshal(data, &c); err != nil {
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := c.validate(); err != nil {
 		return config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
+}
+
+func (c config) validate() error {
+	switch {
+	case c.Alpha <= 0 || c.Alpha >= 1:
+		return fmt.Errorf("alpha: %v, want more than 0 and less than 1", c.Alpha)
+	case c.MinSamples < 1:
+		return fmt.Errorf("minSamples: %d, want at least 1", c.MinSamples)
+	case len(c.Groups) == 0:
+		return errors.New("groups: none")
+	}
+	for i, g := range c.Groups {
+		if err := g.validate(c.MinSamples); err != nil {
+			return fmt.Errorf("groups[%d].%w", i, err)
+		}
+	}
+	return nil
+}
+
+// validate checks g, whose rows are judged only with minSamples samples on each side.
+func (g group) validate(minSamples int) error {
+	switch {
+	case len(g.Packages) == 0:
+		return errors.New("packages: none")
+	case g.Bench == "":
+		return errors.New("bench: empty, which selects no benchmark")
+	case g.ReportOnly && len(g.Thresholds) > 0:
+		return errors.New("thresholds: set in a reportOnly group")
+	case !g.ReportOnly && len(g.Thresholds) == 0:
+		return errors.New("thresholds: none, want some or reportOnly")
+	}
+	if _, err := regexp.Compile(g.Bench); err != nil {
+		return fmt.Errorf("bench: %w", err)
+	}
+	for _, m := range slices.Sorted(maps.Keys(g.Thresholds)) {
+		switch t := g.Thresholds[m]; {
+		case !slices.Contains(judgedMetrics, m):
+			return fmt.Errorf("thresholds[%q]: not a metric the gate judges, want one of %s", m, strings.Join(judgedMetrics, ", "))
+		case t < 0:
+			return fmt.Errorf("thresholds[%q]: %v, want at least 0", m, t)
+		}
+	}
+	switch {
+	case g.ReportOnly:
+	case g.Rounds < minJudgedRounds:
+		return fmt.Errorf("rounds: %d, want at least %d in a judged group", g.Rounds, minJudgedRounds)
+	case g.Rounds < minSamples:
+		return fmt.Errorf("rounds: %d, fewer than minSamples %d, so no row would be judged", g.Rounds, minSamples)
+	}
+	return nil
+}
+
+// only keeps just the groups named in names.
+func (c *config) only(names []string) error {
+	for _, n := range names {
+		if !slices.ContainsFunc(c.Groups, func(g group) bool { return g.Name == n }) {
+			return fmt.Errorf("-groups: no group %q in the configuration", n)
+		}
+	}
+	c.Groups = slices.DeleteFunc(c.Groups, func(g group) bool { return !slices.Contains(names, g.Name) })
+	return nil
 }
 
 // group is the group named name.

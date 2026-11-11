@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/wzshiming/xet/test/benchgate/sample"
 )
@@ -32,7 +34,8 @@ type options struct {
 	baseLabel, headLabel string // what the report calls the trees
 	config               string // configuration file
 	out                  string // output directory
-	measureIdentical     bool
+	measureIdentical     *bool  // nil unless given
+	groups               string // comma-separated names of the only groups to run, empty for all
 }
 
 // run is the command with args, sampling through sampleRun; it returns the exit code.
@@ -45,9 +48,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sampleRun
 	fs.StringVar(&o.baseLabel, "base-label", "", "base tree's name in the report, such as a commit")
 	fs.StringVar(&o.headLabel, "head-label", "", "head tree's name in the report, such as a commit")
 	fs.StringVar(&o.config, "config", "", "configuration `file`")
-	fs.StringVar(&o.out, "out", "", "output `directory`")
-	fs.BoolVar(&o.measureIdentical, "measure-identical", false, "also measure packages whose test binaries are identical")
+	fs.StringVar(&o.out, "out", "", "output `directory`, new or empty")
+	fs.BoolFunc("measure-identical", "measure packages whose test binaries are identical too, whatever the configuration says", func(s string) error {
+		v, err := strconv.ParseBool(s)
+		o.measureIdentical = &v
+		return err
+	})
+	fs.StringVar(&o.groups, "groups", "", "comma-separated `names` of the only groups to run")
 	if err := fs.Parse(args); err != nil {
+		return exitError // the flag set said why
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "benchgate: unexpected argument %q\n", fs.Arg(0))
 		return exitError
 	}
 	report, regressed, err := o.gate(ctx, sampleRun)
@@ -64,11 +76,29 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sampleRun
 
 // gate runs the gate and renders its report; regressed tells whether a regression is confirmed.
 func (o options) gate(ctx context.Context, sampleRun sampler) (report []byte, regressed bool, err error) {
+	for _, f := range []struct{ name, value string }{
+		{"-base", o.base}, {"-head", o.head}, {"-base-label", o.baseLabel}, {"-head-label", o.headLabel},
+		{"-config", o.config}, {"-out", o.out},
+	} {
+		if f.value == "" {
+			return nil, false, fmt.Errorf("missing %s", f.name)
+		}
+	}
 	cfg, err := loadConfig(o.config)
 	if err != nil {
 		return nil, false, err
 	}
-	cfg.MeasureIdentical = cfg.MeasureIdentical || o.measureIdentical
+	if o.measureIdentical != nil {
+		cfg.MeasureIdentical = *o.measureIdentical
+	}
+	if o.groups != "" {
+		if err := cfg.only(strings.Split(o.groups, ",")); err != nil {
+			return nil, false, err
+		}
+	}
+	if entries, err := os.ReadDir(o.out); err == nil && len(entries) > 0 {
+		return nil, false, fmt.Errorf("-out %s is not empty", o.out)
+	}
 	if err := os.MkdirAll(o.out, 0o755); err != nil {
 		return nil, false, err
 	}
