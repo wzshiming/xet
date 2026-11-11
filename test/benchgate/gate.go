@@ -21,6 +21,16 @@ type pass struct {
 	verdicts map[string]verdict.Result // by group name
 }
 
+// files are the sample files of group name, empty without samples.
+func (p pass) files(name string) (base, head string) {
+	for _, g := range p.Groups {
+		if g.Name == name {
+			return g.Base, g.Head
+		}
+	}
+	return "", ""
+}
+
 // suspect is a row of a group that regressed in the first pass.
 type suspect struct {
 	group          string

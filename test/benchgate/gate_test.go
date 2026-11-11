@@ -14,8 +14,8 @@ import (
 
 // fake is a sampler that answers each call with the next of its passes and records what it was asked and wrote.
 type fake struct {
-	passes   []map[string]canned // by group name
-	env      sample.Environment
+	passes   []map[string]canned  // by group name
+	envs     []sample.Environment // by pass, zero beyond
 	requests []sample.Request
 	written  [][2]string // path and content of each file
 }
@@ -32,7 +32,10 @@ func (f *fake) run(_ context.Context, req sample.Request) (sample.Result, error)
 	if len(f.requests) > len(f.passes) {
 		return sample.Result{}, fmt.Errorf("sampling %d times, want %d", len(f.requests), len(f.passes))
 	}
-	res := sample.Result{Env: f.env}
+	res := sample.Result{}
+	if i := len(f.requests) - 1; i < len(f.envs) {
+		res.Env = f.envs[i]
+	}
 	for _, g := range req.Groups {
 		c := f.passes[len(f.requests)-1][g.Name]
 		gr := sample.GroupResult{Name: g.Name, Packages: c.states}

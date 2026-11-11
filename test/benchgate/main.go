@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -107,5 +108,9 @@ func (o options) gate(ctx context.Context, sampleRun sampler) (report []byte, re
 		return nil, false, err
 	}
 	confirmed, _ := res.split()
-	return render(cfg, res), len(confirmed) > 0, nil
+	report = render(o, cfg, res)
+	if err := os.WriteFile(filepath.Join(o.out, "report.md"), report, 0o644); err != nil {
+		return nil, false, err
+	}
+	return report, len(confirmed) > 0, nil
 }
