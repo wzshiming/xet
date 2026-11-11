@@ -1,5 +1,7 @@
 package client
 
+// DO NOT MERGE: shifts this file's line numbers so that only the server test binary changes.
+
 import (
 	"context"
 	"errors"
