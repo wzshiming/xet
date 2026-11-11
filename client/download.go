@@ -38,7 +38,7 @@ func (c *Client) DownloadFile(ctx context.Context, fileHash xet.FileHash, w io.W
 // DownloadFileV1 downloads and reconstructs a file from its hash into w
 // through the V1 API. It seeks w to determine the current size for resume support.
 func (c *Client) DownloadFileV1(ctx context.Context, fileHash xet.FileHash, w io.WriteSeeker) error {
-	return c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV1)
+	return slowDownloadV1(func() error { return c.downloadFile(ctx, fileHash, w, reconstructionAPIVersionV1) })
 }
 
 // DownloadFileV2 downloads and reconstructs a file from its hash into w
