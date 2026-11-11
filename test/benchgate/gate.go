@@ -119,6 +119,9 @@ func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Requ
 		if err != nil {
 			return pass{}, err
 		}
+		if !slices.ContainsFunc(v.Rows, func(r verdict.Row) bool { return r.Head.N > 0 }) {
+			return pass{}, fmt.Errorf("group %q: its benchmarks gave no row on the head side", g.Name)
+		}
 		p.verdicts[g.Name] = v
 	}
 	return p, nil

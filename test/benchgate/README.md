@@ -19,7 +19,7 @@ same metric.
 | --- | --- |
 | 0 | no confirmed regression |
 | 1 | at least one confirmed regression |
-| 2 | nothing to conclude: a head build or benchmark failed, or the configuration or command line is wrong |
+| 2 | nothing to conclude: a head build or benchmark failed, a measured group has no benchmark row on the head side, or the configuration or command line is wrong |
 
 A base tree that lacks a package, or whose package fails to build or run, is
 not a failure: the report lists the package as not measured, and the command

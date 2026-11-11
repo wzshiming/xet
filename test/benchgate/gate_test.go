@@ -171,6 +171,31 @@ func TestRechecksOnlyWithSuspects(t *testing.T) {
 	}
 }
 
+func TestMeasuredGroupWithoutHeadRowsExitsTwo(t *testing.T) {
+	t.Parallel()
+	const none = "pkg: example.com/fake\nPASS\n"
+	for _, c := range []struct {
+		name  string
+		pass  map[string]canned
+		code  int
+		names string // what stderr says
+	}{
+		{"judged", map[string]canned{"cpu": {base: none, head: none}}, 2, `group "cpu"`},
+		{"report only", map[string]canned{"io": {base: samples(another), head: none}}, 2, `group "io"`},
+		{"not measured", map[string]canned{}, 0, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fake{passes: []map[string]canned{c.pass}}
+			o := command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t))
+			wantCode(t, o, c.code)
+			if !strings.Contains(o.stderr, c.names) {
+				t.Errorf("stderr %q does not name %s", o.stderr, c.names)
+			}
+		})
+	}
+}
+
 func TestBaseFailureReasonGoesToStderrNotTheReport(t *testing.T) {
 	t.Parallel()
 	const reason = "run in round 1 failed: exit status 1\n/home/runner/work/xet/p/p_test.go:12: boom"
