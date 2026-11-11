@@ -35,10 +35,10 @@ Every pull request to master runs the **Benchmark gate** check ([workflow](.gith
 
 | Group | Benchmarks | Benchtime | Judged |
 | --- | --- | --- | --- |
-| `root` | `BenchmarkComputeChunkHash` | 300ms | `sec/op` +10%, `B/op` +10%, `allocs/op` +10% |
-| `filehash` | `BenchmarkComputeFileHash` | 20x | `sec/op` +10% |
+| `root` | `BenchmarkComputeChunkHash` | 300ms | `sec/op` +5%, `B/op` +10%, `allocs/op` +10% |
+| `filehash` | `BenchmarkComputeFileHash` | 20x | `sec/op` +5% |
 | `xorb` | every benchmark in `xorb` | 300ms | `sec/op` +10%, `B/op` +10%, `allocs/op` +10% |
-| `client` | the 1 MiB rows of `BenchmarkClient`, one per class, operation and protocol version | 50x | `sec/op` +20%, `B/op` +50%, `allocs/op` +10% |
+| `client` | the 1 MiB rows of `BenchmarkClient`, one per class, operation and protocol version | 50x | `sec/op` +10%, `B/op` +20%, `allocs/op` +10% |
 | `serve` | the 1 MiB rows of `BenchmarkServe` | 100ms | only reported |
 | `storage` | `BenchmarkReconstructedFile` | 100ms | only reported |
 
