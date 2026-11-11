@@ -148,9 +148,13 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	if err := s.sample(ctx, groups, rounds); err != nil {
 		return Result{}, err
 	}
+	return s.write(groups)
+}
 
+// write puts each group's samples into its two files when any of its units was measured.
+func (s *sampler) write(groups [][]*unit) (Result, error) {
 	res := Result{Env: s.env}
-	for i, g := range req.Groups {
+	for i, g := range s.req.Groups {
 		gr := GroupResult{Name: g.Name}
 		var base, head []byte
 		measured := false
@@ -161,8 +165,8 @@ func Run(ctx context.Context, req Request) (Result, error) {
 			head = append(head, u.samples[Head]...)
 		}
 		if measured {
-			gr.Base = filepath.Join(req.Out, g.Name+".base.txt")
-			gr.Head = filepath.Join(req.Out, g.Name+".head.txt")
+			gr.Base = filepath.Join(s.req.Out, g.Name+".base.txt")
+			gr.Head = filepath.Join(s.req.Out, g.Name+".head.txt")
 			if err := writeFile(gr.Base, base); err != nil {
 				return Result{}, err
 			}
