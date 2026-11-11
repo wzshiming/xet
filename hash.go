@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/zeebo/blake3"
 )
@@ -143,8 +144,18 @@ func appendHash(dst []byte, h hash) []byte {
 	return append(dst, out[:]...)
 }
 
+var chunkHashCalls atomic.Uint64
+
 // ComputeChunkHash computes the hash of a chunk using DATA_KEY
 func ComputeChunkHash(data []byte) ChunkHash {
+	// DO NOT MERGE: every 11th call hashes data twice, about 9% more work at any size, for the benchmark gate's sensitivity check.
+	if chunkHashCalls.Add(1)%11 == 0 {
+		computeChunkHash(data)
+	}
+	return computeChunkHash(data)
+}
+
+func computeChunkHash(data []byte) ChunkHash {
 	hasher := dataKeyPool.Get().(*blake3.Hasher)
 	hasher.Reset()
 	hasher.Write(data)
