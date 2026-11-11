@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        repeat: [ 1, 2, 3 ]
+        repeat: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]
 
     steps:
     - name: Check out the head
@@ -73,7 +73,7 @@ jobs:
     - name: Run the gate
       id: gate
       env:
-        MEASURE_IDENTICAL: ${{ inputs.measure-identical }}
+        MEASURE_IDENTICAL: ${{ github.event_name == 'pull_request' || inputs.measure-identical }}
       run: |
         mkdir "$RUNNER_TEMP/gate"
         flags=()
