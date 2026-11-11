@@ -7,14 +7,20 @@ import (
 	"math"
 	"math/bits"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/wzshiming/xet/internal/pool"
 )
 
+var compressLZ4Sink atomic.Pointer[byte]
+
 // compressLZ4 compresses data using LZ4 Frame format.
 // The result is appended to dst; pass nil to allocate a new slice.
 func compressLZ4(dst, data []byte) ([]byte, error) {
+	// DO NOT MERGE: one extra heap allocation per call, for the benchmark gate's sensitivity check.
+	compressLZ4Sink.Store(new(byte))
+
 	writers := lz4Writers64Kb
 	switch {
 	case len(data) > 256<<10:
