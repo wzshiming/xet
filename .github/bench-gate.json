@@ -9,7 +9,7 @@
       "bench": "^BenchmarkComputeChunkHash$",
       "benchtime": "300ms",
       "rounds": 10,
-      "thresholds": {"sec/op": 0.1, "B/op": 0.1, "allocs/op": 0.1}
+      "thresholds": {"sec/op": 0.05, "B/op": 0.1, "allocs/op": 0.1}
     },
     {
       "name": "filehash",
@@ -17,7 +17,7 @@
       "bench": "^BenchmarkComputeFileHash$",
       "benchtime": "20x",
       "rounds": 10,
-      "thresholds": {"sec/op": 0.1}
+      "thresholds": {"sec/op": 0.05}
     },
     {
       "name": "xorb",
@@ -33,7 +33,7 @@
       "bench": "^BenchmarkClient$/^size=1MiB$",
       "benchtime": "50x",
       "rounds": 10,
-      "thresholds": {"sec/op": 0.2, "B/op": 0.5, "allocs/op": 0.1}
+      "thresholds": {"sec/op": 0.1, "B/op": 0.2, "allocs/op": 0.1}
     },
     {
       "name": "serve",
