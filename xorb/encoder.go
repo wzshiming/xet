@@ -9,6 +9,10 @@ import (
 	"github.com/wzshiming/xet/internal/pool"
 )
 
+// compressionRetestInterval is how many chunks of a file share one predicted compression scheme, xet-core's default
+// compression_scheme_retest_interval.
+const compressionRetestInterval = 32
+
 // Encoder writes xorb data chunk-by-chunk to an io.Writer.
 // Call Encode for each chunk, then Close to flush the footer (if withFooter),
 // then SummoryHash to retrieve the overall xorb hash.
@@ -16,6 +20,10 @@ type Encoder struct {
 	w               io.Writer
 	withFooter      bool
 	uniquenessNonce [4]byte
+
+	// compression is the scheme predicted for the current block, which covers blockLeft more chunks.
+	compression CompressionType
+	blockLeft   int
 
 	// Accumulated per-chunk metadata
 	chunkHashes     []xet.ChunkHash
@@ -51,6 +59,12 @@ func (e *Encoder) SetUniquenessNonce(nonce [4]byte) error {
 	return nil
 }
 
+// StartFile marks the next chunk written as the first of a new file in this xorb, so the encoder picks a new
+// compression scheme for it.
+func (e *Encoder) StartFile() {
+	e.blockLeft = 0
+}
+
 // Write compresses chunk and writes the 8-byte header followed by compressed data to w.
 func (e *Encoder) Write(chunk []byte) (int, error) {
 	if e.err != nil {
@@ -73,9 +87,16 @@ func (e *Encoder) Write(chunk []byte) (int, error) {
 		return 0, e.err
 	}
 
+	// As xet-core's Auto policy, a block of up to 32 chunks of one file takes its first chunk's predicted scheme.
+	if e.blockLeft == 0 {
+		e.compression = chooseCompression(chunk)
+		e.blockLeft = compressionRetestInterval
+	}
+	e.blockLeft--
+
 	tmp := pool.GetChunkBuf()
 	defer pool.PutChunkBuf(tmp)
-	compressed, compressionType, err := selectBestCompression(tmp[8:8], chunk)
+	compressed, compressionType, err := compressChunk(tmp[8:8], chunk, e.compression)
 	if err != nil {
 		e.err = fmt.Errorf("failed to compress chunk: %w", err)
 		return 0, e.err

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"sync"
 
 	"github.com/pierrec/lz4/v4"
@@ -154,45 +156,100 @@ func reverseByteGrouping4(dst, data []byte) ([]byte, error) {
 	return dst, nil
 }
 
-// selectBestCompression tries different compression methods and returns the best one.
-// The result is appended to dst; pass nil to allocate a new slice.
-func selectBestCompression(dst, data []byte) ([]byte, CompressionType, error) {
-	// Try no compression
-	noneSize := len(data)
-	bestType := CompressionNone
-	bestSize := noneSize
+// schemeCompressors holds the compressor of each scheme chooseCompression picks; tests replace one to make it fail.
+var schemeCompressors = [...]func(dst, data []byte) ([]byte, error){
+	CompressionLZ4:           compressLZ4,
+	CompressionByteGrouping4: compressByteGrouping4LZ4,
+}
 
-	tmp0 := pool.GetChunkBuf()
-	tmp1 := pool.GetChunkBuf()
-	defer func() {
-		pool.PutChunkBuf(tmp0)
-		pool.PutChunkBuf(tmp1)
-	}()
-
-	// Try LZ4
-	lz4Data, err := compressLZ4(tmp0[:0], data)
-	if err == nil && len(lz4Data) < bestSize {
-		bestType = CompressionLZ4
-		bestSize = len(lz4Data)
+// compressChunk appends data compressed once with scheme, LZ4 or ByteGrouping4, to dst, or data itself as
+// CompressionNone when, as in xet-core's serialize_chunk, that does not make it smaller.
+func compressChunk(dst, data []byte, scheme CompressionType) ([]byte, CompressionType, error) {
+	out, err := schemeCompressors[scheme](dst, data)
+	if err != nil {
+		return dst, scheme, err
 	}
-
-	// Try ByteGrouping4 + LZ4
-	bg4Data, err := compressByteGrouping4LZ4(tmp1[:0], data)
-	if err == nil && len(bg4Data) < bestSize {
-		bestType = CompressionByteGrouping4
+	if len(out)-len(dst) >= len(data) {
+		return append(dst, data...), CompressionNone, nil
 	}
+	return out, scheme, nil
+}
 
-	// Append the best result to dst
-	switch bestType {
-	case CompressionNone:
-		dst = append(dst, data...)
-	case CompressionLZ4:
-		dst = append(dst, lz4Data...)
-	case CompressionByteGrouping4:
-		dst = append(dst, bg4Data...)
+// chooseCompression ports xet-core's CompressionScheme::choose_from_data: ByteGrouping4 when the BG4 predictor
+// recommends it, LZ4 otherwise. xet-core chose the 0.02 threshold by logistic regression.
+func chooseCompression(data []byte) CompressionType {
+	if bg4MaxKLDivergence(data) > 0.02 {
+		return CompressionByteGrouping4
 	}
+	return CompressionLZ4
+}
 
-	return dst, bestType, nil
+// bg4MaxKLDivergence ports xet-core's BG4Predictor: per byte position mod 4 a histogram of byte popcounts, and the
+// largest KL divergence of a position's histogram from the pooled one, with the arithmetic of bg4_recommended.
+func bg4MaxKLDivergence(data []byte) float64 {
+	histograms := popcountHistograms(data)
+
+	// Each pooled bin starts at 1 so q is never 0; the pooled total leaves those 9 out.
+	baseCounts := [9]uint32{1, 1, 1, 1, 1, 1, 1, 1, 1}
+	var totals [4]uint32
+	for i := range 4 {
+		for j := range 9 {
+			baseCounts[j] += histograms[i][j]
+			totals[i] += histograms[i][j]
+		}
+	}
+	baseTotal := totals[0] + totals[1] + totals[2] + totals[3]
+
+	maxKL := 0.0
+	for i := range 4 {
+		kl := 0.0
+		for j := range 9 {
+			p := float64(histograms[i][j]) / float64(totals[i])
+			q := float64(baseCounts[j]) / float64(baseTotal)
+			// The conversion rounds the product, as Rust does, rather than letting Go fuse it into an FMA.
+			kl += float64(p * math.Log(p/q))
+		}
+		// An empty bin makes kl NaN (0·ln 0); Rust's f64::max skips NaN, math.Max would return it.
+		if kl > maxKL {
+			maxKL = kl
+		}
+	}
+	return maxKL
+}
+
+// popcountFields[b] is 1 in the 7-bit field of b's popcount, so adding up to 127 of them counts each popcount.
+var popcountFields = func() (fields [256]uint64) {
+	for b := range fields {
+		fields[b] = 1 << (7 * bits.OnesCount8(uint8(b)))
+	}
+	return fields
+}()
+
+// popcountHistograms counts the bytes of data with each popcount 0-8 per byte position mod 4, the histograms of
+// xet-core's BG4Predictor, adding popcountFields in registers rather than incrementing a counter per byte.
+func popcountHistograms(data []byte) (histograms [4][9]uint32) {
+	for len(data) >= 4 {
+		// At most 127 groups of 4 bytes, so no 7-bit field overflows.
+		block := data[:min(len(data)&^3, 127*4)]
+		data = data[len(block):]
+		var p0, p1, p2, p3 uint64
+		for ; len(block) >= 4; block = block[4:] {
+			p0 += popcountFields[block[0]]
+			p1 += popcountFields[block[1]]
+			p2 += popcountFields[block[2]]
+			p3 += popcountFields[block[3]]
+		}
+		for j := range 9 {
+			histograms[0][j] += uint32(p0>>(7*j)) & 0x7f
+			histograms[1][j] += uint32(p1>>(7*j)) & 0x7f
+			histograms[2][j] += uint32(p2>>(7*j)) & 0x7f
+			histograms[3][j] += uint32(p3>>(7*j)) & 0x7f
+		}
+	}
+	for i, b := range data {
+		histograms[i][bits.OnesCount8(b)]++
+	}
+	return histograms
 }
 
 // Frames match xet-core's lz4_flex defaults: hf_xet allocates a frame's declared block size for every chunk it decodes.

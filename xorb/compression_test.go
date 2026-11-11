@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
+	"math/bits"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -140,8 +142,8 @@ func TestByteGrouping4Transform(t *testing.T) {
 	}
 }
 
-func TestSelectBestCompression(t *testing.T) {
-	// Test that SelectBestCompression works correctly
+func TestCompressChunk(t *testing.T) {
+	// Test that compressChunk works correctly with the scheme chooseCompression picks
 	testCases := []struct {
 		name string
 		data []byte
@@ -160,9 +162,9 @@ func TestSelectBestCompression(t *testing.T) {
 				}
 			}
 
-			compressed, compressionType, err := selectBestCompression(nil, tc.data)
+			compressed, compressionType, err := compressChunk(nil, tc.data, chooseCompression(tc.data))
 			if err != nil {
-				t.Fatalf("SelectBestCompression failed: %v", err)
+				t.Fatalf("Compression failed: %v", err)
 			}
 
 			// Decompress based on type
@@ -304,7 +306,7 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 	})
 
 	t.Run("DecodeChunk_reuse", func(t *testing.T) {
-		compressed, ct, err := selectBestCompression(nil, data)
+		compressed, ct, err := compressChunk(nil, data, chooseCompression(data))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -321,13 +323,19 @@ func TestAppendToDestBufferReuse(t *testing.T) {
 		}
 	})
 
-	t.Run("selectBestCompression_reuse", func(t *testing.T) {
-		var buf []byte
-		for range 3 {
-			var err error
-			buf, _, err = selectBestCompression(buf[:0], data)
+	t.Run("compressChunk_reuse", func(t *testing.T) {
+		for _, scheme := range []CompressionType{CompressionLZ4, CompressionByteGrouping4} {
+			want, wantType, err := compressChunk(nil, data, scheme)
 			if err != nil {
 				t.Fatal(err)
+			}
+			var buf []byte
+			for range 3 {
+				var ct CompressionType
+				buf, ct, err = compressChunk(buf[:0], data, scheme)
+				if err != nil || ct != wantType || !bytes.Equal(buf, want) {
+					t.Fatalf("compressChunk(reused dst, scheme %d) = type %d, %d bytes, %v; want type %d and the %d bytes of a nil dst", scheme, ct, len(buf), err, wantType, len(want))
+				}
 			}
 		}
 	})
@@ -417,7 +425,7 @@ func BenchmarkDecompressLZ4(b *testing.B) {
 	}
 }
 
-// selectionClassesForTest are BenchmarkSelectBestCompression's chunks and the type each must get; bg4 and text are
+// selectionClassesForTest are BenchmarkCompressChunk's chunks and the type each must get; bg4 and text are
 // genBG4 and genLZ4 of decode_bench_test.go.
 var selectionClassesForTest = []struct {
 	name string
@@ -457,24 +465,121 @@ var selectionClassesForTest = []struct {
 	}},
 }
 
-func BenchmarkSelectBestCompression(b *testing.B) {
+func BenchmarkCompressChunk(b *testing.B) {
 	for _, class := range selectionClassesForTest {
 		b.Run("class="+class.name, func(b *testing.B) {
-			var seed [32]byte
-			copy(seed[:], class.name)
-			data := make([]byte, xet.TargetChunkSize)
-			class.fill(rand.NewChaCha8(seed), data)
-			buf, ct, err := selectBestCompression(nil, data)
+			data := selectionChunkForTest(b, class.name, xet.TargetChunkSize)
+			scheme := chooseCompression(data)
+			buf, ct, err := compressChunk(nil, data, scheme)
 			if err != nil || ct != class.ct {
-				b.Fatalf("selectBestCompression(class %s) = type %d, %v; want type %d", class.name, ct, err, class.ct)
+				b.Fatalf("compressChunk(class %s) = type %d, %v; want type %d", class.name, ct, err, class.ct)
 			}
 			b.SetBytes(int64(len(data)))
 			b.ReportAllocs()
 			for b.Loop() {
-				if buf, _, err = selectBestCompression(buf[:0], data); err != nil {
-					b.Fatal(err)
-				}
+				buf, _, _ = compressChunk(buf[:0], data, scheme)
 			}
 		})
+	}
+}
+
+// selectionChunkForTest returns n bytes of the selectionClassesForTest class named class, seeded with its name.
+func selectionChunkForTest(tb testing.TB, class string, n int) []byte {
+	tb.Helper()
+	for _, c := range selectionClassesForTest {
+		if c.name == class {
+			var seed [32]byte
+			copy(seed[:], class)
+			data := make([]byte, n)
+			c.fill(rand.NewChaCha8(seed), data)
+			return data
+		}
+	}
+	tb.Fatalf("no selection class %q", class)
+	return nil
+}
+
+func TestBG4MaxKLDivergenceMatchesXetCore(t *testing.T) {
+	// max_kl_div of BG4Predictor::bg4_recommended (xet-core v1.8.0 bg4_prediction.rs) on the same 64 KiB chunks.
+	for _, c := range []struct {
+		class string
+		want  float64
+	}{
+		{"random", 2.4972461959398473e-5},
+		{"bg4", 0.03637494117851614},
+		{"bf16-like", 0.17244787130345923},
+	} {
+		// Written so that a NaN fails too.
+		if got := bg4MaxKLDivergence(selectionChunkForTest(t, c.class, xet.TargetChunkSize)); !(math.Abs(got-c.want) <= 1e-12*c.want) {
+			t.Errorf("bg4MaxKLDivergence(class %s) = %v, want xet-core's %v", c.class, got, c.want)
+		}
+	}
+}
+
+// The random chunk with bf16 high bytes 0x3c-0x3e at position 3 of its first k groups: k = 3751 and 3752, one byte
+// apart, straddle xet-core's 0.02, so the first gets LZ4 and the second ByteGrouping4.
+func TestChooseCompressionThresholdMatchesXetCore(t *testing.T) {
+	// max_kl_div of BG4Predictor::bg4_recommended (xet-core v1.8.0 bg4_prediction.rs) on the same chunks.
+	for _, c := range []struct {
+		k      int
+		wantKL float64
+		want   CompressionType
+	}{
+		{3751, 0.0199939157191288, CompressionLZ4},
+		{3752, 0.020004114314403257, CompressionByteGrouping4},
+	} {
+		data := selectionChunkForTest(t, "random", xet.TargetChunkSize)
+		for i := range c.k {
+			data[4*i+3] = 0x3c + byte(i%3)
+		}
+		if got := bg4MaxKLDivergence(data); !(math.Abs(got-c.wantKL) <= 1e-12*c.wantKL) {
+			t.Errorf("bg4MaxKLDivergence(k=%d) = %v, want xet-core's %v", c.k, got, c.wantKL)
+		}
+		if got := chooseCompression(data); got != c.want {
+			t.Errorf("chooseCompression(k=%d, max KL %v) = type %d, want %d", c.k, c.wantKL, got, c.want)
+		}
+	}
+}
+
+// The high bytes of a bf16-like chunk leave empty popcount bins, so their positions' KL divergences are NaN (0·ln 0),
+// which Rust's f64::max skips: the low bytes' positions still recommend BG4.
+func TestChooseCompressionSkipsPositionsWithEmptyPopcountBins(t *testing.T) {
+	data := selectionChunkForTest(t, "bf16-like", xet.TargetChunkSize)
+	for i := 1; i < len(data); i += 2 {
+		if n := bits.OnesCount8(data[i]); n != 4 && n != 5 {
+			t.Fatalf("high byte %d has popcount %d, want only 4 and 5 in its positions", i, n)
+		}
+	}
+	if got := chooseCompression(data); got != CompressionByteGrouping4 {
+		t.Errorf("chooseCompression(bf16-like chunk) = type %d, want ByteGrouping4 (%d)", got, CompressionByteGrouping4)
+	}
+}
+
+// popcountHistograms counts what xet-core's add_data_reference counts byte by byte, whatever the length and bytes.
+func TestPopcountHistogramsMatchStraightforwardLoop(t *testing.T) {
+	inputs := map[string][]byte{}
+	for _, class := range selectionClassesForTest {
+		chunk := selectionChunkForTest(t, class.name, xet.MaxChunkSize)
+		for _, n := range []int{0, 1, 2, 3, 4, 5, 6, 7, 507, 508, 509, 510, 511, 1015, 1016, 1017, 4097, xet.TargetChunkSize - 1, xet.TargetChunkSize, xet.TargetChunkSize + 2, xet.MaxChunkSize - 3, xet.MaxChunkSize} {
+			inputs[fmt.Sprintf("%s/n=%d", class.name, n)] = chunk[:n]
+		}
+	}
+	// As 257 is 1 mod 4, i%257 puts every byte value at every position mod 4.
+	everyValue := make([]byte, 4*257)
+	for i := range everyValue {
+		everyValue[i] = byte(i % 257)
+	}
+	inputs["every byte value"] = everyValue
+	for _, v := range []byte{0x00, 0x0f, 0xfe, 0xff} {
+		inputs[fmt.Sprintf("run of %#02x", v)] = bytes.Repeat([]byte{v}, xet.MaxChunkSize-1)
+	}
+	for name, data := range inputs {
+		var want [4][9]uint32
+		for i, b := range data {
+			want[i%4][bits.OnesCount8(b)]++
+		}
+		if got := popcountHistograms(data); got != want {
+			t.Errorf("popcountHistograms(%s) = %v, want %v", name, got, want)
+		}
 	}
 }
