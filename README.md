@@ -36,13 +36,13 @@ Every pull request to master runs the **Benchmark gate** check ([workflow](.gith
 | Group | Benchmarks | Benchtime | Judged |
 | --- | --- | --- | --- |
 | `root` | `BenchmarkComputeChunkHash` | 300ms | `sec/op` +5%, `B/op` +10%, `allocs/op` +10% |
-| `filehash` | `BenchmarkComputeFileHash` | 20x | `sec/op` +5% |
+| `filehash` | `BenchmarkComputeFileHash` | 20x | `sec/op` +5%, `allocs/op` +20% |
 | `xorb` | every benchmark in `xorb` | 300ms | `sec/op` +10%, `B/op` +10%, `allocs/op` +10% |
 | `client` | the 1 MiB rows of `BenchmarkClient`, one per class, operation and protocol version | 50x | `sec/op` +10%, `B/op` +20%, `allocs/op` +10% |
 | `serve` | the 1 MiB rows of `BenchmarkServe` | 100ms | only reported |
 | `storage` | `BenchmarkReconstructedFile` | 100ms | only reported |
 
-A row regresses when its change is statistically significant and larger than the threshold; a regression fails the check only when a re-check with fresh samples of the row regresses it again. Benchmarks that take milliseconds per operation run a fixed number of iterations, `20x` or `50x`, rather than for a duration, so that every sample spreads its slow first iterations and one-off allocations over the same count. The bytes and allocations of `BenchmarkComputeFileHash` vary between runs of the same binary, so the report shows them without judging them.
+A row regresses when its change is statistically significant and larger than the threshold; a regression fails the check only when a re-check with fresh samples of the row regresses it again. Benchmarks that take milliseconds per operation run a fixed number of iterations, `20x` or `50x`, rather than for a duration, so that every sample spreads its slow first iterations and one-off allocations over the same count. The bytes per operation of `BenchmarkComputeFileHash` vary between runs of the same binary, so the report shows them without judging them.
 
 When the check is red:
 

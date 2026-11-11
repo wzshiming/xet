@@ -17,7 +17,7 @@
       "bench": "^BenchmarkComputeFileHash$",
       "benchtime": "20x",
       "rounds": 10,
-      "thresholds": {"sec/op": 0.05}
+      "thresholds": {"sec/op": 0.05, "allocs/op": 0.2}
     },
     {
       "name": "xorb",
