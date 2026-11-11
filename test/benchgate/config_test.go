@@ -65,6 +65,7 @@ func TestConfigErrorsExitTwoNamingTheField(t *testing.T) {
 		{"benchtime neither a duration nor a count", func(_ map[string]any, g []map[string]any) { g[0]["benchtime"] = "soon" }, "groups[0].benchtime:"},
 		{"benchtime of no iterations", func(_ map[string]any, g []map[string]any) { g[1]["benchtime"] = "0x" }, "groups[1].benchtime:"},
 		{"negative benchtime", func(_ map[string]any, g []map[string]any) { g[1]["benchtime"] = "-1s" }, "groups[1].benchtime:"},
+		{"report-only group without rounds", func(_ map[string]any, g []map[string]any) { delete(g[1], "rounds") }, "groups[1].rounds:"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -78,5 +79,19 @@ func TestConfigErrorsExitTwoNamingTheField(t *testing.T) {
 				t.Errorf("stderr %q does not say %s", o.stderr, c.names)
 			}
 		})
+	}
+}
+
+func TestDataAfterTheConfigurationExitsTwo(t *testing.T) {
+	t.Parallel()
+	for _, trailing := range []string{" this is not JSON", "\n{}", "}"} {
+		path := filepath.Join(t.TempDir(), "gate.json")
+		writeFile(t, path, validConfig+trailing)
+		f := &fake{}
+		o := command(t, f.run, t.TempDir(), t.TempDir(), path)
+		if o.code != 2 || len(f.requests) != 0 || !strings.Contains(o.stderr, "after the configuration") {
+			t.Errorf("with %q after the configuration: exit code %d, sampled %d times, stderr %q; want 2, no sampling and the data named",
+				trailing, o.code, len(f.requests), o.stderr)
+		}
 	}
 }

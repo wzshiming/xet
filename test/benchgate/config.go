@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"regexp"
@@ -51,6 +52,9 @@ func loadConfig(path string) (config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return config{}, fmt.Errorf("%s: data after the configuration object", path)
 	}
 	if err := c.validate(); err != nil {
 		return config{}, fmt.Errorf("%s: %w", path, err)
@@ -101,6 +105,8 @@ func (g group) validate(minSamples int) error {
 		}
 	}
 	switch {
+	case g.ReportOnly && g.Rounds < 1:
+		return fmt.Errorf("rounds: %d, want at least 1", g.Rounds)
 	case g.ReportOnly:
 	case g.Rounds < minJudgedRounds:
 		return fmt.Errorf("rounds: %d, want at least %d in a judged group", g.Rounds, minJudgedRounds)
