@@ -65,18 +65,19 @@ func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out st
 	recheck := req
 	recheck.Groups, recheck.Out = nil, filepath.Join(out, "recheck")
 	for _, g := range req.Groups {
+		var rows []sample.Row
 		for _, row := range res.first.verdicts[g.Name].Rows {
 			if row.Class != verdict.Regression {
 				continue
 			}
 			res.suspects = append(res.suspects, suspect{group: g.Name, first: row})
-			if n := len(recheck.Groups); n == 0 || recheck.Groups[n-1].Name != g.Name {
-				recheck.Groups = append(recheck.Groups, g)
+			if r := (sample.Row{Pkg: row.Pkg, Name: row.Name}); !slices.Contains(rows, r) {
+				rows = append(rows, r)
 			}
-			last := &recheck.Groups[len(recheck.Groups)-1]
-			if r := (sample.Row{Pkg: row.Pkg, Name: row.Name}); !slices.Contains(last.Rows, r) {
-				last.Rows = append(last.Rows, r)
-			}
+		}
+		if len(rows) > 0 {
+			g.Rows = rows
+			recheck.Groups = append(recheck.Groups, g)
 		}
 	}
 	if len(res.suspects) == 0 {
