@@ -1,0 +1,133 @@
+goos: darwin
+goarch: arm64
+pkg: example.com/a
+cpu: Apple M1
+BenchmarkSlower20-8   	 1000000	       998.0 ns/op	1002.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1001 ns/op	 999.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1003 ns/op	 997.01 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	       999.0 ns/op	1001.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1000 ns/op	1000.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1002 ns/op	 998.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	       997.0 ns/op	1003.01 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1004 ns/op	 996.02 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1000 ns/op	1000.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20-8   	 1000000	      1001 ns/op	 999.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkSlower20Few-8	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower20Few-8	 1000000	      1002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower20Few-8	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	       998.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSlower3-8    	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 1000000	       900.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 2000000	       500.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 1000000	      1300 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 2000000	       700.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 1000000	      1100 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	  800000	      1500 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 2000000	       600.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 1000000	      1200 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	 1500000	       800.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkOverlap-8    	  900000	      1400 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.30 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        49.90 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.20 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        49.80 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.40 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocs-8     	24000000	        50.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       201.0 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       199.5 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.2 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.8 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       199.9 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.4 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.1 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       199.7 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.6 ns/op	      64 B/op	       2 allocs/op
+BenchmarkAllocsSame-8 	 6000000	       200.3 ns/op	      64 B/op	       2 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.1 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       499.8 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.4 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.0 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       499.6 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.3 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.2 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       499.9 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.5 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes5-8     	 2400000	       500.0 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.1 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       499.8 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.4 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.0 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       499.6 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.3 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.2 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       499.9 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.5 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkBytes15-8    	 2400000	       500.0 ns/op	    1000 B/op	       3 allocs/op
+BenchmarkDropped-8    	 3000000	       400.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       399.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       399.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       399.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDropped-8    	 3000000	       400.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	       998.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	       997.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisy-8      	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1001 ns/op	         2.001 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	       999.0 ns/op	         1.998 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1002 ns/op	         2.003 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1000 ns/op	         2.000 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	       998.0 ns/op	         1.997 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1003 ns/op	         2.004 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1000 ns/op	         2.000 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	       999.0 ns/op	         1.999 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1001 ns/op	         2.002 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkFaster-8     	 1000000	      1002 ns/op	         2.001 cpu-s/GiB	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	       998.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8        	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: example.com/b
+cpu: Apple M1
+BenchmarkDup-8	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1002 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	       998.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
+BenchmarkDup-8	 1000000	       999.0 ns/op	       0 B/op	       0 allocs/op
+PASS

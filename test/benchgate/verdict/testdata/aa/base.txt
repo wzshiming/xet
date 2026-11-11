@@ -1,0 +1,45 @@
+goos: darwin
+goarch: arm64
+pkg: example.com/aa
+cpu: Apple M1
+BenchmarkHash-8  	  480000	      2501 ns/op	1637.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2498 ns/op	1639.71 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2505 ns/op	1635.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2496 ns/op	1641.03 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2503 ns/op	1636.44 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2499 ns/op	1639.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2502 ns/op	1637.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2507 ns/op	1633.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2497 ns/op	1640.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkHash-8  	  480000	      2500 ns/op	1638.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkEncode-8	   80000	     15020 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     14870 ns/op	    4097 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     15210 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     14950 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     15100 ns/op	    4097 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     14800 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     15300 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     14990 ns/op	    4097 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     15050 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkEncode-8	   80000	     15150 ns/op	    4096 B/op	       3 allocs/op
+BenchmarkDecode-8	 1000000	      1150 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1500000	       800.0 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1000000	      1000 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1000000	      1250 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1300000	       900.0 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	  900000	      1300 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1400000	       850.0 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1000000	      1000 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1000000	      1200 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkDecode-8	 1200000	       950.0 ns/op	    2048 B/op	       2 allocs/op
+BenchmarkSmall-8 	48000000	        25.01 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        24.98 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        25.03 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        24.99 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        25.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        25.02 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        24.97 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        25.04 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        25.00 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSmall-8 	48000000	        24.99 ns/op	       0 B/op	       0 allocs/op
+PASS
