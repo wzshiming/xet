@@ -118,10 +118,11 @@ func TestNoisyMarksAConfidenceIntervalWiderThanTheThreshold(t *testing.T) {
 		name, metric string
 		want         bool
 	}{
-		{"BenchmarkNoisy-8", "sec/op", true},    // head ±15%, base ±0%
-		{"BenchmarkAdded-8", "sec/op", true},    // head only, ±13%
-		{"BenchmarkSlower3-8", "sec/op", false}, // both ±0%
-		{"BenchmarkSlower20-8", "B/s", false},   // not judged
+		{"BenchmarkNoisy-8", "sec/op", true},     // head ±15%, base ±0%
+		{"BenchmarkNoisyBase-8", "sec/op", true}, // base ±15%, head ±0%
+		{"BenchmarkAdded-8", "sec/op", true},     // head only, ±13%
+		{"BenchmarkSlower3-8", "sec/op", false},  // both ±0%
+		{"BenchmarkSlower20-8", "B/s", false},    // not judged
 	} {
 		if r := find(t, res, "example.com/a", c.name, c.metric); r.Noisy != c.want {
 			t.Errorf("%s %s: noisy %v, want %v", c.name, c.metric, r.Noisy, c.want)

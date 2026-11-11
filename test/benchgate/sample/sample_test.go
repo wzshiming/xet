@@ -519,6 +519,31 @@ func TestRowSelectionRunsOnlyTheSelectedRow(t *testing.T) {
 	}
 }
 
+func TestRowSelectionTakesNoRowWhoseNameOnlyStartsTheSame(t *testing.T) {
+	t.Parallel()
+	prefixed := map[string]string{
+		"a/a_test.go":      strings.Replace(synth["a/a_test.go"], "[]int{1, 2}", "[]int{1, 2, 10}", 1),
+		"a/prefix_test.go": "package a\n\nimport \"testing\"\n\nfunc BenchmarkSumAll(b *testing.B) {\n\tfor i := 0; i < b.N; i++ {\n\t\tSum(1000)\n\t}\n}\n",
+	}
+	req := request(t, tree(t, prefixed), tree(t, prefixed), 1)
+	req.MeasureIdentical = true
+	req.Groups[0].Rows = []sample.Row{
+		{Pkg: "example.com/synth/a", Name: "BenchmarkSum" + procs()},
+		{Pkg: "example.com/synth/a", Name: "BenchmarkSub/n=1" + procs()},
+	}
+	res := run(t, req)
+	one := map[string]int{"sec/op": 1, "B/op": 1, "allocs/op": 1}
+	want := map[row]map[string]int{
+		{"example.com/synth/a", "BenchmarkSum" + procs()}:     one,
+		{"example.com/synth/a", "BenchmarkSub/n=1" + procs()}: one,
+	}
+	for _, file := range []string{res.Groups[0].Base, res.Groups[0].Head} {
+		if got := readSamples(t, file); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: values by row and unit %v, want %v", file, got, want)
+		}
+	}
+}
+
 func TestBothSidesRunAtTheSamplersGOMAXPROCS(t *testing.T) {
 	t.Setenv("GOMAXPROCS", strconv.Itoa(runtime.GOMAXPROCS(0)+1))
 	req := request(t, tree(t, nil), tree(t, nil), 1)

@@ -95,6 +95,16 @@ BenchmarkNoisy-8      	 1000000	       997.0 ns/op	       0 B/op	       0 allocs
 BenchmarkNoisy-8      	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
 BenchmarkNoisy-8      	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
 BenchmarkNoisy-8      	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	       950.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	      1150 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1500000	       800.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	      1010 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	      1200 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1300000	       900.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	       990.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	      1100 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1400000	       850.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNoisyBase-8  	 1000000	      1050 ns/op	       0 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1000000	      1001 ns/op	         2.001 cpu-s/GiB	       0 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1000000	       999.0 ns/op	         1.998 cpu-s/GiB	       0 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1000000	      1002 ns/op	         2.003 cpu-s/GiB	       0 B/op	       0 allocs/op
