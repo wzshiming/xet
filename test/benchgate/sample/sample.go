@@ -145,33 +145,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	}
 
 	groups, rounds := s.plan()
-	for r := 1; r <= rounds; r++ {
-		s.env.Loads = append(s.env.Loads, loadAverages())
-		sides := []Side{Base, Head}
-		if r%2 == 0 {
-			sides = []Side{Head, Base}
-		}
-		for _, units := range groups {
-			for _, u := range units {
-				if u.state != Measured || r > u.group.Rounds {
-					continue
-				}
-				for _, side := range sides {
-					out, err := s.bench(ctx, u, r, side)
-					if err != nil && side == Head {
-						return Result{}, fmt.Errorf("group %q, package %q: head run in round %d failed: %w", u.group.Name, u.pkg, r, err)
-					}
-					if err != nil {
-						u.state, u.samples = BaseFailed, nil
-						break
-					}
-					u.samples[side] = append(u.samples[side], out...)
-				}
-			}
-		}
-	}
-	// A cancelled base run would otherwise pass for a base failure.
-	if err := ctx.Err(); err != nil {
+	if err := s.sample(ctx, groups, rounds); err != nil {
 		return Result{}, err
 	}
 
@@ -232,6 +206,37 @@ func (s *sampler) plan() ([][]*unit, int) {
 		}
 	}
 	return groups, rounds
+}
+
+// sample runs the measured units round by round, both sides of a unit back to back, the first side alternating by round.
+func (s *sampler) sample(ctx context.Context, groups [][]*unit, rounds int) error {
+	for r := 1; r <= rounds; r++ {
+		s.env.Loads = append(s.env.Loads, loadAverages())
+		sides := []Side{Base, Head}
+		if r%2 == 0 {
+			sides = []Side{Head, Base}
+		}
+		for _, units := range groups {
+			for _, u := range units {
+				if u.state != Measured || r > u.group.Rounds {
+					continue
+				}
+				for _, side := range sides {
+					out, err := s.bench(ctx, u, r, side)
+					if err != nil && side == Head {
+						return fmt.Errorf("group %q, package %q: head run in round %d failed: %w", u.group.Name, u.pkg, r, err)
+					}
+					if err != nil {
+						u.state, u.samples = BaseFailed, nil
+						break
+					}
+					u.samples[side] = append(u.samples[side], out...)
+				}
+			}
+		}
+	}
+	// A cancelled base run would otherwise pass for a base failure.
+	return ctx.Err()
 }
 
 var groupName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
