@@ -115,20 +115,25 @@ func comparison(b *strings.Builder, o options, cfg config, res result) {
 			}
 			var rows [][]string
 			for _, r := range res.first.verdicts[g.Name].Rows {
-				delta, p := "", ""
-				if r.Class != verdict.New && r.Class != verdict.Removed {
-					delta, p = change(r.Delta), fmt.Sprintf("%.3f", r.P)
-				}
-				noisy := ""
-				if r.Noisy {
-					noisy = "noisy"
-				}
-				rows = append(rows, []string{r.Pkg, r.Name, r.Metric, side(r.Base, r.Metric), side(r.Head, r.Metric),
-					delta, p, fmt.Sprintf("%d+%d", r.Base.N, r.Head.N), string(r.Class), noisy})
+				rows = append(rows, cells(r))
 			}
 			table(b, []string{"Package", "Benchmark", "Metric", "Base", "Head", "Delta", "p", "n", "Class", "Noisy"}, rows)
 		}
 	}
+}
+
+// cells are a compared row as the comparison shows it.
+func cells(r verdict.Row) []string {
+	delta, p := "", ""
+	if r.Class != verdict.New && r.Class != verdict.Removed {
+		delta, p = change(r.Delta), fmt.Sprintf("%.3f", r.P)
+	}
+	noisy := ""
+	if r.Noisy {
+		noisy = "noisy"
+	}
+	return []string{r.Pkg, r.Name, r.Metric, side(r.Base, r.Metric), side(r.Head, r.Metric),
+		delta, p, fmt.Sprintf("%d+%d", r.Base.N, r.Head.N), string(r.Class), noisy}
 }
 
 func notMeasured(b *strings.Builder, res result) {
