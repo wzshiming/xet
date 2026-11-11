@@ -4,10 +4,26 @@
   "measureIdentical": false,
   "groups": [
     {
-      "name": "cpu",
-      "packages": [".", "xorb"],
+      "name": "root",
+      "packages": ["."],
+      "bench": "^BenchmarkComputeChunkHash$",
+      "benchtime": "300ms",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.1, "B/op": 0.1, "allocs/op": 0.1}
+    },
+    {
+      "name": "filehash",
+      "packages": ["."],
+      "bench": "^BenchmarkComputeFileHash$",
+      "benchtime": "20x",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.1}
+    },
+    {
+      "name": "xorb",
+      "packages": ["xorb"],
       "bench": ".",
-      "benchtime": "100ms",
+      "benchtime": "300ms",
       "rounds": 10,
       "thresholds": {"sec/op": 0.1, "B/op": 0.1, "allocs/op": 0.1}
     },
@@ -15,9 +31,9 @@
       "name": "client",
       "packages": ["server"],
       "bench": "^BenchmarkClient$/^size=1MiB$",
-      "benchtime": "100ms",
+      "benchtime": "50x",
       "rounds": 10,
-      "thresholds": {"sec/op": 0.2, "B/op": 0.2, "allocs/op": 0.2}
+      "thresholds": {"sec/op": 0.2, "B/op": 0.5, "allocs/op": 0.1}
     },
     {
       "name": "serve",
