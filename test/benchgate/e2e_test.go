@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -93,11 +94,14 @@ var synth = map[string]string{
 }
 
 var (
-	slowWork  = map[string]string{"a/a.go": fmt.Sprintf(packageA, "", 2)}
-	allocWork = map[string]string{"a/a.go": fmt.Sprintf(packageA, "keep = new([16]byte)", 1)}
-	slowMix   = map[string]string{"b/b.go": fmt.Sprintf(packageB, 2)}
-	brokenA   = map[string]string{"a/a.go": "package a\n\nfunc Work(n int) int { return undefined }\n"}
-	withoutB  = map[string]string{"b/b.go": "", "b/b_test.go": ""}
+	slowWork       = map[string]string{"a/a.go": fmt.Sprintf(packageA, "", 2)}
+	allocWork      = map[string]string{"a/a.go": fmt.Sprintf(packageA, "keep = new([16]byte)", 1)}
+	slowMix        = map[string]string{"b/b.go": fmt.Sprintf(packageB, 2)}
+	brokenA        = map[string]string{"a/a.go": "package a\n\nfunc Work(n int) int { return undefined }\n"}
+	withoutB       = map[string]string{"b/b.go": "", "b/b_test.go": ""}
+	withoutBTests  = map[string]string{"b/b_test.go": ""}
+	failingMix     = map[string]string{"b/b_test.go": "package b\n\nimport \"testing\"\n\nfunc BenchmarkMix(b *testing.B) { b.Fatal(\"failed on purpose\") }\n"}
+	failingSlowMix = map[string]string{"b/b.go": slowMix["b/b.go"], "b/b_test.go": failingMix["b/b_test.go"]}
 )
 
 // judgeAll judges every metric at a threshold the tests' 2x effects exceed and machine noise does not.
@@ -155,17 +159,44 @@ type outcome struct {
 	out            string // output directory
 }
 
+// commandLine is the command's arguments for base, head, config and output directory out, then flags.
+func commandLine(base, head, config, out string, flags []string) []string {
+	return append([]string{
+		"-base", base, "-head", head, "-base-label", "base-commit", "-head-label", "head-commit",
+		"-config", config, "-out", out,
+	}, flags...)
+}
+
 // command runs the command on base and head with a configuration, a new output directory and flags.
 func command(t *testing.T, sampleRun sampler, base, head, config string, flags ...string) outcome {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "out")
-	args := append([]string{
-		"-base", base, "-head", head, "-base-label", "base-commit", "-head-label", "head-commit",
-		"-config", config, "-out", out,
-	}, flags...)
 	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), args, &stdout, &stderr, sampleRun)
+	code := run(t.Context(), commandLine(base, head, config, out, flags), &stdout, &stderr, sampleRun)
 	return outcome{code: code, report: stdout.String(), stderr: stderr.String(), out: out}
+}
+
+// buildCommand builds the command into a new directory and returns its path.
+func buildCommand(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "benchgate")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// process runs the built command bin as a script would, otherwise as command does.
+func process(t *testing.T, bin, base, head, config string, flags ...string) outcome {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "out")
+	cmd := exec.Command(bin, commandLine(base, head, config, out, flags)...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil && cmd.ProcessState == nil {
+		t.Fatal(err)
+	}
+	return outcome{code: cmd.ProcessState.ExitCode(), report: stdout.String(), stderr: stderr.String(), out: out}
 }
 
 func wantCode(t *testing.T, o outcome, want int) {
@@ -298,5 +329,34 @@ func TestBaseWithoutAPackagePassesAndSaysSo(t *testing.T) {
 	wantCode(t, o, 0)
 	if notMeasured := rows(section(t, o.report, "## Not measured")); !hasRow(notMeasured, "b", "base has no such package") {
 		t.Errorf("not measured %q, want package b for a base without it", notMeasured)
+	}
+}
+
+func TestBuiltCommandExitsTwoUnlessOnlyTheBaseFails(t *testing.T) {
+	t.Parallel()
+	bin := buildCommand(t)
+	for _, c := range []struct {
+		name       string
+		base, head map[string]string
+		code       int
+	}{
+		{"benchmark failing on both sides", failingMix, failingSlowMix, 2},
+		{"benchmark failing on the head side", nil, failingMix, 2},
+		{"benchmark failing on the base side", failingMix, nil, 0},
+		{"package without test files on both sides", withoutBTests, withoutBTests, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			o := process(t, bin, tree(t, c.base), tree(t, c.head), writeConfig(t, judgeAll))
+			wantCode(t, o, c.code)
+			if c.code == 2 && !strings.Contains(o.stderr, `package "b": head`) {
+				t.Errorf("stderr %q does not name the head side of package b", o.stderr)
+			}
+			if c.code == 0 {
+				if notMeasured := rows(section(t, o.report, "## Not measured")); !hasRow(notMeasured, "b", "base failed to build or run") {
+					t.Errorf("not measured %q, want package b for its failing base", notMeasured)
+				}
+			}
+		})
 	}
 }
