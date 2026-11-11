@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"slices"
 
 	"github.com/wzshiming/xet/test/benchgate/sample"
 	"github.com/wzshiming/xet/test/benchgate/verdict"
@@ -10,8 +11,8 @@ import (
 
 // result is what a gate run found.
 type result struct {
-	first     pass
-	confirmed []finding
+	first, recheck pass
+	suspects       []suspect
 }
 
 // pass is a sampling of groups and the comparison of each group with samples.
@@ -20,27 +21,64 @@ type pass struct {
 	verdicts map[string]verdict.Result // by group name
 }
 
-// finding is a row of a group.
-type finding struct {
-	group string
-	row   verdict.Row
+// suspect is a row of a group that regressed in the first pass.
+type suspect struct {
+	group          string
+	first, recheck verdict.Row // recheck is zero when the re-check has no such row
 }
 
-// gate samples the configured groups of base and head into out and judges them.
+// split divides the suspects into those the re-check found regressed too and the others.
+func (r result) split() (confirmed, excluded []suspect) {
+	for _, s := range r.suspects {
+		if s.recheck.Class == verdict.Regression {
+			confirmed = append(confirmed, s)
+		} else {
+			excluded = append(excluded, s)
+		}
+	}
+	return confirmed, excluded
+}
+
+// gate samples the configured groups of base and head into out and judges them, then samples the
+// rows that regressed again and judges those samples alone.
 func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out string) (result, error) {
 	req := sample.Request{Base: base, Head: head, MeasureIdentical: cfg.MeasureIdentical, Out: filepath.Join(out, "first")}
 	for _, g := range cfg.Groups {
 		req.Groups = append(req.Groups, sample.Group{Name: g.Name, Packages: g.Packages, Bench: g.Bench, Benchtime: g.Benchtime, Rounds: g.Rounds})
 	}
-	first, err := measure(ctx, sampleRun, cfg, req)
-	if err != nil {
+	var res result
+	var err error
+	if res.first, err = measure(ctx, sampleRun, cfg, req); err != nil {
 		return result{}, err
 	}
-	res := result{first: first}
-	for _, g := range cfg.Groups {
-		for _, row := range first.verdicts[g.Name].Rows {
-			if row.Class == verdict.Regression {
-				res.confirmed = append(res.confirmed, finding{group: g.Name, row: row})
+
+	recheck := req
+	recheck.Groups, recheck.Out = nil, filepath.Join(out, "recheck")
+	for _, g := range req.Groups {
+		for _, row := range res.first.verdicts[g.Name].Rows {
+			if row.Class != verdict.Regression {
+				continue
+			}
+			res.suspects = append(res.suspects, suspect{group: g.Name, first: row})
+			if n := len(recheck.Groups); n == 0 || recheck.Groups[n-1].Name != g.Name {
+				recheck.Groups = append(recheck.Groups, g)
+			}
+			last := &recheck.Groups[len(recheck.Groups)-1]
+			if r := (sample.Row{Pkg: row.Pkg, Name: row.Name}); !slices.Contains(last.Rows, r) {
+				last.Rows = append(last.Rows, r)
+			}
+		}
+	}
+	if len(res.suspects) == 0 {
+		return res, nil
+	}
+	if res.recheck, err = measure(ctx, sampleRun, cfg, recheck); err != nil {
+		return result{}, err
+	}
+	for i, s := range res.suspects {
+		for _, row := range res.recheck.verdicts[s.group].Rows {
+			if row.Key == s.first.Key {
+				res.suspects[i].recheck = row
 			}
 		}
 	}

@@ -76,5 +76,6 @@ func (o options) gate(ctx context.Context, sampleRun sampler) (report []byte, re
 	if err != nil {
 		return nil, false, err
 	}
-	return render(cfg, res), len(res.confirmed) > 0, nil
+	confirmed, _ := res.split()
+	return render(cfg, res), len(confirmed) > 0, nil
 }

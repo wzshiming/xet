@@ -17,12 +17,11 @@ var reasons = map[sample.State]string{
 // render is the Markdown report of res.
 func render(cfg config, res result) []byte {
 	var b strings.Builder
+	confirmed, excluded := res.split()
 	b.WriteString("# Benchmark gate\n\n## Confirmed regressions\n\n")
-	var confirmed [][]string
-	for _, f := range res.confirmed {
-		confirmed = append(confirmed, []string{f.group, f.row.Pkg, f.row.Name, f.row.Metric})
-	}
-	table(&b, []string{"Group", "Package", "Benchmark", "Metric"}, confirmed)
+	suspects(&b, confirmed)
+	b.WriteString("## Excluded after re-check\n\n")
+	suspects(&b, excluded)
 
 	b.WriteString("## Comparison\n\n")
 	for _, reportOnly := range []bool{false, true} {
@@ -54,6 +53,15 @@ func render(cfg config, res result) []byte {
 	}
 	table(&b, []string{"Group", "Package", "Reason"}, unmeasured)
 	return []byte(b.String())
+}
+
+// suspects writes a table of suspects.
+func suspects(b *strings.Builder, list []suspect) {
+	var rows [][]string
+	for _, s := range list {
+		rows = append(rows, []string{s.group, s.first.Pkg, s.first.Name, s.first.Metric})
+	}
+	table(b, []string{"Group", "Package", "Benchmark", "Metric"}, rows)
 }
 
 // table writes a Markdown table of header and rows, or "None." without rows.
