@@ -63,7 +63,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sampleRun
 		fmt.Fprintf(stderr, "benchgate: unexpected argument %q\n", fs.Arg(0))
 		return exitError
 	}
-	report, regressed, err := o.gate(ctx, sampleRun)
+	report, regressed, err := o.gate(ctx, sampleRun, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "benchgate:", err)
 		return exitError
@@ -75,8 +75,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sampleRun
 	return exitPass
 }
 
-// gate runs the gate and renders its report; regressed tells whether a regression is confirmed.
-func (o options) gate(ctx context.Context, sampleRun sampler) (report []byte, regressed bool, err error) {
+// gate runs the gate, warning on stderr, and renders its report; regressed tells whether a regression is confirmed.
+func (o options) gate(ctx context.Context, sampleRun sampler, stderr io.Writer) (report []byte, regressed bool, err error) {
 	for _, f := range []struct{ name, value string }{
 		{"-base", o.base}, {"-head", o.head}, {"-base-label", o.baseLabel}, {"-head-label", o.headLabel},
 		{"-config", o.config}, {"-out", o.out},
@@ -103,7 +103,7 @@ func (o options) gate(ctx context.Context, sampleRun sampler) (report []byte, re
 	if err := os.MkdirAll(o.out, 0o755); err != nil {
 		return nil, false, err
 	}
-	res, err := gate(ctx, sampleRun, cfg, o.base, o.head, o.out)
+	res, err := gate(ctx, sampleRun, cfg, o.base, o.head, o.out, stderr)
 	if err != nil {
 		return nil, false, err
 	}

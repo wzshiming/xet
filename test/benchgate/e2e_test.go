@@ -356,6 +356,9 @@ func TestBuiltCommandExitsTwoUnlessOnlyTheBaseFails(t *testing.T) {
 				if notMeasured := rows(section(t, o.report, "## Not measured")); !hasRow(notMeasured, "b", "base failed to build or run") {
 					t.Errorf("not measured %q, want package b for its failing base", notMeasured)
 				}
+				if !strings.Contains(o.stderr, "failed on purpose") {
+					t.Errorf("stderr %q does not say why the base failed", o.stderr)
+				}
 			}
 		})
 	}

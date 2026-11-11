@@ -424,6 +424,35 @@ func TestBaseBuildFailureIsBaseFailed(t *testing.T) {
 	wantStates(t, res, map[string]sample.State{"synth:a": sample.Measured, "synth:b": sample.BaseFailed})
 }
 
+func TestBaseFailedSaysWhy(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		base map[string]string
+		why  []string
+	}{
+		{"build", map[string]string{"b/b.go": brokenB}, []string{"build failed", "undefined"}},
+		{"no test files", map[string]string{"b/b_test.go": ""}, []string{"build failed", "no test files"}},
+		{"run", map[string]string{"b/b_test.go": failsFromRun(1)}, []string{"run in round 1 failed", "failed on purpose"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			res := run(t, request(t, tree(t, c.base), tree(t, changedA), 2))
+			wantStates(t, res, map[string]sample.State{"synth:a": sample.Measured, "synth:b": sample.BaseFailed})
+			for _, p := range res.Groups[0].Packages {
+				if p.Package != "b" {
+					continue
+				}
+				for _, w := range c.why {
+					if !strings.Contains(p.Reason, w) {
+						t.Errorf("reason %q does not say %q", p.Reason, w)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestHeadRunFailureIsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := sample.Run(t.Context(), request(t, tree(t, nil), tree(t, map[string]string{"b/b_test.go": failsOnSecondRun}), 2))

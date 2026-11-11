@@ -171,6 +171,24 @@ func TestRechecksOnlyWithSuspects(t *testing.T) {
 	}
 }
 
+func TestBaseFailureReasonGoesToStderrNotTheReport(t *testing.T) {
+	t.Parallel()
+	const reason = "run in round 1 failed: exit status 1\n/home/runner/work/xet/p/p_test.go:12: boom"
+	states := []sample.Status{{Package: "p", State: sample.BaseFailed, Reason: reason}, {Package: "q", State: sample.Identical}}
+	f := &fake{passes: []map[string]canned{{"cpu": {states: states}}}}
+	o := command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t))
+	wantCode(t, o, 0)
+	if want := `group "cpu", package "p": base ` + reason; !strings.Contains(o.stderr, want) {
+		t.Errorf("stderr %q does not say %q", o.stderr, want)
+	}
+	if strings.Contains(o.report, "boom") || strings.Contains(o.report, "/home/runner") {
+		t.Errorf("report holds the reason:\n%s", o.report)
+	}
+	if notMeasured := rows(section(t, o.report, "## Not measured")); !hasRow(notMeasured, "cpu", "p", "base failed to build or run") {
+		t.Errorf("not measured %q, want package p for its failing base", notMeasured)
+	}
+}
+
 func TestBothPassesKeepTheirSamplesInTheOutputDirectory(t *testing.T) {
 	t.Parallel()
 	f := &fake{passes: []map[string]canned{{"cpu": regressed}, {"cpu": clean}}}

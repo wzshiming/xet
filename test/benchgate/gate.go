@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"path/filepath"
 	"slices"
 
@@ -50,15 +52,15 @@ func (r result) split() (confirmed, excluded []suspect) {
 }
 
 // gate samples the configured groups of base and head into out and judges them, then samples the
-// rows that regressed again and judges those samples alone.
-func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out string) (result, error) {
+// rows that regressed again and judges those samples alone; it warns on stderr.
+func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out string, stderr io.Writer) (result, error) {
 	req := sample.Request{Base: base, Head: head, MeasureIdentical: cfg.MeasureIdentical, Out: filepath.Join(out, "first")}
 	for _, g := range cfg.Groups {
 		req.Groups = append(req.Groups, sample.Group{Name: g.Name, Packages: g.Packages, Bench: g.Bench, Benchtime: g.Benchtime, Rounds: g.Rounds})
 	}
 	var res result
 	var err error
-	if res.first, err = measure(ctx, sampleRun, cfg, req); err != nil {
+	if res.first, err = measure(ctx, sampleRun, cfg, req, stderr); err != nil {
 		return result{}, err
 	}
 
@@ -83,7 +85,7 @@ func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out st
 	if len(res.suspects) == 0 {
 		return res, nil
 	}
-	if res.recheck, err = measure(ctx, sampleRun, cfg, recheck); err != nil {
+	if res.recheck, err = measure(ctx, sampleRun, cfg, recheck, stderr); err != nil {
 		return result{}, err
 	}
 	for i, s := range res.suspects {
@@ -96,14 +98,20 @@ func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out st
 	return res, nil
 }
 
-// measure samples as req says and compares each group with samples under its policy.
-func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Request) (pass, error) {
+// measure samples as req says and compares each group with samples under its policy; it says on
+// stderr why a base failed.
+func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Request, stderr io.Writer) (pass, error) {
 	res, err := sampleRun(ctx, req)
 	if err != nil {
 		return pass{}, err
 	}
 	p := pass{Result: res, verdicts: make(map[string]verdict.Result)}
 	for _, g := range res.Groups {
+		for _, s := range g.Packages {
+			if s.State == sample.BaseFailed {
+				fmt.Fprintf(stderr, "benchgate: group %q, package %q: base %s\n", g.Name, s.Package, s.Reason)
+			}
+		}
 		if g.Base == "" {
 			continue
 		}

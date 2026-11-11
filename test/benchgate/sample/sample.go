@@ -67,6 +67,7 @@ type GroupResult struct {
 type Status struct {
 	Package string
 	State   State
+	Reason  string // for BaseFailed, what failed with the go command's or the benchmark's output
 }
 
 // Unknown stands for an environment value that could not be read.
@@ -103,6 +104,7 @@ type binaries struct {
 	path       map[Side]string
 	importPath string // from the head binary
 	base       State  // BaseMissing or BaseFailed when there is no base binary
+	reason     string // why the base build failed
 	identical  bool
 }
 
@@ -113,6 +115,7 @@ type unit struct {
 	bins    *binaries
 	bench   string // -test.bench expression
 	state   State
+	reason  string // why the base failed
 	samples map[Side][]byte
 }
 
@@ -159,7 +162,7 @@ func (s *sampler) write(groups [][]*unit) (Result, error) {
 		var base, head []byte
 		measured := false
 		for _, u := range groups[i] {
-			gr.Packages = append(gr.Packages, Status{Package: u.pkg, State: u.state})
+			gr.Packages = append(gr.Packages, Status{Package: u.pkg, State: u.state, Reason: u.reason})
 			measured = measured || u.state == Measured
 			base = append(base, u.samples[Base]...)
 			head = append(head, u.samples[Head]...)
@@ -200,7 +203,7 @@ func (s *sampler) plan() ([][]*unit, int) {
 			}
 			switch {
 			case u.bins.base != "":
-				u.state = u.bins.base
+				u.state, u.reason = u.bins.base, u.bins.reason
 			case u.bins.identical && !s.req.MeasureIdentical:
 				u.state = Identical
 			default:
@@ -233,6 +236,7 @@ func (s *sampler) sample(ctx context.Context, groups [][]*unit, rounds int) erro
 					case err != nil:
 						// The head still runs: a failure on both sides is the head's.
 						u.state, u.samples = BaseFailed, nil
+						u.reason = strings.TrimSpace(fmt.Sprintf("run in round %d failed: %v", r, err))
 					case u.state == Measured:
 						u.samples[side] = append(u.samples[side], out...)
 					}
@@ -279,12 +283,11 @@ func (s *sampler) build(ctx context.Context, g, p string) error {
 			s.env.GoVersion = info.GoVersion
 		}
 	}
-	switch {
-	case !hasGoFiles(filepath.Join(s.req.Base, p)):
+	if !hasGoFiles(filepath.Join(s.req.Base, p)) {
 		b.base = BaseMissing
-	case s.compile(ctx, p, Base) != nil:
-		b.base = BaseFailed
-	default:
+	} else if err := s.compile(ctx, p, Base); err != nil {
+		b.base, b.reason = BaseFailed, strings.TrimSpace("build failed: "+err.Error())
+	} else {
 		b.identical = sameBytes(b.path[Base], b.path[Head])
 	}
 	return nil
