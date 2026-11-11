@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
@@ -84,8 +85,35 @@ func BenchmarkDouble(b *testing.B) {
 // changedA changes what package a compiles to.
 var changedA = map[string]string{"a/a.go": strings.Replace(synth["a/a.go"], "s += i", "s += 2 * i", 1)}
 
+// changedB changes what package b compiles to.
+var changedB = strings.Replace(synth["b/b.go"], "2 * n", "3 * n", 1)
+
 // brokenB does not compile.
 const brokenB = "package b\n\nfunc Double(n int) int { return undefined }\n"
+
+// failsFromRun is a benchmark of package b that fails from its nth process on, counted in the package directory.
+func failsFromRun(n int) string {
+	return fmt.Sprintf(`package b
+
+import (
+	"os"
+	"testing"
+)
+
+func BenchmarkDouble(b *testing.B) {
+	runs, _ := os.ReadFile("runs")
+	if err := os.WriteFile("runs", append(runs, '.'), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	if len(runs)+1 >= %d {
+		b.Fatal("failed on purpose")
+	}
+	for i := 0; i < b.N; i++ {
+		Double(i)
+	}
+}
+`, n)
+}
 
 // failsOnSecondRun is a benchmark of package b that fails from its second process on, in the package directory.
 const failsOnSecondRun = `package b
@@ -374,6 +402,35 @@ func TestHeadRunFailureIsAnError(t *testing.T) {
 	t.Parallel()
 	_, err := sample.Run(t.Context(), request(t, tree(t, nil), tree(t, map[string]string{"b/b_test.go": failsOnSecondRun}), 2))
 	wantError(t, err, `group "synth"`, `package "b"`, "head")
+}
+
+func TestRunFailureOnBothSidesIsAnErrorInAnyRound(t *testing.T) {
+	t.Parallel()
+	for n := 1; n <= 3; n++ {
+		t.Run(fmt.Sprintf("from run %d", n), func(t *testing.T) {
+			t.Parallel()
+			base := tree(t, map[string]string{"b/b_test.go": failsFromRun(n)})
+			head := tree(t, map[string]string{"b/b.go": changedB, "b/b_test.go": failsFromRun(n)})
+			_, err := sample.Run(t.Context(), request(t, base, head, 3))
+			wantError(t, err, `group "synth"`, `package "b"`, "head run", fmt.Sprintf("round %d", n))
+		})
+	}
+}
+
+func TestHeadRunsInTheRoundItsBaseFailed(t *testing.T) {
+	t.Parallel()
+	res := run(t, request(t, tree(t, map[string]string{"b/b_test.go": failsFromRun(1)}), tree(t, changedA), 3))
+	wantStates(t, res, map[string]sample.State{"synth:a": sample.Measured, "synth:b": sample.BaseFailed})
+	var runs []sample.Step
+	for _, s := range res.Env.Order {
+		if s.Round > 0 && s.Package == "b" {
+			runs = append(runs, s)
+		}
+	}
+	want := []sample.Step{{Round: 1, Group: "synth", Package: "b", Side: sample.Base}, {Round: 1, Group: "synth", Package: "b", Side: sample.Head}}
+	if !slices.Equal(runs, want) {
+		t.Errorf("runs of package b %+v, want %+v", runs, want)
+	}
 }
 
 func TestFailingUnitTestDoesNotStopSampling(t *testing.T) {

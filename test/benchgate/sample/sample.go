@@ -227,14 +227,15 @@ func (s *sampler) sample(ctx context.Context, groups [][]*unit, rounds int) erro
 				}
 				for _, side := range sides {
 					out, err := s.bench(ctx, u, r, side)
-					if err != nil && side == Head {
+					switch {
+					case err != nil && side == Head:
 						return fmt.Errorf("group %q, package %q: head run in round %d failed: %w", u.group.Name, u.pkg, r, err)
-					}
-					if err != nil {
+					case err != nil:
+						// The head still runs: a failure on both sides is the head's.
 						u.state, u.samples = BaseFailed, nil
-						break
+					case u.state == Measured:
+						u.samples[side] = append(u.samples[side], out...)
 					}
-					u.samples[side] = append(u.samples[side], out...)
 				}
 			}
 		}
