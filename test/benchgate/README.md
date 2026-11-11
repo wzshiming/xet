@@ -19,7 +19,7 @@ same metric.
 | --- | --- |
 | 0 | no confirmed regression |
 | 1 | at least one confirmed regression |
-| 2 | nothing to conclude: a head build or benchmark failed, a measured group has no benchmark row on the head side, or the configuration or command line is wrong |
+| 2 | nothing to conclude: a head build or benchmark failed, a measured group has no benchmark row on the head side, the configuration or command line is wrong, or SIGINT or SIGTERM stopped the run |
 
 A base tree that lacks a package, or whose package fails to build or run, is
 not a failure: the report lists the package as not measured, and the command
@@ -28,6 +28,9 @@ head's and exits 2, whichever side ran first; so does a package without test
 files, of which `go test` builds no test binary. A malformed line in the base
 samples, such as one a base benchmark printed to standard output, is left out
 with a warning on standard error; in the head samples it exits 2.
+
+SIGINT and SIGTERM stop the run: the gate kills the benchmark or build in
+progress, removes the test binaries it built and exits 2.
 
 ## Running it locally
 

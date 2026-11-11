@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/wzshiming/xet/test/benchgate/sample"
 )
@@ -26,7 +28,10 @@ const (
 type sampler func(context.Context, sample.Request) (sample.Result, error)
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr, sample.Run))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr, sample.Run)
+	stop()
+	os.Exit(code)
 }
 
 // options are the command line's values.
