@@ -31,6 +31,10 @@ jobs:
     name: Benchmark gate
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        repeat: [ 1, 2, 3 ]
 
     steps:
     - name: Check out the head
@@ -98,5 +102,5 @@ jobs:
       if: ${{ !cancelled() && steps.gate.outcome != 'skipped' }}
       uses: actions/upload-artifact@v4
       with:
-        name: bench-gate-${{ github.run_attempt }}
+        name: bench-gate-repeat-${{ matrix.repeat }}-attempt-${{ github.run_attempt }}
         path: ${{ runner.temp }}/gate
