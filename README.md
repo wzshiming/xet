@@ -31,7 +31,18 @@ Implemented in this repository:
 
 Every pull request to master runs the **Benchmark gate** check ([workflow](.github/workflows/bench-gate.yml)). On one runner, [benchgate](test/benchgate/README.md) builds the benchmarks' test binaries of the pull request merged into master and of the master commit it merges into, and runs the two sides in alternating rounds. Packages whose two test binaries are identical are not measured, so a pull request that changes no benchmarked code passes without running a benchmark, and its summary says nothing was measured.
 
-[.github/bench-gate.json](.github/bench-gate.json) says what is judged, each group with its own thresholds: time, bytes and allocations per operation (`sec/op`, `B/op`, `allocs/op`) of every benchmark in the root and `xorb` packages, and of the 1 MiB rows of `BenchmarkClient`, one per class, operation and protocol version. A row regresses when its change is statistically significant and larger than the threshold; a regression fails the check only when a re-check with fresh samples of the row regresses it again. The 1 MiB rows of `BenchmarkServe` and the rows of `BenchmarkReconstructedFile` are only reported.
+[.github/bench-gate.json](.github/bench-gate.json) sorts the benchmarks into groups. Each group runs its benchmarks 10 times on each side, every run with the group's `-benchtime`, and judges time, bytes and allocations per operation (`sec/op`, `B/op`, `allocs/op`) against the group's thresholds, set from A/A runs on GitHub's runners:
+
+| Group | Benchmarks | Benchtime | Judged |
+| --- | --- | --- | --- |
+| `root` | `BenchmarkComputeChunkHash` | 300ms | `sec/op` +10%, `B/op` +10%, `allocs/op` +10% |
+| `filehash` | `BenchmarkComputeFileHash` | 20x | `sec/op` +10% |
+| `xorb` | every benchmark in `xorb` | 300ms | `sec/op` +10%, `B/op` +10%, `allocs/op` +10% |
+| `client` | the 1 MiB rows of `BenchmarkClient`, one per class, operation and protocol version | 50x | `sec/op` +20%, `B/op` +50%, `allocs/op` +10% |
+| `serve` | the 1 MiB rows of `BenchmarkServe` | 100ms | only reported |
+| `storage` | `BenchmarkReconstructedFile` | 100ms | only reported |
+
+A row regresses when its change is statistically significant and larger than the threshold; a regression fails the check only when a re-check with fresh samples of the row regresses it again. Benchmarks that take milliseconds per operation run a fixed number of iterations, `20x` or `50x`, rather than for a duration, so that every sample spreads its slow first iterations and one-off allocations over the same count. The bytes and allocations of `BenchmarkComputeFileHash` vary between runs of the same binary, so the report shows them without judging them.
 
 When the check is red:
 
@@ -40,7 +51,7 @@ When the check is red:
 - Reproduce the run locally as [test/benchgate/README.md](test/benchgate/README.md) shows, with the base commit the report names and the pull request merged into it as the head.
 - There is no override: the check stays red, and a maintainer decides whether to merge anyway.
 
-A new benchmark in the root or `xorb` package is judged as it is. Elsewhere, add its package and `-bench` pattern to a group of .github/bench-gate.json or add a group, in the format of [test/benchgate/README.md](test/benchgate/README.md#configuration): a judged group needs at least 10 rounds and thresholds that A/A runs on GitHub's runners pass, and a group with `"reportOnly": true` is compared without being judged. A pull request that only changes the configuration builds identical test binaries, so check the pattern with a manual run: Actions, Benchmark gate, Run workflow, with the branch as head. A manual run compares master with itself by default and measures identical test binaries too; a group whose pattern selects no benchmark fails it.
+A new benchmark in `xorb` is judged as it is, in the `xorb` group. A new benchmark in the root package is judged once its name joins the pattern of the `root` group, or of a group of its own when it takes milliseconds per operation. Elsewhere, add its package and `-bench` pattern to a group of .github/bench-gate.json or add a group, in the format of [test/benchgate/README.md](test/benchgate/README.md#configuration): a group of benchmarks taking microseconds per operation runs for `300ms`, one taking milliseconds a fixed count such as `50x`. A judged group needs at least 10 rounds and thresholds that A/A runs on GitHub's runners pass, so a metric that varies between such runs gets no threshold; a group with `"reportOnly": true` is compared without being judged. A pull request that only changes the configuration builds identical test binaries, so check the pattern with a manual run: Actions, Benchmark gate, Run workflow, with the branch as head. A manual run compares master with itself by default and measures identical test binaries too; a group whose pattern selects no benchmark fails it.
 
 ## License
 
