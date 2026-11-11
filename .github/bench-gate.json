@@ -1,0 +1,39 @@
+{
+  "alpha": 0.05,
+  "minSamples": 10,
+  "measureIdentical": false,
+  "groups": [
+    {
+      "name": "cpu",
+      "packages": [".", "xorb"],
+      "bench": ".",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.1, "B/op": 0.1, "allocs/op": 0.1}
+    },
+    {
+      "name": "client",
+      "packages": ["server"],
+      "bench": "^BenchmarkClient$/^size=1MiB$",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.2, "B/op": 0.2, "allocs/op": 0.2}
+    },
+    {
+      "name": "serve",
+      "packages": ["server"],
+      "bench": "^BenchmarkServe$/^size=1MiB$",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "reportOnly": true
+    },
+    {
+      "name": "storage",
+      "packages": ["storage"],
+      "bench": "^BenchmarkReconstructedFile$",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "reportOnly": true
+    }
+  ]
+}

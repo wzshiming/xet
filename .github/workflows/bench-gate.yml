@@ -1,0 +1,99 @@
+name: Benchmark gate
+
+on:
+  pull_request:
+    branches: [ master ]
+    types: [ opened, synchronize, reopened ]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref
+        required: true
+        default: master
+      head:
+        description: Head ref, benchmarked against the base
+        required: true
+        default: master
+      measure-identical:
+        description: Measure packages whose test binaries are identical too
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Benchmark gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Check out the head
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.head }}
+        path: head
+        fetch-depth: 2
+        persist-credentials: false
+
+    - name: Find the base of the merge
+      id: merge
+      if: github.event_name == 'pull_request'
+      run: echo "base=$(git -C head rev-parse --verify 'HEAD^1')" >> "$GITHUB_OUTPUT"
+
+    - name: Check out the base
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ steps.merge.outputs.base || inputs.base }}
+        path: base
+        persist-credentials: false
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: head/go.mod
+        # The gate's -trimpath builds would not hit the Tests workflow's cache.
+        cache: false
+
+    - name: Build the gate
+      run: go -C head/test/benchgate build -o "$RUNNER_TEMP/benchgate" .
+
+    - name: Run the gate
+      id: gate
+      env:
+        MEASURE_IDENTICAL: ${{ inputs.measure-identical }}
+      run: |
+        mkdir "$RUNNER_TEMP/gate"
+        flags=()
+        if [ -n "$MEASURE_IDENTICAL" ]; then
+          flags+=("-measure-identical=$MEASURE_IDENTICAL")
+        fi
+        base=$(git -C base rev-parse HEAD)
+        head=$(git -C head rev-parse HEAD)
+        code=0
+        "$RUNNER_TEMP/benchgate" -base "$GITHUB_WORKSPACE/base" -head "$GITHUB_WORKSPACE/head" \
+          -base-label "$base" -head-label "$head" \
+          -config "$GITHUB_WORKSPACE/head/.github/bench-gate.json" -out "$RUNNER_TEMP/gate/out" \
+          "${flags[@]}" 2> "$RUNNER_TEMP/gate/stderr.txt" || code=$?
+        cat "$RUNNER_TEMP/gate/stderr.txt" >&2
+        if [ "$code" -le 1 ]; then
+          cat "$RUNNER_TEMP/gate/out/report.md" >> "$GITHUB_STEP_SUMMARY"
+        else
+          {
+            printf '# Benchmark gate\n\n**FAIL**: nothing to conclude, the gate exited %d:\n\n' "$code"
+            sed 's/^/    /' "$RUNNER_TEMP/gate/stderr.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        exit "$code"
+
+    - name: Upload the samples and the report
+      if: ${{ !cancelled() && steps.gate.outcome != 'skipped' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-gate-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/gate
