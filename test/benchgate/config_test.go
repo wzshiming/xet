@@ -62,6 +62,9 @@ func TestConfigErrorsExitTwoNamingTheField(t *testing.T) {
 		{"no groups", func(c map[string]any, _ []map[string]any) { c["groups"] = []any{} }, "groups:"},
 		{"group without packages", func(_ map[string]any, g []map[string]any) { delete(g[0], "packages") }, "groups[0].packages:"},
 		{"empty benchmark expression", func(_ map[string]any, g []map[string]any) { g[1]["bench"] = "" }, "groups[1].bench:"},
+		{"benchtime neither a duration nor a count", func(_ map[string]any, g []map[string]any) { g[0]["benchtime"] = "soon" }, "groups[0].benchtime:"},
+		{"benchtime of no iterations", func(_ map[string]any, g []map[string]any) { g[1]["benchtime"] = "0x" }, "groups[1].benchtime:"},
+		{"negative benchtime", func(_ map[string]any, g []map[string]any) { g[1]["benchtime"] = "-1s" }, "groups[1].benchtime:"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()

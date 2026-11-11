@@ -8,7 +8,9 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wzshiming/xet/test/benchgate/verdict"
 )
@@ -84,6 +86,8 @@ func (g group) validate(minSamples int) error {
 		return errors.New("thresholds: set in a reportOnly group")
 	case !g.ReportOnly && len(g.Thresholds) == 0:
 		return errors.New("thresholds: none, want some or reportOnly")
+	case g.Benchtime != "" && !validBenchtime(g.Benchtime):
+		return fmt.Errorf("benchtime: %q, want a duration such as 100ms or a count such as 10x", g.Benchtime)
 	}
 	if _, err := regexp.Compile(g.Bench); err != nil {
 		return fmt.Errorf("bench: %w", err)
@@ -104,6 +108,16 @@ func (g group) validate(minSamples int) error {
 		return fmt.Errorf("rounds: %d, fewer than minSamples %d, so no row would be judged", g.Rounds, minSamples)
 	}
 	return nil
+}
+
+// validBenchtime tells whether go test takes s as -benchtime: a positive duration or count.
+func validBenchtime(s string) bool {
+	if n, ok := strings.CutSuffix(s, "x"); ok {
+		c, err := strconv.ParseInt(n, 10, 0)
+		return err == nil && c > 0
+	}
+	d, err := time.ParseDuration(s)
+	return err == nil && d > 0
 }
 
 // only keeps just the groups named in names.

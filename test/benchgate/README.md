@@ -100,7 +100,7 @@ The configuration is JSON; an unknown field is an error.
 | `groups[].name` | letters, digits, `_`, `-` and `.`, starting with a letter, digit or `_`; names the group's sample files |
 | `groups[].packages` | package directories relative to the tree roots |
 | `groups[].bench` | the `go test -bench` regular expression, not empty |
-| `groups[].benchtime` | the `go test -benchtime` value, empty for Go's default |
+| `groups[].benchtime` | the `go test -benchtime` value, a positive duration such as `100ms` or count such as `10x`; empty for Go's default |
 | `groups[].rounds` | samples of each row on each side; at least 10 and at least `minSamples` in a judged group |
 | `groups[].thresholds` | judged metric, `sec/op`, `B/op` or `allocs/op`, to the least relative increase that is a regression: 0.1 for 10% |
 | `groups[].reportOnly` | `true` for a group compared without being judged, in place of `thresholds` |
