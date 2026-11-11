@@ -144,27 +144,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		}
 	}
 
-	groups := make([][]*unit, len(req.Groups))
-	rounds := 0
-	for i, g := range req.Groups {
-		for _, p := range g.Packages {
-			u := &unit{group: g, pkg: p, bins: s.bins[p], bench: g.Bench, state: Measured, samples: make(map[Side][]byte)}
-			if len(g.Rows) > 0 {
-				if u.bench = selection(g.Rows, u.bins.importPath, s.procs); u.bench == "" {
-					continue
-				}
-			}
-			switch {
-			case u.bins.base != "":
-				u.state = u.bins.base
-			case u.bins.identical && !req.MeasureIdentical:
-				u.state = Identical
-			default:
-				rounds = max(rounds, g.Rounds)
-			}
-			groups[i] = append(groups[i], u)
-		}
-	}
+	groups, rounds := s.plan()
 	for r := 1; r <= rounds; r++ {
 		s.env.Loads = append(s.env.Loads, loadAverages())
 		sides := []Side{Base, Head}
@@ -226,6 +206,32 @@ func (s *sampler) tree(side Side) string {
 		return s.req.Base
 	}
 	return s.req.Head
+}
+
+// plan lists each group's units and the number of rounds the measured ones need.
+func (s *sampler) plan() ([][]*unit, int) {
+	groups := make([][]*unit, len(s.req.Groups))
+	rounds := 0
+	for i, g := range s.req.Groups {
+		for _, p := range g.Packages {
+			u := &unit{group: g, pkg: p, bins: s.bins[p], bench: g.Bench, state: Measured, samples: make(map[Side][]byte)}
+			if len(g.Rows) > 0 {
+				if u.bench = selection(g.Rows, u.bins.importPath, s.procs); u.bench == "" {
+					continue
+				}
+			}
+			switch {
+			case u.bins.base != "":
+				u.state = u.bins.base
+			case u.bins.identical && !s.req.MeasureIdentical:
+				u.state = Identical
+			default:
+				rounds = max(rounds, g.Rounds)
+			}
+			groups[i] = append(groups[i], u)
+		}
+	}
+	return groups, rounds
 }
 
 var groupName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
