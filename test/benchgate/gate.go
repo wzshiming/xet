@@ -122,7 +122,9 @@ func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Requ
 		if v.Skipped > 0 {
 			fmt.Fprintf(stderr, "benchgate: group %q: malformed base sample lines left out: %d\n", g.Name, v.Skipped)
 		}
-		if !slices.ContainsFunc(v.Rows, func(r verdict.Row) bool { return r.Head.N > 0 }) {
+		// An unmeasured package may hold every row the group's pattern selects.
+		allMeasured := !slices.ContainsFunc(g.Packages, func(s sample.Status) bool { return s.State != sample.Measured })
+		if allMeasured && !slices.ContainsFunc(v.Rows, func(r verdict.Row) bool { return r.Head.N > 0 }) {
 			return pass{}, fmt.Errorf("group %q: its benchmarks gave no row on the head side", g.Name)
 		}
 		p.verdicts[g.Name] = v

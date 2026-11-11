@@ -363,3 +363,29 @@ func TestBuiltCommandExitsTwoUnlessOnlyTheBaseFails(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupWithoutHeadRowsExitsTwoOnlyWhenEveryPackageWasMeasured(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, bench string
+		flags       []string
+		code        int
+	}{
+		{"pattern matching only in an identical package", "^BenchmarkWork$", nil, 0},
+		{"pattern matching in no package", "^BenchmarkNone$", []string{"-measure-identical"}, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			config := filepath.Join(t.TempDir(), "gate.json")
+			writeFile(t, config, `{"alpha": 0.05, "minSamples": 10, "groups": [
+	{"name": "cpu", "packages": ["a", "b"], "bench": "`+c.bench+`", "rounds": 10, "thresholds": `+judgeAll+`}
+]}
+`)
+			o := command(t, sample.Run, tree(t, nil), tree(t, slowMix), config, c.flags...)
+			wantCode(t, o, c.code)
+			if c.code == 2 && !strings.Contains(o.stderr, `group "cpu"`) {
+				t.Errorf("stderr %q does not name group cpu", o.stderr)
+			}
+		})
+	}
+}

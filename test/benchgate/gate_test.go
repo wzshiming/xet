@@ -196,6 +196,30 @@ func TestMeasuredGroupWithoutHeadRowsExitsTwo(t *testing.T) {
 	}
 }
 
+func TestPartlyMeasuredGroupWithoutHeadRowsPasses(t *testing.T) {
+	t.Parallel()
+	for _, state := range []sample.State{sample.Identical, sample.BaseMissing, sample.BaseFailed} {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			states := []sample.Status{{Package: "p", State: sample.Measured}, {Package: "q", State: state}}
+			f := &fake{passes: []map[string]canned{{"cpu": {base: "PASS\n", head: "PASS\n", states: states}}}}
+			wantCode(t, command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t)), 0)
+		})
+	}
+}
+
+func TestRecheckWithoutHeadRowsExitsTwo(t *testing.T) {
+	t.Parallel()
+	// The re-check samples only package p, which holds the suspect.
+	recheck := canned{base: "PASS\n", head: "PASS\n", states: []sample.Status{{Package: "p", State: sample.Measured}}}
+	f := &fake{passes: []map[string]canned{{"cpu": regressed}, {"cpu": recheck}}}
+	o := command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t))
+	wantCode(t, o, 2)
+	if !strings.Contains(o.stderr, `group "cpu"`) {
+		t.Errorf("stderr %q does not name group cpu", o.stderr)
+	}
+}
+
 func TestMalformedBaseLinesAreLeftOutWithAWarning(t *testing.T) {
 	t.Parallel()
 	const malformed = "BenchmarkA-8\tprinted by the benchmark\n"
