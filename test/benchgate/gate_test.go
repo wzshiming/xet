@@ -196,6 +196,30 @@ func TestMeasuredGroupWithoutHeadRowsExitsTwo(t *testing.T) {
 	}
 }
 
+func TestMalformedBaseLinesAreLeftOutWithAWarning(t *testing.T) {
+	t.Parallel()
+	const malformed = "BenchmarkA-8\tprinted by the benchmark\n"
+	for _, c := range []struct {
+		name   string
+		cpu    canned
+		code   int
+		stderr string
+	}{
+		{"base", canned{base: clean.base + malformed, head: clean.head}, 0, `group "cpu": malformed base sample lines left out: 1`},
+		{"head", canned{base: clean.base, head: clean.head + malformed}, 2, "cpu.head.txt"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			f := &fake{passes: []map[string]canned{{"cpu": c.cpu}}}
+			o := command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t))
+			wantCode(t, o, c.code)
+			if !strings.Contains(o.stderr, c.stderr) {
+				t.Errorf("stderr %q does not say %s", o.stderr, c.stderr)
+			}
+		})
+	}
+}
+
 func TestBaseFailureReasonGoesToStderrNotTheReport(t *testing.T) {
 	t.Parallel()
 	const reason = "run in round 1 failed: exit status 1\n/home/runner/work/xet/p/p_test.go:12: boom"

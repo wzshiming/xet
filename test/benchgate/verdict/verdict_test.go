@@ -171,7 +171,7 @@ func TestRowsFollowFirstAppearanceBaseFirst(t *testing.T) {
 	}
 }
 
-func TestUnreadableOrMalformedSampleFileIsAnError(t *testing.T) {
+func TestUnreadableFileOrMalformedHeadLineIsAnError(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing.txt")
 	malformed := filepath.Join(dir, "malformed.txt")
@@ -179,12 +179,27 @@ func TestUnreadableOrMalformedSampleFileIsAnError(t *testing.T) {
 	overlong := filepath.Join(dir, "overlong.txt")
 	writeFile(t, overlong, "pkg: "+strings.Repeat("p", 1<<16)+"\n")
 	good := filepath.Join("testdata", "ab", "base.txt")
-	for _, bad := range []string{missing, malformed, overlong} {
-		for _, files := range [][2]string{{bad, good}, {good, bad}} {
-			if _, err := verdict.Compare(files[0], files[1], gate); err == nil {
-				t.Errorf("Compare(%s, %s) succeeded, want an error", files[0], files[1])
-			}
+	for _, files := range [][2]string{{missing, good}, {good, missing}, {overlong, good}, {good, overlong}, {good, malformed}} {
+		if _, err := verdict.Compare(files[0], files[1], gate); err == nil {
+			t.Errorf("Compare(%s, %s) succeeded, want an error", files[0], files[1])
 		}
+	}
+}
+
+func TestMalformedBaseLinesAreLeftOut(t *testing.T) {
+	dir := t.TempDir()
+	base, head := filepath.Join(dir, "base.txt"), filepath.Join(dir, "head.txt")
+	writeFile(t, base, "pkg: p\nBenchmarkA-8 1 2 ns/op\nBenchmarkA-8\tprinted by the benchmark\nUnit ns/op two errors\nBenchmarkA-8 1 3 ns/op\nBenchmarkA-8 x\n")
+	writeFile(t, head, "pkg: p\nBenchmarkA-8 1 2 ns/op\n")
+	res, err := verdict.Compare(base, head, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := find(t, res, "p", "BenchmarkA-8", "sec/op"); r.Base.N != 2 {
+		t.Errorf("base samples %d, want the 2 of the well-formed lines", r.Base.N)
+	}
+	if res.Skipped != 3 {
+		t.Errorf("skipped %d lines, want the 3 malformed ones", res.Skipped)
 	}
 }
 

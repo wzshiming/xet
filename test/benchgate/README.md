@@ -25,7 +25,9 @@ A base tree that lacks a package, or whose package fails to build or run, is
 not a failure: the report lists the package as not measured, and the command
 prints why the base failed on standard error. A failure on both sides is the
 head's and exits 2, whichever side ran first; so does a package without test
-files, of which `go test` builds no test binary.
+files, of which `go test` builds no test binary. A malformed line in the base
+samples, such as one a base benchmark printed to standard output, is left out
+with a warning on standard error; in the head samples it exits 2.
 
 ## Running it locally
 

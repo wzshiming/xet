@@ -99,7 +99,7 @@ func gate(ctx context.Context, sampleRun sampler, cfg config, base, head, out st
 }
 
 // measure samples as req says and compares each group with samples under its policy; it says on
-// stderr why a base failed.
+// stderr why a base failed and how many malformed base sample lines it left out.
 func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Request, stderr io.Writer) (pass, error) {
 	res, err := sampleRun(ctx, req)
 	if err != nil {
@@ -118,6 +118,9 @@ func measure(ctx context.Context, sampleRun sampler, cfg config, req sample.Requ
 		v, err := verdict.Compare(g.Base, g.Head, cfg.policy(cfg.group(g.Name)))
 		if err != nil {
 			return pass{}, err
+		}
+		if v.Skipped > 0 {
+			fmt.Fprintf(stderr, "benchgate: group %q: malformed base sample lines left out: %d\n", g.Name, v.Skipped)
 		}
 		if !slices.ContainsFunc(v.Rows, func(r verdict.Row) bool { return r.Head.N > 0 }) {
 			return pass{}, fmt.Errorf("group %q: its benchmarks gave no row on the head side", g.Name)

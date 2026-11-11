@@ -62,24 +62,33 @@ type Row struct {
 type Result struct {
 	Rows        []Row // in order of first appearance, base file first
 	Regressions []Key
+	Skipped     int // malformed lines of the base file, left out; one in the head file is an error
 }
 
 // Compare judges the head samples against the base samples under p, with benchstat's default statistics.
 func Compare(basePath, headPath string, p Policy) (Result, error) {
-	base, keys, err := load(basePath)
+	base, keys, malformed, err := load(basePath)
 	if err != nil {
 		return Result{}, err
 	}
-	head, headKeys, err := load(headPath)
+	head, headKeys, headMalformed, err := load(headPath)
 	if err != nil {
 		return Result{}, err
+	}
+	if len(headMalformed) > 0 {
+		return Result{}, headMalformed[0]
 	}
 	for _, k := range headKeys {
 		if _, ok := base[k]; !ok {
 			keys = append(keys, k)
 		}
 	}
-	var res Result
+	lines := make(map[int]bool) // a unit line can hold more than one error
+	for _, e := range malformed {
+		_, line := e.Pos()
+		lines[line] = true
+	}
+	res := Result{Skipped: len(lines)}
 	for _, k := range keys {
 		row := judge(k, base[k], head[k], p)
 		res.Rows = append(res.Rows, row)
@@ -90,19 +99,21 @@ func Compare(basePath, headPath string, p Policy) (Result, error) {
 	return res, nil
 }
 
-func load(path string) (map[Key][]float64, []Key, error) {
+// load reads a file's values by row and the errors of its malformed lines.
+func load(path string) (map[Key][]float64, []Key, []*benchfmt.SyntaxError, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer f.Close()
 	values := make(map[Key][]float64)
 	var keys []Key
+	var malformed []*benchfmt.SyntaxError
 	r := benchfmt.NewReader(f, path)
 	for r.Scan() {
 		switch res := r.Result().(type) {
 		case *benchfmt.SyntaxError:
-			return nil, nil, res
+			malformed = append(malformed, res)
 		case *benchfmt.Result:
 			for _, v := range res.Values {
 				k := Key{Pkg: res.GetConfig("pkg"), Name: "Benchmark" + string(res.Name), Metric: v.Unit}
@@ -113,7 +124,7 @@ func load(path string) (map[Key][]float64, []Key, error) {
 			}
 		}
 	}
-	return values, keys, r.Err()
+	return values, keys, malformed, r.Err()
 }
 
 func judge(k Key, base, head []float64, p Policy) Row {
