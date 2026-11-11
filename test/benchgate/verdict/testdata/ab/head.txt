@@ -105,6 +105,26 @@ BenchmarkNoisyBase-8  	 1000000	       997.0 ns/op	       0 B/op	       0 allocs
 BenchmarkNoisyBase-8  	 1000000	      1000 ns/op	       0 B/op	       0 allocs/op
 BenchmarkNoisyBase-8  	 1000000	      1003 ns/op	       0 B/op	       0 allocs/op
 BenchmarkNoisyBase-8  	 1000000	      1001 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroBound-8  	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
+BenchmarkZeroMedian-8 	 1000000	       100.0 ns/op	       4 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1500000	       800.2 ns/op	         1.601 cpu-s/GiB	       0 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1500000	       799.8 ns/op	         1.598 cpu-s/GiB	       0 B/op	       0 allocs/op
 BenchmarkFaster-8     	 1500000	       800.5 ns/op	         1.603 cpu-s/GiB	       0 B/op	       0 allocs/op

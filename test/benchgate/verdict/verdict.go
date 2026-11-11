@@ -34,6 +34,12 @@ type Side struct {
 	Lo, Hi float64 // 95% confidence interval of the median
 }
 
+// PctRange is how far the interval reaches from the median as benchstat's ± column shows it, such
+// as 5%, or ∞ with too few samples, or ? where a bound and the median differ in sign.
+func (s Side) PctRange() string {
+	return benchmath.Summary{Center: s.Median, Lo: s.Lo, Hi: s.Hi}.PctRangeString()
+}
+
 // Class is a row's classification.
 type Class string
 
@@ -181,7 +187,7 @@ func delta(base, head float64) float64 {
 	return head/base - 1
 }
 
-// spread is the half-width of the interval relative to the median, as benchstat's ± column; 0 for an absent side.
+// spread is how far the interval reaches from the median, relative to it; 0 for an absent side.
 func spread(s Side) float64 {
 	d := max(s.Hi-s.Median, s.Median-s.Lo)
 	if d == 0 {

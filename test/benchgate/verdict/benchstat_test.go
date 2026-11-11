@@ -78,7 +78,7 @@ func checkSide(t *testing.T, k verdict.Key, side string, s verdict.Side, cells [
 	if got := fmt.Sprint(s.Median); got != cells[0] {
 		t.Errorf("%+v: %s median %s, benchstat %s", k, side, got, cells[0])
 	}
-	if got := (benchmath.Summary{Center: s.Median, Lo: s.Lo, Hi: s.Hi}).PctRangeString(); got != cells[1] {
+	if got := s.PctRange(); got != cells[1] {
 		t.Errorf("%+v: %s CI ±%s, benchstat ±%s", k, side, got, cells[1])
 	}
 }

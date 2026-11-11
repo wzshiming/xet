@@ -181,19 +181,7 @@ func side(s verdict.Side, metric string) string {
 	if s.N == 0 {
 		return ""
 	}
-	return value(s.Median, metric) + " " + interval(s)
-}
-
-// interval is how far the confidence interval reaches from the median, relative to it, as benchstat's ±.
-func interval(s verdict.Side) string {
-	d := max(s.Hi-s.Median, s.Median-s.Lo)
-	if d == 0 {
-		return "±0%"
-	}
-	if r := d / math.Abs(s.Median); !math.IsInf(r, 0) {
-		return fmt.Sprintf("±%.0f%%", r*100)
-	}
-	return "±∞"
+	return value(s.Median, metric) + " ±" + s.PctRange()
 }
 
 // unit is a prefixed unit of a metric.

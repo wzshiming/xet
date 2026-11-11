@@ -267,6 +267,30 @@ func TestNumbersAreShownWithUnitPrefixes(t *testing.T) {
 	}
 }
 
+func TestIntervalsReadAsBenchstatShowsThem(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	b.WriteString("pkg: example.com/fake\n")
+	zeroMedian := []int{0, 0, 0, 0, 0, 0, 0, 4, 4, 4}
+	for i, zeroBound := range []int{0, 0, 0, 4, 4, 4, 4, 4, 4, 4} {
+		fmt.Fprintf(&b, "BenchmarkA-8 1000 100 ns/op %d B/op 0 allocs/op\nBenchmarkB-8 1000 100 ns/op %d B/op 0 allocs/op\n", zeroBound, zeroMedian[i])
+	}
+	f := &fake{passes: []map[string]canned{{"cpu": {base: b.String(), head: b.String()}}}}
+	o := command(t, f.run, t.TempDir(), t.TempDir(), fakeConfig(t))
+	wantCode(t, o, 0)
+	cpu := rows(section(t, o.report, "### cpu (judged)"))
+	// benchstat prints ± ? where a bound and the median differ in sign.
+	for _, cells := range [][]string{
+		{"BenchmarkA-8", "sec/op", "100ns ±0%"},
+		{"BenchmarkA-8", "B/op", "4B ±?"},
+		{"BenchmarkB-8", "B/op", "0B ±?"},
+	} {
+		if !hasRow(cpu, cells...) {
+			t.Errorf("cpu rows %q, want a row with %q", cpu, cells)
+		}
+	}
+}
+
 func TestConclusionLine(t *testing.T) {
 	t.Parallel()
 	twice := canned{base: samples(steady, another), head: samples(slower, bench{"BenchmarkB-8", 100, 0, 0})}
