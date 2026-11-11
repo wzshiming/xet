@@ -44,7 +44,10 @@ jobs:
     - name: Find the base of the merge
       id: merge
       if: github.event_name == 'pull_request'
-      run: echo "base=$(git -C head rev-parse --verify 'HEAD^1')" >> "$GITHUB_OUTPUT"
+      # Assigned first: bash -e ignores a failed substitution inside echo's arguments.
+      run: |
+        base=$(git -C head rev-parse --verify 'HEAD^1')
+        echo "base=$base" >> "$GITHUB_OUTPUT"
 
     - name: Check out the base
       uses: actions/checkout@v5
