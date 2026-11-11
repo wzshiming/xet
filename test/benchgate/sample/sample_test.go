@@ -378,6 +378,32 @@ func TestBaseWithoutThePackageIsBaseMissing(t *testing.T) {
 	wantStates(t, res, map[string]sample.State{"synth:a": sample.Measured, "synth:b": sample.BaseMissing})
 }
 
+func TestHeadPackageWithoutTestFilesIsABuildError(t *testing.T) {
+	t.Parallel()
+	noTests := map[string]string{"b/b_test.go": ""}
+	for _, c := range []struct {
+		name string
+		base map[string]string
+	}{
+		{"on both sides", noTests},
+		{"on the head side", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			req := request(t, tree(t, c.base), tree(t, noTests), 2)
+			_, err := sample.Run(t.Context(), req)
+			wantError(t, err, `group "synth"`, `package "b"`, "head build failed", "no test files")
+			wantNoFiles(t, req.Out)
+		})
+	}
+}
+
+func TestBasePackageWithoutTestFilesIsBaseFailed(t *testing.T) {
+	t.Parallel()
+	res := run(t, request(t, tree(t, map[string]string{"b/b_test.go": ""}), tree(t, changedA), 2))
+	wantStates(t, res, map[string]sample.State{"synth:a": sample.Measured, "synth:b": sample.BaseFailed})
+}
+
 func TestBaseRunFailureIsBaseFailedWithoutSamplesOfThePackage(t *testing.T) {
 	t.Parallel()
 	base := tree(t, map[string]string{"b/b_test.go": failsOnSecondRun})

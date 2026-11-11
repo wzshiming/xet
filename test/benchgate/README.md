@@ -22,7 +22,9 @@ same metric.
 | 2 | nothing to conclude: a head build or benchmark failed, or the configuration or command line is wrong |
 
 A base tree that lacks a package, or whose package fails to build or run, is
-not a failure: the report lists the package as not measured.
+not a failure: the report lists the package as not measured. A failure on both
+sides is the head's and exits 2, whichever side ran first; so does a package
+without test files, of which `go test` builds no test binary.
 
 ## Running it locally
 

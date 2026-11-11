@@ -298,8 +298,13 @@ func (s *sampler) compile(ctx context.Context, p string, side Side) error {
 	cmd.Dir = filepath.Join(s.tree(side), p)
 	// Both sides build with the go command on PATH, whatever toolchain their go.mod names.
 	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
-	if output, err := cmd.CombinedOutput(); err != nil {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
 		return fmt.Errorf("%w\n%s", cancelled(ctx, err), output)
+	}
+	// go test -c succeeds without writing a binary for a package without test files.
+	if _, err := os.Stat(s.bins[p].path[side]); err != nil {
+		return fmt.Errorf("no test binary: %s", bytes.TrimSpace(output))
 	}
 	return nil
 }
