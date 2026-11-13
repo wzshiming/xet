@@ -27,6 +27,7 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
+	"github.com/wzshiming/xet/internal/httpserve"
 	"github.com/wzshiming/xet/mirror"
 )
 
@@ -294,7 +295,7 @@ func (h *Handler) serveFromStream(w http.ResponseWriter, r *http.Request, st *mi
 		_ = rs.Close()
 	}()
 	writeMetadataHeaders(w, etag, size, commit)
-	http.ServeContent(w, r, "", time.Time{}, rs)
+	httpserve.ServeContent(w, r, "", time.Time{}, rs)
 	return true
 }
 
