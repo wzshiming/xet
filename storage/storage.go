@@ -45,6 +45,11 @@ type Storage interface {
 	// PutShard stores a shard, named by the SHA-256 of its stored bytes
 	PutShard(ctx context.Context, shard *shard.Shard) (bool, error)
 
+	// PutVerifiedShard is PutShard without PrepareShard, so it reads no xorb: the caller vouches
+	// that the shard matches the stored xorbs, and every file must carry its SHA-256 (MetadataExt).
+	// Shards from clients go through PutShard.
+	PutVerifiedShard(ctx context.Context, shard *shard.Shard) (bool, error)
+
 	// GetShard retrieves a shard by file hash
 	GetShard(ctx context.Context, fileHash xet.FileHash) (*shard.Shard, error)
 

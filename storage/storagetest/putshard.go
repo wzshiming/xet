@@ -355,3 +355,39 @@ func testPutShardCommitsMultiTermFile(t *testing.T, b Backend) {
 		t.Fatalf("read after Seek(%d) = %q, %v; want %q", offset, got, err, f.Content[offset:])
 	}
 }
+
+// PutVerifiedShard commits a shard whose files all carry their SHA-256, and
+// rejects one with no file, or with a file lacking it, before writing anything.
+func testPutVerifiedShardNeedsEveryFileSHA256(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	if inserted, err := st.PutVerifiedShard(ctx, shard.NewShard()); err == nil || inserted {
+		t.Fatalf("PutVerifiedShard(no file) = %v, %v; want an error", inserted, err)
+	}
+	sh := shard.NewShard()
+	files := []File{
+		addFile(t, ctx, st, sh, [][]byte{[]byte("first file of a verified shard")}),
+		addFile(t, ctx, st, sh, [][]byte{[]byte("second file of a verified shard")}),
+	}
+	setSHA256 := func(i int) {
+		sh.Files[i].MetadataExt = &shard.FileMetadataExt{SHA256Hash: shard.NewSHA256Hash(SHA256Digest(files[i].SHA256Hex))}
+		sh.Files[i].Flags |= shard.FileWithMetadataExt
+	}
+
+	setSHA256(0)
+	if inserted, err := st.PutVerifiedShard(ctx, sh); err == nil || inserted {
+		t.Fatalf("PutVerifiedShard(second file without SHA-256) = %v, %v; want an error", inserted, err)
+	}
+	if usage, err := st.Usage(ctx); err != nil || usage != (storage.Usage{Xorbs: usage.Xorbs}) {
+		t.Fatalf("Usage() after the rejected shards = %+v, %v; want the xorbs alone", usage, err)
+	}
+
+	setSHA256(1)
+	if inserted, err := st.PutVerifiedShard(ctx, sh); err != nil || !inserted {
+		t.Fatalf("PutVerifiedShard() = %v, %v", inserted, err)
+	}
+	assertFilesCommitted(t, ctx, st, files...)
+	if inserted, err := st.PutVerifiedShard(ctx, sh); err != nil || inserted {
+		t.Fatalf("repeated PutVerifiedShard() = %v, %v; want no-op", inserted, err)
+	}
+}
