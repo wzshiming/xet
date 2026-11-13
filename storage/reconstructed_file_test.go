@@ -141,7 +141,7 @@ func putSubRangeFile(t *testing.T, st storage.Storage, xorbs [][][]byte) storedF
 	fb.FileHash = f.FileHash
 	sh := shard.NewShard()
 	sh.AddFile(fb)
-	if _, err := st.PutShard(t.Context(), sh); err != nil {
+	if _, err := storage.PutShard(t.Context(), st, sh); err != nil {
 		t.Fatalf("PutShard(sub-range file): %v", err)
 	}
 	return loadFile(t, st, f, sha256.Sum256(f.Content))

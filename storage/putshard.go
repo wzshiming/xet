@@ -119,22 +119,51 @@ func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	return nil
 }
 
-// PutShardIndexes indexes only the shard's probe-able chunks (shard.GlobalDedupEligibleChunks)
+// PutShard verifies s against the stored xorbs with PrepareShard, stores it
+// under the SHA-256 of its encoding and writes its index entries, reporting
+// whether the shard object was inserted. A shard whose every file st already
+// indexes is a no-op.
+func PutShard(ctx context.Context, st Storage, s *shard.Shard) (bool, error) {
+	indexed := len(s.Files) > 0
+	for _, file := range s.Files {
+		shardHash, err := st.GetFileIndexEntry(ctx, file.FileHash)
+		if err != nil {
+			return false, fmt.Errorf("check shard: %w", err)
+		}
+		if shardHash == "" {
+			indexed = false
+			break
+		}
+	}
+	if indexed {
+		return false, nil
+	}
+
+	if err := PrepareShard(ctx, s, st); err != nil {
+		return false, err
+	}
+	shardHash, inserted, err := st.PutShard(ctx, s)
+	if err != nil {
+		return false, fmt.Errorf("store shard: %w", err)
+	}
+	return inserted, putShardIndexes(ctx, st, s, shardHash)
+}
+
+// putShardIndexes indexes only the shard's probe-able chunks (shard.GlobalDedupEligibleChunks)
 // and writes the files entries last, so a partial write remains retryable.
-func PutShardIndexes(ctx context.Context, s *shard.Shard, shardHash string, put func(ctx context.Context, kind, name string, value []byte) error) error {
-	value := []byte(shardHash)
+func putShardIndexes(ctx context.Context, st Storage, s *shard.Shard, shardHash string) error {
 	for _, e := range s.GlobalDedupEligibleChunks() {
-		if err := put(ctx, "index/chunks", e.Hash.String(), value); err != nil {
+		if err := st.PutChunkIndexEntry(ctx, e.Hash, shardHash); err != nil {
 			return fmt.Errorf("write chunk index: %w", err)
 		}
 	}
 	for _, file := range s.Files {
-		if err := put(ctx, "index/sha256", file.MetadataExt.SHA256Hash.String(), value); err != nil {
+		if err := st.PutSHA256IndexEntry(ctx, file.MetadataExt.SHA256Hash.String(), shardHash); err != nil {
 			return fmt.Errorf("write SHA-256 index for file %s: %w", file.FileHash.String(), err)
 		}
 	}
 	for _, file := range s.Files {
-		if err := put(ctx, "index/files", file.FileHash.String(), value); err != nil {
+		if err := st.PutFileIndexEntry(ctx, file.FileHash, shardHash); err != nil {
 			return fmt.Errorf("write file index for file %s: %w", file.FileHash.String(), err)
 		}
 	}

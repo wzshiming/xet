@@ -71,7 +71,7 @@ func authorizerFixture(t *testing.T) (storage.Storage, xet.FileHash, xet.XorbHas
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stor.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj); err != nil {
 		t.Fatal(err)
 	}
 	return stor, fileHash, xorbHash, chunkHash, digest, encoded.Bytes(), shardBytes
@@ -447,9 +447,9 @@ func (s *untouchedStorage) HasXorb(context.Context, xet.XorbHash) (bool, error) 
 	return false, errors.New("rejected upload")
 }
 
-func (s *untouchedStorage) PutShard(context.Context, *shard.Shard) (bool, error) {
+func (s *untouchedStorage) PutShard(context.Context, *shard.Shard) (string, bool, error) {
 	s.t.Error("PutShard called for a rejected shard upload")
-	return false, errors.New("rejected upload")
+	return "", false, errors.New("rejected upload")
 }
 
 func TestShardUploadRejectsContentLengthBeforeBody(t *testing.T) {
@@ -780,7 +780,7 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 	}
 	fileBlock.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 	shardObj.AddFile(fileBlock)
-	if _, err := stor.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj); err != nil {
 		t.Fatal(err)
 	}
 

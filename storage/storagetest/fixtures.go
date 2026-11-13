@@ -120,7 +120,7 @@ func PutFile(tb testing.TB, ctx context.Context, st storage.Storage, parts [][]b
 	for _, part := range parts {
 		f.Content = append(f.Content, part...)
 	}
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
 		tb.Fatal(err)
 	}
 	digest := sha256.Sum256(f.Content)
@@ -148,7 +148,7 @@ func PutXorbFile(tb testing.TB, ctx context.Context, st storage.Storage, xorbs [
 	tb.Helper()
 	sh := shard.NewShard()
 	f := addXorbFile(tb, ctx, st, sh, xorbs)
-	if _, err := st.PutShard(ctx, sh); err != nil {
+	if _, err := storage.PutShard(ctx, st, sh); err != nil {
 		tb.Fatal(err)
 	}
 	shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
@@ -427,7 +427,7 @@ func PutListedFile(tb testing.TB, ctx context.Context, st storage.Storage, parts
 	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 	fileBlock.FileHash = fileHash
 	shardObj.AddFile(fileBlock)
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
 		tb.Fatal(err)
 	}
 	return fileHash.String(), storedSize

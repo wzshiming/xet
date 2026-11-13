@@ -15,7 +15,6 @@ import (
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // object is one immutable stored blob; data is never mutated after insertion.
@@ -164,16 +163,16 @@ func notFound(kind, name string) error {
 	return fmt.Errorf("%s %s: %w", kind, name, iofs.ErrNotExist)
 }
 
-// PutXorb validates the stream into a private copy; dedup hits leave the stored object untouched.
+// PutXorb reads the stream into a private copy; dedup hits leave the stored object untouched.
 func (s *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
 	if _, exists := s.get("xorbs", xorbHash.String()); exists {
 		return false, nil
 	}
-	var buf bytes.Buffer
-	if err := xorb.Validate(io.TeeReader(r, &buf), xorbHash); err != nil {
-		return false, fmt.Errorf("validate xorb: %w", err)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return false, fmt.Errorf("read xorb: %w", err)
 	}
-	return s.put("xorbs", xorbHash.String(), buf.Bytes(), false), nil
+	return s.put("xorbs", xorbHash.String(), data, false), nil
 }
 
 // GetXorbURL routes through the CAS server's xorb endpoint, absolute when a base URL is set.
@@ -209,32 +208,31 @@ func (s *Storage) GetXorbChunkOffsets(_ context.Context, xorbHash xet.XorbHash) 
 	return offsets, nil
 }
 
-// PutShard stores a shard and its index entries; like the file backend, existing entries keep their first writer.
-func (s *Storage) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(sh.Files) > 0
-	for _, file := range sh.Files {
-		if s.indexEntry("index/files", file.FileHash.String()) == "" {
-			alreadyExists = false
-			break
-		}
-	}
-	if alreadyExists {
-		return false, nil
-	}
-	if err := storage.PrepareShard(ctx, sh, s); err != nil {
-		return false, err
-	}
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (s *Storage) PutShard(_ context.Context, sh *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(sh)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-	inserted := s.put("shards", shardHash, encoded, false)
-	err = storage.PutShardIndexes(ctx, sh, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		s.put(kind, name, value, false)
-		return nil
-	})
-	return inserted, err
+	return shardHash, s.put("shards", shardHash, encoded, false), nil
+}
+
+// PutFileIndexEntry writes the index/files entry for fileHash unless one exists.
+func (s *Storage) PutFileIndexEntry(_ context.Context, fileHash xet.FileHash, shardHash string) error {
+	s.put("index/files", fileHash.String(), []byte(shardHash), false)
+	return nil
+}
+
+// PutChunkIndexEntry writes the index/chunks entry for chunkHash unless one exists.
+func (s *Storage) PutChunkIndexEntry(_ context.Context, chunkHash xet.ChunkHash, shardHash string) error {
+	s.put("index/chunks", chunkHash.String(), []byte(shardHash), false)
+	return nil
+}
+
+// PutSHA256IndexEntry writes the index/sha256 entry for sha256Hex unless one exists.
+func (s *Storage) PutSHA256IndexEntry(_ context.Context, sha256Hex, shardHash string) error {
+	s.put("index/sha256", sha256Hex, []byte(shardHash), false)
+	return nil
 }
 
 // GetShard retrieves a shard by file hash.

@@ -122,7 +122,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	bad := append([]byte(nil), encoded...)
 	bad[10] ^= 0xff
 	otherHash := xet.XorbHash{42}
-	if _, err := ss.PutXorb(ctx, otherHash, bytes.NewReader(bad)); err == nil {
+	if _, err := storage.PutXorb(ctx, ss, otherHash, bytes.NewReader(bad)); err == nil {
 		t.Fatal("PutXorb() accepted a corrupted xorb")
 	}
 	if ok, err := ss.HasXorb(ctx, otherHash); err != nil || ok {
@@ -231,7 +231,7 @@ func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
 		s := shard.NewShard()
 		storagetest.AddFileBlock(t, ctx, ss, s, [][]byte{[]byte("identical content")})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
-		if inserted, err := ss.PutShard(ctx, s); err != nil || !inserted {
+		if inserted, err := storage.PutShard(ctx, ss, s); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 
@@ -293,10 +293,10 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || inserted {
 		t.Fatalf("PutShard() repeat = %v, %v", inserted, err)
 	}
 
@@ -407,7 +407,7 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 			content := []byte("fan me out")
 			shardObj := shard.NewShard()
 			fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, [][]byte{content})
-			if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
@@ -600,17 +600,17 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	fc.setFail(func(req *http.Request) bool {
 		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/index/sha256/")
 	})
-	if _, err := ss.PutShard(ctx, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj); err == nil {
 		t.Fatal("PutShard() succeeded despite injected failure")
 	}
 
-	// The partial shard must not count as existing, in cache or in S3.
-	if exists, err := ss.hasFile(ctx, fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	// The partial shard must not count as existing.
+	if got, err := ss.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+		t.Fatalf("GetFileIndexEntry() after partial failure = %q, %v", got, err)
 	}
 
 	fc.setFail(nil)
-	if _, err := ss.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 
@@ -636,8 +636,8 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 }
 
 // TestS3PutShardEvictsStaleIndexCaches: putIndexObject overwrites index
-// objects, so PutShard must evict the in-process caches for every key it
-// writes — a warm chunk cache must not keep resolving to the shard the
+// objects, so each index entry put must evict the in-process cache for its
+// key — a warm chunk cache must not keep resolving to the shard the
 // entry pointed at before the overwrite.
 func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
 	ctx := context.Background()

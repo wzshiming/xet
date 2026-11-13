@@ -36,12 +36,12 @@ func (s storeCAS) HasXorb(ctx context.Context, h xet.XorbHash) (bool, error) {
 }
 
 func (s storeCAS) UploadXorb(ctx context.Context, h xet.XorbHash, r io.ReadSeeker) (*upload.XorbUploadResponse, error) {
-	inserted, err := s.Storage.PutXorb(ctx, h, r)
+	inserted, err := storage.PutXorb(ctx, s.Storage, h, r)
 	return &upload.XorbUploadResponse{WasInserted: inserted}, err
 }
 
 func (s storeCAS) UploadShard(ctx context.Context, sh *shard.Shard) (*upload.ShardUploadResponse, error) {
-	if _, err := s.Storage.PutShard(ctx, sh); err != nil {
+	if _, err := storage.PutShard(ctx, s.Storage, sh); err != nil {
 		return nil, err
 	}
 	return &upload.ShardUploadResponse{Result: 1}, nil
