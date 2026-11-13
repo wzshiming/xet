@@ -3,8 +3,6 @@ package mirror
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/wzshiming/xet/mirror/spool"
@@ -63,9 +61,6 @@ func (m *Mirror) startTask(ctx context.Context, key, src resolveKey, pre *probeR
 		pr, err := pre, error(nil)
 		if pr == nil {
 			pr, err = m.probe(bg, origin, src)
-		}
-		if err == nil {
-			err = probeErr(pr)
 		}
 		if err != nil {
 			return m.failTask(nt, err), nil
@@ -165,17 +160,6 @@ func (m *Mirror) acquire(ctx context.Context, origin, token string, key resolveK
 
 	t, e, err := m.startTask(ctx, key, src, pre, origin, token)
 	return key, t, e, err
-}
-
-// probeErr maps a non-2xx probe status to the ingest error; not-found matches ErrUpstreamNotFound.
-func probeErr(pr *probeResult) error {
-	switch {
-	case pr.status == http.StatusNotFound:
-		return ErrUpstreamNotFound
-	case pr.status < 200 || pr.status >= 300:
-		return fmt.Errorf("upstream status %d", pr.status)
-	}
-	return nil
 }
 
 // runTask executes one ingestion end to end on a background context carrying

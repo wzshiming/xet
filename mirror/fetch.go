@@ -2,6 +2,7 @@ package mirror
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 	"github.com/wzshiming/xet/client/hf"
 )
 
-// fetchXet spools the file over the upstream xet CAS; every attempt re-resolves through a client bound to the file's repository with the task's pinned hub token.
+// fetchXet spools the file over the upstream xet CAS; every attempt re-resolves through a client bound to the file's repository with the task's pinned hub token, and one DownloadFile call is one attempt.
 func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 	repo, path, err := hf.ParseResolveURL(t.origin + src.String())
 	if err != nil {
@@ -22,7 +23,7 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 	if err != nil {
 		return err
 	}
-	return fetchWithRetries(ctx, "xet download", func() error {
+	return fetchWithRetries(ctx, &attempts{max: maxFetchAttempts}, func() error {
 		f, err := c.Resolve(ctx, path)
 		if err != nil {
 			return fmt.Errorf("resolve upstream xet download: %w", err)
@@ -32,25 +33,66 @@ func (m *Mirror) fetchXet(ctx context.Context, t *task, src resolveKey) error {
 }
 
 // fetchPlain downloads the file bytes over plain HTTP into the spool, resuming
-// from the current spool offset with Range requests on retries.
+// from the current spool offset with Range requests on retries; the request
+// context carries the attempts, so httpseek's body re-opens count against them.
 func (m *Mirror) fetchPlain(ctx context.Context, t *task, src resolveKey) error {
-	return fetchWithRetries(ctx, "plain download", func() error {
+	a := &attempts{max: maxFetchAttempts}
+	ctx = context.WithValue(ctx, attemptsKey{}, a)
+	return fetchWithRetries(ctx, a, func() error {
 		return m.fetchPlainOnce(ctx, t, src)
 	})
 }
 
-func fetchWithRetries(ctx context.Context, operation string, fetch func() error) error {
-	var lastErr error
-	for attempt := range maxFetchAttempts {
-		if err := sleepBackoff(ctx, attempt); err != nil {
-			return err
-		}
-		lastErr = fetch()
-		if lastErr == nil {
+// attempts counts the upstream tries of one probe or download against max.
+type attempts struct {
+	n, max int
+}
+
+type attemptsKey struct{}
+
+// next counts one more try after sleeping the backoff due before it; false once max tries were made or ctx ended during the sleep.
+func (a *attempts) next(ctx context.Context) bool {
+	if a.n >= a.max || sleepBackoff(ctx, a.n) != nil {
+		return false
+	}
+	a.n++
+	return true
+}
+
+// fetchWithRetries runs fetch until it succeeds or a's tries are spent, typing the failure.
+func fetchWithRetries(ctx context.Context, a *attempts, fetch func() error) error {
+	start := time.Now()
+	var err error
+	for a.next(ctx) {
+		if err = fetch(); err == nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("%s failed after %d attempts: %w", operation, maxFetchAttempts, lastErr)
+	return upstreamFailure(ctx, err, a.n, time.Since(start))
+}
+
+// upstreamFailure types err, the last failure of attempts tries over elapsed:
+// an answer keeps its kind; anything else is a Timeout once a request stalled
+// or ctx's deadline passed, a Transport failure otherwise.
+func upstreamFailure(ctx context.Context, err error, attempts int, elapsed time.Duration) *UpstreamError {
+	var ue *UpstreamError
+	if !errors.As(err, &ue) {
+		ue = &UpstreamError{Kind: UpstreamTransport, err: err}
+		var timeout interface{ Timeout() bool }
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
+			ue.Kind = UpstreamTimeout
+		}
+	}
+	ue.Attempts, ue.Elapsed = attempts, elapsed
+	return ue
+}
+
+// statusError types a non-2xx upstream answer.
+func statusError(status int) *UpstreamError {
+	if status == http.StatusNotFound {
+		return &UpstreamError{Kind: UpstreamNotFound, Status: status}
+	}
+	return &UpstreamError{Kind: UpstreamStatus, Status: status}
 }
 
 func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) error {
@@ -73,22 +115,20 @@ func (m *Mirror) fetchPlainOnce(ctx context.Context, t *task, src resolveKey) er
 	}()
 
 	body := io.Reader(resp.Body)
+	// The first response is the last early size source: a size it lacks stays unknown until the fetch completes.
 	switch {
 	case offset == 0 && resp.StatusCode == http.StatusOK:
-		if resp.ContentLength >= 0 {
-			t.item.SetSize(resp.ContentLength)
-		}
+		t.item.SetSize(resp.ContentLength)
 	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
-		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
-			t.item.SetSize(total)
-		}
+		t.item.SetSize(parseContentRangeTotal(resp.Header.Get("Content-Range")))
 	case offset > 0 && resp.StatusCode == http.StatusOK:
+		t.item.SetSize(resp.ContentLength)
 		// Upstream ignored the Range; skip what the spool already holds.
 		if _, err := io.CopyN(io.Discard, body, offset); err != nil {
 			return fmt.Errorf("skip resumed bytes: %w", err)
 		}
 	default:
-		return fmt.Errorf("upstream fetch status %d", resp.StatusCode)
+		return statusError(resp.StatusCode)
 	}
 
 	_, err = io.Copy(t.item, body)

@@ -66,17 +66,99 @@ func isCommit(rev string) bool {
 }
 
 const (
-	maxFetchAttempts   = 5
-	failureBackoffBase = 10 * time.Second
-	failureBackoffCap  = 10 * time.Minute
-	maxFailureShift    = 6
-	defaultMaxIngests  = 16
-	maxFailedEntries   = 16384 // bounds the process-local failure records a 404 scan can accumulate
+	defaultProbeBudget  = 15 * time.Second // wall clock of one probe: every redirect hop, retry and backoff
+	defaultStallTimeout = 30 * time.Second // longest any upstream request may go without a byte
+	maxProbeAttempts    = 5
+	maxProbeHops        = 8 // requests per probe attempt
+	maxFetchAttempts    = 2 // upstream opens per ingest; the fetch's retries and httpseek's re-opens draw from it
+	failureBackoffBase  = 10 * time.Second
+	failureBackoffCap   = 10 * time.Minute
+	maxFailureShift     = 6
+	defaultMaxIngests   = 16
+	maxFailedEntries    = 16384 // bounds the process-local failure records a 404 scan can accumulate
 )
 
 // ErrUpstreamNotFound reports that the upstream hub has no file at the
 // requested key. Errors returned by Resolve match it with errors.Is.
 var ErrUpstreamNotFound = errors.New("upstream file not found")
+
+// UpstreamErrorKind classifies an UpstreamError.
+type UpstreamErrorKind int
+
+const (
+	// UpstreamNotFound is a 404 answer; the error matches ErrUpstreamNotFound.
+	UpstreamNotFound UpstreamErrorKind = iota + 1
+	// UpstreamTimeout is an upstream that sent nothing in time: the probe
+	// budget ran out, or a request went the stall timeout without a byte.
+	UpstreamTimeout
+	// UpstreamStatus is any other non-2xx answer, including a redirect chain
+	// longer than a probe follows.
+	UpstreamStatus
+	// UpstreamTransport is any other failure to get the bytes: refused or
+	// dropped connections, bodies cut short, xet protocol errors.
+	UpstreamTransport
+)
+
+func (k UpstreamErrorKind) String() string {
+	switch k {
+	case UpstreamNotFound:
+		return "not found"
+	case UpstreamTimeout:
+		return "timeout"
+	case UpstreamStatus:
+		return "status"
+	case UpstreamTransport:
+		return "transport"
+	}
+	return fmt.Sprintf("UpstreamErrorKind(%d)", int(k))
+}
+
+// UpstreamError reports a failed upstream probe or ingest download. Resolve
+// returns it for the file's failed ingest, also when answering from the
+// recorded failure during its retry backoff.
+type UpstreamError struct {
+	Kind UpstreamErrorKind
+	// Status is the upstream's answer for NotFound and Status, 0 otherwise.
+	Status int
+	// Elapsed is how long the failed probe or download took, all attempts included.
+	Elapsed time.Duration
+	// Attempts counts the probe attempts, or the download's upstream opens.
+	Attempts int
+	// RetryAfter is the time until Resolve tries the upstream again for the file.
+	RetryAfter time.Duration
+
+	err error // the last attempt's failure, nil for a plain answer
+}
+
+func (e *UpstreamError) Error() string {
+	var b strings.Builder
+	switch e.Kind {
+	case UpstreamNotFound:
+		b.WriteString("upstream file not found")
+	case UpstreamStatus:
+		fmt.Fprintf(&b, "upstream status %d", e.Status)
+	case UpstreamTimeout:
+		b.WriteString("upstream timeout")
+	default:
+		fmt.Fprintf(&b, "upstream %s failure", e.Kind)
+	}
+	attempts := "attempts"
+	if e.Attempts == 1 {
+		attempts = "attempt"
+	}
+	fmt.Fprintf(&b, " after %d %s in %v", e.Attempts, attempts, e.Elapsed.Round(time.Millisecond))
+	if e.err != nil {
+		b.WriteString(": " + e.err.Error())
+	}
+	return b.String()
+}
+
+func (e *UpstreamError) Unwrap() error { return e.err }
+
+// Is reports a NotFound failure as ErrUpstreamNotFound.
+func (e *UpstreamError) Is(target error) bool {
+	return target == ErrUpstreamNotFound && e.Kind == UpstreamNotFound
+}
 
 // resolveKey identifies one (repo, rev, path) file and keys the in-memory
 // entry and task maps. Fields hold escaped URL path segments exactly as they
@@ -161,6 +243,8 @@ type Mirror struct {
 	maxIngests         int
 	ingestSlots        chan struct{}
 	transport          http.RoundTripper
+	probeBudget        time.Duration // defaultProbeBudget; tests shorten it
+	stallTimeout       time.Duration // defaultStallTimeout; tests shorten it
 
 	probeClient *http.Client  // does not follow redirects; used for metadata probes
 	fetchClient *http.Client  // follows redirects; body drops resume via httpseek
@@ -225,6 +309,8 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 		cacheDir:           "./xet-mirror",
 		revalidateInterval: 5 * time.Minute,
 		maxIngests:         defaultMaxIngests,
+		probeBudget:        defaultProbeBudget,
+		stallTimeout:       defaultStallTimeout,
 		entries:            map[resolveKey]*fileEntry{},
 		branches:           map[revKey]*branchEntry{},
 		commits:            map[revKey]*commitState{},
@@ -258,24 +344,25 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	if m.transport == nil {
 		m.transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
-	injecting := &authInjector{inner: client.NewIdleTimeoutTransport(m.transport, client.DefaultIdleTimeout)}
+	// Every upstream request — probe, plain fetch, xet client — fails once it goes stallTimeout without a byte.
+	upstream := client.NewIdleTimeoutTransport(m.transport, m.stallTimeout)
+	injecting := &authInjector{inner: upstream}
 	m.probeClient = &http.Client{
-		Timeout:   30 * time.Second,
 		Transport: injecting,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 	m.fetchClient = &http.Client{
-		Transport: httpseek.NewMustReaderTransport(injecting, func(r *http.Request, retry int, err error) error {
-			if retry >= maxFetchAttempts {
-				return fmt.Errorf("max retries reached: %w", err)
+		Transport: httpseek.NewMustReaderTransport(injecting, func(r *http.Request, _ int, err error) error {
+			if a, _ := r.Context().Value(attemptsKey{}).(*attempts); a != nil && a.next(r.Context()) {
+				return nil
 			}
-			return nil
+			return err
 		}),
 	}
 
-	m.hubClient = &http.Client{Transport: m.transport}
+	m.hubClient = &http.Client{Transport: upstream}
 	m.cache = client.NewCache(m.cacheDir, download.DefaultCacheSize, upload.DefaultCacheSize)
 
 	if m.spool == nil {

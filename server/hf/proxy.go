@@ -9,7 +9,6 @@ import (
 
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
-	"github.com/wzshiming/xet/mirror"
 )
 
 // upstreamBase parses the provider's hub base URL, which needs an http(s) scheme and a host.
@@ -25,7 +24,7 @@ func upstreamBase(base string) (*url.URL, error) {
 func NewUpstreamProxy(upstream client.UpstreamProvider) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if upstream == nil {
-			serveFetchError(w, false, errors.New("hf: no upstream provider"))
+			serveFetchError(w, errors.New("hf: no upstream provider"))
 			return
 		}
 		perm := auth.Write
@@ -34,12 +33,12 @@ func NewUpstreamProxy(upstream client.UpstreamProvider) http.Handler {
 		}
 		base, upstreamToken, err := upstream.Resolve(r.Context(), perm)
 		if err != nil {
-			serveFetchError(w, errors.Is(err, mirror.ErrUpstreamNotFound), err)
+			serveFetchError(w, err)
 			return
 		}
 		upstreamURL, err := upstreamBase(base)
 		if err != nil {
-			serveFetchError(w, false, err)
+			serveFetchError(w, err)
 			return
 		}
 		proxy := &httputil.ReverseProxy{
