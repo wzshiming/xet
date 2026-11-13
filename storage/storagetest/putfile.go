@@ -2,6 +2,7 @@ package storagetest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,10 +11,13 @@ import (
 	iofs "io/fs"
 	"math/rand/v2"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -140,5 +144,192 @@ func testPutFileEmpty(t *testing.T, b Backend) {
 	}
 	if _, err := st.GetShard(ctx, xet.FileHash{}); !errors.Is(err, iofs.ErrNotExist) {
 		t.Fatalf("GetShard(zero hash) = %v, want not found", err)
+	}
+}
+
+// hookedPutStore wraps a store for the PutFile pin cases, recording the xorb of every PutXorb call.
+type hookedPutStore struct {
+	storage.Storage
+	onPutXorb   func(xet.XorbHash) // runs as each PutXorb starts
+	holdShards  chan struct{}      // when set, each PutShard signals shardHeld, then waits, ignoring ctx, for it to close
+	shardHeld   chan struct{}
+	putXorbErr  error // when set, PutXorb fails with it instead of storing
+	putShardErr error // when set, PutShard fails with it instead of storing
+
+	mu    sync.Mutex
+	xorbs []xet.XorbHash
+}
+
+func (s *hookedPutStore) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Reader) (bool, error) {
+	s.mu.Lock()
+	s.xorbs = append(s.xorbs, xorbHash)
+	s.mu.Unlock()
+	if s.onPutXorb != nil {
+		s.onPutXorb(xorbHash)
+	}
+	if s.putXorbErr != nil {
+		return false, s.putXorbErr
+	}
+	return s.Storage.PutXorb(ctx, xorbHash, r)
+}
+
+func (s *hookedPutStore) PutShard(ctx context.Context, sh *shard.Shard) (bool, error) {
+	if s.holdShards != nil {
+		select {
+		case s.shardHeld <- struct{}{}:
+		default:
+		}
+		<-s.holdShards
+	}
+	if s.putShardErr != nil {
+		return false, s.putShardErr
+	}
+	return s.Storage.PutShard(ctx, sh)
+}
+
+// putXorbs returns the xorbs of the PutXorb calls so far, in call order.
+func (s *hookedPutStore) putXorbs() []xet.XorbHash {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.xorbs)
+}
+
+// PutFile pins each xorb in the WithPins table before its PutXorb starts and holds none once it returned.
+func testPutFilePinsXorbBeforePutXorb(t *testing.T, b Backend) {
+	ctx := context.Background()
+	table := pins.New[xet.XorbHash]()
+	st := &hookedPutStore{Storage: b.New(t)}
+	st.onPutXorb = func(h xet.XorbHash) {
+		if !table.Pinned(h) {
+			t.Errorf("PutXorb(%s) started with the xorb unpinned, want it pinned in the WithPins table first", h)
+		}
+	}
+	data := make([]byte, 3<<19)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+	if _, err := storage.PutFile(ctx, st, bytes.NewReader(data), storage.WithPins(table)); err != nil {
+		t.Fatalf("PutFile(): %v", err)
+	}
+	xorbs := st.putXorbs()
+	if len(xorbs) == 0 {
+		t.Fatal("PutFile() of fresh bytes made no PutXorb")
+	}
+	for _, h := range xorbs {
+		if table.Pinned(h) {
+			t.Fatalf("xorb %s still pinned after PutFile() returned, want every pin released", h)
+		}
+	}
+}
+
+// PutFile keeps the stored xorb it dedups against and the xorbs it stores pinned while its shard is pending, and releases them once it returned.
+func testPutFilePinsDedupXorb(t *testing.T, b Backend) {
+	ctx := context.Background()
+	inner := b.New(t)
+	random := make([]byte, 3<<19)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(random)
+	first, fresh := slices.Concat(random[:1<<20], random[:1<<19]), random[1<<20:]
+	stored, err := inner.GetShard(ctx, storeFile(t, ctx, inner, first).FileHash)
+	if err != nil {
+		t.Fatalf("GetShard(): %v", err)
+	}
+	reused := stored.CASInfos[0].CASHash
+
+	table := pins.New[xet.XorbHash]()
+	st := &hookedPutStore{Storage: inner, holdShards: make(chan struct{}), shardHeld: make(chan struct{}, 1)}
+	release := sync.OnceFunc(func() { close(st.holdShards) })
+	var fileHash xet.FileHash
+	var putErr error
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		fileHash, putErr = storage.PutFile(ctx, st, bytes.NewReader(slices.Concat(first[:len(first)/2], fresh)), storage.WithPins(table))
+	}()
+	t.Cleanup(func() {
+		release()
+		<-finished
+	})
+	// Leave headroom so a hang fails here, not at the binary's deadline.
+	wait := 10 * time.Minute
+	if deadline, ok := t.Deadline(); ok {
+		wait = min(wait, time.Until(deadline)*9/10)
+	}
+	select {
+	case <-st.shardHeld:
+	case <-finished:
+		t.Fatalf("PutFile() returned %v before its PutShard", putErr)
+	case <-time.After(wait):
+		t.Fatalf("PutFile() reached no PutShard within %v", wait)
+	}
+	if !table.Pinned(reused) {
+		t.Fatalf("reused xorb %s unpinned while the shard is pending, want the stored xorb PutFile dedups against pinned", reused)
+	}
+	own := st.putXorbs()
+	if len(own) == 0 {
+		t.Fatal("PutFile() made no PutXorb for the fresh half")
+	}
+	for _, h := range own {
+		if !table.Pinned(h) {
+			t.Fatalf("stored xorb %s unpinned while the shard is pending, want it pinned until PutFile returns", h)
+		}
+	}
+	release()
+	<-finished
+	if putErr != nil {
+		t.Fatalf("PutFile(): %v", putErr)
+	}
+	for _, h := range append(own, reused) {
+		if table.Pinned(h) {
+			t.Fatalf("xorb %s still pinned after PutFile() returned, want every pin released", h)
+		}
+	}
+	sh, err := inner.GetShard(ctx, fileHash)
+	if err != nil {
+		t.Fatalf("GetShard(): %v", err)
+	}
+	if !slices.ContainsFunc(sh.Files[0].Entries, func(e shard.FileDataSequenceEntry) bool { return e.CASHash == reused }) {
+		t.Fatalf("the file's shard references no chunk of the stored xorb %s, want its shared half reused", reused)
+	}
+}
+
+// PutFile releases every pin it took once it returns, whether it stored the file or a PutXorb or the PutShard failed.
+func testPutFileReleasesPinsOnReturn(t *testing.T, b Backend) {
+	ctx := context.Background()
+	data := make([]byte, 1<<18)
+	_, _ = rand.NewChaCha8([32]byte{}).Read(data)
+	for _, tc := range []struct {
+		name                    string
+		putXorbErr, putShardErr error
+	}{
+		{"stored", nil, nil},
+		{"PutXorb refused", errors.New("put xorb: refused"), nil},
+		{"PutShard refused", nil, errors.New("put shard: refused")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table := pins.New[xet.XorbHash]()
+			st := &hookedPutStore{Storage: b.New(t), putXorbErr: tc.putXorbErr, putShardErr: tc.putShardErr}
+			st.onPutXorb = func(h xet.XorbHash) {
+				if !table.Pinned(h) {
+					t.Errorf("PutXorb(%s) started with the xorb unpinned: PutFile took no pin to release", h)
+				}
+			}
+			_, err := storage.PutFile(ctx, st, bytes.NewReader(data), storage.WithPins(table))
+			if want := cmp.Or(tc.putXorbErr, tc.putShardErr); !errors.Is(err, want) {
+				t.Fatalf("PutFile() = %v, want %v", err, want)
+			}
+			xorbs := st.putXorbs()
+			if len(xorbs) == 0 {
+				t.Fatal("PutFile() of fresh bytes made no PutXorb")
+			}
+			for _, h := range xorbs {
+				if table.Pinned(h) {
+					t.Fatalf("xorb %s still pinned after PutFile() returned, want every pin released", h)
+				}
+			}
+		})
+	}
+	if _, err := storage.PutFile(ctx, b.New(t), bytes.NewReader(data)); err != nil {
+		t.Fatalf("PutFile() without options: %v", err)
+	}
+	if _, err := storage.PutFile(ctx, b.New(t), bytes.NewReader(data), storage.WithPins(nil)); err != nil {
+		t.Fatalf("PutFile() WithPins(nil): %v", err)
 	}
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/internal/pool"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/xorb"
 )
@@ -23,10 +24,27 @@ type xorbReader struct {
 	buf      bytes.Buffer
 }
 
+// PutFileOption configures PutFile.
+type PutFileOption func(*putFileConfig)
+
+type putFileConfig struct {
+	pins *pins.Table[xet.XorbHash]
+}
+
+// WithPins pins in p every xorb PutFile stores or reuses until it returns; nil pins nothing.
+func WithPins(p *pins.Table[xet.XorbHash]) PutFileOption {
+	return func(c *putFileConfig) { c.pins = p }
+}
+
 // PutFile stores the file read from r: chunks already held by a stored shard
 // are reused, the new ones are packed into xorbs, and the shard describing the
 // file is committed; an empty file stores nothing. It returns the file's xet hash.
-func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, error) {
+// With WithPins the xorbs it stores and reuses stay pinned until it returns.
+func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker, opts ...PutFileOption) (xet.FileHash, error) {
+	var cfg putFileConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	base, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return xet.FileHash{}, fmt.Errorf("locate file start: %w", err)
@@ -76,10 +94,23 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 		}
 	}
 
+	unpins := map[xet.XorbHash]func(){}
+	defer func() {
+		for _, unpin := range unpins {
+			unpin()
+		}
+	}()
+	pin := func(h xet.XorbHash) {
+		if _, ok := unpins[h]; !ok {
+			unpins[h] = cfg.pins.Pin(h)
+		}
+	}
+
 	var fresh []int
 	var freshSizes []uint32
 	for i := range chunks {
 		if loc, ok := located[chunks[i].Hash]; ok {
+			pin(loc.XorbHash)
 			chunks[i].XorbHash, chunks[i].ChunkIndex = loc.XorbHash, loc.ChunkIndex
 		} else {
 			fresh = append(fresh, i)
@@ -98,6 +129,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 			x.offsets = append(x.offsets, offsets[fresh[k]])
 		}
 		xorbHash := xet.ComputeXorbHash(hashes, x.sizes)
+		pin(xorbHash)
 		if _, err := stor.PutXorb(ctx, xorbHash, x); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store xorb %s: %w", xorbHash.String(), err)
 		}
