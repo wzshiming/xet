@@ -64,3 +64,27 @@ jobs:
       env:
         XET_CORE_VERSION: ${{ matrix.version }}
       run: go test ./...
+
+  benchgate:
+    name: Benchmark Gate Tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: test/benchgate/go.mod
+        cache-dependency-path: test/benchgate/go.sum
+
+    - name: Run go fix
+      working-directory: test/benchgate
+      run: |
+        go fix ./...
+        git diff --exit-code
+
+    - name: Run benchmark gate tests
+      working-directory: test/benchgate
+      run: go test ./...
