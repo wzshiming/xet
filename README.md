@@ -27,6 +27,12 @@ Implemented in this repository:
 - Test and conformance coverage is evolving with protocol and upstream changes.
 - Chunk boundaries, and therefore xet file hashes, follow the current xet-core chunker, which never cuts a chunk shorter than the 8 KiB minimum ([xet-core#487](https://github.com/huggingface/xet-core/pull/487), first shipped in hf-xet 1.1.10, September 2025). Earlier clients could occasionally cut a shorter chunk, so a file uploaded with hf-xet 1.1.9 or older — which includes many uploads made before 2026 — may be recorded upstream under a xet hash that differs from the one this implementation computes for the same bytes. The SHA-256 (LFS OID) is unaffected.
 
+## Benchmark Gate
+
+Every pull request to master runs the **Benchmark gate** check ([workflow](.github/workflows/bench-gate.yml)): one CI job builds the pull request's merge result and the master commit it merges into, benchmarks both on that runner in alternating rounds, and fails on a regression.
+
+How a regression is judged, which pull requests are measured, what to do when the check is red and how to add a benchmark are in [test/benchgate/README.md](test/benchgate/README.md).
+
 ## License
 
 Licensed under the MIT License. See [LICENSE](https://github.com/wzshiming/xet/blob/master/LICENSE) for the full license text.

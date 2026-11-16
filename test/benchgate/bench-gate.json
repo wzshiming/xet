@@ -1,0 +1,55 @@
+{
+  "alpha": 0.05,
+  "minSamples": 10,
+  "measureIdentical": false,
+  "groups": [
+    {
+      "name": "root",
+      "packages": ["."],
+      "bench": "^BenchmarkComputeChunkHash$",
+      "benchtime": "300ms",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.05, "B/op": 0.1, "allocs/op": 0.1}
+    },
+    {
+      "name": "filehash",
+      "packages": ["."],
+      "bench": "^BenchmarkComputeFileHash$",
+      "benchtime": "20x",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.05, "allocs/op": 0.2}
+    },
+    {
+      "name": "xorb",
+      "packages": ["xorb"],
+      "bench": ".",
+      "benchtime": "300ms",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.1, "B/op": 0.1, "allocs/op": 0.1}
+    },
+    {
+      "name": "client",
+      "packages": ["server"],
+      "bench": "^BenchmarkClient$/^size=1MiB$",
+      "benchtime": "50x",
+      "rounds": 10,
+      "thresholds": {"sec/op": 0.1, "B/op": 0.2, "allocs/op": 0.1}
+    },
+    {
+      "name": "serve",
+      "packages": ["server"],
+      "bench": "^BenchmarkServe$/^size=1MiB$",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "reportOnly": true
+    },
+    {
+      "name": "storage",
+      "packages": ["storage"],
+      "bench": "^BenchmarkReconstructedFile$",
+      "benchtime": "100ms",
+      "rounds": 10,
+      "reportOnly": true
+    }
+  ]
+}
