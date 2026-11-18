@@ -29,9 +29,11 @@ Implemented in this repository:
 
 ## Benchmark Gate
 
-Every pull request to master runs the **Benchmark gate** check ([workflow](.github/workflows/bench-gate.yml)): one CI job builds the pull request's merge result and the master commit it merges into, benchmarks both on that runner in alternating rounds, and fails on a regression.
+Every pull request to master runs the **Benchmark gate** check ([workflow](.github/workflows/bench-gate.yml)) with [benchgate](https://github.com/wzshiming/benchgate): one CI job builds the pull request's merge result and the master commit it merges into, benchmarks both on that runner in alternating rounds, and fails on a confirmed regression.
 
-How a regression is judged, which pull requests are measured, what to do when the check is red and how to add a benchmark are in [test/benchgate/README.md](test/benchgate/README.md).
+The configuration is [test/benchgate.json](test/benchgate.json). A new benchmark in the `xorb` package is judged as it is; elsewhere, add it to a group's `bench` pattern or add a group.
+
+How a regression is judged, which pull requests are measured and what to do when the check is red are in [benchgate's README](https://github.com/wzshiming/benchgate/blob/master/README.md).
 
 ## License
 
