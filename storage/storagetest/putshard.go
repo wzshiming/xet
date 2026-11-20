@@ -89,12 +89,12 @@ func testPutShardCommitsNewFilesBesideKnownFile(t *testing.T, b Backend) {
 	sh := shard.NewShard()
 	addFile(t, ctx, st, sh, partsA)
 	fileB := addFile(t, ctx, st, sh, [][]byte{[]byte("file B chunk one"), []byte("file B chunk two")})
-	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh); err != nil || !inserted {
 		t.Fatalf("PutShard([A,B]) = %v, %v", inserted, err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
 
-	if inserted, err := st.PutShard(ctx, sh); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh); err != nil || inserted {
 		t.Fatalf("repeated PutShard([A,B]) = %v, %v; want no-op", inserted, err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
@@ -107,7 +107,7 @@ func testPutShardRetryRepairsMissingFileEntry(t *testing.T, b Backend) {
 	sh := shard.NewShard()
 	a := addFile(t, ctx, st, sh, [][]byte{[]byte("file A of an interrupted upload")})
 	fileB := addFile(t, ctx, st, sh, [][]byte{[]byte("file B of an interrupted upload")})
-	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh); err != nil || !inserted {
 		t.Fatalf("PutShard([A,B]) = %v, %v", inserted, err)
 	}
 	if _, err := storage.NewGC(st).Unlink(ctx, fileB.FileHash); err != nil {
@@ -117,7 +117,7 @@ func testPutShardRetryRepairsMissingFileEntry(t *testing.T, b Backend) {
 		t.Fatalf("GetFileIndexEntry(B) after unlink = %q, %v", got, err)
 	}
 
-	if _, err := st.PutShard(ctx, sh); err != nil {
+	if _, err := storage.PutShard(ctx, st, sh); err != nil {
 		t.Fatalf("PutShard([A,B]) retry: %v", err)
 	}
 	assertFilesCommitted(t, ctx, st, a, fileB)
@@ -148,7 +148,7 @@ func testPutShardVerifiesFileHash(t *testing.T, b Backend) {
 				digest[0] ^= 1
 				sh.Files[0].MetadataExt.SHA256Hash = shard.NewSHA256Hash(digest)
 			}
-			inserted, err := st.PutShard(ctx, sh)
+			inserted, err := storage.PutShard(ctx, st, sh)
 			if test.wantErr != "" {
 				if inserted || !errors.Is(err, storage.ErrInvalidShard) || !strings.Contains(err.Error(), test.wantErr) {
 					t.Errorf("PutShard() = %v, %v, want %q", inserted, err, test.wantErr)
@@ -200,7 +200,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 				test.mutate(sh)
 			}
 
-			inserted, err := st.PutShard(ctx, sh)
+			inserted, err := storage.PutShard(ctx, st, sh)
 			if test.wantErr == "" {
 				if err != nil || !inserted {
 					t.Fatalf("PutShard() = %v, %v", inserted, err)
@@ -227,7 +227,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 			if got, err := st.GetFileIndexEntry(ctx, f.FileHash); err != nil || got != "" {
 				t.Fatalf("GetFileIndexEntry() after rejection = %q, %v", got, err)
 			}
-			if got, err := st.GetSHA256IndexEntry(ctx, f.SHA256Hex); err != nil || got != "" {
+			if got, err := st.GetSHA256IndexEntry(ctx, SHA256Digest(f.SHA256Hex)); err != nil || got != "" {
 				t.Fatalf("GetSHA256IndexEntry() after rejection = %q, %v", got, err)
 			}
 			for _, cb := range sh.CASInfos {
@@ -240,7 +240,7 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 
 			honest := shard.NewShard()
 			addXorbFile(t, ctx, st, honest, [][][]byte{parts})
-			if inserted, err := st.PutShard(ctx, honest); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, st, honest); err != nil || !inserted {
 				t.Fatalf("honest PutShard() after rejection = %v, %v", inserted, err)
 			}
 			assertFilesCommitted(t, ctx, st, f)
@@ -263,7 +263,8 @@ func testPutShardVerifiesCASChunks(t *testing.T, b Backend) {
 }
 
 // testPutShardIndexesProbeableChunksOnly: PutShard indexes exactly the probe-able chunks — file
-// starts, flagged and hash-sampled ones, also in a xorb no file references — and no other chunk.
+// starts, flagged and hash-sampled ones, also in a xorb no file references — and no other chunk,
+// so WalkChunkIndex gives exactly their entries.
 func testPutShardIndexesProbeableChunksOnly(t *testing.T, b Backend) {
 	ctx := context.Background()
 	st := b.New(t)
@@ -273,7 +274,7 @@ func testPutShardIndexesProbeableChunksOnly(t *testing.T, b Backend) {
 	unreferenced := shard.NewShard()
 	orphan := addXorbFile(t, ctx, st, unreferenced, [][][]byte{{PlainChunk(t, "orphan-a"), SampledChunk(t, "orphan-b")}})
 	sh.AddCASBlock(unreferenced.CASInfos[0])
-	if inserted, err := st.PutShard(ctx, sh); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, st, sh); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
 	shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
@@ -281,6 +282,7 @@ func testPutShardIndexesProbeableChunksOnly(t *testing.T, b Backend) {
 		t.Fatalf("GetFileIndexEntry() = %q, %v", shardHash, err)
 	}
 
+	var probeable []string
 	for _, c := range []struct {
 		name string
 		hash xet.ChunkHash
@@ -296,6 +298,13 @@ func testPutShardIndexesProbeableChunksOnly(t *testing.T, b Backend) {
 		if got, err := st.GetChunkIndexEntry(ctx, c.hash); err != nil || got != c.want {
 			t.Errorf("GetChunkIndexEntry(%s chunk) = %q, %v; want %q", c.name, got, err, c.want)
 		}
+		if c.want != "" {
+			probeable = append(probeable, c.hash.String()+" -> "+c.want)
+		}
+	}
+	slices.Sort(probeable)
+	if got := indexEntries(t, ctx, st, storage.Storage.WalkChunkIndex); !slices.Equal(got, probeable) {
+		t.Errorf("WalkChunkIndex() = %q, want exactly the probe-able chunks %q", got, probeable)
 	}
 	if _, err := st.GetShardByChunkHash(ctx, f.ChunkHashes[2]); err == nil {
 		t.Error("GetShardByChunkHash(plain chunk) resolved; want not found")

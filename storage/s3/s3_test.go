@@ -72,7 +72,7 @@ func TestS3StorageDeleteXorbWhileReaderOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rc.Close()
-	if err := ss.DeleteXorb(ctx, xorbHash); err != nil {
+	if _, err := ss.DeleteXorb(ctx, xorbHash); err != nil {
 		t.Fatal(err)
 	}
 	got, err := io.ReadAll(rc)
@@ -122,7 +122,7 @@ func TestS3StorageXorbRoundTrip(t *testing.T) {
 	bad := append([]byte(nil), encoded...)
 	bad[10] ^= 0xff
 	otherHash := xet.XorbHash{42}
-	if _, err := ss.PutXorb(ctx, otherHash, bytes.NewReader(bad)); err == nil {
+	if _, err := storage.PutXorb(ctx, ss, otherHash, bytes.NewReader(bad)); err == nil {
 		t.Fatal("PutXorb() accepted a corrupted xorb")
 	}
 	if ok, err := ss.HasXorb(ctx, otherHash); err != nil || ok {
@@ -231,7 +231,7 @@ func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
 		s := shard.NewShard()
 		storagetest.AddFileBlock(t, ctx, ss, s, [][]byte{[]byte("identical content")})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
-		if inserted, err := ss.PutShard(ctx, s); err != nil || !inserted {
+		if inserted, err := storage.PutShard(ctx, ss, s); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 
@@ -268,7 +268,7 @@ func TestS3FooteredShardObjectStaysReadable(t *testing.T) {
 	if err := ss.putObject(ctx, ss.objectKey("shards", name), bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	if err := ss.putIndexObject(ctx, ss.objectKey("index/files", fileHash.String()), []byte(name)); err != nil {
+	if _, err := ss.PutFileIndexEntry(ctx, fileHash, name); err != nil {
 		t.Fatal(err)
 	}
 
@@ -293,10 +293,10 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
-	if inserted, err := ss.PutShard(ctx, shardObj); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || inserted {
 		t.Fatalf("PutShard() repeat = %v, %v", inserted, err)
 	}
 
@@ -407,7 +407,7 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 			content := []byte("fan me out")
 			shardObj := shard.NewShard()
 			fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, [][]byte{content})
-			if inserted, err := ss.PutShard(ctx, shardObj); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
@@ -600,17 +600,17 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	fc.setFail(func(req *http.Request) bool {
 		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/index/sha256/")
 	})
-	if _, err := ss.PutShard(ctx, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj); err == nil {
 		t.Fatal("PutShard() succeeded despite injected failure")
 	}
 
-	// The partial shard must not count as existing, in cache or in S3.
-	if exists, err := ss.hasFile(ctx, fileHash); err != nil || exists {
-		t.Fatalf("hasFile() after partial failure = %v, %v", exists, err)
+	// The partial shard must not count as existing.
+	if got, err := ss.GetFileIndexEntry(ctx, fileHash); err != nil || got != "" {
+		t.Fatalf("GetFileIndexEntry() after partial failure = %q, %v", got, err)
 	}
 
 	fc.setFail(nil)
-	if _, err := ss.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 
@@ -635,11 +635,10 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 }
 
-// TestS3PutShardEvictsStaleIndexCaches: putIndexObject overwrites index
-// objects, so PutShard must evict the in-process caches for every key it
-// writes — a warm chunk cache must not keep resolving to the shard the
-// entry pointed at before the overwrite.
-func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
+// TestS3PutShardKeepsExistingChunkEntry: a second shard carrying a stored
+// chunk leaves the chunk's index entry on the first shard, so the chunk
+// still resolves to the first file.
+func TestS3PutShardKeepsExistingChunkEntry(t *testing.T) {
 	ctx := context.Background()
 	ss := newTestS3Storage(t)
 
@@ -656,21 +655,253 @@ func TestS3PutShardEvictsStaleIndexCaches(t *testing.T) {
 	}
 
 	// A second shard carrying the same chunk (a different file, so PutShard
-	// commits it) overwrites the chunk index object.
+	// commits it) finds the chunk index object and keeps it.
 	f2 := storagetest.PutFile(t, ctx, ss, [][]byte{shared, []byte("unique to file two")})
 	if f1.ChunkHashes[0] != f2.ChunkHashes[0] {
 		t.Fatal("test setup: shared part must map to one chunk hash")
 	}
-	if got, err := ss.GetChunkIndexEntry(ctx, f2.ChunkHashes[0]); err != nil || got != f2.ShardHash {
-		t.Fatalf("stored chunk entry = %q, %v; want %q", got, err, f2.ShardHash)
+	if got, err := ss.GetChunkIndexEntry(ctx, f2.ChunkHashes[0]); err != nil || got != f1.ShardHash {
+		t.Fatalf("stored chunk entry = %q, %v; want the first shard's %q", got, err, f1.ShardHash)
 	}
 
-	// A fresh resolution must follow the overwritten entry, not the cache.
 	sh, err = ss.GetShardByChunkHash(ctx, f2.ChunkHashes[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := sh.Files[0].FileHash; got != f2.FileHash {
-		t.Fatalf("chunk resolves to file %s, want %s (stale cache)", got.String(), f2.FileHash.String())
+	if got := sh.Files[0].FileHash; got != f1.FileHash {
+		t.Fatalf("chunk resolves to file %s, want the first file %s", got.String(), f1.FileHash.String())
+	}
+}
+
+// TestS3IndexPutEvictsStaleCachedLookup: once an index entry is deleted
+// straight from the bucket, behind the lookup this instance cached, the Put
+// that writes the key again leaves lookups resolving the new entry.
+func TestS3IndexPutEvictsStaleCachedLookup(t *testing.T) {
+	for _, ix := range []struct {
+		kind   string
+		name   func(f storagetest.File) string
+		lookup func(ctx context.Context, ss *Storage, f storagetest.File) (*shard.Shard, error)
+		put    func(ctx context.Context, ss *Storage, f storagetest.File, shardHash string) (bool, error)
+	}{{
+		kind: "files",
+		name: func(f storagetest.File) string { return f.FileHash.String() },
+		lookup: func(ctx context.Context, ss *Storage, f storagetest.File) (*shard.Shard, error) {
+			return ss.GetShard(ctx, f.FileHash)
+		},
+		put: func(ctx context.Context, ss *Storage, f storagetest.File, shardHash string) (bool, error) {
+			return ss.PutFileIndexEntry(ctx, f.FileHash, shardHash)
+		},
+	}, {
+		kind: "chunks",
+		name: func(f storagetest.File) string { return f.ChunkHashes[0].String() },
+		lookup: func(ctx context.Context, ss *Storage, f storagetest.File) (*shard.Shard, error) {
+			return ss.GetShardByChunkHash(ctx, f.ChunkHashes[0])
+		},
+		put: func(ctx context.Context, ss *Storage, f storagetest.File, shardHash string) (bool, error) {
+			return ss.PutChunkIndexEntry(ctx, f.ChunkHashes[0], shardHash)
+		},
+	}, {
+		kind: "sha256",
+		name: func(f storagetest.File) string { return f.SHA256Hex },
+		lookup: func(ctx context.Context, ss *Storage, f storagetest.File) (*shard.Shard, error) {
+			return ss.GetShardBySHA256(ctx, storagetest.SHA256Digest(f.SHA256Hex))
+		},
+		put: func(ctx context.Context, ss *Storage, f storagetest.File, shardHash string) (bool, error) {
+			return ss.PutSHA256IndexEntry(ctx, storagetest.SHA256Digest(f.SHA256Hex), shardHash)
+		},
+	}} {
+		t.Run(ix.kind, func(t *testing.T) {
+			ctx := context.Background()
+			ss := newTestS3Storage(t)
+			first := storagetest.PutFile(t, ctx, ss, [][]byte{[]byte("first file")})
+			second := storagetest.PutFile(t, ctx, ss, [][]byte{[]byte("second file")})
+			resolves := func(want storagetest.File) {
+				t.Helper()
+				sh, err := ix.lookup(ctx, ss, first)
+				if err != nil {
+					t.Fatalf("lookup of the first file's key: %v", err)
+				}
+				if got := sh.Files[0].FileHash; got != want.FileHash {
+					t.Fatalf("first file's key resolves to file %s, want %s", got.String(), want.FileHash.String())
+				}
+			}
+
+			resolves(first)
+			if err := ss.deleteObject(ctx, ss.objectKey("index/"+ix.kind, ix.name(first))); err != nil {
+				t.Fatal(err)
+			}
+			if inserted, err := ix.put(ctx, ss, first, second.ShardHash); err != nil || !inserted {
+				t.Fatalf("Put(key deleted from the bucket) = %v, %v; want true", inserted, err)
+			}
+			resolves(second)
+		})
+	}
+}
+
+// sent lists the method and path of each request recorded since the last reset.
+func (ct *countingTransport) sent() []string {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	sent := make([]string, 0, len(ct.requests))
+	for _, r := range ct.requests {
+		sent = append(sent, r.method+" "+r.path)
+	}
+	return sent
+}
+
+// storedObject reaches one kind of object through its Put and Delete methods.
+type storedObject struct {
+	kind string
+	key  string // the object key in a store without prefix
+	put  func(ctx context.Context, ss *Storage) (bool, error)
+	del  func(ctx context.Context, ss *Storage) (bool, error)
+}
+
+// storedObjects gives an xorb, a shard and an entry of each index.
+func storedObjects(t *testing.T) []storedObject {
+	t.Helper()
+	sh := shard.NewShard()
+	_, shardHash, err := storage.EncodeShard(sh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xorbHash, fileHash, chunkHash, digest := xet.XorbHash{1}, xet.FileHash{2}, xet.ChunkHash{3}, [32]byte{4}
+	return []storedObject{{
+		kind: "xorb",
+		key:  storage.ObjectKey("xorbs", xorbHash.String()),
+		put: func(ctx context.Context, ss *Storage) (bool, error) {
+			return ss.PutXorb(ctx, xorbHash, strings.NewReader("xorb bytes"))
+		},
+		del: func(ctx context.Context, ss *Storage) (bool, error) { return ss.DeleteXorb(ctx, xorbHash) },
+	}, {
+		kind: "shard",
+		key:  storage.ObjectKey("shards", shardHash),
+		put: func(ctx context.Context, ss *Storage) (bool, error) {
+			_, inserted, err := ss.PutShard(ctx, sh)
+			return inserted, err
+		},
+		del: func(ctx context.Context, ss *Storage) (bool, error) { return ss.DeleteShard(ctx, shardHash) },
+	}, {
+		kind: "file index entry",
+		key:  storage.ObjectKey("index/files", fileHash.String()),
+		put: func(ctx context.Context, ss *Storage) (bool, error) {
+			return ss.PutFileIndexEntry(ctx, fileHash, shardHash)
+		},
+		del: func(ctx context.Context, ss *Storage) (bool, error) { return ss.DeleteFileIndexEntry(ctx, fileHash) },
+	}, {
+		kind: "chunk index entry",
+		key:  storage.ObjectKey("index/chunks", chunkHash.String()),
+		put: func(ctx context.Context, ss *Storage) (bool, error) {
+			return ss.PutChunkIndexEntry(ctx, chunkHash, shardHash)
+		},
+		del: func(ctx context.Context, ss *Storage) (bool, error) { return ss.DeleteChunkIndexEntry(ctx, chunkHash) },
+	}, {
+		kind: "SHA-256 index entry",
+		key:  storage.ObjectKey("index/sha256", hex.EncodeToString(digest[:])),
+		put: func(ctx context.Context, ss *Storage) (bool, error) {
+			return ss.PutSHA256IndexEntry(ctx, digest, shardHash)
+		},
+		del: func(ctx context.Context, ss *Storage) (bool, error) { return ss.DeleteSHA256IndexEntry(ctx, digest) },
+	}}
+}
+
+// TestS3PutWritesOnlyWhenHeadFindsNoObject: every Put sends one HEAD for its
+// key, then one PUT when the key is absent and nothing more when it exists.
+func TestS3PutWritesOnlyWhenHeadFindsNoObject(t *testing.T) {
+	for _, obj := range storedObjects(t) {
+		t.Run(obj.kind, func(t *testing.T) {
+			ctx := context.Background()
+			ss, ct := newCountingS3Storage(t)
+			head, put := "HEAD /test-bucket/"+obj.key, "PUT /test-bucket/"+obj.key
+			if inserted, err := obj.put(ctx, ss); err != nil || !inserted {
+				t.Fatalf("Put(absent key) = %v, %v; want true", inserted, err)
+			}
+			if got, want := ct.sent(), []string{head, put}; !slices.Equal(got, want) {
+				t.Fatalf("Put(absent key) sent %q, want %q", got, want)
+			}
+			ct.reset()
+			if inserted, err := obj.put(ctx, ss); err != nil || inserted {
+				t.Fatalf("Put(existing key) = %v, %v; want false", inserted, err)
+			}
+			if got, want := ct.sent(), []string{head}; !slices.Equal(got, want) {
+				t.Fatalf("Put(existing key) sent %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestS3DeleteDeletesOnlyWhenHeadFindsObject: every Delete sends one HEAD for
+// its key, then one DELETE when the object exists and nothing more when not.
+func TestS3DeleteDeletesOnlyWhenHeadFindsObject(t *testing.T) {
+	for _, obj := range storedObjects(t) {
+		t.Run(obj.kind, func(t *testing.T) {
+			ctx := context.Background()
+			ss, ct := newCountingS3Storage(t)
+			head, del := "HEAD /test-bucket/"+obj.key, "DELETE /test-bucket/"+obj.key
+			if _, err := obj.put(ctx, ss); err != nil {
+				t.Fatal(err)
+			}
+			ct.reset()
+			if existed, err := obj.del(ctx, ss); err != nil || !existed {
+				t.Fatalf("Delete(stored key) = %v, %v; want true", existed, err)
+			}
+			if got, want := ct.sent(), []string{head, del}; !slices.Equal(got, want) {
+				t.Fatalf("Delete(stored key) sent %q, want %q", got, want)
+			}
+			ct.reset()
+			if existed, err := obj.del(ctx, ss); err != nil || existed {
+				t.Fatalf("Delete(deleted key) = %v, %v; want false", existed, err)
+			}
+			if got, want := ct.sent(), []string{head}; !slices.Equal(got, want) {
+				t.Fatalf("Delete(deleted key) sent %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestS3PutAndDeleteErrorsNameTheFailedRequest: a Put or Delete whose HEAD,
+// PUT or DELETE fails returns an error that names the request's step and the
+// object.
+func TestS3PutAndDeleteErrorsNameTheFailedRequest(t *testing.T) {
+	prefixes := map[string]struct{ putHead, put, delHead, del string }{
+		"xorb":                {"check xorb object: ", "upload xorb: ", "check xorb: ", "delete xorb: "},
+		"shard":               {"check shard object: ", "upload shard: ", "check shard: ", "delete shard: "},
+		"file index entry":    {"check file index: ", "operation error S3: PutObject, ", "check file index: ", "delete file index: "},
+		"chunk index entry":   {"check chunk index: ", "operation error S3: PutObject, ", "check chunk index: ", "delete chunk index: "},
+		"SHA-256 index entry": {"check SHA-256 index: ", "operation error S3: PutObject, ", "check SHA-256 index: ", "delete SHA-256 index: "},
+	}
+	for _, obj := range storedObjects(t) {
+		t.Run(obj.kind, func(t *testing.T) {
+			ctx := context.Background()
+			ss, ct := newCountingS3Storage(t)
+			want := prefixes[obj.kind]
+			check := func(what string, err error, prefix string) {
+				t.Helper()
+				if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+					t.Errorf("%s = %v, want an error starting %q", what, err, prefix)
+				}
+			}
+			failing := func(method string) {
+				ct.setFail(func(req *http.Request) bool { return req.Method == method })
+			}
+
+			failing(http.MethodHead)
+			_, err := obj.put(ctx, ss)
+			check("Put with HEAD failing", err, want.putHead)
+			failing(http.MethodPut)
+			_, err = obj.put(ctx, ss)
+			check("Put with PUT failing", err, want.put)
+
+			ct.reset()
+			if _, err := obj.put(ctx, ss); err != nil {
+				t.Fatal(err)
+			}
+			failing(http.MethodHead)
+			_, err = obj.del(ctx, ss)
+			check("Delete with HEAD failing", err, want.delHead)
+			failing(http.MethodDelete)
+			_, err = obj.del(ctx, ss)
+			check("Delete with DELETE failing", err, want.del)
+		})
 	}
 }

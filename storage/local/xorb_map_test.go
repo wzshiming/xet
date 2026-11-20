@@ -117,7 +117,7 @@ func TestDeleteXorbWhileReaderOpen(t *testing.T) {
 	defer a.Close()
 	assertNext(t, a, encoded[:7])
 
-	if err := await(t, inBackground(func() error { return fs.DeleteXorb(ctx, x) })); err != nil {
+	if err := await(t, inBackground(func() error { _, err := fs.DeleteXorb(ctx, x); return err })); err != nil {
 		t.Fatalf("DeleteXorb with a reader open: %v", err)
 	}
 	if ok, err := fs.HasXorb(ctx, x); err != nil || ok {
@@ -215,7 +215,7 @@ func TestXorbMappedMatchesCacheWhenIdle(t *testing.T) {
 	assertIdle("the last reader of evicted X closed", 1)
 
 	for _, xorbHash := range []xet.XorbHash{x, y} {
-		if err := fs.DeleteXorb(ctx, xorbHash); err != nil {
+		if _, err := fs.DeleteXorb(ctx, xorbHash); err != nil {
 			t.Fatal(err)
 		}
 	}

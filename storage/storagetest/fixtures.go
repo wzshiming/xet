@@ -23,8 +23,8 @@ import (
 // NoGrace makes every stored object immediately sweepable.
 const NoGrace = -time.Hour
 
-// zeroSHA256Hex is the all-zero digest empty files store as their SHA-256.
-const zeroSHA256Hex = "0000000000000000000000000000000000000000000000000000000000000000"
+// zeroSHA256 is the all-zero digest empty files store as their SHA-256.
+var zeroSHA256 [32]byte
 
 // File captures everything a stored test file owns so sweeps can be
 // asserted object by object.
@@ -120,7 +120,7 @@ func PutFile(tb testing.TB, ctx context.Context, st storage.Storage, parts [][]b
 	for _, part := range parts {
 		f.Content = append(f.Content, part...)
 	}
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
 		tb.Fatal(err)
 	}
 	digest := sha256.Sum256(f.Content)
@@ -148,7 +148,7 @@ func PutXorbFile(tb testing.TB, ctx context.Context, st storage.Storage, xorbs [
 	tb.Helper()
 	sh := shard.NewShard()
 	f := addXorbFile(tb, ctx, st, sh, xorbs)
-	if _, err := st.PutShard(ctx, sh); err != nil {
+	if _, err := storage.PutShard(ctx, st, sh); err != nil {
 		tb.Fatal(err)
 	}
 	shardHash, err := st.GetFileIndexEntry(ctx, f.FileHash)
@@ -244,6 +244,22 @@ func assertChunkIndexEntry(tb testing.TB, ctx context.Context, st storage.Storag
 	tb.Helper()
 	if got, err := st.GetChunkIndexEntry(ctx, chunkHash); err != nil || got != want {
 		tb.Fatalf("chunk entry %s = %q, %v; want %q", chunkHash.String(), got, err, want)
+	}
+}
+
+// putFileIndexEntry records shardHash for fileHash, failing unless the Put wrote it.
+func putFileIndexEntry(tb testing.TB, ctx context.Context, st storage.Storage, fileHash xet.FileHash, shardHash string) {
+	tb.Helper()
+	if inserted, err := st.PutFileIndexEntry(ctx, fileHash, shardHash); err != nil || !inserted {
+		tb.Fatalf("PutFileIndexEntry(%s) = %v, %v; want true", fileHash.String(), inserted, err)
+	}
+}
+
+// putSHA256IndexEntry records shardHash for digest, failing unless the Put wrote it.
+func putSHA256IndexEntry(tb testing.TB, ctx context.Context, st storage.Storage, digest [32]byte, shardHash string) {
+	tb.Helper()
+	if inserted, err := st.PutSHA256IndexEntry(ctx, digest, shardHash); err != nil || !inserted {
+		tb.Fatalf("PutSHA256IndexEntry(%x) = %v, %v; want true", digest, inserted, err)
 	}
 }
 
@@ -345,12 +361,12 @@ func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.File
 	return h.Storage.GetFileIndexEntry(ctx, fileHash)
 }
 
-func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error) {
+func (h *hookedGCStore) GetSHA256IndexEntry(ctx context.Context, digest [32]byte) (string, error) {
 	if h.onSHA256EntryGet != nil {
 		h.sha256EntryGets++
 		h.onSHA256EntryGet(h.sha256EntryGets)
 	}
-	return h.Storage.GetSHA256IndexEntry(ctx, sha256Hex)
+	return h.Storage.GetSHA256IndexEntry(ctx, digest)
 }
 
 func (h *hookedGCStore) GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (string, error) {
@@ -358,7 +374,7 @@ func (h *hookedGCStore) GetChunkIndexEntry(ctx context.Context, chunkHash xet.Ch
 	return h.Storage.GetChunkIndexEntry(ctx, chunkHash)
 }
 
-func (h *hookedGCStore) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error {
+func (h *hookedGCStore) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (bool, error) {
 	h.chunkEntryDeletes = append(h.chunkEntryDeletes, chunkHash)
 	return h.Storage.DeleteChunkIndexEntry(ctx, chunkHash)
 }
@@ -427,7 +443,7 @@ func PutListedFile(tb testing.TB, ctx context.Context, st storage.Storage, parts
 	fileHash := xet.ComputeFileHash(chunkHashes, chunkSizes)
 	fileBlock.FileHash = fileHash
 	shardObj.AddFile(fileBlock)
-	if _, err := st.PutShard(ctx, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
 		tb.Fatal(err)
 	}
 	return fileHash.String(), storedSize
@@ -490,13 +506,13 @@ func CheckFanoutStore(tb testing.TB, ctx context.Context, st storage.Storage, sh
 	if err := st.WalkFileIndex(ctx, collectIndex("index/files")); err != nil {
 		tb.Fatalf("WalkFileIndex(): %v", err)
 	}
+	if err := st.WalkChunkIndex(ctx, collectIndex("index/chunks")); err != nil {
+		tb.Fatalf("WalkChunkIndex(): %v", err)
+	}
 	if err := st.WalkSHA256Index(ctx, collectIndex("index/sha256")); err != nil {
 		tb.Fatalf("WalkSHA256Index(): %v", err)
 	}
 	for kind, h := range want {
-		if kind == "index/chunks" {
-			continue // no walker exists for the chunk index
-		}
 		if got := walked[kind]; len(got) != 1 || got[0] != h {
 			tb.Errorf("walk %s = %q, want [%s]", kind, got, h)
 		}

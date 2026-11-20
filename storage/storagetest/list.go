@@ -34,7 +34,7 @@ func testListFilesGroupsBySHA256(t *testing.T, b Backend) {
 	emptyHash := xet.FileHash{}
 	emptyShard := shard.NewShard()
 	emptyShard.AddFile(shard.FileBlock{FileHash: emptyHash})
-	if _, err := st.PutShard(ctx, emptyShard); err != nil {
+	if _, err := storage.PutShard(ctx, st, emptyShard); err != nil {
 		t.Fatalf("PutShard(empty file): %v", err)
 	}
 
@@ -69,8 +69,8 @@ func testListFilesMarksDanglingEntries(t *testing.T, b Backend) {
 	content := []byte("still resolvable")
 	realHash, realStored := PutListedFile(t, ctx, st, [][]byte{content})
 
-	danglingHash := strings.Repeat("ab", 32)
-	b.SetIndexEntry(t, st, "index/files", danglingHash, strings.Repeat("cd", 32))
+	danglingHash := xet.FileHash{0xab}
+	putFileIndexEntry(t, ctx, st, danglingHash, strings.Repeat("cd", 32))
 
 	got, err := storage.ListFiles(ctx, st)
 	if err != nil {
@@ -79,7 +79,7 @@ func testListFilesMarksDanglingEntries(t *testing.T, b Backend) {
 
 	digest := sha256.Sum256(content)
 	want := []storage.FileListEntry{
-		{FileHashes: []string{danglingHash}, Missing: true},
+		{FileHashes: []string{danglingHash.String()}, Missing: true},
 		{SHA256: hex.EncodeToString(digest[:]), FileHashes: []string{realHash}, OriginalSize: uint64(len(content)), UniqueSize: realStored},
 	}
 	SortEntries(want)
@@ -99,7 +99,7 @@ func testListFilesToleratesVanishedXorb(t *testing.T, b Backend) {
 	partB := []byte("the chunk whose xorb vanishes")
 	f := PutFile(t, ctx, st, [][]byte{partA, partB})
 	vanished := f.XorbHashes[1]
-	if err := st.DeleteXorb(ctx, vanished); err != nil {
+	if _, err := st.DeleteXorb(ctx, vanished); err != nil {
 		t.Fatalf("DeleteXorb: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func testListFilesComputesUniqueAndShared(t *testing.T, b Backend) {
 	if len(shardAB.CASInfos) != 1 {
 		t.Fatalf("test setup: %d CAS blocks left, want only partB's", len(shardAB.CASInfos))
 	}
-	if _, err := st.PutShard(ctx, shardAB); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardAB); err != nil {
 		t.Fatalf("PutShard: %v", err)
 	}
 
@@ -182,7 +182,7 @@ func testListFilesMarksInvalidChunkMetadata(t *testing.T, b Backend) {
 		t.Fatal(err)
 	}
 	b.PutRawShardObject(t, ctx, st, shardHash, raw)
-	b.SetIndexEntry(t, st, "index/files", fileHash.String(), shardHash)
+	putFileIndexEntry(t, ctx, st, fileHash, shardHash)
 	// The shard loads fine, so a missing flag can only come from the chunk index.
 	if _, err := st.GetShardByHash(ctx, shardHash); err != nil {
 		t.Fatalf("test setup: GetShardByHash: %v", err)

@@ -27,7 +27,7 @@ func (c storageClient) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool
 }
 
 func (c storageClient) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, r io.ReadSeeker) (*XorbUploadResponse, error) {
-	inserted, err := c.st.PutXorb(ctx, xorbHash, r)
+	inserted, err := storage.PutXorb(ctx, c.st, xorbHash, r)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +35,7 @@ func (c storageClient) UploadXorb(ctx context.Context, xorbHash xet.XorbHash, r 
 }
 
 func (c storageClient) UploadShard(ctx context.Context, sh *shard.Shard) (*ShardUploadResponse, error) {
-	inserted, err := c.st.PutShard(ctx, sh)
+	inserted, err := storage.PutShard(ctx, c.st, sh)
 	if err != nil {
 		return nil, err
 	}

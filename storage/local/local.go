@@ -20,7 +20,6 @@ import (
 	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
-	"github.com/wzshiming/xet/xorb"
 )
 
 // Storage implements storage.Storage on the local filesystem.
@@ -96,21 +95,6 @@ func (fs *Storage) objectPath(kind, name string) string {
 	return filepath.Join(fs.basePath, filepath.FromSlash(storage.ObjectKey(kind, name)))
 }
 
-// hasFile checks whether a file hash already has a shard mapping.
-func (fs *Storage) hasFile(fileHash xet.FileHash) (bool, error) {
-	if _, exists := fs.caches.Files.Get(fileHash); exists {
-		return true, nil
-	}
-
-	filePath := fs.objectPath("index/files", fileHash.String())
-	if _, err := os.Stat(filePath); err == nil {
-		return true, nil
-	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check file index: %w", err)
-	}
-	return false, nil
-}
-
 // getShard resolves a file hash through index/files/<file-hash>, whose contents
 // are the hash of the serialized shard stored at shards/<shard-hash>.
 func (fs *Storage) getShard(fileHash xet.FileHash) (*shard.Shard, error) {
@@ -169,9 +153,9 @@ func (fs *Storage) GetShardByHash(ctx context.Context, shardHash string) (*shard
 	return fs.getShardByHash(shardHash)
 }
 
-// WalkFileIndex calls fn for every committed index/files entry.
-func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
-	root := filepath.Join(fs.basePath, "index", "files")
+// walkIndex calls fn with the name and recorded shard hash of every committed entry under kind.
+func (fs *Storage) walkIndex(ctx context.Context, kind string, fn func(name, shardHash string) error) error {
+	root := filepath.Join(fs.basePath, filepath.FromSlash(kind))
 	return filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
 		if err != nil {
 			// Tolerate concurrent deletion anywhere under the index.
@@ -190,12 +174,12 @@ func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 		if err != nil {
 			return err
 		}
-		fileHash := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
-		// Skip in-flight .tmp files and anything that is not a hash name.
-		if len(fileHash) != 64 {
+		name := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
+		// Skip in-flight temp files and anything that is not a hash name.
+		if len(name) != 64 {
 			return nil
 		}
-		if _, err := hex.DecodeString(fileHash); err != nil {
+		if _, err := hex.DecodeString(name); err != nil {
 			return nil
 		}
 		data, err := os.ReadFile(path)
@@ -205,8 +189,18 @@ func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHas
 			}
 			return err
 		}
-		return fn(fileHash, strings.TrimSpace(string(data)))
+		return fn(name, strings.TrimSpace(string(data)))
 	})
+}
+
+// WalkFileIndex calls fn for every committed index/files entry.
+func (fs *Storage) WalkFileIndex(ctx context.Context, fn func(fileHash, shardHash string) error) error {
+	return fs.walkIndex(ctx, "index/files", fn)
+}
+
+// WalkChunkIndex calls fn for every committed index/chunks entry.
+func (fs *Storage) WalkChunkIndex(ctx context.Context, fn func(chunkHash, shardHash string) error) error {
+	return fs.walkIndex(ctx, "index/chunks", fn)
 }
 
 // PutXorb stores an xorb
@@ -228,11 +222,10 @@ func (fs *Storage) PutXorb(ctx context.Context, xorbHash xet.XorbHash, r io.Read
 	}
 	tmpPath := f.Name()
 
-	err = xorb.Validate(io.TeeReader(r, f), xorbHash) // Validate xorb format before storing
-	if err != nil {
+	if _, err := io.Copy(f, r); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return false, fmt.Errorf("validate xorb: %w", err)
+		return false, fmt.Errorf("write xorb file: %w", err)
 	}
 	if err := f.Chmod(0644); err != nil {
 		f.Close()
@@ -281,51 +274,38 @@ func (fs *Storage) HasXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, er
 	return false, fmt.Errorf("check xorb file: %w", err)
 }
 
-// PutShard stores a shard
-func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
-	// Only a shard whose every file is already indexed is a no-op
-	alreadyExists := len(s.Files) > 0
-	for _, fileBlock := range s.Files {
-		exists, err := fs.hasFile(fileBlock.FileHash)
-		if err != nil {
-			return false, fmt.Errorf("check shard: %w", err)
-		}
-		if !exists {
-			alreadyExists = false
-			break
-		}
-	}
-
-	if alreadyExists {
-		return false, nil // Already exists
-	}
-
-	if err := storage.PrepareShard(ctx, s, fs); err != nil {
-		return false, err
-	}
-
+// PutShard stores the shard under the SHA-256 of its encoding unless that object exists.
+func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (string, bool, error) {
 	encoded, shardHash, err := storage.EncodeShard(s)
 	if err != nil {
-		return false, fmt.Errorf("serialize shard: %w", err)
+		return "", false, fmt.Errorf("serialize shard: %w", err)
 	}
-
 	shardPath := fs.objectPath("shards", shardHash)
-	wasInserted := true
 	if _, err := os.Stat(shardPath); err == nil {
-		wasInserted = false
+		return shardHash, false, nil
 	} else if !os.IsNotExist(err) {
-		return false, fmt.Errorf("check shard file: %w", err)
-	} else if err := overwriteIndexFile(shardPath, encoded); err != nil {
-		return false, fmt.Errorf("write shard file: %w", err)
+		return "", false, fmt.Errorf("check shard file: %w", err)
 	}
+	if err := overwriteIndexFile(shardPath, encoded); err != nil {
+		return "", false, fmt.Errorf("write shard file: %w", err)
+	}
+	return shardHash, true, nil
+}
 
-	// Nothing is cached here; the read path populates the caches from the
-	// stored objects, so a warm process serves exactly what a restarted one
-	// would.
-	err = storage.PutShardIndexes(ctx, s, shardHash, func(_ context.Context, kind, name string, value []byte) error {
-		return writeIndexFile(fs.objectPath(kind, name), value)
-	})
-	return wasInserted, err
+// PutFileIndexEntry writes the index/files entry for fileHash unless one exists.
+// Nothing is cached on writes; reads fill the caches from the stored entries.
+func (fs *Storage) PutFileIndexEntry(ctx context.Context, fileHash xet.FileHash, shardHash string) (bool, error) {
+	return writeIndexFile(fs.objectPath("index/files", fileHash.String()), []byte(shardHash))
+}
+
+// PutChunkIndexEntry writes the index/chunks entry for chunkHash unless one exists.
+func (fs *Storage) PutChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash, shardHash string) (bool, error) {
+	return writeIndexFile(fs.objectPath("index/chunks", chunkHash.String()), []byte(shardHash))
+}
+
+// PutSHA256IndexEntry writes the index/sha256 entry for digest unless one exists.
+func (fs *Storage) PutSHA256IndexEntry(ctx context.Context, digest [32]byte, shardHash string) (bool, error) {
+	return writeIndexFile(fs.objectPath("index/sha256", hex.EncodeToString(digest[:])), []byte(shardHash))
 }
 
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in
@@ -409,12 +389,16 @@ func (fs *Storage) GetShardByChunkHash(ctx context.Context, chunkHash xet.ChunkH
 	return fs.getShardByHash(shardHash)
 }
 
-func writeIndexFile(path string, value []byte) error {
+// writeIndexFile writes value to path unless a file is there, reporting whether it wrote.
+func writeIndexFile(path string, value []byte) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {
-		return nil
+		return false, nil
 	}
-	return overwriteIndexFile(path, value)
+	if err := overwriteIndexFile(path, value); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // overwriteIndexFile writes an index entry unconditionally, replacing any
@@ -506,42 +490,7 @@ func (fs *Storage) Usage(ctx context.Context) (storage.Usage, error) {
 
 // WalkSHA256Index calls fn for every committed index/sha256 entry.
 func (fs *Storage) WalkSHA256Index(ctx context.Context, fn func(sha256Hex, shardHash string) error) error {
-	root := filepath.Join(fs.basePath, "index", "sha256")
-	return filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
-		if err != nil {
-			// Tolerate concurrent deletion anywhere under the index.
-			if errors.Is(err, iofs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		sha256Hex := strings.ReplaceAll(filepath.ToSlash(rel), "/", "")
-		// Skip in-flight .tmp files and anything that is not a hash name.
-		if len(sha256Hex) != 64 {
-			return nil
-		}
-		if _, err := hex.DecodeString(sha256Hex); err != nil {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			if errors.Is(err, iofs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		return fn(sha256Hex, strings.TrimSpace(string(data)))
-	})
+	return fs.walkIndex(ctx, "index/sha256", fn)
 }
 
 // DeleteFileIndexEntry removes the index/files entry for fileHash, reporting
@@ -572,26 +521,32 @@ func (fs *Storage) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash)
 	return strings.TrimSpace(string(b)), nil
 }
 
-// DeleteShard removes a stored shard object.
-func (fs *Storage) DeleteShard(ctx context.Context, shardHash string) error {
+// DeleteShard removes a stored shard object, reporting whether it existed.
+func (fs *Storage) DeleteShard(ctx context.Context, shardHash string) (bool, error) {
 	err := os.Remove(fs.objectPath("shards", shardHash))
 	fs.caches.Shards.Remove(shardHash)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("delete shard: %w", err)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("delete shard: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
-// DeleteXorb removes a stored xorb object.
-func (fs *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) error {
+// DeleteXorb removes a stored xorb object, reporting whether it existed.
+func (fs *Storage) DeleteXorb(ctx context.Context, xorbHash xet.XorbHash) (bool, error) {
 	// Evict first: Windows cannot delete a file with a mapped view, so there the remove fails until readers close.
 	fs.xorbCache.Remove(xorbHash)
 	fs.caches.Offsets.Remove(xorbHash)
 	err := os.Remove(fs.objectPath("xorbs", xorbHash.String()))
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("delete xorb: %w", err)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("delete xorb: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // GetChunkIndexEntry returns the shard hash recorded for chunkHash, or ""
@@ -607,31 +562,24 @@ func (fs *Storage) GetChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHa
 	return strings.TrimSpace(string(b)), nil
 }
 
-// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash.
-func (fs *Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) error {
+// DeleteChunkIndexEntry removes the index/chunks entry for chunkHash,
+// reporting whether it existed.
+func (fs *Storage) DeleteChunkIndexEntry(ctx context.Context, chunkHash xet.ChunkHash) (bool, error) {
 	err := os.Remove(fs.objectPath("index/chunks", chunkHash.String()))
 	fs.caches.Chunks.Remove(chunkHash)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("delete chunk index: %w", err)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("delete chunk index: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
-// evictSHA256 drops the cached mapping for a hex SHA-256 digest.
-func (fs *Storage) evictSHA256(sha256Hex string) {
-	raw, err := hex.DecodeString(sha256Hex)
-	if err != nil || len(raw) != 32 {
-		return
-	}
-	var digest [32]byte
-	copy(digest[:], raw)
-	fs.caches.SHA256.Remove(digest)
-}
-
-// GetSHA256IndexEntry returns the shard hash recorded for the hex SHA-256
+// GetSHA256IndexEntry returns the shard hash recorded for the SHA-256
 // digest, or "" when the entry is absent, bypassing the cache.
-func (fs *Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (string, error) {
-	b, err := os.ReadFile(fs.objectPath("index/sha256", sha256Hex))
+func (fs *Storage) GetSHA256IndexEntry(ctx context.Context, digest [32]byte) (string, error) {
+	b, err := os.ReadFile(fs.objectPath("index/sha256", hex.EncodeToString(digest[:])))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
@@ -643,9 +591,9 @@ func (fs *Storage) GetSHA256IndexEntry(ctx context.Context, sha256Hex string) (s
 
 // DeleteSHA256IndexEntry removes the index/sha256 entry, reporting whether
 // it existed.
-func (fs *Storage) DeleteSHA256IndexEntry(ctx context.Context, sha256Hex string) (bool, error) {
-	err := os.Remove(fs.objectPath("index/sha256", sha256Hex))
-	fs.evictSHA256(sha256Hex)
+func (fs *Storage) DeleteSHA256IndexEntry(ctx context.Context, digest [32]byte) (bool, error) {
+	err := os.Remove(fs.objectPath("index/sha256", hex.EncodeToString(digest[:])))
+	fs.caches.SHA256.Remove(digest)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
