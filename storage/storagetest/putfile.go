@@ -127,6 +127,21 @@ func testPutFileReusesStoredChunks(t *testing.T, b Backend) {
 	assertNewChunks(t, ctx, st, f2, f1.ChunkHashes)
 }
 
+// PutFile records the SHA-256 WithSHA256 gives as the file's instead of hashing the file.
+func testPutFileRecordsGivenSHA256(t *testing.T, b Backend) {
+	ctx := context.Background()
+	st := b.New(t)
+	data := []byte("a file whose SHA-256 the caller already has")
+	given := sha256.Sum256([]byte("not the file's bytes"))
+	fileHash, err := storage.PutFile(ctx, st, bytes.NewReader(data), storage.WithSHA256(given))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetFileHashBySHA256(ctx, given); err != nil || got != fileHash {
+		t.Fatalf("GetFileHashBySHA256(given) = %s, %v; want %s", got.String(), err, fileHash.String())
+	}
+}
+
 // An empty file stores nothing: no xorb, no shard, no index entry.
 func testPutFileEmpty(t *testing.T, b Backend) {
 	ctx := context.Background()

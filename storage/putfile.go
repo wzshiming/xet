@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 
@@ -23,10 +24,30 @@ type xorbReader struct {
 	buf      bytes.Buffer
 }
 
+// PutFileOption configures PutFile.
+type PutFileOption func(*putFileConfig)
+
+type putFileConfig struct {
+	sha256 *[32]byte
+}
+
+// WithSHA256 gives PutFile the SHA-256 of the bytes it will read from r, which
+// it records unchecked instead of hashing them.
+func WithSHA256(digest [32]byte) PutFileOption {
+	return func(c *putFileConfig) { c.sha256 = &digest }
+}
+
 // PutFile stores the file read from r: chunks already held by a stored shard
 // are reused, the new ones are packed into xorbs, and the shard describing the
 // file is committed; an empty file stores nothing. It returns the file's xet hash.
-func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, error) {
+// PutXorb validates the new xorbs, and the shards it reuses chunks from were
+// verified when stored, so the shard is committed with PutVerifiedShard, which
+// reads no xorb back.
+func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker, opts ...PutFileOption) (xet.FileHash, error) {
+	var cfg putFileConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	base, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return xet.FileHash{}, fmt.Errorf("locate file start: %w", err)
@@ -40,7 +61,12 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 	var chunkSizes []uint64
 	var file shard.FileInfo
 	unique := map[xet.ChunkHash]int{}
-	err = xet.ChunkData(r, func(offset int64, chunk []byte) error {
+	var src io.Reader = r
+	digest := sha256.New()
+	if cfg.sha256 == nil {
+		src = io.TeeReader(r, digest)
+	}
+	err = xet.ChunkData(src, func(offset int64, chunk []byte) error {
 		h := xet.ComputeChunkHash(chunk)
 		chunkHashes = append(chunkHashes, h)
 		chunkSizes = append(chunkSizes, uint64(len(chunk)))
@@ -58,6 +84,11 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 		return xet.FileHash{}, fmt.Errorf("chunk file: %w", err)
 	}
 	file.Hash = xet.ComputeFileHash(chunkHashes, chunkSizes)
+	if cfg.sha256 != nil {
+		file.SHA256 = *cfg.sha256
+	} else {
+		copy(file.SHA256[:], digest.Sum(nil))
+	}
 
 	// A failed lookup only leaves the chunks it would locate to be stored anew.
 	located := map[xet.ChunkHash]shard.ChunkLocation{}
@@ -108,7 +139,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 	}
 
 	if len(chunks) > 0 {
-		if _, err := stor.PutShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
+		if _, err := stor.PutVerifiedShard(ctx, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
 		}
 	}

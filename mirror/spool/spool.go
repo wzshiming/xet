@@ -265,7 +265,9 @@ func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256
 	if err != nil {
 		return Result{}, fmt.Errorf("hash spool: %w", err)
 	}
-	digest := hex.EncodeToString(hasher.Sum(nil))
+	var sum [32]byte
+	copy(sum[:], hasher.Sum(nil))
+	digest := hex.EncodeToString(sum[:])
 	if wantSHA256 != "" && digest != wantSHA256 {
 		return Result{}, fmt.Errorf("%w: sha256 mismatch: got %s, expected %s", ErrCorrupt, digest, wantSHA256)
 	}
@@ -275,7 +277,7 @@ func ingest(ctx context.Context, st storage.Storage, r io.ReadSeeker, wantSHA256
 		if _, err := r.Seek(0, io.SeekStart); err != nil {
 			return Result{}, fmt.Errorf("rewind spool: %w", err)
 		}
-		fileHash, err := storage.PutFile(ctx, st, r)
+		fileHash, err := storage.PutFile(ctx, st, r, storage.WithSHA256(sum))
 		if err != nil {
 			return Result{}, fmt.Errorf("ingest into storage: %w", err)
 		}
