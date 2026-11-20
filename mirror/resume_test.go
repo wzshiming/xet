@@ -539,10 +539,8 @@ func TestMirrorStalledPlainFetchResumes(t *testing.T) {
 	srv := httptest.NewServer(up)
 	t.Cleanup(srv.Close)
 
-	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir())
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), withStallTimeout(200*time.Millisecond))
 	t.Cleanup(func() { close(up.abort) })
-	// Shorten the upstream read-idle guard below the shared auth injector.
-	m.probeClient.Transport.(*authInjector).inner = client.NewIdleTimeoutTransport(http.DefaultTransport.(*http.Transport).Clone(), 200*time.Millisecond)
 
 	res, err := m.Resolve(context.Background(), "org/repo", "main", "stall.bin")
 	if err != nil {
@@ -564,6 +562,111 @@ func TestMirrorStalledPlainFetchResumes(t *testing.T) {
 	}
 	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
 		t.Fatal("stored bytes mismatch after stall resume")
+	}
+}
+
+// An upstream that answers the probe but never sends a byte of the file fails
+// the ingest as a Timeout after two upstream opens in all: the fetch's retries
+// and httpseek's re-opens draw from one budget.
+func TestMirrorSilentPlainFetch(t *testing.T) {
+	upstream := newPlainUpstream()
+	upstream.set("/org/repo/resolve/main/f.bin", []byte("never sent"))
+	release := make(chan struct{})
+	var gets atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/cdn") {
+			gets.Add(1)
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		}
+		upstream.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	m, _ := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), withStallTimeout(100*time.Millisecond))
+
+	_, err := ingestWait(t, m, "org/repo", "main", "f.bin")
+	var ue *UpstreamError
+	if !errors.As(err, &ue) || ue.Kind != UpstreamTimeout || ue.Attempts != maxFetchAttempts {
+		t.Fatalf("ingest err = %#v; want a Timeout after %d attempts", err, maxFetchAttempts)
+	}
+	if got := gets.Load(); got != maxFetchAttempts {
+		t.Fatalf("upstream data GETs = %d, want %d", got, maxFetchAttempts)
+	}
+	_, err = m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+	if !errors.As(err, &ue) || ue.Kind != UpstreamTimeout || ue.Attempts != maxFetchAttempts || ue.RetryAfter <= 0 {
+		t.Fatalf("Resolve during the backoff = %#v; want the recorded Timeout with a retry delay", err)
+	}
+	if got := gets.Load(); got != maxFetchAttempts {
+		t.Fatalf("upstream data GETs during the backoff = %d, want %d", got, maxFetchAttempts)
+	}
+}
+
+// An upstream trickling the body with gaps under the stall timeout, longer in
+// all than it, is never failed: one open, and every block reaches a reader of
+// the stream before the upstream sends the next.
+func TestMirrorTricklingPlainFetch(t *testing.T) {
+	const stall, blocks, block = 300 * time.Millisecond, 4, 16 * 1024
+	data := make([]byte, blocks*block)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	upstream := newPlainUpstream()
+	upstream.set("/org/repo/resolve/main/slow.bin", data)
+	seen := make(chan struct{}, blocks) // one per block the reader got
+	var gets atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/cdn") {
+			upstream.ServeHTTP(w, r)
+			return
+		}
+		gets.Add(1)
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		for i := range blocks {
+			if i > 0 {
+				select {
+				case <-seen:
+				case <-r.Context().Done():
+					return
+				}
+				time.Sleep(stall / 2)
+			}
+			_, _ = w.Write(data[i*block : (i+1)*block])
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	m, stor := newTestMirror(t, srv.URL, t.TempDir(), t.TempDir(), withStallTimeout(stall))
+
+	res, err := m.Resolve(context.Background(), "org/repo", "main", "slow.bin")
+	if err != nil || res.Stream == nil {
+		t.Fatalf("Resolve = %+v, %v; want an in-flight stream", res, err)
+	}
+	rc, err := res.Stream.NewReader(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	buf := make([]byte, block)
+	for i := range blocks {
+		if _, err := io.ReadFull(rc, buf); err != nil || !bytes.Equal(buf, data[i*block:(i+1)*block]) {
+			t.Fatalf("block %d: %v; want its bytes before the next is sent", i, err)
+		}
+		seen <- struct{}{}
+	}
+	awaitClosed(t, doneOf(res), "trickling ingest")
+	entry, err := entryOf(res)
+	if err != nil {
+		t.Fatalf("a trickle under the stall timeout failed: %v", err)
+	}
+	if got := gets.Load(); got != 1 {
+		t.Fatalf("upstream data GETs = %d, want 1", got)
+	}
+	if got := readStored(t, stor, entry.SHA256); !bytes.Equal(got, data) {
+		t.Fatal("stored bytes mismatch")
 	}
 }
 
