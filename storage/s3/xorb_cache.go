@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/internal/xorbmap"
 	"github.com/wzshiming/xet/storage"
 )
 
@@ -77,4 +78,53 @@ func (ss *Storage) removeXorbFile(h xet.XorbHash) {
 	}
 	delete(ss.xorbLive, h)
 	os.Remove(ss.xorbCachePath(h))
+}
+
+// copyXorbs reads the cached copies' files for PutShard's pass over every xorb a shard
+// names: each copy still downloads once and stays cached, but no page of it is faulted
+// in through its mapping, where it would stay resident until the copy is evicted.
+type copyXorbs struct{ *Storage }
+
+func (x copyXorbs) GetXorbReadSeekCloser(_ context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+	// The hold keeps the copy on disk until Close.
+	m, err := x.xorbCache.Acquire(xorbHash)
+	if err != nil {
+		return nil, fmt.Errorf("get xorb: %w", err)
+	}
+	f, err := os.Open(x.xorbCachePath(xorbHash))
+	if err != nil {
+		m.Release()
+		return nil, fmt.Errorf("open xorb copy: %w", err)
+	}
+	return &copyFile{File: f, held: m}, nil
+}
+
+func (x copyXorbs) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+	return x.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
+		rc, err := x.GetXorbReadSeekCloser(ctx, xorbHash)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		offsets, err := storage.ReadXorbChunkOffsets(rc)
+		if err != nil {
+			return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
+		}
+		return offsets, nil
+	})
+}
+
+// copyFile reads a cached copy, holding its mapping until the first Close.
+type copyFile struct {
+	*os.File
+	held *xorbmap.Mapping
+}
+
+func (c *copyFile) Close() error {
+	err := c.File.Close()
+	if c.held != nil {
+		c.held.Release()
+		c.held = nil
+	}
+	return err
 }

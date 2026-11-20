@@ -300,7 +300,7 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 		return false, nil // Already exists
 	}
 
-	if err := storage.PrepareShard(ctx, s, fs); err != nil {
+	if err := storage.PrepareShard(ctx, s, fileXorbs{fs}); err != nil {
 		return false, err
 	}
 
@@ -326,6 +326,33 @@ func (fs *Storage) PutShard(ctx context.Context, s *shard.Shard) (bool, error) {
 		return writeIndexFile(fs.objectPath(kind, name), value)
 	})
 	return wasInserted, err
+}
+
+// fileXorbs reads xorb files directly for PutShard's pass over every xorb a shard
+// names: through the mapping cache, each would stay mapped and resident until evicted.
+type fileXorbs struct{ *Storage }
+
+func (x fileXorbs) GetXorbReadSeekCloser(_ context.Context, xorbHash xet.XorbHash) (io.ReadSeekCloser, error) {
+	f, err := os.Open(x.objectPath("xorbs", xorbHash.String()))
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func (x fileXorbs) GetXorbChunkOffsets(ctx context.Context, xorbHash xet.XorbHash) ([]uint64, error) {
+	return x.caches.Offsets.GetOrLoad(xorbHash, func() ([]uint64, error) {
+		rc, err := x.GetXorbReadSeekCloser(ctx, xorbHash)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		offsets, err := storage.ReadXorbChunkOffsets(rc)
+		if err != nil {
+			return nil, fmt.Errorf("read xorb chunk offsets: %w", err)
+		}
+		return offsets, nil
+	})
 }
 
 // xorbChunkOffsets returns the cumulative packed end-offset of every chunk in

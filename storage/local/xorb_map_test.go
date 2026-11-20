@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
 	"github.com/wzshiming/xet/xorb"
@@ -252,4 +253,50 @@ func TestXorbChunkOffsetsShareOpenReaderMap(t *testing.T) {
 		t.Fatalf("after loading X's chunk offsets with reader A open: xorbCache.Len() = %d, Mapped() = %d; want 1, 1", cached, mapped)
 	}
 	assertRest(t, a, encoded[7:])
+}
+
+// PutFile verifies its shard through the xorb files: no xorb it writes or reads
+// enters the cache, and one a reader cached stays there.
+func TestPutFileLeavesXorbCacheAlone(t *testing.T) {
+	ctx := context.Background()
+	fs := newRangeStore(t)
+	assertCached := func(after string, want int) {
+		t.Helper()
+		if cached, mapped := fs.xorbCache.Len(), fs.xorbCache.Mapped(); cached != want || mapped != int64(want) {
+			t.Fatalf("after %s: xorbCache.Len() = %d, Mapped() = %d; want %d, %d", after, cached, mapped, want, want)
+		}
+	}
+	data := make([]byte, 2<<20)
+	rand.NewChaCha8([32]byte{1}).Read(data)
+
+	first, err := storage.PutFile(ctx, fs, bytes.NewReader(data[:1<<20]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCached("PutFile", 0)
+	sh, err := fs.GetShard(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused := sh.CASInfos[0].CASHash
+	if got := drainXorb(fs, reused); got.err != nil {
+		t.Fatal(got.err)
+	}
+	assertCached("reading the first file's xorb", 1)
+
+	// The second file starts with the first, so it has terms in that xorb.
+	second, err := storage.PutFile(ctx, fs, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh, err = fs.GetShard(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(sh.Files[0].Entries, func(e shard.FileDataSequenceEntry) bool { return e.CASHash == reused }) {
+		t.Fatalf("the second file has no term in the first file's xorb %s", reused.String())
+	}
+	assertCached("PutFile of a file reusing the cached xorb", 1)
+	if !fs.xorbCache.Has(reused) {
+		t.Fatal("the reused xorb left the cache during PutFile")
+	}
 }
