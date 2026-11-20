@@ -14,6 +14,7 @@ import (
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/mirror/spool"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/storage"
 )
 
@@ -22,6 +23,7 @@ type Handler struct {
 	authorizer auth.Authorizer
 	storage    storage.Storage
 	gc         *storage.GC
+	pins       *pins.Table[xet.XorbHash]
 	gcGrace    time.Duration
 	gcAnchor   storage.SweepAnchor
 	mirror     *mirror.Mirror
@@ -44,6 +46,20 @@ func WithAuthorizer(a auth.Authorizer) Option {
 func WithStorage(storage storage.Storage) Option {
 	return func(h *Handler) {
 		h.storage = storage
+	}
+}
+
+// WithGC sweeps with gc, which must wrap WithStorage's storage; if unset, NewHandler builds one over it.
+func WithGC(gc *storage.GC) Option {
+	return func(h *Handler) {
+		h.gc = gc
+	}
+}
+
+// WithPins spares the xorbs pinned in p from the storage pass; nil consults none.
+func WithPins(p *pins.Table[xet.XorbHash]) Option {
+	return func(h *Handler) {
+		h.pins = p
 	}
 }
 
@@ -95,7 +111,9 @@ func NewHandler(opts ...Option) *Handler {
 		opt(h)
 	}
 
-	h.gc = storage.NewGC(h.storage)
+	if h.gc == nil {
+		h.gc = storage.NewGC(h.storage)
+	}
 
 	h.registerRoutes()
 	return h
@@ -240,6 +258,7 @@ func (h *Handler) handleUnlinkSHA256(w http.ResponseWriter, r *http.Request) {
 // remaining_* describe one request only. dry_run reports every pass's full
 // upper bound (for storage the mark-time bound: no per-shard re-checks, no
 // entry counts), ignoring max and budget.
+// The storage pass spares xorbs pinned in the table given by WithPins (skipped_pinned) at any grace; pins cover xorbs only, so grace=0 still needs a quiescent store.
 func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, auth.Grant{Permission: auth.Write}) {
 		return
@@ -301,6 +320,7 @@ func (h *Handler) handleGC(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := storage.SweepOptions{
 		Grace:      grace,
+		Pins:       h.pins,
 		DryRun:     dryRun,
 		MaxDeletes: maxDeletes,
 		Budget:     budget,

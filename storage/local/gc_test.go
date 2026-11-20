@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/wzshiming/xet"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/shard"
 	"github.com/wzshiming/xet/storage"
 	"github.com/wzshiming/xet/storage/storagetest"
@@ -31,6 +33,7 @@ type hookedGCStore struct {
 	fileEntryGets    int
 	beforeWalkShards func() // fired before every WalkShards delegation
 	beforeWalkXorbs  func() // fired before every WalkXorbs delegation
+	afterWalkXorbs   func() // fired after every WalkXorbs delegation returns
 	loadShardErrs    map[string]error
 }
 
@@ -55,9 +58,13 @@ func (h *hookedGCStore) WalkXorbs(ctx context.Context, fn func(xorbHash string, 
 	if h.beforeWalkXorbs != nil {
 		h.beforeWalkXorbs()
 	}
-	return h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
+	err := h.Storage.WalkXorbs(ctx, func(xorbHash string, size int64, modTime time.Time) error {
 		return fn(xorbHash, size, h.walkTime(modTime))
 	})
+	if h.afterWalkXorbs != nil {
+		h.afterWalkXorbs()
+	}
+	return err
 }
 
 func (h *hookedGCStore) GetFileIndexEntry(ctx context.Context, fileHash xet.FileHash) (string, error) {
@@ -478,5 +485,104 @@ func TestSweepAnchorSHA256KeepsNilMetadataFileShards(t *testing.T) {
 	}
 	if got, want := storagetest.SweptHashes(res.SweptXorbs), []string{xorbHashes[0].String()}; !slices.Equal(got, want) {
 		t.Fatalf("SweptXorbs = %v, want %v", got, want)
+	}
+}
+
+// TestSweepPinHeldAcrossPass: an orphan pinned when a pass begins is spared by that whole pass though unpinned before its xorb walk, and swept by the next.
+func TestSweepPinHeldAcrossPass(t *testing.T) {
+	ctx := context.Background()
+	st, err := NewStorage(WithBasePath(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("unpinned mid-pass"))
+	if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	hooked := &hookedGCStore{Storage: st}
+	g := storage.NewGC(hooked)
+	table := pins.New[xet.XorbHash]()
+	unpin := table.Pin(xorbHash)
+	hooked.beforeWalkXorbs = func() { unpin() }
+	opts := storage.SweepOptions{Grace: storagetest.NoGrace, Pins: table}
+	res, err := g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("SweepStep: %v", err)
+	}
+	if len(res.SweptXorbs) != 0 || res.SkippedPinned != 1 {
+		t.Fatalf("SweepStep swept xorbs %v with SkippedPinned %d; want none and 1: the xorb was pinned when the pass began",
+			storagetest.SweptHashes(res.SweptXorbs), res.SkippedPinned)
+	}
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
+		t.Fatalf("HasXorb after the pass = %v, %v; want present", ok, err)
+	}
+
+	hooked.beforeWalkXorbs = nil
+	res, err = g.SweepStep(ctx, opts)
+	if err != nil {
+		t.Fatalf("next SweepStep: %v", err)
+	}
+	if got, want := storagetest.SweptHashes(res.SweptXorbs), []string{xorbHash.String()}; !slices.Equal(got, want) {
+		t.Fatalf("next SweepStep swept xorbs %v, want %v", got, want)
+	}
+	if ok, err := st.HasXorb(ctx, xorbHash); err != nil || ok {
+		t.Fatalf("HasXorb after the next pass = %v, %v; want absent", ok, err)
+	}
+}
+
+// TestSweepPinTakenAfterMarkIsSpared: an orphan first pinned once the xorb walk marked it dead is spared by that pass's delete, though unpinned before it, and swept by the next pass once unpinned.
+func TestSweepPinTakenAfterMarkIsSpared(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		unpin bool
+	}{
+		{"still pinned at the delete", false},
+		{"unpinned before the delete", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st, err := NewStorage(WithBasePath(t.TempDir()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, xorbHash := storagetest.EncodeXorb(t, true, []byte("pinned after the mark"))
+			if _, err := st.PutXorb(ctx, xorbHash, bytes.NewReader(encoded)); err != nil {
+				t.Fatal(err)
+			}
+
+			hooked := &hookedGCStore{Storage: st}
+			g := storage.NewGC(hooked)
+			table := pins.New[xet.XorbHash]()
+			unpin := func() {}
+			hooked.afterWalkXorbs = func() {
+				unpin = table.Pin(xorbHash)
+				if tc.unpin {
+					unpin()
+				}
+			}
+			opts := storage.SweepOptions{Grace: storagetest.NoGrace, Pins: table}
+			res, err := g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("SweepStep: %v", err)
+			}
+			if len(res.SweptXorbs) != 0 || res.SkippedPinned != 1 {
+				t.Fatalf("SweepStep swept xorbs %v with SkippedPinned %d; want none and 1: the xorb was pinned after the walk marked it, before its delete",
+					storagetest.SweptHashes(res.SweptXorbs), res.SkippedPinned)
+			}
+			if ok, err := st.HasXorb(ctx, xorbHash); err != nil || !ok {
+				t.Fatalf("HasXorb after the pass = %v, %v; want present", ok, err)
+			}
+
+			hooked.afterWalkXorbs = nil
+			unpin()
+			res, err = g.SweepStep(ctx, opts)
+			if err != nil {
+				t.Fatalf("next SweepStep: %v", err)
+			}
+			if got, want := storagetest.SweptHashes(res.SweptXorbs), []string{xorbHash.String()}; !slices.Equal(got, want) {
+				t.Fatalf("next SweepStep swept xorbs %v, want %v", got, want)
+			}
+		})
 	}
 }

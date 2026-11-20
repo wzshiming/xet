@@ -11,10 +11,12 @@ import (
 	"time"
 
 	"github.com/gorilla/handlers"
+	"github.com/wzshiming/xet"
 	"github.com/wzshiming/xet/auth"
 	"github.com/wzshiming/xet/client"
 	"github.com/wzshiming/xet/mirror"
 	"github.com/wzshiming/xet/mirror/spool"
+	"github.com/wzshiming/xet/pins"
 	"github.com/wzshiming/xet/server"
 	"github.com/wzshiming/xet/server/hf"
 	"github.com/wzshiming/xet/server/internalapi"
@@ -87,7 +89,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	queue, err := spool.NewSpool(filepath.Join(*storageDir, "spool"), stor)
+	gc := storage.NewGC(stor)
+	table := pins.New[xet.XorbHash]()
+	queue, err := spool.NewSpool(filepath.Join(*storageDir, "spool"), stor, spool.WithPins(table))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create spool: %v\n", err)
 		os.Exit(1)
@@ -154,6 +158,8 @@ func main() {
 	if *internalAPI {
 		next = internalapi.NewHandler(
 			internalapi.WithStorage(stor),
+			internalapi.WithGC(gc),
+			internalapi.WithPins(table),
 			internalapi.WithAuthorizer(auth.AuthorizerFunc(func(r *http.Request, _ auth.Grant) error {
 				token, ok := auth.BearerToken(r)
 				if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(*internalToken)) != 1 {
