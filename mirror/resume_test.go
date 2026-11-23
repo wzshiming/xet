@@ -809,3 +809,67 @@ func TestMirrorSlowXetFetchNotStalled(t *testing.T) {
 		t.Fatalf("mirror used its own chunk cache despite WithCache: %v", err)
 	}
 }
+
+// failingXetUpstream is a xet hub whose CAS fails every request with 503.
+type failingXetUpstream struct {
+	hubURL       string
+	reconQueries atomic.Int64
+}
+
+func newFailingXetUpstream(t *testing.T, resolvePath string) *failingXetUpstream {
+	t.Helper()
+	u := &failingXetUpstream{}
+	casSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reconstructions/") {
+			u.reconQueries.Add(1)
+		}
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(casSrv.Close)
+	fileHash := strings.Repeat("ab", 32)
+	hubSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/xet-read-token/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"casUrl": casSrv.URL, "accessToken": "upstream-cas-token", "exp": time.Now().Add(time.Hour).Unix()})
+		case r.URL.Path == resolvePath:
+			w.Header().Set("X-Linked-Size", "1024")
+			w.Header().Add("Link", fmt.Sprintf("<%s/v1/reconstructions/%s>; rel=\"xet-reconstruction-info\"", casSrv.URL, fileHash))
+			w.Header().Add("Link", fmt.Sprintf("<%s/api/xet-read-token>; rel=\"xet-auth\"", u.hubURL))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(hubSrv.Close)
+	u.hubURL = hubSrv.URL
+	return u
+}
+
+// A CAS that keeps failing is retried by the mirror's fetch attempts alone, one reconstruction query each, unless the caller's client options add retries.
+func TestMirrorXetFetchSingleRetryLayer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []client.Options
+		want int64 // reconstruction queries over the mirror's 5 attempts
+	}{
+		{"default", nil, 5},
+		{"client retries override", []client.Options{client.WithRetries(2), client.WithRetryBaseDelay(0)}, 15},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFailingXetUpstream(t, "/org/repo/resolve/main/f.bin")
+			m, _ := newTestMirror(t, up.hubURL, t.TempDir(), t.TempDir(), WithClientOptions(tc.opts...))
+
+			res, err := m.Resolve(context.Background(), "org/repo", "main", "f.bin")
+			if err != nil {
+				t.Fatal(err)
+			}
+			awaitClosed(t, doneOf(res), "failing xet ingest")
+			if _, err := entryOf(res); err == nil || !strings.Contains(err.Error(), "failed after 5 attempts") {
+				t.Fatalf("ingest err = %v, want the mirror's 5 attempts exhausted", err)
+			}
+			if got := up.reconQueries.Load(); got != tc.want {
+				t.Fatalf("reconstruction queries = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

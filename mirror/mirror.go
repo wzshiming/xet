@@ -197,7 +197,7 @@ func WithSpool(s *spool.Spool) Option {
 	return func(m *Mirror) { m.spool = s }
 }
 
-// WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache and upstream provider itself (WithCache in opts replaces the mirror's cache).
+// WithClientOptions configures the per-download xet clients; the mirror sets their transport, chunk cache, upstream provider and WithRetries(0) itself (WithCache or WithRetries in opts replaces the mirror's).
 func WithClientOptions(opts ...client.Options) Option {
 	return func(m *Mirror) { m.clientOpts = opts }
 }
@@ -289,7 +289,7 @@ func NewMirror(opts ...Option) (*Mirror, error) {
 	return m, nil
 }
 
-// newClient binds a xet client to repo with token for one download: the mirror's transport and cache, the caller's options, and the repository's token endpoints bound last.
+// newClient binds a xet client to repo with token for one download: the mirror's transport and cache, no retries beneath the mirror's fetch attempts, the caller's options, and the repository's token endpoints bound last.
 func (m *Mirror) newClient(repo hf.Repo, token string) (*hf.Client, error) {
-	return hf.NewClient(repo, hf.WithHTTPClient(m.hubClient), hf.WithToken(token), hf.WithClientOptions(append([]client.Options{client.WithCache(m.cache)}, m.clientOpts...)...))
+	return hf.NewClient(repo, hf.WithHTTPClient(m.hubClient), hf.WithToken(token), hf.WithClientOptions(append([]client.Options{client.WithCache(m.cache), client.WithRetries(0)}, m.clientOpts...)...))
 }

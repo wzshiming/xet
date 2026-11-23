@@ -97,7 +97,7 @@ func (c *Client) newDownloadReaderV1(ctx context.Context, fileHash xet.FileHash,
 		// Only a rejected Range query warrants restarting from scratch; a 404
 		// means the file is absent and rewinding would just lose the resume
 		// offset.
-		if resumeOffset > 0 && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) {
+		if resumeOffset > 0 && ctx.Err() == nil && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) && !errors.Is(err, errRetriesExhausted) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
 				reconstructionResp, err = c.getReconstructionV1(ctx, fileHash, nil)
@@ -120,7 +120,7 @@ func (c *Client) newDownloadReaderV2(ctx context.Context, fileHash xet.FileHash,
 	if err != nil {
 		// A missing V2 endpoint must not rewind w: the caller falls back to
 		// V1, which resumes from the same offset.
-		if resumeOffset > 0 && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) {
+		if resumeOffset > 0 && ctx.Err() == nil && !errors.Is(err, errNotFound) && !errors.Is(err, errUnauthorized) && !isAuthError(err) && !errors.Is(err, errRetriesExhausted) {
 			if _, seekErr := w.Seek(0, io.SeekStart); seekErr == nil {
 				resumeOffset = 0
 				reconstructionResp, err = c.getReconstructionV2(ctx, fileHash, nil)

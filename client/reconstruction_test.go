@@ -115,6 +115,7 @@ func TestGetReconstructionV1RetriesOnServer5xx(t *testing.T) {
 
 	c, err := NewClient(
 		WithRetries(2),
+		WithRetryBaseDelay(time.Millisecond),
 		WithUpstreamProvider(StaticUpstreamProvider(server.URL, "")),
 	)
 	if err != nil {
