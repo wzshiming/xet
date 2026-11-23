@@ -141,7 +141,7 @@ func (c *Client) Commit(ctx context.Context, summary string, files ...CommitFile
 			if err := rewind(f.Content); err != nil {
 				return nil, fmt.Errorf("upload %s: %w", f.Path, err)
 			}
-			if _, err := c.Client.UploadFileV2(ctx, f.Content); err != nil {
+			if _, err := c.Client.UploadFile(ctx, f.Content); err != nil {
 				return nil, fmt.Errorf("upload %s: %w", f.Path, err)
 			}
 			lines = append(lines, commitLine{Key: "lfsFile", Value: commitLFSFile{Algo: "sha256", OID: digest, Path: f.Path, Size: preupload.Files[i].Size}})
