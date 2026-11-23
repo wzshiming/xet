@@ -231,7 +231,7 @@ func TestS3ShardNameIsDeterministicContentHash(t *testing.T) {
 		s := shard.NewShard()
 		storagetest.AddFileBlock(t, ctx, ss, s, [][]byte{[]byte("identical content")})
 		s.SetFooter(time.Unix(int64(creationTime), 0))
-		if inserted, err := storage.PutShard(ctx, ss, s); err != nil || !inserted {
+		if inserted, err := storage.PutShard(ctx, ss, s, nil); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 
@@ -293,10 +293,10 @@ func TestS3StorageShardRoundTrip(t *testing.T) {
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, parts)
 
-	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
-	if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || inserted {
+	if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || inserted {
 		t.Fatalf("PutShard() repeat = %v, %v", inserted, err)
 	}
 
@@ -407,7 +407,7 @@ func TestS3StorageTwoLevelFanoutLayout(t *testing.T) {
 			content := []byte("fan me out")
 			shardObj := shard.NewShard()
 			fileHash, _, _ := storagetest.AddFileBlock(t, ctx, ss, shardObj, [][]byte{content})
-			if inserted, err := storage.PutShard(ctx, ss, shardObj); err != nil || !inserted {
+			if inserted, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil || !inserted {
 				t.Fatalf("PutShard() = %v, %v", inserted, err)
 			}
 
@@ -600,7 +600,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	fc.setFail(func(req *http.Request) bool {
 		return req.Method == http.MethodPut && strings.Contains(req.URL.Path, "/index/sha256/")
 	})
-	if _, err := storage.PutShard(ctx, ss, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj, nil); err == nil {
 		t.Fatal("PutShard() succeeded despite injected failure")
 	}
 
@@ -610,7 +610,7 @@ func TestS3StoragePutShardRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	fc.setFail(nil)
-	if _, err := storage.PutShard(ctx, ss, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, ss, shardObj, nil); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 

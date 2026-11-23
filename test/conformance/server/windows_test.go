@@ -114,7 +114,7 @@ func TestServerWindowedDownloadConformance(t *testing.T) {
 			}
 			file.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 			sh.AddFile(file)
-			if _, err := storage.PutShard(t.Context(), stor, sh); err != nil {
+			if _, err := storage.PutShard(t.Context(), stor, sh, nil); err != nil {
 				t.Fatal(err)
 			}
 

@@ -43,7 +43,7 @@ func TestShardNameIsDeterministicContentHash(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inserted, err := storage.PutShard(context.Background(), st, newIdenticalShard(st, creationTime)); err != nil || !inserted {
+		if inserted, err := storage.PutShard(context.Background(), st, newIdenticalShard(st, creationTime), nil); err != nil || !inserted {
 			t.Fatalf("PutShard() = %v, %v", inserted, err)
 		}
 		entries, err := fanoutEntries(filepath.Join(basePath, "shards"))
@@ -138,7 +138,7 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.PutShard(ctx, fs, shardObj); err == nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj, nil); err == nil {
 		t.Fatal("PutShard() succeeded despite blocked sha256 index")
 	}
 
@@ -150,7 +150,7 @@ func TestPutShardRetryAfterPartialFailure(t *testing.T) {
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.PutShard(ctx, fs, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, fs, shardObj, nil); err != nil {
 		t.Fatalf("PutShard() retry: %v", err)
 	}
 
@@ -210,7 +210,7 @@ func TestFileStorageTwoLevelFanoutLayout(t *testing.T) {
 	content := []byte("fan me out")
 	shardObj := shard.NewShard()
 	fileHash, _, _ := storagetest.AddFileBlock(t, ctx, fs, shardObj, [][]byte{content})
-	if inserted, err := storage.PutShard(ctx, fs, shardObj); err != nil || !inserted {
+	if inserted, err := storage.PutShard(ctx, fs, shardObj, nil); err != nil || !inserted {
 		t.Fatalf("PutShard() = %v, %v", inserted, err)
 	}
 

@@ -13,7 +13,7 @@ import (
 )
 
 // Empty files use zero digests instead of the SHA-256 of an empty stream.
-func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Storage) (digest [32]byte, fileHash xet.FileHash, err error) {
+func computeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs Storage, termDone func()) (digest [32]byte, fileHash xet.FileHash, err error) {
 	if len(fileBlock.Entries) == 0 {
 		return digest, fileHash, nil
 	}
@@ -51,6 +51,7 @@ func ComputeFileHashes(ctx context.Context, fileBlock *shard.FileBlock, xorbs St
 		hashes, sizes := decoder.Chunks()
 		chunkHashes = append(chunkHashes, hashes...)
 		chunkSizes = append(chunkSizes, sizes...)
+		termDone()
 	}
 	copy(digest[:], h.Sum(nil))
 	fileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
@@ -93,16 +94,31 @@ func verifyCASBlock(ctx context.Context, cb *shard.CASBlock, xorbs Storage) erro
 }
 
 func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
+	return prepareShard(ctx, s, xorbs, func(PutShardPhase, int, int) {})
+}
+
+// prepareShard is PrepareShard reporting PutShardVerifying to progress, which must not be nil.
+func prepareShard(ctx context.Context, s *shard.Shard, xorbs Storage, progress PutShardProgress) error {
 	if len(s.Files) == 0 {
 		return fmt.Errorf("shard has no file blocks")
+	}
+	done, total := 0, len(s.CASInfos)
+	for _, file := range s.Files {
+		total += len(file.Entries)
+	}
+	progress(PutShardVerifying, done, total)
+	verified := func() {
+		done++
+		progress(PutShardVerifying, done, total)
 	}
 	for i := range s.CASInfos {
 		if err := verifyCASBlock(ctx, &s.CASInfos[i], xorbs); err != nil {
 			return err
 		}
+		verified()
 	}
 	for i := range s.Files {
-		computed, fileHash, err := ComputeFileHashes(ctx, &s.Files[i], xorbs)
+		computed, fileHash, err := computeFileHashes(ctx, &s.Files[i], xorbs, verified)
 		if err != nil {
 			return fmt.Errorf("compute SHA-256 for file %s: %w", s.Files[i].FileHash.String(), err)
 		}
@@ -119,11 +135,26 @@ func PrepareShard(ctx context.Context, s *shard.Shard, xorbs Storage) error {
 	return nil
 }
 
+// PutShardPhase is the step of PutShard a PutShardProgress report belongs to.
+type PutShardPhase uint8
+
+const (
+	// PutShardVerifying reports done of total checks, one per CAS block and per file term.
+	PutShardVerifying PutShardPhase = iota + 1
+	// PutShardWriting is reported once, as (0, 0), before the shard object is stored.
+	PutShardWriting
+	// PutShardIndexing is reported once, as (0, 0), before the first index entry is written.
+	PutShardIndexing
+)
+
+// PutShardProgress may be nil; PutShard calls it on the caller's goroutine.
+type PutShardProgress func(phase PutShardPhase, done, total int)
+
 // PutShard verifies s against the stored xorbs with PrepareShard, stores it
 // under the SHA-256 of its encoding and writes its index entries, reporting
 // whether the shard object was inserted. A shard whose every file st already
 // indexes is a no-op.
-func PutShard(ctx context.Context, st Storage, s *shard.Shard) (bool, error) {
+func PutShard(ctx context.Context, st Storage, s *shard.Shard, progress PutShardProgress) (bool, error) {
 	indexed := len(s.Files) > 0
 	for _, file := range s.Files {
 		shardHash, err := st.GetFileIndexEntry(ctx, file.FileHash)
@@ -139,13 +170,18 @@ func PutShard(ctx context.Context, st Storage, s *shard.Shard) (bool, error) {
 		return false, nil
 	}
 
-	if err := PrepareShard(ctx, s, st); err != nil {
+	if progress == nil {
+		progress = func(PutShardPhase, int, int) {}
+	}
+	if err := prepareShard(ctx, s, st, progress); err != nil {
 		return false, err
 	}
+	progress(PutShardWriting, 0, 0)
 	shardHash, inserted, err := st.PutShard(ctx, s)
 	if err != nil {
 		return false, fmt.Errorf("store shard: %w", err)
 	}
+	progress(PutShardIndexing, 0, 0)
 	return inserted, putShardIndexes(ctx, st, s, shardHash)
 }
 

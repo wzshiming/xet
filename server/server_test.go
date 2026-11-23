@@ -71,7 +71,7 @@ func authorizerFixture(t *testing.T) (storage.Storage, xet.FileHash, xet.XorbHas
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.PutShard(ctx, stor, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 	return stor, fileHash, xorbHash, chunkHash, digest, encoded.Bytes(), shardBytes
@@ -780,7 +780,7 @@ func TestXetBridgeExtractsCompleteFileBySHA256(t *testing.T) {
 	}
 	fileBlock.FileHash = xet.ComputeFileHash(chunkHashes, chunkSizes)
 	shardObj.AddFile(fileBlock)
-	if _, err := storage.PutShard(ctx, stor, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, stor, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 
