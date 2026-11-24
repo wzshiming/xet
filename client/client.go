@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +29,7 @@ type Client struct {
 	getHttpClient *http.Client
 	concurrency   int
 	retries       int
+	retryDelay    time.Duration
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cache         *Cache
@@ -72,6 +72,13 @@ func WithRetries(retries int) Options {
 	}
 }
 
+// WithRetryBaseDelay sets the nominal wait before the first retry (default 3s), tripled per retry up to 6 minutes and jittered; <= 0 disables waiting.
+func WithRetryBaseDelay(delay time.Duration) Options {
+	return func(c *Client) {
+		c.retryDelay = delay
+	}
+}
+
 // WithIdleTimeout sets the GET/HEAD read-idle timeout (default DefaultIdleTimeout; <= 0 disables it).
 func WithIdleTimeout(timeout time.Duration) Options {
 	return func(c *Client) {
@@ -102,6 +109,7 @@ func NewClient(opts ...Options) (*Client, error) {
 		httpClient:  &http.Client{},
 		concurrency: 4,
 		retries:     5,
+		retryDelay:  defaultRetryBaseDelay,
 		idleTimeout: DefaultIdleTimeout,
 
 		detectedShardAPIVersion: new(atomic.Uint32),
@@ -199,45 +207,6 @@ func (e statusCodeError) Is(target error) bool {
 	return false
 }
 
-func isNetworkError(err error) bool {
-	var netErr interface{ Timeout() bool }
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	if _, ok := errors.AsType[*url.Error](err); ok {
-		return true
-	}
-	return false
-}
-
-func isServerError(statusCode int) bool {
-	return statusCode == http.StatusInternalServerError ||
-		statusCode == http.StatusBadGateway ||
-		statusCode == http.StatusServiceUnavailable ||
-		statusCode == http.StatusGatewayTimeout
-}
-
-func (c *Client) retryAttempts() int {
-	return max(c.retries+1, 1)
-}
-
-func resetRequestBody(req *http.Request) error {
-	if req.Body == nil {
-		return nil
-	}
-
-	if req.GetBody != nil {
-		body, err := req.GetBody()
-		if err != nil {
-			return err
-		}
-		req.Body = body
-		return nil
-	}
-
-	return fmt.Errorf("request body is not retryable")
-}
-
 // do issues one request on the plain httpClient, guarding GET/HEAD with the read-idle timeout.
 func (c *Client) do(req *http.Request) (*http.Response, error) {
 	httpClient := c.httpClient
@@ -247,39 +216,4 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 		httpClient = &guarded
 	}
 	return httpClient.Do(req)
-}
-
-func (c *Client) doWithNetworkRetry(req *http.Request) (*http.Response, error) {
-	attempts := c.retryAttempts()
-
-	var lastErr error
-	for i := range attempts {
-		if i > 0 {
-			if err := resetRequestBody(req); err != nil {
-				return nil, fmt.Errorf("reset request body: %w", err)
-			}
-		}
-
-		resp, err := c.do(req)
-		if err == nil {
-			if isServerError(resp.StatusCode) {
-				lastErr = fmt.Errorf("server error status %s", resp.Status)
-				resp.Body.Close()
-				if req.Context().Err() != nil {
-					break
-				}
-				continue
-			}
-			return resp, nil
-		}
-		if !isNetworkError(err) {
-			return nil, fmt.Errorf("do request: %w", err)
-		}
-		lastErr = err
-		if req.Context().Err() != nil {
-			break
-		}
-	}
-
-	return nil, fmt.Errorf("network error after %d attempts: %w", attempts, lastErr)
 }

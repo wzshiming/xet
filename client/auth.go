@@ -13,30 +13,57 @@ import (
 
 var errNoUpstreamProvider = errors.New("no upstream provider bound")
 
-// casAuth is the per-operation snapshot authTransport authenticates CAS-origin requests with.
+// casAuth is the credential authTransport authenticates CAS-origin requests with until a retry resolves perm again.
 type casAuth struct {
-	origin string
-	token  string
+	perm    auth.Permission
+	baseURL string
+	origin  string
+	token   string
 }
 
 type casAuthKey struct{}
 
 // casContext resolves the CAS endpoint for perm through the bound provider and marks ctx so authTransport authenticates requests to that origin.
 func (c *Client) casContext(ctx context.Context, perm auth.Permission) (context.Context, string, error) {
+	mark, err := c.resolveCAS(ctx, perm)
+	if err != nil {
+		return nil, "", err
+	}
+	return context.WithValue(ctx, casAuthKey{}, mark), mark.baseURL, nil
+}
+
+// renewCASContext resolves the credential ctx is marked with again; an unmarked ctx is returned as it is.
+func (c *Client) renewCASContext(ctx context.Context) (context.Context, error) {
+	mark, _ := ctx.Value(casAuthKey{}).(*casAuth)
+	if mark == nil {
+		return ctx, nil
+	}
+	renewed, err := c.resolveCAS(ctx, mark.perm)
+	if err != nil {
+		return nil, err
+	}
+	if renewed.baseURL != mark.baseURL {
+		// The request was built for the first endpoint, and the new token belongs to the other.
+		return nil, &authError{fmt.Errorf("CAS endpoint changed from %s to %s", mark.baseURL, renewed.baseURL)}
+	}
+	return context.WithValue(ctx, casAuthKey{}, renewed), nil
+}
+
+// resolveCAS asks the bound provider for perm's CAS endpoint and token.
+func (c *Client) resolveCAS(ctx context.Context, perm auth.Permission) (*casAuth, error) {
 	if c.provider == nil {
-		return nil, "", errNoUpstreamProvider
+		return nil, errNoUpstreamProvider
 	}
 	// A provider may fetch its token through this client's transport; the mark of an enclosing operation must not authenticate that.
 	baseURL, token, err := c.provider.Resolve(context.WithValue(ctx, casAuthKey{}, nil), perm)
 	if err != nil {
-		return nil, "", &authError{err}
+		return nil, &authError{err}
 	}
 	baseURL, origin, err := casOrigin(baseURL)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	mark := &casAuth{origin: origin, token: token}
-	return context.WithValue(ctx, casAuthKey{}, mark), baseURL, nil
+	return &casAuth{perm: perm, baseURL: baseURL, origin: origin, token: token}, nil
 }
 
 // casOrigin returns baseURL without its trailing slash and its scheme://host origin.

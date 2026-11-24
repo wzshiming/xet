@@ -71,22 +71,25 @@ func (c *Client) UploadShard(ctx context.Context, shardObj *shard.Shard) (*uploa
 // API. Error frames marked retryable retry the whole upload, mirroring the
 // xet-core reference client.
 func (c *Client) UploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	attempts := c.retryAttempts()
-	var lastErr error
-	for i := range attempts {
-		if i > 0 && ctx.Err() != nil {
-			break
-		}
-		uploadResp, err := c.uploadShardV2(ctx, shardObj)
-		if err == nil {
-			return uploadResp, nil
-		}
-		if _, ok := errors.AsType[*retryableShardUploadError](err); !ok {
-			return nil, err
-		}
-		lastErr = err
+	req, scope, err := c.newShardUploadRequest(ctx, "v2", shardObj)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("v2 shard upload failed after %d attempts: %w", attempts, lastErr)
+
+	var uploadResp *upload.ShardUploadResponse
+	err = c.doWithRetry(req, func(resp *http.Response) (err error) {
+		defer resp.Body.Close()
+		if err = reqError(req, resp); err != nil {
+			return err
+		}
+		uploadResp, err = parseShardUploadNDJSON(resp.Body)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	_ = c.cache.Upload.Store(scope, shardObj.ChunkLocations())
+	return uploadResp, nil
 }
 
 // newShardUploadRequest builds a POST request carrying the encoded shard for
@@ -116,38 +119,17 @@ func (c *Client) newShardUploadRequest(ctx context.Context, version string, shar
 	return req, baseURL, nil
 }
 
-// uploadShardV2 performs a single /v2/shards upload attempt, caching the shard's chunk locations on success.
-func (c *Client) uploadShardV2(ctx context.Context, shardObj *shard.Shard) (*upload.ShardUploadResponse, error) {
-	req, scope, err := c.newShardUploadRequest(ctx, "v2", shardObj)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.doWithNetworkRetry(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if err := reqError(req, resp); err != nil {
-		return nil, err
-	}
-
-	uploadResp, err := parseShardUploadNDJSON(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	_ = c.cache.Upload.Store(scope, shardObj.ChunkLocations())
-	return uploadResp, nil
-}
-
-// retryableShardUploadError reports a terminal /v2/shards error frame marked
-// retryable. The whole upload should be attempted again.
+// retryableShardUploadError is a retryable /v2/shards error frame or a stream broken before its terminal frame; the whole upload is attempted again.
 type retryableShardUploadError struct {
-	message string
+	err error
 }
 
 func (e *retryableShardUploadError) Error() string {
-	return e.message
+	return e.err.Error()
+}
+
+func (e *retryableShardUploadError) Unwrap() error {
+	return e.err
 }
 
 // maxShardUploadEventSize caps a single NDJSON frame at 1 MiB, mirroring the
@@ -170,6 +152,10 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 		}
 		var event shardUploadEventV2
 		if err := json.Unmarshal(line, &event); err != nil {
+			// The scanner hands out a broken stream's unterminated tail before its read error.
+			if scanner.Err() != nil {
+				break
+			}
 			return nil, fmt.Errorf("decode v2 shard upload event (line=%q): %w", line, err)
 		}
 		switch event.Type {
@@ -180,7 +166,7 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 				event.Message = "unknown error"
 			}
 			if event.Retryable {
-				return nil, &retryableShardUploadError{message: event.Message}
+				return nil, &retryableShardUploadError{errors.New(event.Message)}
 			}
 			return nil, fmt.Errorf("v2 shard upload failed: %s", event.Message)
 		default:
@@ -188,7 +174,11 @@ func parseShardUploadNDJSON(r io.Reader) (*upload.ShardUploadResponse, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read v2 shard upload events: %w", err)
+		err = fmt.Errorf("read v2 shard upload events: %w", err)
+		if errors.Is(err, bufio.ErrTooLong) {
+			return nil, err
+		}
+		return nil, &retryableShardUploadError{err}
 	}
 	return nil, fmt.Errorf("v2 shard upload stream ended without a result event")
 }

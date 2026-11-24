@@ -108,7 +108,7 @@ func TestUploadShardV2RetriesRetryableError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithRetries(1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithRetries(1), WithRetryBaseDelay(time.Millisecond), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -133,12 +133,12 @@ func TestUploadShardV2ExhaustsRetryableRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithRetries(1), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
+	c, err := NewClient(WithCache(NewCache(t.TempDir(), 0, 0)), WithRetries(1), WithRetryBaseDelay(time.Millisecond), WithUpstreamProvider(StaticUpstreamProvider(srv.URL, "")))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
 	_, err = c.UploadShardV2(t.Context(), shard.NewShard())
-	if err == nil || !strings.Contains(err.Error(), "after 2 attempts") {
+	if err == nil || !strings.Contains(err.Error(), "v2 shard upload failed after 2 attempts") {
 		t.Fatalf("expected retry exhaustion error, got %v", err)
 	}
 	if got := attempts.Load(); got != 2 {
