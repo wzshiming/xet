@@ -108,7 +108,7 @@ func PutFile(ctx context.Context, stor Storage, r io.ReadSeeker) (xet.FileHash, 
 	}
 
 	if len(chunks) > 0 {
-		if _, err := PutShard(ctx, stor, shard.BuildShard([]shard.FileInfo{file}, chunks)); err != nil {
+		if _, err := PutShard(ctx, stor, shard.BuildShard([]shard.FileInfo{file}, chunks), nil); err != nil {
 			return xet.FileHash{}, fmt.Errorf("store shard: %w", err)
 		}
 	}

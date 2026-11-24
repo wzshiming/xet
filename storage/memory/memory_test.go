@@ -147,12 +147,12 @@ func TestConcurrentAccess(t *testing.T) {
 			} else if ok {
 				xorbInserts.Add(1)
 			}
-			if ok, err := storage.PutShard(ctx, st, shared[i]); err != nil {
+			if ok, err := storage.PutShard(ctx, st, shared[i], nil); err != nil {
 				t.Error(err)
 			} else if ok {
 				shardInserts.Add(1)
 			}
-			if ok, err := storage.PutShard(ctx, st, own[i]); err != nil || !ok {
+			if ok, err := storage.PutShard(ctx, st, own[i], nil); err != nil || !ok {
 				t.Errorf("PutShard(own %d) = %v, %v", i, ok, err)
 			}
 			digest := sha256.Sum256(contents[i])

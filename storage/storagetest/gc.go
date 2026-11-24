@@ -1233,7 +1233,7 @@ func testSweepAbortPreservesZeroSHA256Entry(t *testing.T, b Backend) {
 	shardObj := shard.NewShard()
 	emptyHash, _, _ := AddFileBlock(t, ctx, st, shardObj, nil)
 	fullHash, fullXorbs, _ := AddFileBlock(t, ctx, st, shardObj, [][]byte{content})
-	if _, err := storage.PutShard(ctx, st, shardObj); err != nil {
+	if _, err := storage.PutShard(ctx, st, shardObj, nil); err != nil {
 		t.Fatal(err)
 	}
 	var shardHash string
