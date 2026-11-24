@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wzshiming/httpseek"
@@ -32,6 +33,9 @@ type Client struct {
 	idleTimeout   time.Duration
 	progressFunc  progress.ProgressFunc
 	cache         *Cache
+
+	// detectedShardAPIVersion is the version automatic uploads settled on, 0 until one did; copies of a Client share it.
+	detectedShardAPIVersion *atomic.Uint32
 }
 
 type Options func(*Client)
@@ -99,6 +103,8 @@ func NewClient(opts ...Options) (*Client, error) {
 		concurrency: 4,
 		retries:     5,
 		idleTimeout: DefaultIdleTimeout,
+
+		detectedShardAPIVersion: new(atomic.Uint32),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -142,9 +148,10 @@ func (c *Client) Usage(ctx context.Context) (Usage, error) {
 }
 
 var (
-	errNotFound     = fmt.Errorf("404 not found")
-	errUnauthorized = errors.New("401 Unauthorized")
-	errForbidden    = errors.New("403 Forbidden")
+	errNotFound       = fmt.Errorf("404 not found")
+	errUnauthorized   = errors.New("401 Unauthorized")
+	errForbidden      = errors.New("403 Forbidden")
+	errNotImplemented = errors.New("501 Not Implemented")
 )
 
 func reqError(req *http.Request, resp *http.Response) error {
@@ -168,7 +175,7 @@ func reqError(req *http.Request, resp *http.Response) error {
 	return nil
 }
 
-// statusError is resp.Status as an error; a 401 also matches errUnauthorized and a 403 errForbidden so callers can keep them terminal.
+// statusError is resp.Status as an error; a 401, 403 or 501 also matches its sentinel.
 func statusError(resp *http.Response) error {
 	return statusCodeError{resp.StatusCode, resp.Status}
 }
@@ -186,6 +193,8 @@ func (e statusCodeError) Is(target error) bool {
 		return e.code == http.StatusUnauthorized
 	case errForbidden:
 		return e.code == http.StatusForbidden
+	case errNotImplemented:
+		return e.code == http.StatusNotImplemented
 	}
 	return false
 }

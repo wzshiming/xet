@@ -635,6 +635,37 @@ func TestCommitDanglingLFS(t *testing.T) {
 	}
 }
 
+// A commit's lfs file reaches a CAS without /v2/shards through /v1/shards.
+func TestCommitToV1OnlyCAS(t *testing.T) {
+	repo := newPrivateRepo(t)
+	opts := repo.opts
+	handler := server.NewHandler(server.WithStorage(opts.Storage), server.WithAuthorizer(opts.Issuer))
+	cas := httptest.NewServer(repo.cas.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/shards" {
+			http.NotFound(w, r)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})))
+	t.Cleanup(cas.Close)
+	opts.CAS = cas.URL
+	hub := hftest.NewHub(t, opts)
+	c := repo.bound(t, Repo{Endpoint: hub.URL, RepoID: repoID}, hubSecret)
+
+	if _, err := c.Commit(t.Context(), "test: v1-only CAS", files(deterministic(1<<16))...); err != nil {
+		t.Fatalf("Commit to a CAS without /v2/shards: %v", err)
+	}
+	var shards []string
+	for _, req := range repo.cas.requests() {
+		if req.Route() == "POST shards" {
+			shards = append(shards, req.Path)
+		}
+	}
+	if !slices.Equal(shards, []string{"/v2/shards", "/v1/shards"}) {
+		t.Fatalf("shard uploads = %q, want /v2/shards then /v1/shards", shards)
+	}
+}
+
 // lfsByExtension picks the upload mode by path alone, so one reader can be committed as an lfs file and as a regular one.
 func lfsByExtension(path string, _ []byte, _ int64) string {
 	if strings.HasSuffix(path, ".bin") {
